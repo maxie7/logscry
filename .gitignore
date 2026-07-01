@@ -1,0 +1,24 @@
+# Binaries and build output
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test / coverage output
+*.test
+*.out
+coverage.*
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Env / secrets — never commit API keys
+.env
+*.local
+
+# Editor / OS cruft
+.DS_Store
+*.swp
