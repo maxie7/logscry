@@ -22,3 +22,4 @@ go.work.sum
 # Editor / OS cruft
 .DS_Store
 *.swp
+.idea/
