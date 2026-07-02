@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/maxie7/logscry/internal/model"
 )
@@ -124,6 +125,59 @@ func (f fakeSource) Lines(ctx context.Context, out chan<- model.LogLine) error {
 		}
 	}
 	return nil
+}
+
+// TestRunStreamsStdinAndTerminatesOnEOF guards the end-to-end ingest path that
+// backs `printf ... | logscry`: the stdin source and the Run fan-in must run
+// concurrently so lines are emitted as they arrive, AND Run must return once
+// stdin hits EOF so the process can exit. The time.After guard turns a hang
+// (the reported bug) into a test failure instead of a stuck suite.
+func TestRunStreamsStdinAndTerminatesOnEOF(t *testing.T) {
+	src := &StdinSource{r: strings.NewReader("hello\nworld\n")}
+
+	out := make(chan model.LogLine, 8)
+	done := make(chan error, 1)
+	go func() { done <- Run(context.Background(), []Source{src}, out) }()
+
+	var got []string
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ll := <-out:
+			got = append(got, ll.Raw)
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+			// Drain anything buffered after Run returned.
+			for drained := false; !drained; {
+				select {
+				case ll := <-out:
+					got = append(got, ll.Raw)
+				default:
+					drained = true
+				}
+			}
+			if want := []string{"hello", "world"}; !equalStrings(got, want) {
+				t.Fatalf("emitted %q, want %q", got, want)
+			}
+			return
+		case <-deadline:
+			t.Fatalf("Run did not terminate on stdin EOF within 2s (emitted so far: %q)", got)
+		}
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestRunFansInAllSources(t *testing.T) {

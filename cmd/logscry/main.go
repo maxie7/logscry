@@ -9,7 +9,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -43,23 +42,20 @@ func run(ctx context.Context, args []string) error {
 		}
 	}()
 
-	out := bufio.NewWriter(os.Stdout)
-	defer out.Flush()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case line, ok := <-lines:
 			if !ok {
+				// Every source has finished (e.g. stdin EOF) and the fan-in
+				// closed the channel: shut down cleanly.
 				return nil
 			}
 			// TODO(M2): route through the pipeline instead of printing directly.
-			if _, err := fmt.Fprintf(out, "[%s %s] %s\n", line.Source, streamLabel(line.Stream), line.Raw); err != nil {
-				return err
-			}
-			// Flush per line so piped/streamed output appears in real time.
-			if err := out.Flush(); err != nil {
+			// Write straight to os.Stdout (unbuffered) so each line appears the
+			// instant it arrives — this is a real-time tail.
+			if _, err := fmt.Fprintf(os.Stdout, "[%s %s] %s\n", line.Source, streamLabel(line.Stream), line.Raw); err != nil {
 				return err
 			}
 		}
