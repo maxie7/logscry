@@ -2,8 +2,10 @@
 
 // Command logscry is a real-time, AI-assisted log/event triage CLI/TUI.
 //
-// M0: minimal end-to-end path — read stdin, run each line through the pipeline
-// pass-through, and print it to stdout, with graceful shutdown on SIGINT/SIGTERM.
+// M1: ingestion — read from stdin, or run a subprocess (logscry -- ./app) and
+// capture its stdout+stderr. All sources fan into one channel; a temporary
+// consumer prints each line prefixed by its source and stream. The pipeline,
+// scoring, and TUI arrive in later milestones.
 package main
 
 import (
@@ -16,27 +18,27 @@ import (
 
 	"github.com/maxie7/logscry/internal/ingest"
 	"github.com/maxie7/logscry/internal/model"
-	"github.com/maxie7/logscry/internal/pipeline"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx); err != nil {
+	if err := run(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "logscry:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context) error {
+func run(ctx context.Context, args []string) error {
 	lines := make(chan model.LogLine, 1024)
 
-	src := ingest.NewStdinSource()
+	sources := buildSources(args)
 	go func() {
 		defer close(lines)
-		// A read error on stdin ends the run; surface it on stderr but don't crash.
-		if err := src.Lines(ctx, lines); err != nil && ctx.Err() == nil {
+		// Source errors end the run; surface them on stderr but don't crash. A
+		// cancelled context (Ctrl-C) is an expected stop, not an error to report.
+		if err := ingest.Run(ctx, sources, lines); err != nil && ctx.Err() == nil {
 			fmt.Fprintln(os.Stderr, "logscry: ingest:", err)
 		}
 	}()
@@ -52,8 +54,8 @@ func run(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			processed := pipeline.Process(line)
-			if _, err := fmt.Fprintln(out, processed.Raw); err != nil {
+			// TODO(M2): route through the pipeline instead of printing directly.
+			if _, err := fmt.Fprintf(out, "[%s %s] %s\n", line.Source, streamLabel(line.Stream), line.Raw); err != nil {
 				return err
 			}
 			// Flush per line so piped/streamed output appears in real time.
@@ -62,4 +64,34 @@ func run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// buildSources selects the ingest sources from the CLI args. Everything after a
+// "--" separator is run as a subprocess (logscry -- ./app); otherwise logscry
+// reads from stdin. Docker selection flags arrive in a later M1 task.
+func buildSources(args []string) []ingest.Source {
+	if argv := subprocessArgv(args); len(argv) > 0 {
+		return []ingest.Source{ingest.NewSubprocessSource(argv)}
+	}
+	return []ingest.Source{ingest.NewStdinSource()}
+}
+
+// subprocessArgv returns the args following the first "--" separator, or nil if
+// there is no separator (or nothing follows it).
+func subprocessArgv(args []string) []string {
+	for i, a := range args {
+		if a == "--" {
+			return args[i+1:]
+		}
+	}
+	return nil
+}
+
+// streamLabel renders a Stream as a short lowercase label for the temporary
+// consumer output.
+func streamLabel(s model.Stream) string {
+	if s == model.Stderr {
+		return "stderr"
+	}
+	return "stdout"
 }
