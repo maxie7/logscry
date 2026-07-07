@@ -1,0 +1,33 @@
+# golangci-lint v2 configuration.
+# Conservative, explicit linter set — matches the v2 "standard" defaults so the
+# existing M0/M1 code passes without noise. Grow this as the codebase matures.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Ignoring the error from a deferred Close() on a read stream/client is
+      # idiomatic; don't flag it as noise. The first pattern covers anything
+      # typed as io.Closer (e.g. the Docker log ReadCloser); the second covers
+      # the Docker client, whose Close is on the concrete type so the interface
+      # pattern misses it.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*github.com/docker/docker/client.Client).Close
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      # Group local packages after third-party imports (the established style).
+      local-prefixes:
+        - github.com/maxie7/logscry
