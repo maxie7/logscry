@@ -2,17 +2,20 @@
 
 // Command logscry is a real-time, AI-assisted log/event triage CLI/TUI.
 //
-// M1: ingestion — read from stdin, or run a subprocess (logscry -- ./app) and
-// capture its stdout+stderr. All sources fan into one channel; a temporary
-// consumer prints each line prefixed by its source and stream. The pipeline,
-// scoring, and TUI arrive in later milestones.
+// M1: ingestion — read from stdin, run a subprocess (logscry -- ./app) and
+// capture its stdout+stderr, or follow Docker container logs (--docker-all and
+// friends). All sources fan into one channel; a temporary consumer prints each
+// line prefixed by its source and stream. The pipeline, scoring, and TUI arrive
+// in later milestones.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/maxie7/logscry/internal/ingest"
@@ -30,9 +33,12 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
-	lines := make(chan model.LogLine, 1024)
+	sources, err := buildSources(args)
+	if err != nil {
+		return err
+	}
 
-	sources := buildSources(args)
+	lines := make(chan model.LogLine, 1024)
 	go func() {
 		defer close(lines)
 		// Source errors end the run; surface them on stderr but don't crash. A
@@ -62,25 +68,64 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 
-// buildSources selects the ingest sources from the CLI args. Everything after a
-// "--" separator is run as a subprocess (logscry -- ./app); otherwise logscry
-// reads from stdin. Docker selection flags arrive in a later M1 task.
-func buildSources(args []string) []ingest.Source {
-	if argv := subprocessArgv(args); len(argv) > 0 {
-		return []ingest.Source{ingest.NewSubprocessSource(argv)}
+// stringList is a repeatable string flag (e.g. --docker-label k=v --docker-label x=y).
+type stringList []string
+
+func (s *stringList) String() string     { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
+
+// buildSources parses the CLI args and selects the ingest sources. Everything
+// after a "--" separator is run as a subprocess (logscry -- ./app). Docker
+// selection flags add a Docker source. If neither is selected, logscry reads
+// from stdin. Docker and a subprocess can run together (logscry --docker-all --
+// ./app).
+func buildSources(args []string) ([]ingest.Source, error) {
+	// Split at the first "--" before flag parsing: the stdlib flag package's own
+	// "--" handling is ambiguous with a bare `logscry ./app`, and we require an
+	// explicit "--" to treat trailing args as a subprocess.
+	flagArgs, argv := splitArgs(args)
+
+	fs := flag.NewFlagSet("logscry", flag.ContinueOnError)
+	var (
+		dockerAll   = fs.Bool("docker-all", false, "follow logs from all Docker containers")
+		dockerName  = fs.String("docker-name", "", "follow Docker containers whose name matches this regexp")
+		dockerTail  = fs.String("docker-tail", "100", "number of trailing log lines to fetch per container on attach")
+		dockerLabel stringList
+	)
+	fs.Var(&dockerLabel, "docker-label", "follow Docker containers with this k=v label (repeatable, AND-combined)")
+	if err := fs.Parse(flagArgs); err != nil {
+		return nil, err
 	}
-	return []ingest.Source{ingest.NewStdinSource()}
+
+	var sources []ingest.Source
+	if len(argv) > 0 {
+		sources = append(sources, ingest.NewSubprocessSource(argv))
+	}
+	if *dockerAll || *dockerName != "" || len(dockerLabel) > 0 {
+		src := ingest.NewDockerSource(ingest.DockerSelector{
+			All:       *dockerAll,
+			NameRegex: *dockerName,
+			Label:     dockerLabel,
+		})
+		src.Tail = *dockerTail
+		sources = append(sources, src)
+	}
+	if len(sources) == 0 {
+		sources = append(sources, ingest.NewStdinSource())
+	}
+	return sources, nil
 }
 
-// subprocessArgv returns the args following the first "--" separator, or nil if
-// there is no separator (or nothing follows it).
-func subprocessArgv(args []string) []string {
+// splitArgs partitions args at the first "--" separator: everything before is
+// returned as flag args, everything after as the subprocess argv (nil when there
+// is no separator).
+func splitArgs(args []string) (flagArgs, argv []string) {
 	for i, a := range args {
 		if a == "--" {
-			return args[i+1:]
+			return args[:i], args[i+1:]
 		}
 	}
-	return nil
+	return args, nil
 }
 
 // streamLabel renders a Stream as a short lowercase label for the temporary

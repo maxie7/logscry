@@ -18,10 +18,10 @@ Repo stays private through M5; flip to public at M6.
 - [x] `ingest.Source` interface (`Lines(ctx, out)` / `Name()`)
 - [x] stdin source
 - [x] subprocess source (`exec.Command`, capture stdout+stderr, tag `Stream`)
-- [ ] Docker source: `ContainerLogs` (Follow, Timestamps), parse RFC3339Nano
-- [ ] Docker: `stdcopy.StdCopy` demux when no TTY; raw when TTY (detect via `ContainerInspect`)
-- [ ] Docker: auto-attach/detach via `client.Events` on start/die
-- [ ] Selection flags: `--docker-all` / `--docker-label` / `--docker-name`
+- [x] Docker source: `ContainerLogs` (Follow, Timestamps), parse RFC3339Nano
+- [x] Docker: `stdcopy.StdCopy` demux when no TTY; raw when TTY (detect via `ContainerInspect`)
+- [x] Docker: auto-attach/detach via `client.Events` on start/die
+- [x] Selection flags: `--docker-all` / `--docker-label` / `--docker-name`
 - [x] Fan-in all sources into one `chan LogLine`
 
 ## Epic M2 — Pipeline & templating  `[private]`
