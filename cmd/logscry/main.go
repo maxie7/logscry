@@ -4,9 +4,11 @@
 //
 // M1: ingestion — read from stdin, run a subprocess (logscry -- ./app) and
 // capture its stdout+stderr, or follow Docker container logs (--docker-all and
-// friends). All sources fan into one channel; a temporary consumer prints each
-// line prefixed by its source and stream. The pipeline, scoring, and TUI arrive
-// in later milestones.
+// friends). All sources fan into one channel.
+//
+// M2: the pipeline goroutine normalizes, templates, and deduplicates each line,
+// emitting an Event with a running per-template count. A plain-text consumer
+// prints those in real time; scoring and the TUI arrive in later milestones.
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 
 	"github.com/maxie7/logscry/internal/ingest"
 	"github.com/maxie7/logscry/internal/model"
+	"github.com/maxie7/logscry/internal/pipeline"
 )
 
 func main() {
@@ -48,24 +51,39 @@ func run(ctx context.Context, args []string) error {
 		}
 	}()
 
+	// The pipeline goroutine owns the template state map; it reads lines, and
+	// emits a processed Event per line. It closes events when lines drains.
+	events := make(chan pipeline.Event, 1024)
+	go pipeline.Run(ctx, lines, events)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case line, ok := <-lines:
+		case ev, ok := <-events:
 			if !ok {
-				// Every source has finished (e.g. stdin EOF) and the fan-in
-				// closed the channel: shut down cleanly.
+				// Every source finished (e.g. stdin EOF) and the pipeline closed
+				// the events channel: shut down cleanly.
 				return nil
 			}
-			// TODO(M2): route through the pipeline instead of printing directly.
 			// Write straight to os.Stdout (unbuffered) so each line appears the
-			// instant it arrives — this is a real-time tail.
-			if _, err := fmt.Fprintf(os.Stdout, "[%s %s] %s\n", line.Source, streamLabel(line.Stream), line.Raw); err != nil {
+			// instant it arrives — this is a real-time tail. The running count
+			// makes dedup visible: repeated templates increment in place.
+			if _, err := fmt.Fprintf(os.Stdout, "[%s %s x%d] %s\n",
+				ev.Line.Source, levelLabel(ev.Line.Level), ev.Count, ev.Pattern); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+// levelLabel renders a detected level for the plain-text consumer, using "-" when
+// no level was detected so the columns stay aligned.
+func levelLabel(level string) string {
+	if level == "" {
+		return "-"
+	}
+	return level
 }
 
 // stringList is a repeatable string flag (e.g. --docker-label k=v --docker-label x=y).
@@ -126,13 +144,4 @@ func splitArgs(args []string) (flagArgs, argv []string) {
 		}
 	}
 	return args, nil
-}
-
-// streamLabel renders a Stream as a short lowercase label for the temporary
-// consumer output.
-func streamLabel(s model.Stream) string {
-	if s == model.Stderr {
-		return "stderr"
-	}
-	return "stdout"
 }

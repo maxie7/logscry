@@ -25,11 +25,11 @@ Repo stays private through M5; flip to public at M6.
 - [x] Fan-in all sources into one `chan LogLine`
 
 ## Epic M2 — Pipeline & templating  `[private]`
-- [ ] Normalize: detect JSON vs text; extract level + message
-- [ ] Templating: mask `NUM/HEX/UUID/IP/STR` (ordered, compiled regexes) → signature + hash
-- [ ] Template state map: firstSeen / lastSeen / count / recent ring buffer
-- [ ] TUI shows live templated stream with per-template counts
-- [ ] Unit tests for templating
+- [x] Normalize: detect JSON vs text; extract level + message
+- [x] Templating: mask `NUM/HEX/UUID/IP/STR` (ordered, compiled regexes) → signature + hash
+- [x] Template state map: firstSeen / lastSeen / count / recent ring buffer
+- [ ] TUI shows live templated stream with per-template counts <!-- next session; plain-text consumer stands in for now -->
+- [x] Unit tests for templating
 
 ## Epic M3 — Scoring engine (the make-or-break)  `[private]`
 - [ ] Novelty signal (unseen, or unseen > cooloff)
