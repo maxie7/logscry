@@ -51,10 +51,17 @@ func TestNormalizePlaintext(t *testing.T) {
 		wantMessage string
 	}{
 		{"bracket prefix", "[ERROR] disk full", "ERROR", "disk full"},
+		{"explicit bracket info", "[INFO] server started", "INFO", "server started"},
 		{"colon prefix", "WARN: retrying", "WARN", "retrying"},
 		{"logfmt prefix", "level=error something broke", "ERROR", "something broke"},
 		{"lowercase bracket", "[info] ready", "INFO", "ready"},
 		{"no level", "just a plain line", "", "just a plain line"},
+		// Level detection fires ONLY on explicit leading markers ([LVL], LVL:,
+		// level=lvl). A bare level word — mid-sentence or even leading without a
+		// colon/bracket — is prose, not a level: don't mislabel it (this feeds
+		// M3's severity signal).
+		{"bare word mid-sentence not a level", "plain info line", "", "plain info line"},
+		{"bare leading word not a level", "info server started", "", "info server started"},
 		{"colon but not a level", "http://example.com fetched", "", "http://example.com fetched"},
 		{"non-level word with colon", "Starting: booting up", "", "Starting: booting up"},
 	}
