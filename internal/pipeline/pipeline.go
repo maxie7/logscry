@@ -95,25 +95,84 @@ func pushRecent(recent []time.Time, now time.Time) []time.Time {
 	return recent
 }
 
-// Run reads lines from in, processes each through a single goroutine-confined
-// Pipeline, and emits Events on out. It returns when in is closed or ctx is
-// cancelled, closing out on the way so the consumer can drain and stop.
-func Run(ctx context.Context, in <-chan model.LogLine, out chan<- Event) {
-	defer close(out)
+// Options selects what Run emits. Both channels are optional: plain mode wants
+// the per-line Events, the TUI wants the periodic Snapshots, and neither consumer
+// pays for the other.
+type Options struct {
+	// Events receives one Event per line, sent synchronously so the plain-text
+	// consumer stays a real-time tail. Nil to skip.
+	Events chan<- Event
+	// Snapshots receives an immutable view of the pipeline state every Interval,
+	// sent non-blockingly (see trySend) so a slow renderer can never stall
+	// ingestion. Give it capacity 1: the consumer wants the latest state, not a
+	// backlog. Nil to skip.
+	Snapshots chan<- Snapshot
+	// Interval is the snapshot cadence (default 100ms).
+	Interval time.Duration
+	// RingSize bounds the snapshot's stream tail (default 2000 events).
+	RingSize int
+}
+
+// Run reads lines from in and processes each through a single goroutine-confined
+// Pipeline, emitting per the Options. It returns when in is closed or ctx is
+// cancelled; on the way out it emits a final snapshot and closes both channels,
+// so consumers can drain and learn that the stream ended.
+func Run(ctx context.Context, in <-chan model.LogLine, opts Options) {
+	if opts.Events != nil {
+		defer close(opts.Events)
+	}
+	if opts.Snapshots != nil {
+		defer close(opts.Snapshots)
+	}
+
 	p := New()
+	c := newCollector(opts.RingSize)
+
+	// Without a snapshot consumer there is nothing to tick for; a nil channel
+	// blocks forever in a select, which is exactly the "never fires" we want.
+	var ticks <-chan time.Time
+	if opts.Snapshots != nil {
+		interval := opts.Interval
+		if interval <= 0 {
+			interval = defaultInterval
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-ticks:
+			if c.dirty {
+				trySend(opts.Snapshots, c.snapshot(p, time.Now()))
+			}
 		case line, ok := <-in:
 			if !ok {
+				// Every source finished. Push a last snapshot so the final counts are
+				// never lost to a drop — blocking, since nothing follows it, but still
+				// giving up on cancellation in case the consumer has already quit.
+				if opts.Snapshots != nil {
+					select {
+					case opts.Snapshots <- c.snapshot(p, time.Now()):
+					case <-ctx.Done():
+					}
+				}
 				return
 			}
-			ev := p.Process(line, time.Now())
-			select {
-			case out <- ev:
-			case <-ctx.Done():
-				return
+			now := time.Now()
+			ev := p.Process(line, now)
+			if opts.Snapshots != nil {
+				c.observe(ev, now)
+			}
+			if opts.Events != nil {
+				select {
+				case opts.Events <- ev:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}

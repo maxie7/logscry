@@ -38,11 +38,25 @@ LLM backend, and the TUI land in M1–M5. See `logscry_RDI_v1.md` for the full s
 # build
 make build
 
-# M0: pass-through tail
-echo "hello" | ./bin/logscry
+# tail a log stream (TUI: keys come from /dev/tty, so stdin stays free for logs)
+tail -f /var/log/app.log | ./bin/logscry
+
+# run a program and watch its stdout+stderr
+./bin/logscry -- ./myapp
+
+# follow Docker containers, attaching to new ones automatically
+./bin/logscry --docker-all
+
+# plain line output instead of the TUI (for pipes and CI)
+./bin/logscry --plain -- ./myapp
 ```
 
-_Full usage (subprocess, Docker, TUI, config) coming as milestones land._
+In the TUI: `t` toggles between the live stream and the aggregated template table
+(where thousands of lines collapse into a handful of patterns), `p` pauses rendering
+while ingestion continues, and `q` quits. logscry falls back to `--plain` on its own
+when stdout is not a terminal, so piping and redirecting never see escape codes.
+
+_Scoring, LLM explanations, and the flagged-event cards land in later milestones._
 
 ## Demo
 

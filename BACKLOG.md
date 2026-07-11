@@ -28,7 +28,10 @@ Repo stays private through M5; flip to public at M6.
 - [x] Normalize: detect JSON vs text; extract level + message
 - [x] Templating: mask `NUM/HEX/UUID/IP/STR` (ordered, compiled regexes) → signature + hash
 - [x] Template state map: firstSeen / lastSeen / count / recent ring buffer
-- [ ] TUI shows live templated stream with per-template counts <!-- next session; plain-text consumer stands in for now -->
+- [x] TUI shows live templated stream with per-template counts
+- [x] Bubble Tea: stream view + aggregated template table (`t`), pause (`p`), scroll, quit
+- [x] Snapshot channel (cap 1, non-blocking send): render rate decoupled from event rate
+- [x] TTY matrix: TUI on `/dev/tty` when stdin carries logs; auto-plain when piped or headless
 - [x] Unit tests for templating
 
 ## Epic M3 — Scoring engine (the make-or-break)  `[private]`
@@ -53,7 +56,8 @@ Repo stays private through M5; flip to public at M6.
 - [ ] Bubble Tea layout: live stream (left) + flagged-event cards (right)
 - [ ] Card fields: severity, summary, cause, suggestion, count, first/last seen
 - [ ] Keybindings: scroll, expand card, pause/resume, quit
-- [ ] `--plain` non-TUI line mode
+- [x] `--plain` non-TUI line mode <!-- pulled forward into M2: the TUI needs a non-TUI escape hatch to exist -->
+
 
 ## Epic M6 — Demo, README, go public
 - [ ] `examples/demo`: docker-compose + tiny buggy service (fails on a specific route)

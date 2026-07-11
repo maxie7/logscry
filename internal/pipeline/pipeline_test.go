@@ -115,7 +115,7 @@ func TestRunProcessesAndClosesOutput(t *testing.T) {
 	close(in)
 
 	out := make(chan Event, 3)
-	go Run(context.Background(), in, out)
+	go Run(context.Background(), in, Options{Events: out})
 
 	var events []Event
 	for ev := range out { // Run closes out when in drains

@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package tui renders the live stream and flagged-event cards using Bubble Tea.
+// Package tui renders the live templated stream with Bubble Tea.
+//
+// The TUI is a pure consumer of pipeline.Snapshot: the pipeline goroutine owns all
+// state and hands over immutable copies on its own cadence, so rendering is
+// decoupled from the event rate and a slow terminal can never apply backpressure
+// to ingestion. Nothing here may write to stdout — see Run.
+//
+// TODO(M5): flagged-event cards pane beside the stream, card expansion, severity
+// badges. View() already composes panes, so it slots in without restructuring.
 package tui
 
-import "context"
+import (
+	"context"
+	"os"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/maxie7/logscry/internal/pipeline"
+)
 
 // Run starts the terminal UI and blocks until the user quits or ctx is cancelled.
 //
-// TODO(M5): Bubble Tea program with a live-stream pane (left) and a scrollable
-// list of flagged-event cards (right); keybindings for scroll/expand/pause/quit.
-func Run(ctx context.Context) error {
-	_ = ctx
-	return nil
+// snaps delivers pipeline state; errs delivers background errors, which are shown
+// in the status bar rather than printed, because any stray write to stdout would
+// corrupt the alternate screen.
+//
+// in is the keyboard source: nil to let Bubble Tea read stdin as usual, or an open
+// /dev/tty when stdin is busy carrying logs (see Resolve). Run does not close it.
+func Run(ctx context.Context, snaps <-chan pipeline.Snapshot, errs <-chan error, in *os.File) error {
+	opts := []tea.ProgramOption{
+		tea.WithAltScreen(),
+		tea.WithContext(ctx), // SIGINT/SIGTERM cancels ctx, which stops the program
+	}
+	if in != nil {
+		opts = append(opts, tea.WithInput(in))
+	}
+
+	p := tea.NewProgram(New(snaps, errs), opts...)
+	_, err := p.Run()
+	// A cancelled context is the ordinary Ctrl-C shutdown path, not a failure.
+	if err != nil && ctx.Err() != nil {
+		return nil
+	}
+	return err
 }
