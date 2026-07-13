@@ -23,6 +23,8 @@ var (
 	// styleEscalate marks a would-be escalation in --explain-dry-run. It has to jump
 	// off a wall of log lines — that is the whole point of the mode.
 	styleEscalate = lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true) // magenta
+	// styleEscHead is the pinned pane's header bar.
+	styleEscHead = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("13")).Bold(true)
 
 	// levelStyles colours the severity token; unknown levels fall back to plain.
 	levelStyles = map[string]lipgloss.Style{
@@ -45,7 +47,39 @@ func (m Model) View() string {
 	if !m.ready {
 		return "starting logscry…"
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, m.vp.View(), m.viewStatus())
+	panes := []string{m.vp.View()}
+	if pinned := m.viewEscalations(); pinned != "" {
+		panes = append(panes, pinned)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, append(panes, m.viewStatus())...)
+}
+
+// viewEscalations renders the pinned dry-run pane: the most recent would-be
+// escalations, newest first, with the reasons that fired them.
+//
+// It is pinned rather than left inline in the stream because inline is useless: at
+// any real log rate an escalation scrolls off in well under a second, and the whole
+// point of --explain-dry-run is to sit and read the reasons while tuning. The stream
+// still highlights the line in place — this pane is what makes it stay.
+func (m Model) viewEscalations() string {
+	n := m.pinnedCount()
+	if n == 0 {
+		return ""
+	}
+	recent := m.snap.Escalations[len(m.snap.Escalations)-n:]
+
+	var b strings.Builder
+	b.WriteString(styleEscHead.Width(m.width).Render(truncate(
+		fmt.Sprintf(" WOULD ESCALATE · %s total (dry run — no LLM called)",
+			formatCount(m.snap.Stats.Escalations)), m.width)))
+	// Newest first: the one that just fired is the one being read.
+	for i := len(recent) - 1; i >= 0; i-- {
+		ev := recent[i]
+		b.WriteByte('\n')
+		b.WriteString(styleEscalate.Render(truncate(fmt.Sprintf(" ⇧ %s │ %s │ score %.2f",
+			ev.Pattern, strings.Join(ev.Reasons, ", "), ev.Score), m.width)))
+	}
+	return b.String()
 }
 
 // viewStream renders the live tail: one templated line per event, newest at the

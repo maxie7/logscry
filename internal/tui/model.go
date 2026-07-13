@@ -13,9 +13,39 @@ import (
 // the rest are kept for the M5 error pane.
 const maxErrors = 20
 
-// chromeHeight is the number of lines the status bar occupies. Fixing it keeps
-// the viewport's height a simple subtraction instead of a reflow calculation.
-const chromeHeight = 2
+// statusHeight is the number of lines the status bar occupies.
+const statusHeight = 2
+
+// escalationPaneMax is how many recent would-be escalations stay pinned in dry-run.
+// Small on purpose: this is a calibration aid, not the M5 cards pane.
+const escalationPaneMax = 5
+
+// pinnedCount is how many escalations the pinned pane is currently showing. Zero
+// unless dry-run is on and something has actually escalated, so the pane costs a
+// normal run nothing.
+func (m Model) pinnedCount() int {
+	if !m.opts.ExplainDryRun {
+		return 0
+	}
+	return min(len(m.snap.Escalations), escalationPaneMax)
+}
+
+// chromeHeight is the number of lines not available to the viewport: the status bar,
+// plus the pinned escalation pane and its header when there is one. It grows as
+// escalations arrive, so the viewport is resized on every snapshot (see resize).
+func (m Model) chromeHeight() int {
+	h := statusHeight
+	if n := m.pinnedCount(); n > 0 {
+		h += n + 1 // the escalations, plus their header
+	}
+	return h
+}
+
+// resize fits the viewport to whatever the chrome leaves it.
+func (m *Model) resize() {
+	m.vp.Width = m.width
+	m.vp.Height = max(m.height-m.chromeHeight(), 0)
+}
 
 // viewMode selects which pane fills the screen.
 type viewMode int
@@ -122,8 +152,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.vp.Width = msg.Width
-		m.vp.Height = max(msg.Height-chromeHeight, 0)
+		m.resize()
 		m.ready = true
 		m.refresh()
 		return m, nil
@@ -131,6 +160,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case snapshotMsg:
 		if !m.paused {
 			m.snap = pipeline.Snapshot(msg)
+			// The pinned pane grows with the first few escalations, taking its lines
+			// out of the viewport's budget.
+			m.resize()
 			m.refresh()
 		}
 		return m, waitForSnapshot(m.snaps)

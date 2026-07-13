@@ -229,3 +229,77 @@ func TestSnapshotCarriesEscalationCounters(t *testing.T) {
 		t.Errorf("Suppressed = %d, want 1: the UI must be able to say what it is not showing", stats.Suppressed)
 	}
 }
+
+// TestRepeatedFatalEscalatesOnce is the end-to-end version of the cache guarantee,
+// through the real templating and dedup rather than a scorer-level fixture. A PANIC
+// escalates on sight; the identical PANIC a moment later is the same fault, already
+// explained, and must not escalate again.
+//
+// The cache is marked when an event ESCALATES, not when an LLM explains it — so this
+// holds with no LLM wired up at all (M3's own configuration), and it is what stops a
+// slow or absent model from letting the same error escalate over and over.
+func TestRepeatedFatalEscalatesOnce(t *testing.T) {
+	p := New(score.New(scoringConfig(), nil))
+	base := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	panicLine := model.LogLine{Raw: "[PANIC] nil pointer dereference in handler", Stream: model.Stderr}
+
+	first := p.Process(panicLine, base)
+	if !first.Escalate {
+		t.Fatalf("the first PANIC did not escalate: score %.2f, reasons %v", first.Score, first.Reasons)
+	}
+
+	second := p.Process(panicLine, base.Add(time.Second))
+	if second.Escalate {
+		t.Errorf("the identical PANIC escalated again: score %.2f, reasons %v", second.Score, second.Reasons)
+	}
+	if first.Hash != second.Hash {
+		t.Fatalf("the two identical lines produced different templates (%q vs %q): dedup is broken, "+
+			"and every repeat would escalate as novel", first.Pattern, second.Pattern)
+	}
+
+	stats := p.Stats()
+	if stats.Escalated != 1 {
+		t.Errorf("Escalated = %d, want 1", stats.Escalated)
+	}
+	if stats.Cached != 1 {
+		t.Errorf("Cached = %d, want 1: the cache is what should have silenced the repeat", stats.Cached)
+	}
+}
+
+// TestSnapshotPinsEscalations: escalations are retained apart from the stream ring, so
+// the renderer can keep showing one after the tail has scrolled far past it.
+func TestSnapshotPinsEscalations(t *testing.T) {
+	// Novelty off, so the routine filler below (itself a never-before-seen template)
+	// does not escalate and the PANIC's severity is the only thing that fires.
+	cfg := scoringConfig()
+	cfg.Weights.Novelty = 0
+
+	p := New(score.New(cfg, nil))
+	c := newCollector(4) // a deliberately tiny stream ring
+	base := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+
+	ev := p.Process(model.LogLine{Raw: "[PANIC] nil pointer dereference in handler"}, base)
+	c.observe(ev, base)
+	if !ev.Escalate {
+		t.Fatal("the PANIC did not escalate")
+	}
+
+	// Bury it: enough routine lines to wrap the stream ring several times over.
+	for i := range 20 {
+		at := base.Add(time.Duration(i+1) * time.Second)
+		c.observe(p.Process(model.LogLine{Raw: "[INFO] request handled"}, at), at)
+	}
+
+	snap := c.snapshot(p, base.Add(time.Minute))
+	if len(snap.Escalations) != 1 {
+		t.Fatalf("Escalations has %d entries, want 1: it was lost with the stream tail", len(snap.Escalations))
+	}
+	if snap.Escalations[0].Pattern != ev.Pattern {
+		t.Errorf("Escalations[0] = %q, want the PANIC", snap.Escalations[0].Pattern)
+	}
+	for _, l := range snap.Lines {
+		if l.Escalate {
+			t.Fatal("the escalation is somehow still in the stream ring; pick a smaller ring for this test")
+		}
+	}
+}

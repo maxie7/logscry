@@ -8,6 +8,10 @@ import (
 )
 
 const (
+	// escalationsKept bounds the retained escalations. They are held apart from the
+	// stream ring because they must outlive it: an escalation that scrolled past a
+	// second ago is exactly the one the user is trying to read.
+	escalationsKept = 20
 	// defaultRingSize bounds the stream ring buffer: the TUI only ever shows a
 	// tail, so memory must not grow with the log volume.
 	defaultRingSize = 2000
@@ -51,6 +55,10 @@ type Snapshot struct {
 	Lines     []Event           // recent processed events, oldest first
 	Templates []TemplateSummary // sorted: count desc, then last seen desc
 	Stats     Stats
+	// Escalations are the most recent events that cleared every gate, oldest first.
+	// The renderer pins these: at any real log rate an escalation scrolls out of the
+	// stream in well under a second, which is no use to someone reading it.
+	Escalations []Event
 }
 
 // collector accumulates the display state that the template map alone does not
@@ -61,6 +69,10 @@ type collector struct {
 	head   int     // next write index
 	filled bool    // ring has wrapped at least once
 	total  int
+
+	// escalated retains the last escalations, oldest first, independently of the
+	// stream ring.
+	escalated []Event
 
 	levels  map[string]string   // template hash -> last level seen
 	sources map[string]struct{} // source name -> seen
@@ -97,6 +109,12 @@ func (c *collector) observe(ev Event, now time.Time) {
 		c.filled = true
 	}
 	c.total++
+	if ev.Escalate {
+		c.escalated = append(c.escalated, ev)
+		if len(c.escalated) > escalationsKept {
+			c.escalated = c.escalated[len(c.escalated)-escalationsKept:]
+		}
+	}
 	if ev.Line.Level != "" {
 		c.levels[ev.Hash] = ev.Line.Level
 	}
@@ -120,8 +138,9 @@ func (c *collector) snapshot(p *Pipeline, now time.Time) Snapshot {
 	}
 	scored := p.Stats()
 	return Snapshot{
-		Lines:     c.lines(),
-		Templates: c.summaries(p),
+		Lines:       c.lines(),
+		Templates:   c.summaries(p),
+		Escalations: append([]Event(nil), c.escalated...),
 		Stats: Stats{
 			TotalLines:      c.total,
 			UniqueTemplates: len(p.templates),

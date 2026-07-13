@@ -4,6 +4,7 @@ package tui
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -247,5 +248,97 @@ func TestTruncate(t *testing.T) {
 	// Runes, not bytes: a multi-byte string must not be cut mid-character.
 	if got := truncate("héllo wörld", 6); got != "héllo…" {
 		t.Errorf("truncate multibyte = %q, want %q", got, "héllo…")
+	}
+}
+
+// --- Dry-run escalation pane (M3) ----------------------------------------------------
+
+// dryRunSnapshot is a snapshot carrying one would-be escalation.
+func dryRunSnapshot() pipeline.Snapshot {
+	snap := testSnapshot()
+	esc := pipeline.Event{
+		Line:     model.LogLine{Source: "svc:api", Level: "PANIC"},
+		Pattern:  "nil pointer dereference in handler",
+		Score:    2.0,
+		Escalate: true,
+		Reasons:  []string{"novel template (first seen)", "level PANIC"},
+	}
+	snap.Lines = append(snap.Lines, esc)
+	snap.Escalations = []pipeline.Event{esc}
+	snap.Stats.Escalations = 1
+	return snap
+}
+
+// TestDryRunPinsEscalations: the escalation must still be readable after the stream
+// has moved on. Inline-only was useless — at any real log rate it scrolls off in well
+// under a second, and reading the reasons is the entire point of the flag.
+func TestDryRunPinsEscalations(t *testing.T) {
+	m := New(nil, nil, Options{ExplainDryRun: true})
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	m = sized.(Model)
+
+	applied, _ := m.Update(snapshotMsg(dryRunSnapshot()))
+	m = applied.(Model)
+
+	view := m.View()
+	if !strings.Contains(view, "WOULD ESCALATE") {
+		t.Fatalf("no escalation pane:\n%s", view)
+	}
+	// The reasons and the score are what get tuned against, so they must be on screen.
+	for _, want := range []string{"nil pointer dereference in handler", "level PANIC", "score 2.00"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("escalation pane is missing %q:\n%s", want, view)
+		}
+	}
+	// It survives the stream scrolling on: the pane renders from Snapshot.Escalations,
+	// not from whatever happens to be in the visible tail.
+	m.vp.GotoTop()
+	if !strings.Contains(m.View(), "WOULD ESCALATE") {
+		t.Error("the pinned pane vanished when the stream was scrolled away")
+	}
+}
+
+// TestDryRunPaneIsOffByDefault: without the flag, escalations are still decided and
+// counted — they are just not surfaced. The pane must cost a normal run nothing.
+func TestDryRunPaneIsOffByDefault(t *testing.T) {
+	m := newTestModel(t)
+	applied, _ := m.Update(snapshotMsg(dryRunSnapshot()))
+	m = applied.(Model)
+
+	if strings.Contains(m.View(), "WOULD ESCALATE") {
+		t.Error("the dry-run pane rendered without --explain-dry-run")
+	}
+	if m.chromeHeight() != statusHeight {
+		t.Errorf("chromeHeight = %d, want %d: the pane is taking rows it does not use",
+			m.chromeHeight(), statusHeight)
+	}
+}
+
+// TestEscalationPaneIsBounded keeps a flood of escalations from eating the screen.
+func TestEscalationPaneIsBounded(t *testing.T) {
+	m := New(nil, nil, Options{ExplainDryRun: true})
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	m = sized.(Model)
+
+	snap := testSnapshot()
+	for i := range escalationPaneMax + 10 {
+		snap.Escalations = append(snap.Escalations, pipeline.Event{
+			Pattern: "failure " + strconv.Itoa(i), Escalate: true, Score: 1, Reasons: []string{"novel template"},
+		})
+	}
+	applied, _ := m.Update(snapshotMsg(snap))
+	m = applied.(Model)
+
+	if got := m.pinnedCount(); got != escalationPaneMax {
+		t.Errorf("pinned %d escalations, want at most %d", got, escalationPaneMax)
+	}
+	// Newest first: the most recent escalation is the one being read.
+	pane := m.viewEscalations()
+	if !strings.Contains(pane, "failure "+strconv.Itoa(escalationPaneMax+9)) {
+		t.Errorf("the newest escalation is not in the pane:\n%s", pane)
+	}
+	if m.vp.Height != 24-m.chromeHeight() {
+		t.Errorf("viewport height = %d, want %d: the pane and the stream are overlapping",
+			m.vp.Height, 24-m.chromeHeight())
 	}
 }
