@@ -421,19 +421,27 @@ func TestNilChannelStillDecidesAndCounts(t *testing.T) {
 
 // --- Config ------------------------------------------------------------------------
 
-// TestValidateRejectsUnreachableBurstFloor: a burst floor above the ring's capacity
-// could never be observed, so the burst signal would silently never fire. Failing
-// loudly beats a tool that is quiet for the wrong reason.
-func TestValidateRejectsUnreachableBurstFloor(t *testing.T) {
+// TestValidateRejectsUnworkableConfigs: a config that could never fire is worse than
+// one that fires too much, because the user only discovers it by never being told
+// anything. Failing loudly beats being quiet for the wrong reason.
+func TestValidateRejectsUnworkableConfigs(t *testing.T) {
 	cfg := Defaults()
-	cfg.BurstFloor = model.RecentCap + 1
+	cfg.BurstMinCount = model.RecentCap + 1
 	if err := cfg.Validate(); err == nil {
-		t.Error("Validate accepted a burst floor the ring can never reach")
+		t.Error("Validate accepted a burst volume gate the ring can never reach")
 	}
 
 	cfg = Defaults()
 	cfg.Threshold = 0
 	if err := cfg.Validate(); err == nil {
 		t.Error("Validate accepted a zero threshold, which would escalate everything")
+	}
+
+	// At or below 1x, a template running at its own steady baseline is a "burst" —
+	// which is precisely the cry-wolf failure the relative signal exists to avoid.
+	cfg = Defaults()
+	cfg.BurstMultiplier = 1
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate accepted a 1x burst multiplier, which would fire on steady traffic")
 	}
 }

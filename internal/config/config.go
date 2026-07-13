@@ -172,11 +172,9 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 		func(c *Config) *int { return &c.Score.WarmupLines })
 
 	// Scoring: burst.
-	b.durationVar("burst-window", s.BurstWindow, "sliding window for burst detection",
+	b.durationVar("burst-window", s.BurstWindow, "sliding window the burst rate is measured over",
 		func(c *Config) *time.Duration { return &c.Score.BurstWindow })
-	b.intVar("burst-floor", s.BurstFloor, "occurrences within the window that always count as a burst",
-		func(c *Config) *int { return &c.Score.BurstFloor })
-	b.floatVar("burst-multiplier", s.BurstMultiplier, "burst if the rate exceeds this many times the baseline",
+	b.floatVar("burst-multiplier", s.BurstMultiplier, "burst when the rate exceeds this many times the template's own baseline",
 		func(c *Config) *float64 { return &c.Score.BurstMultiplier })
 	b.intVar("burst-min-count", s.BurstMinCount, "never call fewer than this many occurrences a burst",
 		func(c *Config) *int { return &c.Score.BurstMinCount })

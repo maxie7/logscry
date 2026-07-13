@@ -28,12 +28,19 @@ type LogLine struct {
 	Message string // message body after stripping structured prefixes
 }
 
-// RecentCap is the capacity of Template.Recent. It lives here because the ring is
-// the evidence burst detection runs on: the pipeline fills it and the scorer reads
-// it, and the scorer rejects a burst floor it could never reach (see score.Config).
-// It must stay comfortably above that floor, or a "50 in 10s" burst would be
-// invisible simply because the ring forgot the first half of it.
-const RecentCap = 256
+// RecentCap is the capacity of Template.Recent. It lives here because the ring is the
+// evidence burst detection runs on: the pipeline fills it and the scorer reads it.
+//
+// The size is chosen against the burst window (10s by default): at 2048 the ring spans
+// the whole window for any template under ~200 lines/sec, so the measured rate is the
+// honest 10-second average and cannot be skewed by a sub-second clump of lines — a
+// batched flush must not read as a spike. Busier templates than that saturate the
+// ring, and the scorer measures their rate over the span it actually holds instead
+// (see score.windowRate).
+//
+// It costs 48KB for a template that has actually seen 2048 lines; the slice grows
+// lazily, so quiet templates cost a few hundred bytes.
+const RecentCap = 2048
 
 // Template is the masked signature of a class of log lines, plus the running
 // state used for dedup, burst detection, and explanation caching.

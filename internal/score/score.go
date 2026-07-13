@@ -55,11 +55,10 @@ type Config struct {
 	Warmup      time.Duration `yaml:"warmup"`       // novelty is muted until this has elapsed AND
 	WarmupLines int           `yaml:"warmup_lines"` // this many lines have been seen
 
-	// Burst.
-	BurstWindow      time.Duration `yaml:"burst_window"`       // sliding window the occurrences are counted in
-	BurstFloor       int           `yaml:"burst_floor"`        // occurrences in the window that always count as a burst
-	BurstMultiplier  float64       `yaml:"burst_multiplier"`   // ...or this many times the established baseline rate
-	BurstMinCount    int           `yaml:"burst_min_count"`    // ...but never below this many occurrences (see burst)
+	// Burst. There is no absolute "N in the window" trigger by design: see burst.
+	BurstWindow      time.Duration `yaml:"burst_window"`       // sliding window the rate is measured over
+	BurstMultiplier  float64       `yaml:"burst_multiplier"`   // fire at this many times the established baseline rate
+	BurstMinCount    int           `yaml:"burst_min_count"`    // ...but never on fewer occurrences than this (volume gate)
 	BaselineMinAge   time.Duration `yaml:"baseline_min_age"`   // a template has no baseline until it is this old
 	BaselineMinCount int           `yaml:"baseline_min_count"` // ...and has been seen this many times
 
@@ -81,9 +80,12 @@ type Config struct {
 //	stderr + ERROR                 0.9   no  — deliberately just under: routine
 //	                                          error chatter must not escalate
 //	novel template (post-warmup)   1.0   yes — the single strongest signal
-//	burst on a real baseline       1.0   yes
+//	rate at 5x its own baseline    1.0   yes — a CHANGE in rate, not a high rate
 //	FATAL / PANIC                  1.0   yes — a crash is worth interrupting for,
 //	                                          even during warmup
+//
+// Note what is absent: a steady stream escalates at no rate whatsoever. A service
+// emitting one line a second and one emitting ten thousand are both simply running.
 func Defaults() Config {
 	return Config{
 		Threshold: 1.0,
@@ -100,7 +102,6 @@ func Defaults() Config {
 		Warmup:           30 * time.Second,
 		WarmupLines:      100,
 		BurstWindow:      10 * time.Second,
-		BurstFloor:       50,
 		BurstMultiplier:  5,
 		BurstMinCount:    10,
 		BaselineMinAge:   60 * time.Second,
@@ -118,12 +119,16 @@ func (c Config) Validate() error {
 	if c.Threshold <= 0 {
 		return fmt.Errorf("threshold must be > 0, got %g (everything would escalate)", c.Threshold)
 	}
-	if c.BurstFloor > model.RecentCap {
-		return fmt.Errorf("burst floor %d exceeds the recent-occurrence ring capacity %d, so a burst could never be observed",
-			c.BurstFloor, model.RecentCap)
+	if c.BurstMinCount > model.RecentCap {
+		return fmt.Errorf("burst min count %d exceeds the recent-occurrence ring capacity %d, so a burst could never be observed",
+			c.BurstMinCount, model.RecentCap)
 	}
 	if c.BurstWindow <= 0 {
 		return fmt.Errorf("burst window must be > 0, got %s", c.BurstWindow)
+	}
+	if c.BurstMultiplier <= 1 {
+		return fmt.Errorf("burst multiplier must be > 1, got %g: at or below 1x, a template running at "+
+			"its own steady baseline would be reported as a burst", c.BurstMultiplier)
 	}
 	if c.RatePerMin < 0 {
 		return fmt.Errorf("rate limit must be >= 0, got %d", c.RatePerMin)
@@ -262,30 +267,65 @@ func (s *Scorer) warmedUp(now time.Time) bool {
 	return now.Sub(s.start) >= s.cfg.Warmup && s.lines > s.cfg.WarmupLines
 }
 
-// burst reports whether a known template's rate has spiked. It fires only for
-// templates with an established baseline: without that guard a template that is new
-// *and* chatty would instantly "burst" on top of already being novel, which is
-// double-counting the same fact.
+// burst reports whether a known template's rate has spiked. It is a purely RELATIVE
+// signal: a template must be running at a multiple of its own established baseline.
+//
+// There is deliberately no absolute "N in the window is always a burst" trigger. Such
+// a floor does not encode "something changed", it encodes "this system is busy" — and
+// a service that steadily emits a few hundred lines a second of one template is busy,
+// not broken. Worse, no value of that floor is safe: whatever number is picked, some
+// perfectly healthy service sits just above it and gets reported forever. Only a
+// CHANGE in rate is news, so only a change can fire.
+//
+// It fires only for templates with an established baseline, which is also what stops a
+// template that is new *and* chatty from "bursting" on top of already being novel —
+// the same fact counted twice.
 func (s *Scorer) burst(tmpl *model.Template, now time.Time) (bool, string) {
 	base, ok := s.baseline(tmpl, now)
 	if !ok {
 		return false, ""
 	}
 
-	n := countSince(tmpl.Recent, now.Add(-s.cfg.BurstWindow))
-	if n >= s.cfg.BurstFloor {
-		return true, fmt.Sprintf("burst: %d in %s (floor %d)", n, s.cfg.BurstWindow, s.cfg.BurstFloor)
+	n, rate := s.windowRate(tmpl.Recent, now)
+	// A minimum-volume gate, not a trigger: without it a template that normally appears
+	// once a minute would "burst" at 10x on the strength of two occurrences —
+	// technically a spike, in practice two log lines.
+	if n < s.cfg.BurstMinCount || rate < s.cfg.BurstMultiplier*base {
+		return false, ""
+	}
+	return true, fmt.Sprintf("burst: %.1f/s vs baseline %.2f/s (%.0f×), %d in the last %s",
+		rate, base, rate/base, n, s.cfg.BurstWindow)
+}
+
+// windowRate estimates a template's current rate from its recent-occurrence ring,
+// returning the occurrences observed in the burst window and the rate they imply.
+//
+// The subtlety is that Recent is a bounded sample. Above roughly RecentCap/window
+// occurrences per second the ring no longer spans the whole window, and dividing by
+// the whole window would understate the rate — by exactly the factor that would hide a
+// genuine spike on an already-busy template. So when the ring is saturated inside the
+// window, the rate is measured over the span it actually covers, which is the true
+// instantaneous rate rather than an average diluted by history we no longer have.
+//
+// This is also what makes the steady-state guarantee hold at ANY rate: a template
+// running flat out at ten thousand lines a second measures ten thousand a second,
+// matches its own baseline, and says nothing.
+func (s *Scorer) windowRate(recent []time.Time, now time.Time) (int, float64) {
+	n := countSince(recent, now.Add(-s.cfg.BurstWindow))
+	if n == 0 {
+		return 0, 0
 	}
 
-	// The multiplier path needs an absolute floor of its own, or a template that
-	// normally appears once a minute would "burst" at 10x on the strength of two
-	// occurrences — technically a spike, in practice noise.
-	rate := float64(n) / s.cfg.BurstWindow.Seconds()
-	if n >= s.cfg.BurstMinCount && rate >= s.cfg.BurstMultiplier*base {
-		return true, fmt.Sprintf("burst: %d in %s (%.1f/s) vs baseline %.2f/s (%.0f×)",
-			n, s.cfg.BurstWindow, rate, base, rate/base)
+	seconds := s.cfg.BurstWindow.Seconds()
+	if n == len(recent) && len(recent) == model.RecentCap {
+		oldest := recent[len(recent)-n]
+		// A floor on the span keeps a same-instant clump from dividing by zero; it is
+		// far below any real log cadence, so it never rounds a genuine rate down.
+		if span := now.Sub(oldest).Seconds(); span < seconds {
+			seconds = max(span, 1e-6)
+		}
 	}
-	return false, ""
+	return n, float64(n) / seconds
 }
 
 // baseline returns the template's established rate in occurrences/sec, and whether it

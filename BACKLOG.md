@@ -37,7 +37,8 @@ Repo stays private through M5; flip to public at M6.
 ## Epic M3 — Scoring engine (the make-or-break)  `[private]`
 - [x] Novelty signal (unseen, or unseen > cooloff) — muted during warmup, or the first
       seconds of a run would flood the user with "novel" routine templates
-- [x] Burst signal (sliding-window count vs threshold / baseline) — no baseline, no burst
+- [x] Burst signal — purely RELATIVE (k× the template's own baseline); no absolute floor,
+      because "busy" is not "changed", and no baseline means no burst
 - [x] Severity signal (stderr / `ERROR|FATAL|PANIC|CRITICAL`) — additive; `stderr + ERROR`
       = 0.9 sits deliberately under the 1.0 threshold, so routine chatter cannot escalate.
       Only fatal-class fires on its own

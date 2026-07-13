@@ -59,8 +59,8 @@ score:
 	if cfg.Score.RatePerMin != 3 {
 		t.Errorf("RatePerMin = %d, want 3: an untyped flag's default overwrote the file", cfg.Score.RatePerMin)
 	}
-	if cfg.Score.BurstFloor != score.Defaults().BurstFloor {
-		t.Errorf("BurstFloor = %d, want the default: nothing set it", cfg.Score.BurstFloor)
+	if cfg.Score.BurstMinCount != score.Defaults().BurstMinCount {
+		t.Errorf("BurstMinCount = %d, want the default: nothing set it", cfg.Score.BurstMinCount)
 	}
 }
 
@@ -77,8 +77,11 @@ func TestInvalidConfigIsRejected(t *testing.T) {
 	if _, err := Load([]string{"--threshold", "0"}); err == nil {
 		t.Error("Load accepted a zero threshold, which would escalate everything")
 	}
-	if _, err := Load([]string{"--burst-floor", "100000"}); err == nil {
-		t.Error("Load accepted a burst floor that could never be reached")
+	if _, err := Load([]string{"--burst-min-count", "100000"}); err == nil {
+		t.Error("Load accepted a burst volume gate that could never be reached")
+	}
+	if _, err := Load([]string{"--burst-multiplier", "1"}); err == nil {
+		t.Error("Load accepted a 1x burst multiplier, which would fire on steady traffic")
 	}
 }
 
