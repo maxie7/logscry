@@ -18,7 +18,7 @@ import (
 // initial WindowSizeMsg.
 func newTestModel(t *testing.T) Model {
 	t.Helper()
-	m := New(nil, nil)
+	m := New(nil, nil, Options{})
 	sized, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	return sized.(Model)
 }
@@ -202,9 +202,11 @@ func TestErrorListIsBounded(t *testing.T) {
 
 // TestStatusBarKeepsModeOnNarrowTerminal: the source list is the elastic segment,
 // so a narrow terminal drops source names rather than the mode and the counters.
+// The width is the floor for that guarantee, and it grew by a segment in M3 when the
+// bar started carrying the escalation count.
 func TestStatusBarKeepsModeOnNarrowTerminal(t *testing.T) {
-	m := New(nil, nil)
-	sized, _ := m.Update(tea.WindowSizeMsg{Width: 46, Height: 24})
+	m := New(nil, nil, Options{})
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 56, Height: 24})
 	m = sized.(Model)
 
 	snap := testSnapshot()
@@ -214,14 +216,14 @@ func TestStatusBarKeepsModeOnNarrowTerminal(t *testing.T) {
 
 	status := m.viewStatus()
 	if !strings.Contains(status, "STREAM") {
-		t.Errorf("mode truncated away at width 46:\n%s", status)
+		t.Errorf("mode truncated away at width 56:\n%s", status)
 	}
 	if !strings.Contains(status, "13 lines") {
-		t.Errorf("counters truncated away at width 46:\n%s", status)
+		t.Errorf("counters truncated away at width 56:\n%s", status)
 	}
 	for _, line := range strings.Split(status, "\n") {
-		if got := runeLen(line); got > 46 {
-			t.Errorf("status line is %d runes wide, want <= 46: %q", got, line)
+		if got := runeLen(line); got > 56 {
+			t.Errorf("status line is %d runes wide, want <= 56: %q", got, line)
 		}
 	}
 }

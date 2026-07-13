@@ -43,6 +43,7 @@ type errMsg struct{ err error }
 type Model struct {
 	snaps <-chan pipeline.Snapshot
 	errCh <-chan error
+	opts  Options
 
 	snap   pipeline.Snapshot
 	mode   viewMode
@@ -58,8 +59,8 @@ type Model struct {
 
 // New builds the model over the pipeline's snapshot channel and the error channel
 // that background goroutines report into.
-func New(snaps <-chan pipeline.Snapshot, errs <-chan error) Model {
-	return Model{snaps: snaps, errCh: errs, vp: viewport.New(0, 0)}
+func New(snaps <-chan pipeline.Snapshot, errs <-chan error, opts Options) Model {
+	return Model{snaps: snaps, errCh: errs, opts: opts, vp: viewport.New(0, 0)}
 }
 
 // Init starts the two channel readers.

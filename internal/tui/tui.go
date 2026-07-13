@@ -20,6 +20,13 @@ import (
 	"github.com/maxie7/logscry/internal/pipeline"
 )
 
+// Options configures the view.
+type Options struct {
+	// ExplainDryRun surfaces the events the scorer would have escalated. Escalations
+	// are decided and counted either way; this only decides whether they are shown.
+	ExplainDryRun bool
+}
+
 // Run starts the terminal UI and blocks until the user quits or ctx is cancelled.
 //
 // snaps delivers pipeline state; errs delivers background errors, which are shown
@@ -28,7 +35,7 @@ import (
 //
 // in is the keyboard source: nil to let Bubble Tea read stdin as usual, or an open
 // /dev/tty when stdin is busy carrying logs (see Resolve). Run does not close it.
-func Run(ctx context.Context, snaps <-chan pipeline.Snapshot, errs <-chan error, in *os.File) error {
+func Run(ctx context.Context, snaps <-chan pipeline.Snapshot, errs <-chan error, in *os.File, o Options) error {
 	opts := []tea.ProgramOption{
 		tea.WithAltScreen(),
 		tea.WithContext(ctx), // SIGINT/SIGTERM cancels ctx, which stops the program
@@ -37,7 +44,7 @@ func Run(ctx context.Context, snaps <-chan pipeline.Snapshot, errs <-chan error,
 		opts = append(opts, tea.WithInput(in))
 	}
 
-	p := tea.NewProgram(New(snaps, errs), opts...)
+	p := tea.NewProgram(New(snaps, errs, o), opts...)
 	_, err := p.Run()
 	// A cancelled context is the ordinary Ctrl-C shutdown path, not a failure.
 	if err != nil && ctx.Err() != nil {

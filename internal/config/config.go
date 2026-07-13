@@ -2,27 +2,270 @@
 
 // Package config loads logscry configuration from flags, an optional YAML file,
 // and the environment (secrets only, e.g. LOGSCRY_API_KEY).
+//
+// Precedence is defaults < file < explicitly-set flags. "Explicitly set" is the
+// subtle part: a flag left alone must not shadow the config file with its own
+// default, so the file is applied first and only the flags the user actually typed
+// are replayed over it (see Load).
 package config
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/maxie7/logscry/internal/score"
+)
+
+// apiKeyEnv is the only secret logscry reads, and it is env-only — never a flag,
+// never the config file, so it cannot end up in a shell history or a commit.
+const apiKeyEnv = "LOGSCRY_API_KEY"
+
+// Docker selects which containers to follow.
+type Docker struct {
+	All       bool     `yaml:"all"`
+	NameRegex string   `yaml:"name"`
+	Labels    []string `yaml:"label"` // k=v, AND-combined
+	Tail      string   `yaml:"tail"`  // trailing lines fetched per container on attach
+}
+
+// LLM is the M4 backend configuration. It is loaded now so the config file has a
+// stable shape, but nothing reads it until the LLM stage exists.
+type LLM struct {
+	BaseURL string `yaml:"base_url"`
+	Model   string `yaml:"model"`
+	// APIKey comes from the environment, never from a flag or the file.
+	APIKey string `yaml:"-"`
+}
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
 	// Sources / mode.
-	Plain bool // --plain: line output instead of the TUI
+	Plain bool `yaml:"plain"`
+	// ExplainDryRun surfaces escalations instead of sending them to a model. It is
+	// how the scoring thresholds get calibrated before an LLM exists (M4).
+	ExplainDryRun bool `yaml:"explain_dry_run"`
 
-	// LLM backend.
-	LLMBaseURL string
-	LLMModel   string
-	// APIKey is populated from the LOGSCRY_API_KEY env var, never a flag/file.
-	APIKey string
+	Score  score.Config `yaml:"score"`
+	Docker Docker       `yaml:"docker"`
+	LLM    LLM          `yaml:"llm"`
 
-	// TODO: scoring weights + thresholds, rate-limit (calls/min), context window
-	// size, cooloff/burst windows, Docker selectors.
+	// Argv is the subprocess to run, i.e. everything after "--". Not configurable
+	// from the file: it is positional by nature.
+	Argv []string `yaml:"-"`
 }
 
-// Load resolves configuration from flags, an optional config file, and env.
+// Defaults returns the zero-config configuration: quiet scoring, no Docker, and a
+// local Ollama for M4.
+func Defaults() Config {
+	return Config{
+		Score:  score.Defaults(),
+		Docker: Docker{Tail: "100"},
+		LLM:    LLM{BaseURL: "http://localhost:11434/v1", Model: "llama3.2"},
+	}
+}
+
+// Load resolves configuration from args, an optional --config YAML file, and the
+// environment.
+func Load(args []string) (Config, error) {
+	// Split at the first "--" before flag parsing: the stdlib flag package's own
+	// "--" handling is ambiguous with a bare `logscry ./app`, and we require an
+	// explicit "--" to treat trailing args as a subprocess.
+	flagArgs, argv := splitArgs(args)
+
+	cfg := Defaults()
+	fs := flag.NewFlagSet("logscry", flag.ContinueOnError)
+	path := fs.String("config", "", "path to a logscry.yaml config file")
+	b := bind(fs, cfg)
+
+	if err := fs.Parse(flagArgs); err != nil {
+		return Config{}, err
+	}
+
+	if *path != "" {
+		if err := loadFile(*path, &cfg); err != nil {
+			return Config{}, err
+		}
+	}
+	// Replay only the flags the user actually typed, so they win over the file while
+	// the ones left alone leave it standing.
+	fs.Visit(func(f *flag.Flag) {
+		if apply, ok := b[f.Name]; ok {
+			apply(&cfg)
+		}
+	})
+
+	cfg.LLM.APIKey = os.Getenv(apiKeyEnv)
+	cfg.Argv = argv
+
+	if err := cfg.Score.Validate(); err != nil {
+		return Config{}, fmt.Errorf("score config: %w", err)
+	}
+	return cfg, nil
+}
+
+// loadFile decodes path over cfg, which already holds the defaults: keys absent from
+// the document simply keep them. Unknown keys are an error rather than a shrug — a
+// typo in a tuning file must not silently leave the tool at a default the user
+// believes they changed.
+func loadFile(path string, cfg *Config) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("config file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	dec := yaml.NewDecoder(f)
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil {
+		return fmt.Errorf("config file %s: %w", path, err)
+	}
+	return nil
+}
+
+// applyFunc copies one parsed flag value into the resolved config.
+type applyFunc func(*Config)
+
+// bind registers every flag against the field it overrides, so that the flag's
+// default, its usage text, and the assignment that applies it all live on one line.
+// It returns the appliers keyed by flag name, for Load to replay over the file.
 //
-// TODO: parse flags, merge --config YAML, read LOGSCRY_API_KEY from env, and
-// apply sensible zero-config defaults (works out of the box against local Ollama).
-func Load() (Config, error) {
-	return Config{}, nil
+// def carries the defaults, which double as the flag defaults shown in -h.
+func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
+	b := binder{fs: fs, apply: make(map[string]applyFunc)}
+
+	b.boolVar("plain", def.Plain, "plain line output instead of the TUI",
+		func(c *Config) *bool { return &c.Plain })
+	b.boolVar("explain-dry-run", def.ExplainDryRun,
+		"show what would be escalated instead of calling the LLM (threshold calibration)",
+		func(c *Config) *bool { return &c.ExplainDryRun })
+
+	// Scoring: the threshold and the weights.
+	s := def.Score
+	b.floatVar("threshold", s.Threshold, "escalate at or above this score",
+		func(c *Config) *float64 { return &c.Score.Threshold })
+	b.floatVar("weight-novelty", s.Weights.Novelty, "score weight of a novel template",
+		func(c *Config) *float64 { return &c.Score.Weights.Novelty })
+	b.floatVar("weight-burst", s.Weights.Burst, "score weight of a burst",
+		func(c *Config) *float64 { return &c.Score.Weights.Burst })
+	b.floatVar("weight-stderr", s.Weights.Stderr, "score weight of a line on stderr",
+		func(c *Config) *float64 { return &c.Score.Weights.Stderr })
+	b.floatVar("weight-warn", s.Weights.Warn, "score weight of level WARN",
+		func(c *Config) *float64 { return &c.Score.Weights.Warn })
+	b.floatVar("weight-error", s.Weights.Error, "score weight of level ERROR/CRITICAL",
+		func(c *Config) *float64 { return &c.Score.Weights.Error })
+	b.floatVar("weight-fatal", s.Weights.Fatal, "score weight of level FATAL/PANIC",
+		func(c *Config) *float64 { return &c.Score.Weights.Fatal })
+	b.floatVar("severity-max", s.Weights.SeverityMax, "cap on the summed severity weight",
+		func(c *Config) *float64 { return &c.Score.Weights.SeverityMax })
+
+	// Scoring: novelty.
+	b.durationVar("cooloff", s.Cooloff, "a template unseen for longer than this is novel again",
+		func(c *Config) *time.Duration { return &c.Score.Cooloff })
+	b.durationVar("warmup", s.Warmup, "mute novelty for this long at startup",
+		func(c *Config) *time.Duration { return &c.Score.Warmup })
+	b.intVar("warmup-lines", s.WarmupLines, "mute novelty until this many lines have been seen",
+		func(c *Config) *int { return &c.Score.WarmupLines })
+
+	// Scoring: burst.
+	b.durationVar("burst-window", s.BurstWindow, "sliding window for burst detection",
+		func(c *Config) *time.Duration { return &c.Score.BurstWindow })
+	b.intVar("burst-floor", s.BurstFloor, "occurrences within the window that always count as a burst",
+		func(c *Config) *int { return &c.Score.BurstFloor })
+	b.floatVar("burst-multiplier", s.BurstMultiplier, "burst if the rate exceeds this many times the baseline",
+		func(c *Config) *float64 { return &c.Score.BurstMultiplier })
+	b.intVar("burst-min-count", s.BurstMinCount, "never call fewer than this many occurrences a burst",
+		func(c *Config) *int { return &c.Score.BurstMinCount })
+	b.durationVar("baseline-min-age", s.BaselineMinAge, "a template has no baseline until it is this old",
+		func(c *Config) *time.Duration { return &c.Score.BaselineMinAge })
+	b.intVar("baseline-min-count", s.BaselineMinCount, "a template has no baseline until seen this many times",
+		func(c *Config) *int { return &c.Score.BaselineMinCount })
+
+	// Scoring: gates and context.
+	b.intVar("rate-limit", s.RatePerMin, "global cap on LLM calls per minute",
+		func(c *Config) *int { return &c.Score.RatePerMin })
+	b.durationVar("cache-ttl", s.CacheTTL, "how long an explained template stays quiet",
+		func(c *Config) *time.Duration { return &c.Score.CacheTTL })
+	b.intVar("context-lines", s.ContextLines, "recent lines carried with an escalation",
+		func(c *Config) *int { return &c.Score.ContextLines })
+
+	// Docker selection.
+	b.boolVar("docker-all", def.Docker.All, "follow logs from all Docker containers",
+		func(c *Config) *bool { return &c.Docker.All })
+	b.stringVar("docker-name", def.Docker.NameRegex, "follow Docker containers whose name matches this regexp",
+		func(c *Config) *string { return &c.Docker.NameRegex })
+	b.stringVar("docker-tail", def.Docker.Tail, "number of trailing log lines to fetch per container on attach",
+		func(c *Config) *string { return &c.Docker.Tail })
+	b.listVar("docker-label", "follow Docker containers with this k=v label (repeatable, AND-combined)",
+		func(c *Config) *[]string { return &c.Docker.Labels })
+
+	// LLM backend (M4).
+	b.stringVar("llm-url", def.LLM.BaseURL, "OpenAI-compatible base URL (default: local Ollama)",
+		func(c *Config) *string { return &c.LLM.BaseURL })
+	b.stringVar("llm-model", def.LLM.Model, "model name to ask for explanations",
+		func(c *Config) *string { return &c.LLM.Model })
+
+	return b.apply
+}
+
+// binder is bind's scratch state: the flag set being filled, and the appliers built
+// alongside it.
+type binder struct {
+	fs    *flag.FlagSet
+	apply map[string]applyFunc
+}
+
+func (b binder) boolVar(name string, def bool, usage string, field func(*Config) *bool) {
+	p := b.fs.Bool(name, def, usage)
+	b.apply[name] = func(c *Config) { *field(c) = *p }
+}
+
+func (b binder) intVar(name string, def int, usage string, field func(*Config) *int) {
+	p := b.fs.Int(name, def, usage)
+	b.apply[name] = func(c *Config) { *field(c) = *p }
+}
+
+func (b binder) floatVar(name string, def float64, usage string, field func(*Config) *float64) {
+	p := b.fs.Float64(name, def, usage)
+	b.apply[name] = func(c *Config) { *field(c) = *p }
+}
+
+func (b binder) stringVar(name, def, usage string, field func(*Config) *string) {
+	p := b.fs.String(name, def, usage)
+	b.apply[name] = func(c *Config) { *field(c) = *p }
+}
+
+func (b binder) durationVar(name string, def time.Duration, usage string, field func(*Config) *time.Duration) {
+	p := b.fs.Duration(name, def, usage)
+	b.apply[name] = func(c *Config) { *field(c) = *p }
+}
+
+// listVar binds a repeatable flag. It has no default: repeating a flag appends, so a
+// default value could only ever be prepended to what the user typed.
+func (b binder) listVar(name, usage string, field func(*Config) *[]string) {
+	var list stringList
+	b.fs.Var(&list, name, usage)
+	b.apply[name] = func(c *Config) { *field(c) = list }
+}
+
+// stringList is a repeatable string flag (e.g. --docker-label k=v --docker-label x=y).
+type stringList []string
+
+func (s *stringList) String() string     { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
+
+// splitArgs partitions args at the first "--" separator: everything before is
+// returned as flag args, everything after as the subprocess argv (nil when there is
+// no separator).
+func splitArgs(args []string) (flagArgs, argv []string) {
+	for i, a := range args {
+		if a == "--" {
+			return args[:i], args[i+1:]
+		}
+	}
+	return args, nil
 }

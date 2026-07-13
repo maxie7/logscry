@@ -20,6 +20,10 @@ var (
 	styleHint   = lipgloss.NewStyle().Foreground(lipgloss.Color("8")) // dim grey
 	styleHead   = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
 
+	// styleEscalate marks a would-be escalation in --explain-dry-run. It has to jump
+	// off a wall of log lines — that is the whole point of the mode.
+	styleEscalate = lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true) // magenta
+
 	// levelStyles colours the severity token; unknown levels fall back to plain.
 	levelStyles = map[string]lipgloss.Style{
 		"ERROR":    lipgloss.NewStyle().Foreground(lipgloss.Color("9")),
@@ -62,6 +66,13 @@ func (m Model) viewStream() string {
 		b.WriteString(" " + ev.Pattern)
 		if ev.Count > 1 {
 			b.WriteString(styleCount.Render(fmt.Sprintf("  x%d", ev.Count)))
+		}
+		// In dry-run the escalation is the news, so it gets its own line under the
+		// event that caused it, carrying the reasons the scorer fired.
+		if m.opts.ExplainDryRun && ev.Escalate {
+			b.WriteByte('\n')
+			b.WriteString(styleEscalate.Render(fmt.Sprintf("  ⇧ WOULD ESCALATE: %s | reasons: %s | score: %.2f",
+				ev.Pattern, strings.Join(ev.Reasons, ", "), ev.Score)))
 		}
 	}
 	return b.String()
@@ -109,10 +120,17 @@ func (m Model) viewStatus() string {
 		mode += " · ENDED"
 	}
 
-	counters := fmt.Sprintf(" %s lines → %s templates | %.0f l/s",
+	counters := fmt.Sprintf(" %s lines → %s templates | %.0f l/s | esc %s",
 		formatCount(m.snap.Stats.TotalLines),
 		formatCount(m.snap.Stats.UniqueTemplates),
-		m.snap.Stats.LinesPerSec)
+		m.snap.Stats.LinesPerSec,
+		formatCount(m.snap.Stats.Escalations))
+	// Only shown once it has bitten. When the rate limiter is holding escalations
+	// back, saying so is the difference between a quiet tool and a tool that looks
+	// quiet because it is hiding things.
+	if n := m.snap.Stats.Suppressed; n > 0 {
+		counters += " · supp " + formatCount(n)
+	}
 
 	sources := "no sources"
 	if len(m.snap.Stats.Sources) > 0 {
@@ -120,12 +138,14 @@ func (m Model) viewStatus() string {
 	}
 
 	// The source list is the elastic segment: on a narrow terminal it gives way
-	// first, so the counters and the mode (PAUSED, ENDED) never truncate away.
+	// first, so the counters and the mode (PAUSED, ENDED) never truncate away. Once
+	// there is no room for it at all, it goes entirely — separators and all — rather
+	// than leaving a stub of punctuation behind.
 	const seps = 6 // the two " | " joins
-	if budget := m.width - runeLen(counters) - runeLen(mode) - seps; budget < runeLen(sources) {
-		sources = truncate(sources, budget)
+	summary := counters + " | " + mode
+	if budget := m.width - runeLen(counters) - runeLen(mode) - seps; budget > 0 {
+		summary = counters + " | " + truncate(sources, budget) + " | " + mode
 	}
-	summary := counters + " | " + sources + " | " + mode
 	bar := styleStatus.Width(m.width).Render(truncate(summary, m.width))
 
 	second := styleHint.Render(truncate(" q quit · t toggle view · p pause · ↑/↓/pgup/pgdn scroll", m.width))

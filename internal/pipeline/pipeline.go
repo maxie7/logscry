@@ -10,16 +10,13 @@ import (
 	"time"
 
 	"github.com/maxie7/logscry/internal/model"
+	"github.com/maxie7/logscry/internal/score"
 )
 
-// recentCap bounds the per-template ring buffer of recent occurrence timestamps
-// used by burst detection (M3).
-const recentCap = 64
-
-// Event is one processed log line ready for display — and, in M3, already scored.
-// It carries a value snapshot of the template's display state (not the live
-// *model.Template) so the consumer, which runs in another goroutine, never races
-// the pipeline goroutine's ongoing mutations of the state map.
+// Event is one processed and scored log line, ready for display. It carries a value
+// snapshot of the template's display state (not the live *model.Template) so the
+// consumer, which runs in another goroutine, never races the pipeline goroutine's
+// ongoing mutations of the state map.
 type Event struct {
 	Line      model.LogLine // normalized: Level and Message filled in
 	Hash      string        // template signature hash (dedup key)
@@ -27,31 +24,34 @@ type Event struct {
 	Count     int           // running count for this template at emit time
 	FirstSeen time.Time
 	LastSeen  time.Time
-	// M3 will add scoring fields (e.g. Score, Escalate) populated inside Process,
-	// which has the live *model.Template — including its Recent ring — in scope.
+
+	// Scoring (zero when the pipeline runs without a Scorer).
+	Score    float64
+	Escalate bool
+	Reasons  []string // why it escalated; allocated once by the scorer, never mutated
 }
 
-// Pipeline holds the template dedup/count state. Its methods are NOT safe for
-// concurrent use: call them from a single goroutine only (see Run).
+// Pipeline holds the template dedup/count state and the scorer that reads it. Its
+// methods are NOT safe for concurrent use: call them from a single goroutine only
+// (see Run).
 type Pipeline struct {
 	templates map[string]*model.Template
+	scorer    *score.Scorer // nil: no scoring, events carry a zero Score
 }
 
-// New returns an empty Pipeline.
-func New() *Pipeline {
-	return &Pipeline{templates: make(map[string]*model.Template)}
+// New returns an empty Pipeline scoring with sc, which may be nil.
+func New(sc *score.Scorer) *Pipeline {
+	return &Pipeline{templates: make(map[string]*model.Template), scorer: sc}
 }
 
-// Process runs one line through normalize -> template -> dedup/count and returns
-// the event to emit. now is the observation time (injected for testability).
-//
-// The M3 scoring step slots in here, after upsert and before the snapshot, where
-// the live *model.Template (Count, Recent, FirstSeen) is available.
+// Process runs one line through normalize -> template -> dedup/count -> score and
+// returns the event to emit. now is the observation time (injected for testability).
 func (p *Pipeline) Process(line model.LogLine, now time.Time) Event {
 	line = Normalize(line)
 	pattern, hash := Templatize(line.Message)
-	tmpl := p.upsert(hash, pattern, now)
-	return Event{
+	tmpl, prevLastSeen := p.upsert(hash, pattern, now)
+
+	ev := Event{
 		Line:      line,
 		Hash:      hash,
 		Pattern:   pattern,
@@ -59,12 +59,29 @@ func (p *Pipeline) Process(line model.LogLine, now time.Time) Event {
 		FirstSeen: tmpl.FirstSeen,
 		LastSeen:  tmpl.LastSeen,
 	}
+	if p.scorer != nil {
+		res := p.scorer.Evaluate(line, tmpl, prevLastSeen, now)
+		ev.Score, ev.Escalate, ev.Reasons = res.Score, res.Escalate, res.Reasons
+	}
+	return ev
 }
 
-// upsert inserts or updates the template state for hash, returning the live entry.
-// New templates start at Count 1; existing ones bump Count, advance LastSeen, and
-// push now onto the bounded Recent ring.
-func (p *Pipeline) upsert(hash, pattern string, now time.Time) *model.Template {
+// Stats returns the scorer's running escalation counters, or the zero value when the
+// pipeline runs without a scorer.
+func (p *Pipeline) Stats() score.Stats {
+	if p.scorer == nil {
+		return score.Stats{}
+	}
+	return p.scorer.Stats()
+}
+
+// upsert inserts or updates the template state for hash, returning the live entry and
+// the LastSeen it held *before* this occurrence. That previous LastSeen is the gap the
+// novelty cooloff is measured against, and this call is the last moment it exists.
+//
+// New templates start at Count 1; existing ones bump Count, advance LastSeen, and push
+// now onto the bounded Recent ring.
+func (p *Pipeline) upsert(hash, pattern string, now time.Time) (tmpl *model.Template, prevLastSeen time.Time) {
 	tmpl, ok := p.templates[hash]
 	if !ok {
 		tmpl = &model.Template{
@@ -76,18 +93,19 @@ func (p *Pipeline) upsert(hash, pattern string, now time.Time) *model.Template {
 			Recent:    []time.Time{now},
 		}
 		p.templates[hash] = tmpl
-		return tmpl
+		return tmpl, time.Time{}
 	}
+	prevLastSeen = tmpl.LastSeen
 	tmpl.Count++
 	tmpl.LastSeen = now
 	tmpl.Recent = pushRecent(tmpl.Recent, now)
-	return tmpl
+	return tmpl, prevLastSeen
 }
 
 // pushRecent appends now to the recent ring, dropping the oldest entry in place
-// once the buffer is full. Bounded at recentCap with no reallocation on wrap.
+// once the buffer is full. Bounded at model.RecentCap with no reallocation on wrap.
 func pushRecent(recent []time.Time, now time.Time) []time.Time {
-	if len(recent) < recentCap {
+	if len(recent) < model.RecentCap {
 		return append(recent, now)
 	}
 	copy(recent, recent[1:])
@@ -111,6 +129,9 @@ type Options struct {
 	Interval time.Duration
 	// RingSize bounds the snapshot's stream tail (default 2000 events).
 	RingSize int
+	// Scorer decides which events escalate. Nil to skip scoring entirely, in which
+	// case every Event carries a zero Score and Escalate is never set.
+	Scorer *score.Scorer
 }
 
 // Run reads lines from in and processes each through a single goroutine-confined
@@ -125,7 +146,7 @@ func Run(ctx context.Context, in <-chan model.LogLine, opts Options) {
 		defer close(opts.Snapshots)
 	}
 
-	p := New()
+	p := New(opts.Scorer)
 	c := newCollector(opts.RingSize)
 
 	// Without a snapshot consumer there is nothing to tick for; a nil channel

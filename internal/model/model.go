@@ -28,6 +28,13 @@ type LogLine struct {
 	Message string // message body after stripping structured prefixes
 }
 
+// RecentCap is the capacity of Template.Recent. It lives here because the ring is
+// the evidence burst detection runs on: the pipeline fills it and the scorer reads
+// it, and the scorer rejects a burst floor it could never reach (see score.Config).
+// It must stay comfortably above that floor, or a "50 in 10s" burst would be
+// invisible simply because the ring forgot the first half of it.
+const RecentCap = 256
+
 // Template is the masked signature of a class of log lines, plus the running
 // state used for dedup, burst detection, and explanation caching.
 type Template struct {

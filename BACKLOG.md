@@ -35,14 +35,24 @@ Repo stays private through M5; flip to public at M6.
 - [x] Unit tests for templating
 
 ## Epic M3 — Scoring engine (the make-or-break)  `[private]`
-- [ ] Novelty signal (unseen, or unseen > cooloff)
-- [ ] Burst signal (sliding-window count vs threshold / baseline)
-- [ ] Severity signal (stderr / `ERROR|FATAL|PANIC|CRITICAL`)
-- [ ] Escalation decision: score ≥ threshold AND not cached AND rate-limiter allows
-- [ ] Global rate limiter (token bucket, calls/min, configurable)
-- [ ] Explanation cache keyed by template hash
-- [ ] Global ring buffer for LLM context (last M lines)
-- [ ] Unit tests for scoring + escalation decision
+- [x] Novelty signal (unseen, or unseen > cooloff) — muted during warmup, or the first
+      seconds of a run would flood the user with "novel" routine templates
+- [x] Burst signal (sliding-window count vs threshold / baseline) — no baseline, no burst
+- [x] Severity signal (stderr / `ERROR|FATAL|PANIC|CRITICAL`) — additive; `stderr + ERROR`
+      = 0.9 sits deliberately under the 1.0 threshold, so routine chatter cannot escalate.
+      Only fatal-class fires on its own
+- [x] Escalation decision: score ≥ threshold AND not cached AND rate-limiter allows
+- [x] Global rate limiter (token bucket, calls/min, configurable) — the cost cap, tested
+      explicitly under a 10k-line flood
+- [x] Explanation cache keyed by template hash
+- [x] Global ring buffer for LLM context (last M lines)
+- [x] Escalation channel: bounded, non-blocking, drops + counts when full (the M4 seam)
+- [x] `--explain-dry-run`: surface would-be escalations instead of calling a model
+      <!-- pulled into M3: it is how the thresholds get calibrated before an LLM exists -->
+- [x] Config: flags + `--config logscry.yaml` + one defaults table (RDI §9)
+      <!-- pulled into M3: a scoring engine whose numbers cannot be tuned is not tunable -->
+- [x] Unit tests for scoring + escalation decision, including the "quiet system" property
+      test: thousands of lines of routine traffic → zero escalations
 
 ## Epic M4 — LLM backend  `[private]`
 - [ ] `llm.Backend` interface (`Explain` / `Name`) + `ExplainRequest`/`ExplainResponse`

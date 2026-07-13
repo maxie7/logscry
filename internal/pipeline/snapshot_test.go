@@ -43,7 +43,7 @@ func TestTrySendDropsWhenFull(t *testing.T) {
 func TestRingBufferBoundsAndWraps(t *testing.T) {
 	const size = 4
 	c := newCollector(size)
-	p := New()
+	p := New(nil)
 	base := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 
 	const total = size + 3 // wrap past the end
@@ -79,7 +79,7 @@ func patternForIndex(i int) string {
 // are copied out, not the zero values behind them.
 func TestSnapshotEmptyRing(t *testing.T) {
 	c := newCollector(8)
-	p := New()
+	p := New(nil)
 	now := time.Now()
 	c.observe(p.Process(model.LogLine{Source: "stdin", Raw: "only line"}, now), now)
 
@@ -126,7 +126,7 @@ func hashes(s []TemplateSummary) []string {
 // template map plus the last level seen per template.
 func TestSummariesCarryLevelAndCounts(t *testing.T) {
 	c := newCollector(16)
-	p := New()
+	p := New(nil)
 	now := time.Now()
 	for range 3 {
 		c.observe(p.Process(model.LogLine{Source: "docker:api", Raw: "[ERROR] disk 1 full"}, now), now)

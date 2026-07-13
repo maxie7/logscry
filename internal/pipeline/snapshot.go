@@ -35,6 +35,12 @@ type Stats struct {
 	UniqueTemplates int
 	LinesPerSec     float64
 	Sources         []string // every source seen so far, sorted
+
+	// Escalations is how many events cleared every gate. Suppressed is how many were
+	// worth escalating but lost to the rate limiter — shown so the UI can be honest
+	// that the cost cap is currently hiding things, rather than silently hiding them.
+	Escalations int
+	Suppressed  int
 }
 
 // Snapshot is an immutable view of the pipeline state at one instant. The
@@ -112,6 +118,7 @@ func (c *collector) snapshot(p *Pipeline, now time.Time) Snapshot {
 		c.rate = float64(c.windowN) / elapsed.Seconds()
 		c.windowFrom, c.windowN = now, 0
 	}
+	scored := p.Stats()
 	return Snapshot{
 		Lines:     c.lines(),
 		Templates: c.summaries(p),
@@ -120,6 +127,8 @@ func (c *collector) snapshot(p *Pipeline, now time.Time) Snapshot {
 			UniqueTemplates: len(p.templates),
 			LinesPerSec:     c.rate,
 			Sources:         c.sourceNames(),
+			Escalations:     scored.Escalated,
+			Suppressed:      scored.Suppressed,
 		},
 	}
 }
