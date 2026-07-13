@@ -4,6 +4,8 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -301,5 +303,83 @@ func TestSnapshotPinsEscalations(t *testing.T) {
 		if l.Escalate {
 			t.Fatal("the escalation is somehow still in the stream ring; pick a smaller ring for this test")
 		}
+	}
+}
+
+// TestFatalMidStreamEscalatesOnce is the end-to-end version of the Docker report: a
+// container emits routine traffic, then panics once, mid-stream, well after warmup.
+// It runs the real Run goroutine over real channels — normalize, template, dedup,
+// score — because the reported failure was never in a decision, it was in the wiring
+// around one.
+func TestFatalMidStreamEscalatesOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := score.Defaults()
+	cfg.Warmup, cfg.WarmupLines = 0, 0 // warmup has its own tests; this is about the fatal
+
+	lines := make(chan model.LogLine, 16)
+	events := make(chan Event, 16)
+	go Run(ctx, lines, Options{Events: events, Scorer: score.New(cfg, nil)})
+
+	// The routine traffic a healthy container emits, exactly as the report described:
+	// INFO on stdout, ERROR on stderr.
+	feed := func(raw string, stream model.Stream) {
+		lines <- model.LogLine{Source: "docker:logtest", Raw: raw, Stream: stream}
+	}
+	panicLine := "[PANIC] nil pointer dereference in handler"
+
+	go func() {
+		defer close(lines)
+		for i := range 40 {
+			feed(fmt.Sprintf("[INFO] user %d failed login from 10.0.0.1", i), model.Stdout)
+			feed(fmt.Sprintf("[ERROR] db timeout after %dms", i), model.Stderr)
+		}
+		feed(panicLine, model.Stderr) // the fault, once, mid-stream
+		for i := range 10 {
+			feed(fmt.Sprintf("[INFO] user %d failed login from 10.0.0.1", i), model.Stdout)
+		}
+		feed(panicLine, model.Stderr) // and again: the same fault is not new news
+	}()
+
+	var (
+		escalations []Event
+		fatalSeen   int
+		templates   = map[string]bool{}
+	)
+	for ev := range events {
+		templates[ev.Hash] = true
+		if strings.Contains(ev.Pattern, "nil pointer dereference") {
+			fatalSeen++
+		}
+		if ev.Escalate {
+			escalations = append(escalations, ev)
+		}
+	}
+
+	// It must reach the pipeline at all — the reported symptom was a template count
+	// that never grew past two, i.e. the line vanishing before it was ever templated.
+	if fatalSeen != 2 {
+		t.Fatalf("the PANIC line reached the pipeline %d times, want 2", fatalSeen)
+	}
+	if len(templates) != 3 {
+		t.Errorf("saw %d templates, want 3 (INFO, ERROR, PANIC)", len(templates))
+	}
+
+	// It escalates once, on sight, on its own — novel plus a fatal level.
+	var fatal []Event
+	for _, ev := range escalations {
+		if strings.Contains(ev.Pattern, "nil pointer dereference") {
+			fatal = append(fatal, ev)
+		}
+	}
+	if len(fatal) != 1 {
+		t.Fatalf("the PANIC escalated %d times, want exactly 1", len(fatal))
+	}
+	if !strings.Contains(strings.Join(fatal[0].Reasons, ", "), "level PANIC") {
+		t.Errorf("reasons = %v, want the fatal level among them", fatal[0].Reasons)
+	}
+	if fatal[0].Line.Stream != model.Stderr {
+		t.Error("the PANIC lost its stderr stream on the way through")
 	}
 }

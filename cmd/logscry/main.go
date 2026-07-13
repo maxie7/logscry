@@ -55,10 +55,10 @@ func run(ctx context.Context, args []string) error {
 		defer func() { _ = ttyIn.Close() }()
 	}
 
-	// Reading logs from an interactive terminal means the stdin source and Bubble
-	// Tea would both be consuming the same keystrokes. Rather than fight over them,
-	// say what is missing. (--plain has no such conflict: it reads typed lines.)
-	if mode == tui.ModeTUI && stdinOnly && ttyIn == nil {
+	// stdin as the only source, and stdin is the terminal the user is sitting at: no
+	// logs are coming, and none ever will. Say what is missing rather than drawing an
+	// empty screen forever. (--plain has no such problem: it reads typed lines.)
+	if mode == tui.ModeTUI && stdinOnly && tui.StdinIsTerminal() {
 		return errors.New("no log source: pipe logs in, run 'logscry -- ./app', or use --docker-all")
 	}
 

@@ -13,6 +13,7 @@ package tui
 
 import (
 	"context"
+	"io"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -25,7 +26,16 @@ type Options struct {
 	// ExplainDryRun surfaces the events the scorer would have escalated. Escalations
 	// are decided and counted either way; this only decides whether they are shown.
 	ExplainDryRun bool
+	// Output is where the program draws. Nil means os.Stdout, which is what production
+	// wants; the tests point it at a pty so they can drive the real program and read
+	// what it actually rendered.
+	Output io.Writer
 }
+
+// StdinIsTerminal reports whether stdin is an interactive terminal rather than a pipe
+// carrying logs. A caller that has stdin as its only source uses this to tell "no logs
+// were piped in" from "logs are on the way".
+func StdinIsTerminal() bool { return isTerminal(os.Stdin) }
 
 // Run starts the terminal UI and blocks until the user quits or ctx is cancelled.
 //
@@ -42,6 +52,9 @@ func Run(ctx context.Context, snaps <-chan pipeline.Snapshot, errs <-chan error,
 	}
 	if in != nil {
 		opts = append(opts, tea.WithInput(in))
+	}
+	if o.Output != nil {
+		opts = append(opts, tea.WithOutput(o.Output))
 	}
 
 	p := tea.NewProgram(New(snaps, errs, o), opts...)
