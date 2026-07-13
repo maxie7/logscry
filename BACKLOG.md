@@ -67,6 +67,13 @@ Repo stays private through M5; flip to public at M6.
 - [ ] Bubble Tea layout: live stream (left) + flagged-event cards (right)
 - [ ] Card fields: severity, summary, cause, suggestion, count, first/last seen
 - [ ] Keybindings: scroll, expand card, pause/resume, quit
+- [ ] Shorten the subprocess source name to the base name (`proc:myapp`, not
+      `proc:/home/maxie/code/.../myapp`): the full path crowds the stream out at ~100
+      columns, and it will look bad in the M6 demo GIF
+- [ ] Surface the `--docker-tail` history limit (status bar). Nothing tells the user the
+      default `100` is all the backlog they get, so an event further back silently never
+      appears — during M3 testing this looked like a broken tool. The README half of this
+      rides along with the M6 README task; call out `--docker-tail all` for full history
 - [x] `--plain` non-TUI line mode <!-- pulled forward into M2: the TUI needs a non-TUI escape hatch to exist -->
 
 
