@@ -223,7 +223,7 @@ func TestStatusBarKeepsModeOnNarrowTerminal(t *testing.T) {
 		t.Errorf("counters truncated away at width 56:\n%s", status)
 	}
 	for _, line := range strings.Split(status, "\n") {
-		if got := runeLen(line); got > 56 {
+		if got := visWidth(line); got > 56 {
 			t.Errorf("status line is %d runes wide, want <= 56: %q", got, line)
 		}
 	}
@@ -269,12 +269,16 @@ func dryRunSnapshot() pipeline.Snapshot {
 	return snap
 }
 
-// TestDryRunPinsEscalations: the escalation must still be readable after the stream
-// has moved on. Inline-only was useless — at any real log rate it scrolls off in well
-// under a second, and reading the reasons is the entire point of the flag.
-func TestDryRunPinsEscalations(t *testing.T) {
+// TestDryRunSurfacesTheScorersCase: the escalation must still be readable after the
+// stream has moved on. Inline-only was useless — at any real log rate it scrolls off in
+// well under a second, and reading the reasons is the entire point of the flag.
+//
+// The reasons and the score sit on the COLLAPSED card, because they are what the
+// thresholds get tuned against: a mode whose evidence is one keystroke out of sight is a
+// mode nobody calibrates with.
+func TestDryRunSurfacesTheScorersCase(t *testing.T) {
 	m := New(nil, nil, Options{ExplainDryRun: true})
-	sized, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
 	m = sized.(Model)
 
 	applied, _ := m.Update(snapshotMsg(dryRunSnapshot()))
@@ -282,63 +286,80 @@ func TestDryRunPinsEscalations(t *testing.T) {
 
 	view := m.View()
 	if !strings.Contains(view, "WOULD ESCALATE") {
-		t.Fatalf("no escalation pane:\n%s", view)
+		t.Fatalf("no cards pane:\n%s", view)
 	}
-	// The reasons and the score are what get tuned against, so they must be on screen.
 	for _, want := range []string{"nil pointer dereference in handler", "level PANIC", "score 2.00"} {
 		if !strings.Contains(view, want) {
-			t.Errorf("escalation pane is missing %q:\n%s", want, view)
+			t.Errorf("the cards pane is missing %q:\n%s", want, view)
 		}
 	}
 	// It survives the stream scrolling on: the pane renders from Snapshot.Escalations,
 	// not from whatever happens to be in the visible tail.
-	m.vp.GotoTop()
+	m.stream.GotoTop()
 	if !strings.Contains(m.View(), "WOULD ESCALATE") {
-		t.Error("the pinned pane vanished when the stream was scrolled away")
+		t.Error("the cards pane vanished when the stream was scrolled away")
 	}
 }
 
-// TestDryRunPaneIsOffByDefault: without the flag, escalations are still decided and
-// counted — they are just not surfaced. The pane must cost a normal run nothing.
-func TestDryRunPaneIsOffByDefault(t *testing.T) {
+// TestDryRunWordingIsOffByDefault: an ordinary run must not claim it "would" have
+// escalated something it actually did escalate. The card is still there — the pane is
+// always there — it just does not borrow dry-run's wording.
+func TestDryRunWordingIsOffByDefault(t *testing.T) {
 	m := newTestModel(t)
 	applied, _ := m.Update(snapshotMsg(dryRunSnapshot()))
 	m = applied.(Model)
 
-	if strings.Contains(m.View(), "WOULD ESCALATE") {
-		t.Error("the dry-run pane rendered without --explain-dry-run")
+	view := m.View()
+	if strings.Contains(view, "WOULD ESCALATE") {
+		t.Error("the dry-run wording rendered without --explain-dry-run")
 	}
-	if m.chromeHeight() != statusHeight {
-		t.Errorf("chromeHeight = %d, want %d: the pane is taking rows it does not use",
-			m.chromeHeight(), statusHeight)
+	if !strings.Contains(view, "ANOMALIES") {
+		t.Errorf("the cards pane is missing from an ordinary run:\n%s", view)
+	}
+	// A scored run with no model attached still has something to show: the scorer fired,
+	// and the card says what on and why, it just never says "explaining…".
+	if !strings.Contains(view, "nil pointer dereference in handler") {
+		t.Errorf("the escalation produced no card:\n%s", view)
+	}
+	if strings.Contains(view, "explaining…") {
+		t.Errorf("a run with no LLM claims an explanation is coming:\n%s", view)
 	}
 }
 
-// TestEscalationPaneIsBounded keeps a flood of escalations from eating the screen.
-func TestEscalationPaneIsBounded(t *testing.T) {
+// TestCardsAreNewestFirst: the cards pane is a live tail, so the thing that just fired is
+// the thing at the top — and it is the one selected, because it is the one being read.
+func TestCardsAreNewestFirst(t *testing.T) {
 	m := New(nil, nil, Options{ExplainDryRun: true})
-	sized, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
 	m = sized.(Model)
 
 	snap := testSnapshot()
-	for i := range escalationPaneMax + 10 {
+	const n = 5
+	for i := range n {
 		snap.Escalations = append(snap.Escalations, pipeline.Event{
-			Pattern: "failure " + strconv.Itoa(i), Escalate: true, Score: 1, Reasons: []string{"novel template"},
+			Hash:    "h" + strconv.Itoa(i),
+			Pattern: "failure " + strconv.Itoa(i),
+			Line:    model.LogLine{Level: "ERROR"},
+			Score:   1, Escalate: true, Reasons: []string{"novel template"},
 		})
 	}
+	snap.Stats.Escalations = n
 	applied, _ := m.Update(snapshotMsg(snap))
 	m = applied.(Model)
 
-	if got := m.pinnedCount(); got != escalationPaneMax {
-		t.Errorf("pinned %d escalations, want at most %d", got, escalationPaneMax)
+	cards := m.renderCards(40)
+	if len(cards) != n {
+		t.Fatalf("rendered %d cards, want %d", len(cards), n)
 	}
-	// Newest first: the most recent escalation is the one being read.
-	pane := m.viewEscalations()
-	if !strings.Contains(pane, "failure "+strconv.Itoa(escalationPaneMax+9)) {
-		t.Errorf("the newest escalation is not in the pane:\n%s", pane)
+	if cards[0].hash != "h4" {
+		t.Errorf("the top card is %q, want the newest (h4)", cards[0].hash)
 	}
-	if m.vp.Height != 24-m.chromeHeight() {
-		t.Errorf("viewport height = %d, want %d: the pane and the stream are overlapping",
-			m.vp.Height, 24-m.chromeHeight())
+	if m.selKey != "h4" {
+		t.Errorf("selection is on %q, want the newest card (h4)", m.selKey)
+	}
+	// The newest card must actually be on screen, not merely first in a list scrolled
+	// somewhere else.
+	if !strings.Contains(m.View(), "failure 4") {
+		t.Errorf("the newest card is not visible:\n%s", m.View())
 	}
 }

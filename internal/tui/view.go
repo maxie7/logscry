@@ -5,160 +5,171 @@ package tui
 import (
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+)
 
-	"github.com/maxie7/logscry/internal/model"
-	"github.com/maxie7/logscry/internal/pipeline"
+// Colours are lipgloss AdaptiveColor: they carry a light and a dark variant, and
+// lipgloss downsamples the hex to whatever the terminal can actually show. Nothing here
+// hardcodes an escape sequence, so the same styles survive a 16-colour terminal, a
+// light background, and NO_COLOR.
+var (
+	colFatal = lipgloss.AdaptiveColor{Light: "#C0392B", Dark: "#FF5F5F"}
+	colError = lipgloss.AdaptiveColor{Light: "#D35400", Dark: "#FF8C42"}
+	colWarn  = lipgloss.AdaptiveColor{Light: "#B7791F", Dark: "#E5C07B"}
+	colDim   = lipgloss.AdaptiveColor{Light: "#6B7280", Dark: "#6B7280"}
+	colFocus = lipgloss.AdaptiveColor{Light: "#0F766E", Dark: "#5EEAD4"}
+	colQuiet = lipgloss.AdaptiveColor{Light: "#15803D", Dark: "#4ADE80"}
+	colOn    = lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#101010"} // text ON a badge
 )
 
 // Styles are package-level: lipgloss resolves the terminal's colour profile once,
 // and re-creating them per frame would be wasted work at 10 fps.
 var (
 	styleSource = lipgloss.NewStyle().Foreground(lipgloss.Color("6")) // cyan
-	styleCount  = lipgloss.NewStyle().Foreground(lipgloss.Color("8")) // dim grey
+	styleCount  = lipgloss.NewStyle().Foreground(colDim)
 	styleStatus = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8"))
-	styleErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("9")) // red
-	styleHint   = lipgloss.NewStyle().Foreground(lipgloss.Color("8")) // dim grey
+	styleErr    = lipgloss.NewStyle().Foreground(colFatal)
+	styleHint   = lipgloss.NewStyle().Foreground(colDim)
 	styleHead   = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
+	styleQuiet  = lipgloss.NewStyle().Foreground(colQuiet).Bold(true)
+	styleField  = lipgloss.NewStyle().Foreground(colDim)
+	styleSelect = lipgloss.NewStyle().Foreground(colFocus).Bold(true)
 
-	// styleEscalate marks a would-be escalation in --explain-dry-run. It has to jump
-	// off a wall of log lines — that is the whole point of the mode.
+	// styleEscalate marks a would-be escalation inline in --explain-dry-run. It has to
+	// jump off a wall of log lines — that is the whole point of the mode.
 	styleEscalate = lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true) // magenta
-	// styleEscHead is the pinned pane's header bar.
-	styleEscHead = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("13")).Bold(true)
 
-	// levelStyles colours the severity token; unknown levels fall back to plain.
+	// The focused pane's border is the only thing telling the user where the arrow keys
+	// will land, so the two states have to be obvious at a glance, not a shade apart.
+	styleBorderFocus = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colFocus)
+	styleBorderDim   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colDim)
+	styleTitleFocus  = lipgloss.NewStyle().Foreground(colFocus).Bold(true)
+	styleTitleDim    = lipgloss.NewStyle().Foreground(colDim).Bold(true)
+
+	// badgeStyles colour the severity badge. Fatal and error carry a filled background —
+	// they have to be findable in peripheral vision — while anything informational is
+	// deliberately quiet: a card that is merely FYI must not shout as loudly as a panic.
+	badgeStyles = map[severity]lipgloss.Style{
+		sevFatal: lipgloss.NewStyle().Foreground(colOn).Background(colFatal).Bold(true),
+		sevError: lipgloss.NewStyle().Foreground(colOn).Background(colError).Bold(true),
+		sevWarn:  lipgloss.NewStyle().Foreground(colOn).Background(colWarn),
+		sevNone:  lipgloss.NewStyle().Foreground(colDim),
+	}
+
+	// levelStyles colours the level token in the stream; unknown levels fall back to plain.
 	levelStyles = map[string]lipgloss.Style{
-		"ERROR":    lipgloss.NewStyle().Foreground(lipgloss.Color("9")),
-		"FATAL":    lipgloss.NewStyle().Foreground(lipgloss.Color("9")),
-		"PANIC":    lipgloss.NewStyle().Foreground(lipgloss.Color("9")),
-		"CRITICAL": lipgloss.NewStyle().Foreground(lipgloss.Color("9")),
-		"WARN":     lipgloss.NewStyle().Foreground(lipgloss.Color("11")),
-		"WARNING":  lipgloss.NewStyle().Foreground(lipgloss.Color("11")),
+		"ERROR":    lipgloss.NewStyle().Foreground(colFatal),
+		"FATAL":    lipgloss.NewStyle().Foreground(colFatal),
+		"PANIC":    lipgloss.NewStyle().Foreground(colFatal),
+		"CRITICAL": lipgloss.NewStyle().Foreground(colFatal),
+		"WARN":     lipgloss.NewStyle().Foreground(colWarn),
+		"WARNING":  lipgloss.NewStyle().Foreground(colWarn),
 		"INFO":     lipgloss.NewStyle().Foreground(lipgloss.Color("10")),
-		"DEBUG":    lipgloss.NewStyle().Foreground(lipgloss.Color("8")),
-		"TRACE":    lipgloss.NewStyle().Foreground(lipgloss.Color("8")),
+		"DEBUG":    lipgloss.NewStyle().Foreground(colDim),
+		"TRACE":    lipgloss.NewStyle().Foreground(colDim),
 	}
 )
 
-// View composes the panes vertically. Each pane is its own renderer, so M5 can add
-// the flagged-cards pane beside the stream with a JoinHorizontal here, without
-// restructuring anything below.
+// View composes the frame: the live stream and the flagged-event cards, with the status
+// bar under them.
+//
+// The two-pane composition IS the thesis of the tool — a torrent of noise on the left,
+// a couple of calm explained cards on the right, and most of the time nothing on the
+// right at all. Below splitMin the panes stack instead of shrinking into two unusable
+// columns (see layout.go).
 func (m Model) View() string {
 	if !m.ready {
 		return "starting logscry…"
 	}
-	panes := []string{m.vp.View()}
-	if pinned := m.viewEscalations(); pinned != "" {
-		panes = append(panes, pinned)
+
+	// A pane with no room to be drawn renders as "" and is dropped rather than joined —
+	// joining an empty string would cost a blank row that the geometry never budgeted for.
+	var panes []string
+	for _, p := range []string{
+		m.pane(m.streamTitle(), m.stream.View(), m.geom.stream, m.focus == focusStream),
+		m.pane(m.cardsPaneTitle(), m.cards.View(), m.geom.cards, m.focus == focusCards),
+	} {
+		if p != "" {
+			panes = append(panes, p)
+		}
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, append(panes, m.viewStatus())...)
+
+	body := lipgloss.JoinVertical(lipgloss.Left, panes...)
+	if m.geom.layout == layoutSplit {
+		body = lipgloss.JoinHorizontal(lipgloss.Top, panes...)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, body, m.viewStatus())
 }
 
-// viewEscalations renders the pinned pane: the most recent escalations, newest first.
-//
-// It is pinned rather than left inline in the stream because inline is useless: at any
-// real log rate an escalation scrolls off in well under a second — and an explanation
-// arrives seconds *after* that, so by the time the model answers, the line it answers
-// about is long gone. Pinning is what lets an escalation appear instantly as
-// "explaining…" and then fill itself in where the user is already looking.
-func (m Model) viewEscalations() string {
-	rows := m.escalationRows()
-	if len(rows) == 0 {
+// pane frames one pane: a border that shows the focus, a title line, and the viewport
+// under it. The border style fixes the size, so the pane occupies exactly the box the
+// geometry gave it whether it is full, empty, or mid-resize.
+func (m Model) pane(title, body string, b box, focused bool) string {
+	w, h := b.inner()
+	if w <= 0 || h <= 0 {
 		return ""
 	}
-	var b strings.Builder
-	b.WriteString(styleEscHead.Width(m.width).Render(truncate(m.escalationHeader(), m.width)))
-	for _, row := range rows {
-		b.WriteByte('\n')
-		b.WriteString(row)
+	border, titleStyle := styleBorderDim, styleTitleDim
+	if focused {
+		border, titleStyle = styleBorderFocus, styleTitleFocus
 	}
-	return b.String()
+	content := titleStyle.Render(pad(truncate(title, w), w)) + "\n" + body
+	return border.Width(w).Height(h + 1).Render(content) // +1: the title line
 }
 
-// escalationHeader names what the pane is showing, which differs by mode in the one way
-// that matters: in dry-run, nothing was asked of a model, and saying so is the point.
-func (m Model) escalationHeader() string {
-	if m.opts.ExplainDryRun {
-		return fmt.Sprintf(" WOULD ESCALATE · %s total (dry run — no LLM called)",
-			formatCount(m.snap.Stats.Escalations))
+// streamTitle names the left pane and reports its scroll-lock state.
+func (m Model) streamTitle() string {
+	name := "STREAM"
+	if m.mode == aggregatedView {
+		name = "AGGREGATED"
 	}
-	return fmt.Sprintf(" ESCALATED · %s total", formatCount(m.snap.Stats.Escalations))
+	if n, scrolled := m.streamNew(); scrolled {
+		return titleWith(name, scrollMarker(n), m.paneWidth(m.geom.stream))
+	}
+	return name
 }
 
-// escalationRows renders the pinned escalations, newest first, already styled and
-// truncated. It returns the rows rather than a block so that chromeHeight can size the
-// pane from the same rendering the view draws — an explained escalation takes two lines
-// and a pending one takes one, so the height cannot be assumed.
-func (m Model) escalationRows() []string {
-	n := m.pinnedCount()
+// cardsPaneTitle does the same for the cards pane.
+func (m Model) cardsPaneTitle() string {
+	if n, scrolled := m.cardsNew(); scrolled {
+		return titleWith(m.cardsTitle(), scrollMarker(n), m.paneWidth(m.geom.cards))
+	}
+	return m.cardsTitle()
+}
+
+// scrollMarker is the "you are not at the live edge" warning. Getting this wrong is what
+// ruins a live tail: a user who has scrolled up to read something must not be yanked back
+// to the bottom by the next arrival — but they do need telling that arrivals are piling
+// up out of sight, or a paused-looking pane reads as a dead one.
+func scrollMarker(n int) string {
 	if n == 0 {
-		return nil
+		return "↑ scrolled"
 	}
-	recent := m.snap.Escalations[len(m.snap.Escalations)-n:]
-
-	var rows []string
-	// Newest first: the one that just fired is the one being read.
-	for i := len(recent) - 1; i >= 0; i-- {
-		ev := recent[i]
-		rows = append(rows, styleEscalate.Render(truncate(
-			fmt.Sprintf(" ⇧ %s │ %s", ev.Pattern, m.escalationStatus(ev)), m.width)))
-		if detail := explanationDetail(ev.Explanation); detail != "" {
-			rows = append(rows, styleHint.Render(truncate("   "+detail, m.width)))
-		}
-	}
-	return rows
+	return fmt.Sprintf("↑ scrolled — %s new", formatCount(n))
 }
 
-// escalationStatus is the right-hand half of an escalation's line: in dry-run, why the
-// scorer fired; with an LLM attached, where the answer has got to.
-func (m Model) escalationStatus(ev pipeline.Event) string {
-	if m.opts.ExplainDryRun || ev.Explanation == nil {
-		return fmt.Sprintf("%s │ score %.2f", strings.Join(ev.Reasons, ", "), ev.Score)
+// titleWith right-aligns a marker against the title, dropping it entirely when the pane
+// is too narrow to carry both — a half-marker is worse than none.
+func titleWith(name, marker string, width int) string {
+	gap := width - visWidth(name) - visWidth(marker) - 1
+	if gap < 1 {
+		return name
 	}
-	switch ex := ev.Explanation; ex.State {
-	case model.ExplainDone:
-		return ex.Summary
-	case model.ExplainFailed:
-		return "explanation unavailable"
-	default:
-		return "explaining…"
-	}
+	return name + strings.Repeat(" ", gap) + marker
 }
 
-// explanationDetail is the indented second line under an escalation: the cause and the
-// check that make it worth having called a model at all, or — when the call failed — why
-// it failed. The reason gets its own line for the same reason the cause does: sharing one
-// with the template means the interesting half is what gets truncated away.
-//
-// Empty while pending, which is what keeps a waiting escalation to a single line.
-func explanationDetail(ex *model.Explanation) string {
-	if ex == nil {
-		return ""
-	}
-	switch ex.State {
-	case model.ExplainFailed:
-		return ex.Err
-	case model.ExplainDone:
-		var parts []string
-		if ex.LikelyCause != "" {
-			parts = append(parts, "cause: "+ex.LikelyCause)
-		}
-		if ex.Suggestion != "" {
-			parts = append(parts, "check: "+ex.Suggestion)
-		}
-		return strings.Join(parts, " · ")
-	default:
-		return ""
-	}
+// paneWidth is the usable width inside a pane.
+func (m Model) paneWidth(b box) int {
+	w, _ := b.inner()
+	return w
 }
 
 // viewStream renders the live tail: one templated line per event, newest at the
 // bottom. It shows the masked pattern rather than the raw text — that is the point
 // of M2 — while Event.Line.Raw stays available for a future raw toggle.
-func (m Model) viewStream() string {
+func (m Model) viewStream(width int) string {
 	if len(m.snap.Lines) == 0 {
 		return styleHint.Render("waiting for logs…")
 	}
@@ -167,19 +178,30 @@ func (m Model) viewStream() string {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
+		// The plain forms are measured first, so the pattern is truncated against the
+		// width the decorations actually leave it — never against escape sequences.
+		prefix := "[" + ev.Line.Source + " " + levelText(ev.Line.Level) + "] "
+		count := ""
+		if ev.Count > 1 {
+			count = fmt.Sprintf("  x%d", ev.Count)
+		}
+		avail := max(width-visWidth(prefix)-visWidth(count), 1)
+
 		b.WriteString(styleSource.Render("[" + ev.Line.Source + " "))
 		b.WriteString(renderLevel(ev.Line.Level))
-		b.WriteString(styleSource.Render("]"))
-		b.WriteString(" " + ev.Pattern)
-		if ev.Count > 1 {
-			b.WriteString(styleCount.Render(fmt.Sprintf("  x%d", ev.Count)))
+		b.WriteString(styleSource.Render("] "))
+		b.WriteString(truncate(ev.Pattern, avail))
+		if count != "" {
+			b.WriteString(styleCount.Render(count))
 		}
-		// In dry-run the escalation is the news, so it gets its own line under the
-		// event that caused it, carrying the reasons the scorer fired.
+		// In dry-run, mark the line the scorer fired on, so it is visible WHERE in the
+		// tail the anomaly sat. The reasons and the score are not repeated here: they
+		// are on the card, in a pane that has the width to show them without cutting the
+		// score off the end.
 		if m.opts.ExplainDryRun && ev.Escalate {
 			b.WriteByte('\n')
-			b.WriteString(styleEscalate.Render(fmt.Sprintf("  ⇧ WOULD ESCALATE: %s | reasons: %s | score: %.2f",
-				ev.Pattern, strings.Join(ev.Reasons, ", "), ev.Score)))
+			b.WriteString(styleEscalate.Render(truncate(
+				fmt.Sprintf("  ⇧ WOULD ESCALATE · score %.2f", ev.Score), width)))
 		}
 	}
 	return b.String()
@@ -188,15 +210,15 @@ func (m Model) viewStream() string {
 // viewAggregated renders the template table, already sorted by the pipeline
 // (count desc, then last seen). This is where thousands of lines visibly collapse
 // into a handful of templates.
-func (m Model) viewAggregated() string {
+func (m Model) viewAggregated(width int) string {
 	if len(m.snap.Templates) == 0 {
 		return styleHint.Render("no templates yet…")
 	}
 
-	// The pattern column takes whatever the fixed columns leave, so a narrow
-	// terminal truncates the message rather than wrapping the table.
+	// The pattern column takes whatever the fixed columns leave, so a narrow pane
+	// truncates the message rather than wrapping the table.
 	const fixed = 7 + 1 + 8 + 1 + 12 + 1 // count + level + last-seen + gaps
-	patternWidth := max(m.width-fixed, 10)
+	patternWidth := max(width-fixed, 10)
 
 	var b strings.Builder
 	b.WriteString(styleHead.Render(fmt.Sprintf("%7s %-8s %-*s %12s",
@@ -212,9 +234,9 @@ func (m Model) viewAggregated() string {
 	return b.String()
 }
 
-// viewStatus renders the two fixed lines of chrome: the run summary, and below it
-// the most recent background error — errors surface here rather than on stdout,
-// which would corrupt the alternate screen.
+// viewStatus renders the two fixed lines of chrome: the run summary, and below it the
+// key hints — or the most recent background error, which surfaces here rather than on
+// stdout, where it would corrupt the alternate screen.
 func (m Model) viewStatus() string {
 	mode := "STREAM"
 	if m.mode == aggregatedView {
@@ -244,6 +266,7 @@ func (m Model) viewStatus() string {
 	if len(m.snap.Stats.Sources) > 0 {
 		sources = strings.Join(m.snap.Stats.Sources, ", ")
 	}
+	sources += m.dockerTail()
 
 	// The source list is the elastic segment: on a narrow terminal it gives way
 	// first, so the counters and the mode (PAUSED, ENDED) never truncate away. Once
@@ -251,16 +274,44 @@ func (m Model) viewStatus() string {
 	// than leaving a stub of punctuation behind.
 	const seps = 6 // the two " | " joins
 	summary := counters + " | " + mode
-	if budget := m.width - runeLen(counters) - runeLen(mode) - seps; budget > 0 {
+	if budget := m.width - visWidth(counters) - visWidth(mode) - seps; budget > 0 {
 		summary = counters + " | " + truncate(sources, budget) + " | " + mode
 	}
 	bar := styleStatus.Width(m.width).Render(truncate(summary, m.width))
 
-	second := styleHint.Render(truncate(" q quit · t toggle view · p pause · ↑/↓/pgup/pgdn scroll", m.width))
+	second := styleHint.Render(truncate(m.footer(), m.width))
 	if err := m.lastError(); err != "" {
 		second = styleErr.Render(truncate(" ! "+err, m.width))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, bar, second)
+}
+
+// footer advertises the keys that actually do something WHERE THE FOCUS CURRENTLY IS.
+// A footer that lists every key in the program is a footer that lies about half of them:
+// ↵ expands nothing while the stream has focus, and there is no card to select.
+func (m Model) footer() string {
+	if m.focus == focusCards {
+		return " tab stream · ↑/↓ select · ↵ expand · p pause · q quit"
+	}
+	return " tab cards · ↑/↓ scroll · t view · p pause · q quit"
+}
+
+// dockerTail surfaces the --docker-tail replay limit, and only when a Docker source is
+// actually attached (it means nothing otherwise).
+//
+// It is in the status bar because its absence cost real time during M3: nothing said that
+// the default 100 lines was ALL the backlog being replayed, so an event that happened
+// further back never appeared, and the tool looked broken rather than bounded.
+func (m Model) dockerTail() string {
+	if m.opts.DockerTail == "" {
+		return ""
+	}
+	for _, s := range m.snap.Stats.Sources {
+		if strings.HasPrefix(s, "docker:") {
+			return " · tail:" + m.opts.DockerTail
+		}
+	}
+	return ""
 }
 
 // llmCounters is the status bar's account of the LLM stage: answered, in flight, failed.
@@ -323,21 +374,21 @@ func formatCount(n int) string {
 	return b.String()
 }
 
-// runeLen is the displayed length of s in runes.
-func runeLen(s string) int { return utf8.RuneCountInString(s) }
+// visWidth is how many terminal CELLS s occupies — not how many runes it has, and not
+// how many bytes.
+//
+// The distinction is not academic. The status bar carries "⏳", which is one rune and two
+// cells; counting it as one meant the bar measured 80 and drew 81, and lipgloss wrapped
+// the overflow onto a second line — silently pushing a row of the layout off an 80-column
+// screen. Escape sequences are the same problem in reverse: a dozen runes, zero cells.
+func visWidth(s string) int { return ansi.StringWidth(s) }
 
-// truncate cuts s to at most width runes, ellipsizing when it does. It counts
-// runes, not bytes, so multi-byte log content does not overflow the line.
+// truncate cuts s to at most width cells, ellipsizing when it does. It is ANSI-aware, so
+// it can never cut through the middle of an escape sequence and leak a colour into the
+// rest of the pane.
 func truncate(s string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	r := []rune(s)
-	if len(r) <= width {
-		return s
-	}
-	if width == 1 {
-		return "…"
-	}
-	return string(r[:width-1]) + "…"
+	return ansi.Truncate(s, width, "…")
 }

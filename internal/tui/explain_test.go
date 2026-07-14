@@ -13,12 +13,23 @@ import (
 )
 
 // explainModel is a sized model with an LLM attached — the ordinary run, as opposed to
-// --explain-dry-run.
+// --explain-dry-run. It is sized at the demo width, where the cards pane is wide enough
+// to show a headline without truncating it.
 func explainModel(t *testing.T) Model {
 	t.Helper()
 	m := New(nil, nil, Options{Explain: true})
-	sized, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
 	return sized.(Model)
+}
+
+// expandSelected opens the selected card, which is where a card keeps its detail: the
+// cause, the suggestion, the failure reason, and the context lines. It goes through the
+// real keys — tab to the cards, then enter — so what the test drives is what a user does.
+func expandSelected(t *testing.T, m Model) Model {
+	t.Helper()
+	focused, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	expanded, _ := focused.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	return expanded.(Model)
 }
 
 // escalationSnapshot is one escalated event carrying whatever explanation state a test
@@ -48,25 +59,25 @@ func apply(t *testing.T, m Model, snap pipeline.Snapshot) Model {
 	return updated.(Model)
 }
 
-// TestEscalationIsPinnedWhilePending: the explanation takes seconds, and at any real log
-// rate the line that caused it is gone in well under one. So the card has to appear the
-// instant the event escalates, saying that an answer is coming — otherwise the user
+// TestEscalationCardAppearsWhilePending: the explanation takes seconds, and at any real
+// log rate the line that caused it is gone in well under one. So the card has to appear
+// the instant the event escalates, saying that an answer is coming — otherwise the user
 // watches an apparently idle tool and concludes it does nothing.
-func TestEscalationIsPinnedWhilePending(t *testing.T) {
+func TestEscalationCardAppearsWhilePending(t *testing.T) {
 	m := apply(t, explainModel(t), escalationSnapshot(&model.Explanation{
 		Hash:  "aaa",
 		State: model.ExplainPending,
 	}))
 
 	view := m.View()
-	if !strings.Contains(view, "ESCALATED") {
-		t.Fatalf("no escalation pane:\n%s", view)
+	if !strings.Contains(view, "ANOMALIES") {
+		t.Fatalf("no cards pane:\n%s", view)
 	}
 	if !strings.Contains(view, "panic: nil map write in handler <NUM>") {
-		t.Errorf("the pinned escalation does not show the template:\n%s", view)
+		t.Errorf("the card does not show the template:\n%s", view)
 	}
 	if !strings.Contains(view, "explaining…") {
-		t.Errorf("a pending escalation does not say it is being explained:\n%s", view)
+		t.Errorf("a pending card does not say it is being explained:\n%s", view)
 	}
 	// Dry-run's wording must not leak into a run that really is calling a model.
 	if strings.Contains(view, "WOULD ESCALATE") {
@@ -75,7 +86,8 @@ func TestEscalationIsPinnedWhilePending(t *testing.T) {
 }
 
 // TestExplanationUpdatesTheCardInPlace: the answer arrives on a later snapshot, and it
-// has to land on the card the user is already looking at.
+// has to land on the card the user is already looking at — replacing the template
+// headline with plain English, which is the entire point of having called a model.
 func TestExplanationUpdatesTheCardInPlace(t *testing.T) {
 	m := explainModel(t)
 	m = apply(t, m, escalationSnapshot(&model.Explanation{Hash: "aaa", State: model.ExplainPending}))
@@ -91,14 +103,19 @@ func TestExplanationUpdatesTheCardInPlace(t *testing.T) {
 	if strings.Contains(view, "explaining…") {
 		t.Errorf("the card still says it is explaining after the answer arrived:\n%s", view)
 	}
-	// All three fields are why the model was called at all.
+	if !strings.Contains(view, "A handler wrote to a nil map.") {
+		t.Errorf("the answered card does not lead with the summary:\n%s", view)
+	}
+
+	// The cause and the check are the other two thirds of why the model was called. They
+	// live behind the expand, so that a pane of cards stays scannable.
+	expanded := expandSelected(t, m).View()
 	for _, want := range []string{
-		"A handler wrote to a nil map.",
 		"cause: The cache map is never initialised.",
 		"check: Make the map in NewServer.",
 	} {
-		if !strings.Contains(view, want) {
-			t.Errorf("the explained card is missing %q:\n%s", want, view)
+		if !strings.Contains(expanded, want) {
+			t.Errorf("the expanded card is missing %q:\n%s", want, expanded)
 		}
 	}
 }
@@ -114,13 +131,15 @@ func TestFailedExplanationSaysSo(t *testing.T) {
 
 	view := m.View()
 	if !strings.Contains(view, "explanation unavailable") {
-		t.Errorf("a failed explanation does not say so:\n%s", view)
-	}
-	if !strings.Contains(view, "model not loaded") {
-		t.Errorf("the failure gives no reason:\n%s", view)
+		t.Errorf("a failed card does not say so:\n%s", view)
 	}
 	if strings.Contains(view, "explaining…") {
-		t.Errorf("a failed explanation still reads as pending:\n%s", view)
+		t.Errorf("a failed card still reads as pending:\n%s", view)
+	}
+	// The reason is on the expanded card: "connection refused" and "bad key" are both
+	// fixable, and neither is distinguishable from "the tool is broken" without it.
+	if expanded := expandSelected(t, m).View(); !strings.Contains(expanded, "model not loaded") {
+		t.Errorf("the failed card gives no reason:\n%s", expanded)
 	}
 }
 
@@ -148,7 +167,7 @@ func TestStatusBarShowsLLMCounters(t *testing.T) {
 // was: there is no LLM, so there is nothing to count.
 func TestStatusBarOmitsLLMCountersWithoutAModel(t *testing.T) {
 	m := New(nil, nil, Options{ExplainDryRun: true})
-	sized, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
 	m = apply(t, sized.(Model), escalationSnapshot(nil))
 
 	if strings.Contains(m.viewStatus(), "llm") {
@@ -159,25 +178,29 @@ func TestStatusBarOmitsLLMCountersWithoutAModel(t *testing.T) {
 	}
 }
 
-// TestExplainedPaneDoesNotOverlapTheStream: an explained escalation is two lines, not one,
-// so the chrome grows as answers arrive. If the viewport is not resized with it, the pane
-// draws over the tail.
-func TestExplainedPaneDoesNotOverlapTheStream(t *testing.T) {
-	m := explainModel(t)
-	pending := apply(t, m, escalationSnapshot(&model.Explanation{Hash: "aaa", State: model.ExplainPending}))
-	explained := apply(t, m, escalationSnapshot(&model.Explanation{
+// TestCardsPaneNeverResizesTheStream is the M5 replacement for the old chrome-height
+// test, and it asserts the inverse property — which is the whole reason the cards moved
+// into a pane of their own.
+//
+// The pinned pane USED to grow as explanations landed, taking rows out of the stream and
+// resizing the viewport under the event loop. Now the panes are fixed by the geometry: a
+// card can grow, shrink, expand or collapse and the stream must not move by a single row.
+func TestCardsPaneNeverResizesTheStream(t *testing.T) {
+	base := explainModel(t)
+	pending := apply(t, base, escalationSnapshot(&model.Explanation{Hash: "aaa", State: model.ExplainPending}))
+	explained := apply(t, pending, escalationSnapshot(&model.Explanation{
 		Hash: "aaa", State: model.ExplainDone,
 		Summary: "A handler wrote to a nil map.", LikelyCause: "Never initialised.", Suggestion: "Make it.",
 	}))
+	expanded := expandSelected(t, explained)
 
-	if explained.chromeHeight() <= pending.chromeHeight() {
-		t.Errorf("chrome did not grow for the explanation's second line: %d then %d",
-			pending.chromeHeight(), explained.chromeHeight())
-	}
-	for _, m := range []Model{pending, explained} {
-		if m.vp.Height != 24-m.chromeHeight() {
-			t.Errorf("viewport height = %d, want %d: the pane and the stream overlap",
-				m.vp.Height, 24-m.chromeHeight())
+	want := base.stream.Height
+	for name, m := range map[string]Model{
+		"pending": pending, "explained": explained, "expanded": expanded,
+	} {
+		if got := m.stream.Height; got != want {
+			t.Errorf("%s: stream height = %d, want %d — the cards pane is resizing the stream",
+				name, got, want)
 		}
 	}
 }

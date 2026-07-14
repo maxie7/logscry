@@ -85,7 +85,7 @@ func run(ctx context.Context, args []string) error {
 	if term.Mode == tui.ModePlain {
 		return runPlain(ctx, lines, errs, sc, escalations, explanations, cfg.ExplainDryRun)
 	}
-	return runTUI(ctx, lines, errs, term, sc, escalations, explanations, cfg.ExplainDryRun)
+	return runTUI(ctx, lines, errs, term, sc, escalations, explanations, cfg)
 }
 
 // startLLM builds the LLM stage: the escalation channel the scorer emits on, and the
@@ -143,7 +143,8 @@ func sources(cfg config.Config) ([]ingest.Source, bool) {
 // state, so it is the one that attaches an answer to the template that asked for it.
 // The TUI then sees it appear in the next snapshot, and never touches pipeline state.
 func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, term tui.Terminal,
-	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation, dryRun bool,
+	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation,
+	cfg config.Config,
 ) error {
 	snaps := make(chan pipeline.Snapshot, 1)
 	go pipeline.Run(ctx, lines, pipeline.Options{
@@ -153,8 +154,9 @@ func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, 
 		Explanations: explanations,
 	})
 	return term.Run(ctx, snaps, errs, tui.Options{
-		ExplainDryRun: dryRun,
+		ExplainDryRun: cfg.ExplainDryRun,
 		Explain:       escalations != nil,
+		DockerTail:    cfg.Docker.Tail,
 	})
 }
 

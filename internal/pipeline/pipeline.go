@@ -37,6 +37,14 @@ type Event struct {
 	// which is exactly what lets a pinned card update in place from "explaining…" to an
 	// answer without anything mutating what the renderer already holds.
 	Explanation *model.Explanation
+
+	// Context is the raw lines immediately before the trigger, oldest first. It is the
+	// evidence an expanded card shows: what was happening around the anomaly.
+	//
+	// It is set ONLY on escalations, and only on the copy the collector retains for the
+	// renderer (see collector.observe) — never on the events in the stream ring, which
+	// number in the thousands and would each be carrying a copy of their predecessors.
+	Context []string
 }
 
 // Pipeline holds the template dedup/count state and the scorer that reads it. Its

@@ -3,63 +3,20 @@
 package tui
 
 import (
+	"strings"
+	"time"
+
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/maxie7/logscry/internal/pipeline"
 )
 
-// maxErrors bounds the retained error list; only the most recent is displayed,
-// the rest are kept for the M5 error pane.
+// maxErrors bounds the retained error list; only the most recent is displayed.
 const maxErrors = 20
 
-// statusHeight is the number of lines the status bar occupies.
-const statusHeight = 2
-
-// How many recent escalations stay pinned. Fewer with an LLM attached, because an
-// explained escalation is two lines rather than one and the pane must not eat the
-// stream. Small on purpose either way: this is a calibration aid and a "the model is
-// answering" signal, not the M5 cards pane.
-const (
-	escalationPaneMax    = 5
-	escalationPaneMaxLLM = 3
-)
-
-// pinnedCount is how many escalations the pinned pane is currently showing. Zero until
-// something actually escalates, so the pane costs a quiet run nothing — and zero when
-// there is nothing to say about an escalation anyway: no model to explain it, and no
-// dry run asking what would have been explained.
-func (m Model) pinnedCount() int {
-	limit := escalationPaneMax
-	switch {
-	case m.opts.ExplainDryRun:
-	case m.opts.Explain:
-		limit = escalationPaneMaxLLM
-	default:
-		return 0
-	}
-	return min(len(m.snap.Escalations), limit)
-}
-
-// chromeHeight is the number of lines not available to the viewport: the status bar,
-// plus the pinned escalation pane and its header when there is one. It grows as
-// escalations arrive and as their explanations land, so the viewport is resized on
-// every snapshot (see resize).
-func (m Model) chromeHeight() int {
-	h := statusHeight
-	if rows := m.escalationRows(); len(rows) > 0 {
-		h += len(rows) + 1 // the escalations, plus their header
-	}
-	return h
-}
-
-// resize fits the viewport to whatever the chrome leaves it.
-func (m *Model) resize() {
-	m.vp.Width = m.width
-	m.vp.Height = max(m.height-m.chromeHeight(), 0)
-}
-
-// viewMode selects which pane fills the screen.
+// viewMode selects what the LEFT pane shows. The cards pane is not a mode — it is
+// always there, which is the point of the layout.
 type viewMode int
 
 const (
@@ -67,6 +24,15 @@ const (
 	streamView viewMode = iota
 	// aggregatedView is the template table — the view that makes dedup visible.
 	aggregatedView
+)
+
+// focus is which pane the arrow keys belong to. Two panes mean the keys need an owner,
+// and the user needs to be able to see who has it (see paneStyle).
+type focus int
+
+const (
+	focusStream focus = iota
+	focusCards
 )
 
 // snapshotMsg carries a new pipeline state into the event loop.
@@ -86,6 +52,7 @@ type Model struct {
 	snaps <-chan pipeline.Snapshot
 	errCh <-chan error
 	opts  Options
+	now   func() time.Time // injected so relative times are testable
 
 	snap   pipeline.Snapshot
 	mode   viewMode
@@ -93,16 +60,50 @@ type Model struct {
 	ended  bool
 	errs   []string
 
-	vp     viewport.Model
+	// The cards pane's selection is keyed by template hash, never by index. Escalations
+	// arrive at the TOP of this list, so an index would silently slide the selection onto
+	// a different card the moment a new one fired — under the cursor of someone reading.
+	focus    focus
+	selKey   string
+	expanded map[string]bool
+
+	// follow is the cards pane's scroll-lock: the selection is pinned to the newest
+	// card, so new arrivals keep it there. It goes false the moment the user steps back
+	// into older cards, and comes back when they return to the newest.
+	follow bool
+
+	// The panes. Both are viewports so that scrolling, clamping and clipping are the
+	// library's problem rather than ours.
+	stream viewport.Model
+	cards  viewport.Model
+	geom   geometry
+
+	// Scroll-lock baselines: the counter each pane held when the user scrolled away
+	// from its home edge, or -1 while the pane is still following. The difference from
+	// the live counter is the "N new" the marker reports.
+	streamDetach int
+	cardsDetach  int
+
 	width  int
 	height int
-	ready  bool // a WindowSizeMsg has arrived and the viewport is sized
+	ready  bool // a WindowSizeMsg has arrived and the panes are sized
 }
 
 // New builds the model over the pipeline's snapshot channel and the error channel
 // that background goroutines report into.
 func New(snaps <-chan pipeline.Snapshot, errs <-chan error, opts Options) Model {
-	return Model{snaps: snaps, errCh: errs, opts: opts, vp: viewport.New(0, 0)}
+	return Model{
+		snaps:        snaps,
+		errCh:        errs,
+		opts:         opts,
+		now:          time.Now,
+		expanded:     make(map[string]bool),
+		follow:       true,
+		stream:       viewport.New(0, 0),
+		cards:        viewport.New(0, 0),
+		streamDetach: -1,
+		cardsDetach:  -1,
+	}
 }
 
 // Init starts the two channel readers.
@@ -138,29 +139,7 @@ func waitForError(ch <-chan error) tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-		case "t":
-			// Each mode has its own natural landing spot: the newest line at the
-			// bottom of the stream, the loudest template at the top of the table.
-			if m.mode == streamView {
-				m.mode = aggregatedView
-				m.refresh()
-				m.vp.GotoTop()
-			} else {
-				m.mode = streamView
-				m.refresh()
-				m.vp.GotoBottom()
-			}
-			return m, nil
-		case "p":
-			m.paused = !m.paused
-			return m, nil
-		}
-		var cmd tea.Cmd
-		m.vp, cmd = m.vp.Update(msg) // scrolling: up/down/pgup/pgdn
-		return m, cmd
+		return m.handleKey(msg)
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -172,9 +151,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case snapshotMsg:
 		if !m.paused {
 			m.snap = pipeline.Snapshot(msg)
-			// The pinned pane grows with the first few escalations, taking its lines
-			// out of the viewport's budget.
-			m.resize()
 			m.refresh()
 		}
 		return m, waitForSnapshot(m.snaps)
@@ -192,27 +168,243 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, waitForError(m.errCh)
 	}
+	return m, nil
+}
+
+// handleKey routes one keystroke. Every scroll key goes to the FOCUSED pane and nowhere
+// else — with two panes on screen, an arrow that moves both of them is an arrow that
+// moves neither on purpose.
+func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+
+	case "tab", "shift+tab":
+		if m.focus == focusStream {
+			m.focus = focusCards
+		} else {
+			m.focus = focusStream
+		}
+		return m, nil
+
+	case "t":
+		// Each mode has its own natural landing spot: the newest line at the bottom of
+		// the stream, the loudest template at the top of the table.
+		if m.mode == streamView {
+			m.mode = aggregatedView
+			m.refreshStream()
+			m.stream.GotoTop()
+		} else {
+			m.mode = streamView
+			m.streamDetach = -1 // back to following: the tail is the point of the tail
+			m.refreshStream()
+			m.stream.GotoBottom()
+		}
+		return m, nil
+
+	case "p":
+		m.paused = !m.paused
+		return m, nil
+
+	case "enter", " ":
+		if m.focus == focusCards && m.selKey != "" {
+			m.expanded[m.selKey] = !m.expanded[m.selKey]
+			m.refreshCards()
+		}
+		return m, nil
+	}
+
+	// home and end are bound here rather than left to the viewport: bubbles ships no
+	// default binding for either, so the footer would have been advertising two keys that
+	// did nothing — and "end" is the key that gets a user out of scroll-lock.
+	if m.focus == focusCards {
+		switch msg.String() {
+		case "up", "k":
+			m.selectBy(-1)
+			return m, nil
+		case "down", "j":
+			m.selectBy(1)
+			return m, nil
+		case "home":
+			m.selectBy(-len(m.snap.Escalations)) // the newest card, and back to following
+			return m, nil
+		case "end":
+			m.selectBy(len(m.snap.Escalations)) // the oldest card still retained
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.cards, cmd = m.cards.Update(msg) // pgup/pgdn
+		return m, cmd
+	}
+
+	switch msg.String() {
+	case "home":
+		m.stream.GotoTop()
+		m.syncStreamFollow()
+		return m, nil
+	case "end":
+		m.stream.GotoBottom()
+		m.syncStreamFollow()
+		return m, nil
+	}
 
 	var cmd tea.Cmd
-	m.vp, cmd = m.vp.Update(msg)
+	m.stream, cmd = m.stream.Update(msg)
+	m.syncStreamFollow()
 	return m, cmd
 }
 
-// refresh re-renders the active pane into the viewport. The stream holds the tail
-// — it follows new lines only while the user has not scrolled away from the bottom
-// — whereas the aggregated table keeps its offset, since its interesting rows (the
-// loudest templates) are at the top.
+// resize refits both panes to the current terminal.
+func (m *Model) resize() {
+	m.geom = geometryFor(m.width, m.height)
+	m.stream.Width, m.stream.Height = m.geom.stream.inner()
+	m.cards.Width, m.cards.Height = m.geom.cards.inner()
+}
+
+// refresh re-renders both panes from the current snapshot.
 func (m *Model) refresh() {
+	m.refreshStream()
+	m.refreshCards()
+}
+
+// refreshStream re-renders the left pane. The stream follows the tail only while the
+// user has not scrolled away from the bottom; the aggregated table keeps its offset,
+// since its interesting rows (the loudest templates) are at the top.
+func (m *Model) refreshStream() {
+	w, _ := m.geom.stream.inner()
 	switch m.mode {
 	case streamView:
-		follow := m.vp.AtBottom()
-		m.vp.SetContent(m.viewStream())
+		follow := m.streamDetach < 0
+		m.stream.SetContent(m.viewStream(w))
 		if follow {
-			m.vp.GotoBottom()
+			m.stream.GotoBottom()
 		}
 	case aggregatedView:
-		m.vp.SetContent(m.viewAggregated())
+		m.stream.SetContent(m.viewAggregated(w))
 	}
+}
+
+// syncStreamFollow records where the tail was when the user scrolled away from it, and
+// re-attaches when they scroll back to the bottom. That baseline is what lets the marker
+// say how many lines have gone past while they were reading something else.
+func (m *Model) syncStreamFollow() {
+	switch {
+	case m.stream.AtBottom():
+		m.streamDetach = -1
+	case m.streamDetach < 0:
+		m.streamDetach = m.snap.Stats.TotalLines
+	}
+}
+
+// refreshCards re-renders the right pane and resolves the selection.
+//
+// The selection survives new arrivals because it is looked up by hash: cards are
+// prepended above it, and it stays on the card it was on. It snaps back to the newest
+// card only when it is following, or when the card it was on has aged out of the
+// retained set entirely — at which point there is nothing left to hold on to.
+func (m *Model) refreshCards() {
+	w, h := m.geom.cards.inner()
+	if len(m.snap.Escalations) == 0 {
+		m.selKey = ""
+		m.cards.SetContent(m.viewCardsEmpty(w, h))
+		m.cards.GotoTop()
+		return
+	}
+
+	cards := m.renderCards(w)
+	idx := indexOfCard(cards, m.selKey)
+	if m.follow || idx < 0 {
+		idx = 0
+		m.follow = true
+		m.cardsDetach = -1
+		m.selKey = cards[0].hash
+		cards = m.renderCards(w) // the marker moved, so the cards must be drawn again
+	}
+
+	var lines []string
+	start, end := 0, 0
+	for i, c := range cards {
+		if i == idx {
+			start, end = len(lines), len(lines)+c.height()
+		}
+		lines = append(lines, c.lines...)
+	}
+	m.cards.SetContent(strings.Join(lines, "\n"))
+	m.ensureVisible(start, end)
+}
+
+// selectBy moves the selection by delta cards, clamped at both ends.
+func (m *Model) selectBy(delta int) {
+	w, _ := m.geom.cards.inner()
+	cards := m.renderCards(w)
+	if len(cards) == 0 {
+		return
+	}
+	i := min(max(indexOfCard(cards, m.selKey)+delta, 0), len(cards)-1)
+	m.selKey = cards[i].hash
+
+	// Following means the selection is on the newest card. Step off it and new arrivals
+	// must not drag the user back to the top mid-read; step back onto it and the pane
+	// resumes following, which is the only way to get out of scroll-lock again.
+	switch {
+	case i == 0:
+		m.follow, m.cardsDetach = true, -1
+	case m.follow:
+		m.follow, m.cardsDetach = false, m.snap.Stats.Escalations
+	}
+	m.refreshCards()
+}
+
+// ensureVisible scrolls the cards pane the minimum distance needed to bring the
+// selected card into view — and no further, so a selection that is already on screen
+// never moves the viewport at all.
+//
+// A card taller than the pane (an expanded one, in the stacked layout) cannot be shown
+// whole, and the two ends are not equally worth showing: scrolling to its END lands the
+// user on the last of its context lines with the badge and the headline off the top,
+// which is a pane that looks like it has lost its place. So the head of the card wins.
+func (m *Model) ensureVisible(start, end int) {
+	h := m.cards.Height
+	if h <= 0 {
+		return
+	}
+	switch {
+	case start < m.cards.YOffset:
+		m.cards.SetYOffset(start)
+	case end > m.cards.YOffset+h:
+		m.cards.SetYOffset(min(end-h, start))
+	}
+}
+
+// indexOfCard finds a card by hash, or -1.
+func indexOfCard(cards []card, hash string) int {
+	if hash == "" {
+		return -1
+	}
+	for i, c := range cards {
+		if c.hash == hash {
+			return i
+		}
+	}
+	return -1
+}
+
+// streamNew is how many lines have arrived since the user scrolled away from the tail,
+// and false when the pane is still following.
+func (m Model) streamNew() (int, bool) {
+	if m.streamDetach < 0 || m.mode != streamView {
+		return 0, false
+	}
+	return max(m.snap.Stats.TotalLines-m.streamDetach, 0), true
+}
+
+// cardsNew is the same for the cards pane: escalations that have fired while the user
+// was reading an older card.
+func (m Model) cardsNew() (int, bool) {
+	if m.cardsDetach < 0 || m.follow {
+		return 0, false
+	}
+	return max(m.snap.Stats.Escalations-m.cardsDetach, 0), true
 }
 
 // lastError returns the most recent error, or "" if there has been none.

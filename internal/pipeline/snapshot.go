@@ -3,6 +3,7 @@
 package pipeline
 
 import (
+	"slices"
 	"sort"
 	"time"
 )
@@ -12,6 +13,10 @@ const (
 	// stream ring because they must outlive it: an escalation that scrolled past a
 	// second ago is exactly the one the user is trying to read.
 	escalationsKept = 20
+	// cardContext is how many preceding raw lines an escalation carries for its card.
+	// Enough to show what was happening around the anomaly, few enough that the whole
+	// retained set stays trivial: escalationsKept × cardContext lines.
+	cardContext = 3
 	// defaultRingSize bounds the stream ring buffer: the TUI only ever shows a
 	// tail, so memory must not grow with the log volume.
 	defaultRingSize = 2000
@@ -118,6 +123,10 @@ func (c *collector) observe(ev Event, now time.Time) {
 	}
 	c.total++
 	if ev.Escalate {
+		// The context rides on the retained copy only. ev was already written to the
+		// ring above without it, so the thousands of ordinary events in the ring stay
+		// exactly as cheap as they were.
+		ev.Context = c.preceding(cardContext)
 		c.escalated = append(c.escalated, ev)
 		if len(c.escalated) > escalationsKept {
 			c.escalated = c.escalated[len(c.escalated)-escalationsKept:]
@@ -134,6 +143,33 @@ func (c *collector) observe(ev Event, now time.Time) {
 	}
 	c.windowN++
 	c.dirty = true
+}
+
+// preceding returns the raw text of the n lines before the one just written, oldest
+// first. It reads backwards through the ring from the newest entry but one — the newest
+// IS the trigger, and a card does not need to quote the line it is already about.
+//
+// It returns fewer than n lines early in a run, and never reaches back past a wrap.
+func (c *collector) preceding(n int) []string {
+	if n <= 0 {
+		return nil
+	}
+	out := make([]string, 0, n)
+	// c.head already points past the trigger, so head-2 is the line before it. The i <
+	// len(c.ring) bound is what stops a walk from lapping the ring and quoting the
+	// trigger back as its own context.
+	for i := 1; i <= n && i < len(c.ring); i++ {
+		idx := c.head - 1 - i
+		if idx < 0 {
+			if !c.filled {
+				break // nothing was ever written there
+			}
+			idx += len(c.ring) // wrapped: the older lines live at the end of the array
+		}
+		out = append(out, c.ring[idx].Line.Raw)
+	}
+	slices.Reverse(out) // oldest first, as the card reads them
+	return out
 }
 
 // snapshot builds an immutable copy of the current state. p is read but not

@@ -12,7 +12,7 @@ import (
 // detection is against an actual terminal.
 func fakeTTY(t *testing.T) (*os.File, func()) {
 	t.Helper()
-	_, slave := newPTY(t)
+	_, slave := newPTY(t, 100)
 	return slave, func() {}
 }
 

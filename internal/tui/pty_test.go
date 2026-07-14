@@ -25,9 +25,11 @@ import (
 // which mode was CHOSEN, never that a keystroke could actually be READ in it. The TUI
 // rendered perfectly and ignored every key, and the suite was green throughout.
 
-// newPTY returns the master and slave ends of a fresh pseudo-terminal. The slave is a
-// genuine tty, which is what makes Bubble Tea enter raw mode and read keys at all.
-func newPTY(t *testing.T) (master, slave *os.File) {
+// newPTY returns the master and slave ends of a fresh pseudo-terminal, cols wide. The
+// slave is a genuine tty, which is what makes Bubble Tea enter raw mode and read keys at
+// all — and the width is what decides which layout the program actually renders, so the
+// stacked fallback can be driven through the same production path as the split.
+func newPTY(t *testing.T, cols int) (master, slave *os.File) {
 	t.Helper()
 
 	m, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
@@ -49,7 +51,7 @@ func newPTY(t *testing.T) (master, slave *os.File) {
 		t.Fatalf("open pts: %v", err)
 	}
 	// Give it a size, or Bubble Tea renders into a zero-width screen and draws nothing.
-	_ = unix.IoctlSetWinsize(int(s.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: 24, Col: 100})
+	_ = unix.IoctlSetWinsize(int(s.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: 24, Col: uint16(cols)})
 
 	t.Cleanup(func() { _ = s.Close(); _ = m.Close() })
 	return m, s
@@ -100,8 +102,15 @@ func answerQueries(t *testing.T, master *os.File, out *strings.Builder, mu *sync
 // production. Whatever main gets, this gets.
 func runOnPTY(t *testing.T, snaps chan pipeline.Snapshot, opts Options) (send func(string), exited chan error, output func() string) {
 	t.Helper()
+	return runOnPTYAt(t, snaps, opts, 120)
+}
 
-	master, slave := newPTY(t)
+// runOnPTYAt is runOnPTY at a chosen width, for the tests that care which layout the
+// program picks.
+func runOnPTYAt(t *testing.T, snaps chan pipeline.Snapshot, opts Options, cols int) (send func(string), exited chan error, output func() string) {
+	t.Helper()
+
+	master, slave := newPTY(t, cols)
 	var (
 		mu  sync.Mutex
 		out strings.Builder
@@ -246,5 +255,102 @@ func TestPTYKeysWorkWithTheLLMPaneUp(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("'q' did not quit once an explanation was on screen")
+	}
+}
+
+// TestPTYCardFlow is the M5 money shot driven end to end on a real terminal, through the
+// production wiring: an anomaly fires and its card appears as "explaining…", the model
+// answers and the card fills in, tab moves the focus to the cards, enter expands the
+// selected one, and q leaves the terminal as it found it.
+//
+// Every step here is a thing a user does in the first thirty seconds of the demo, and
+// each of them goes through Terminal.Run — the same path main takes, on a keyboard
+// resolve() chose. A card that only expands under a hand-built tea.Program proves nothing.
+func TestPTYCardFlow(t *testing.T) {
+	snaps := make(chan pipeline.Snapshot, 1)
+	snaps <- escalationSnapshot(&model.Explanation{Hash: "aaa", State: model.ExplainPending})
+
+	send, exited, output := runOnPTY(t, snaps, Options{Explain: true})
+
+	waitFor(t, "the card to appear as pending", func() bool {
+		return strings.Contains(output(), "explaining…")
+	})
+
+	snaps <- escalationSnapshot(&model.Explanation{
+		Hash: "aaa", State: model.ExplainDone,
+		Summary:     "A handler wrote to a nil map.",
+		LikelyCause: "The cache map is never initialised.",
+		Suggestion:  "Make the map in NewServer.",
+	})
+	waitFor(t, "the answer to land on the card", func() bool {
+		return strings.Contains(output(), "A handler wrote to a nil map.")
+	})
+
+	// The cause is behind the expand, so it must NOT be on screen yet.
+	if strings.Contains(output(), "The cache map is never initialised.") {
+		t.Error("the card was expanded before anyone pressed anything")
+	}
+
+	send("\t")
+	waitFor(t, "focus to move to the cards", func() bool {
+		return strings.Contains(output(), "↵ expand") // the footer follows the focus
+	})
+
+	send("\r")
+	waitFor(t, "enter to expand the selected card", func() bool {
+		return strings.Contains(output(), "The cache map is never initialised.")
+	})
+
+	send("q")
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("'q' did not quit with an expanded card on screen")
+	}
+
+	// And the terminal is handed back: Bubble Tea must leave the alternate screen, or the
+	// user's shell comes back to a screen full of our frame.
+	if !strings.Contains(output(), "\x1b[?1049l") {
+		t.Error("the program did not leave the alternate screen on the way out")
+	}
+}
+
+// TestPTYNarrowTerminalStacks drives the narrow fallback on a real 80-column terminal.
+// Two panes at 80 columns would be two unusable 40-column columns, so the layout stacks
+// instead — and the keyboard, the cards and the quit path all have to keep working there,
+// because 80 columns is not an exotic terminal, it is the default one.
+func TestPTYNarrowTerminalStacks(t *testing.T) {
+	snaps := make(chan pipeline.Snapshot, 1)
+	snaps <- escalationSnapshot(&model.Explanation{
+		Hash: "aaa", State: model.ExplainDone, Summary: "A handler wrote to a nil map.",
+	})
+
+	send, exited, output := runOnPTYAt(t, snaps, Options{Explain: true}, 80)
+
+	waitFor(t, "the stacked frame to render with its card", func() bool {
+		out := output()
+		return strings.Contains(out, "ANOMALIES") && strings.Contains(out, "A handler wrote to a nil map.")
+	})
+	// The stream is still there under the cards — stacking is a fallback, not an amputation.
+	if !strings.Contains(output(), "STREAM") {
+		t.Errorf("the stacked layout lost the stream pane:\n%s", output())
+	}
+
+	send("t")
+	waitFor(t, "'t' to still toggle the view at 80 columns", func() bool {
+		return strings.Contains(output(), "AGGREGATED")
+	})
+
+	send("q")
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("'q' did not quit in the stacked layout")
 	}
 }

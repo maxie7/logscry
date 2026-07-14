@@ -81,6 +81,28 @@ func TestReadLinesSurvivesLongLine(t *testing.T) {
 	}
 }
 
+// TestSubprocessSourceNameIsTheBaseName: the source name is on EVERY line of the stream,
+// in the narrower half of a two-pane layout. A full path there does not just look bad —
+// it pushes the actual log message off the pane.
+func TestSubprocessSourceNameIsTheBaseName(t *testing.T) {
+	tests := map[string]string{
+		"./myapp":                      "proc:myapp",
+		"/home/maxie/code/build/myapp": "proc:myapp",
+		"/usr/bin/python3":             "proc:python3",
+		"myapp":                        "proc:myapp",
+		"":                             "proc",
+	}
+	for argv0, want := range tests {
+		if got := NewSubprocessSource([]string{argv0, "--flag"}).Name(); got != want {
+			t.Errorf("Name() for argv[0]=%q = %q, want %q", argv0, got, want)
+		}
+	}
+	// An empty argv is not a crash: the source names itself and the caller fails elsewhere.
+	if got := NewSubprocessSource(nil).Name(); got != "proc" {
+		t.Errorf("Name() with no argv = %q, want %q", got, "proc")
+	}
+}
+
 func TestSubprocessSourceCapturesBothStreams(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh not available")

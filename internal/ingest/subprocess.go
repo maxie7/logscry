@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"path/filepath"
 	"sync"
 
 	"github.com/maxie7/logscry/internal/model"
@@ -22,12 +23,17 @@ func NewSubprocessSource(argv []string) *SubprocessSource {
 	return &SubprocessSource{Argv: argv}
 }
 
-// Name implements Source. It follows the RDI convention of "proc:<executable>".
+// Name implements Source. It follows the RDI convention of "proc:<executable>", using
+// the executable's BASE name: "proc:myapp", not "proc:/home/me/code/very/long/myapp".
+//
+// The name is on every line of the stream, and the stream pane is the narrower half of a
+// two-pane layout — a path long enough to crowd the message out is a path that makes the
+// whole view useless.
 func (s *SubprocessSource) Name() string {
-	if len(s.Argv) == 0 {
+	if len(s.Argv) == 0 || s.Argv[0] == "" {
 		return "proc"
 	}
-	return "proc:" + s.Argv[0]
+	return "proc:" + filepath.Base(s.Argv[0])
 }
 
 // Lines implements Source: it runs Argv, reading its stdout and stderr

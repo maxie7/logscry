@@ -72,13 +72,24 @@ Repo stays private through M5; flip to public at M6.
       asserted against the fake provider's own request count
 
 ## Epic M5 — TUI polish  `[private]`
-- [ ] Bubble Tea layout: live stream (left) + flagged-event cards (right)
-- [ ] Card fields: severity, summary, cause, suggestion, count, first/last seen
-- [ ] Keybindings: scroll, expand card, pause/resume, quit
-- [ ] Shorten the subprocess source name to the base name (`proc:myapp`, not
+- [x] Bubble Tea layout: live stream (left) + flagged-event cards (right). Two-pane above
+      100 columns; below it the panes stack, because 55/45 of 80 columns is two unusable
+      40-column columns and the cards pane wraps prose
+- [x] Empty state: the cards pane is ALWAYS present and says "No anomalies · watching N
+      templates across M sources". Zero cards is the tool working, so the pane must read
+      as confident, not unfinished — and the layout cannot jump when the first card lands
+- [x] Card fields: severity badge, summary, cause, suggestion, count, first/last seen,
+      source, relative time, escalation reasons + score, context lines from the ring buffer.
+      All three states render: explaining… / explained / explanation unavailable (+ reason)
+- [x] Keybindings: tab focus (focused pane is bordered), scroll, expand card, pause/resume,
+      quit — with a footer that is honest about the keys available in the current focus
+- [x] Scroll-lock on both panes: scrolled away → hold position and show "↑ scrolled — N new";
+      at the home edge → keep following. The cards pane grows from the top, so its home edge
+      is the newest card, and selection is keyed by hash so an arrival cannot move it
+- [x] Shorten the subprocess source name to the base name (`proc:myapp`, not
       `proc:/home/maxie/code/.../myapp`): the full path crowds the stream out at ~100
       columns, and it will look bad in the M6 demo GIF
-- [ ] Surface the `--docker-tail` history limit (status bar). Nothing tells the user the
+- [x] Surface the `--docker-tail` history limit (status bar). Nothing tells the user the
       default `100` is all the backlog they get, so an event further back silently never
       appears — during M3 testing this looked like a broken tool. The README half of this
       rides along with the M6 README task; call out `--docker-tail all` for full history

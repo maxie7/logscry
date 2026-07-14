@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package tui renders the live templated stream with Bubble Tea.
+// Package tui renders the live templated stream and the flagged-event cards with
+// Bubble Tea.
 //
 // The TUI is a pure consumer of pipeline.Snapshot: the pipeline goroutine owns all
 // state and hands over immutable copies on its own cadence, so rendering is
 // decoupled from the event rate and a slow terminal can never apply backpressure
 // to ingestion. Nothing here may write to stdout — see Run.
-//
-// TODO(M5): flagged-event cards pane beside the stream, card expansion, severity
-// badges. View() already composes panes, so it slots in without restructuring.
 package tui
 
 import (
@@ -25,10 +23,14 @@ type Options struct {
 	// ExplainDryRun surfaces the events the scorer would have escalated. Escalations
 	// are decided and counted either way; this only decides whether they are shown.
 	ExplainDryRun bool
-	// Explain is whether an LLM stage is attached, which is what the pinned pane and
+	// Explain is whether an LLM stage is attached, which is what the cards pane and
 	// the status bar need to know: whether an escalation is a question that is being
 	// answered, or one nobody is going to answer.
 	Explain bool
+	// DockerTail is the --docker-tail replay limit, surfaced in the status bar when a
+	// Docker source is attached. Empty when there is none. It is a string because "all"
+	// is a legal value alongside a line count.
+	DockerTail string
 }
 
 // StdinIsTerminal reports whether stdin is an interactive terminal rather than a pipe
