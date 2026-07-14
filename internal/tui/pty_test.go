@@ -318,6 +318,109 @@ func TestPTYCardFlow(t *testing.T) {
 	}
 }
 
+// TestPTYGlobalKeysSurviveFocusChanges closes the test gap behind a "the keyboard dies
+// after tab" report: every earlier pty test drove keys from the INITIAL focus and never
+// after a focus change, so a focus-dependent key regression could not have failed one.
+//
+// It presses tab to cycle through every focus state and asserts that the global keys —
+// t, p and q — still work in EACH of them, on a real terminal, through Terminal.Run. The
+// keys are checked from the cards focus and again back on the stream, because "works in
+// the state it started in" is exactly the assurance that was missing.
+func TestPTYGlobalKeysSurviveFocusChanges(t *testing.T) {
+	// Both focus states, reached by tabbing: 1 tab lands on the cards, 2 comes back.
+	for _, tabs := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("after %d tab(s)", tabs), func(t *testing.T) {
+			snaps := make(chan pipeline.Snapshot, 1)
+			snaps <- escalationSnapshot(&model.Explanation{
+				Hash: "aaa", State: model.ExplainDone, Summary: "A handler wrote to a nil map.",
+			})
+
+			send, exited, output := runOnPTY(t, snaps, Options{Explain: true})
+			waitFor(t, "the first frame", func() bool { return strings.Contains(output(), "STREAM") })
+
+			for range tabs {
+				send("\t")
+				time.Sleep(50 * time.Millisecond) // let each tab land before the next
+			}
+			// The focus really did move: the footer follows it.
+			wantFooter := "↵ expand" // cards
+			if tabs%2 == 0 {
+				wantFooter = "tab cards" // back on the stream
+			}
+			waitFor(t, "focus to settle", func() bool { return strings.Contains(output(), wantFooter) })
+
+			// 't' still toggles the LEFT pane, whichever pane holds the focus. The keys are
+			// sent one at a time and waited on individually: output() is the ACCUMULATED
+			// stream, so asserting on a string an earlier frame already printed — "STREAM",
+			// say — proves nothing at all.
+			send("t")
+			waitFor(t, "'t' to still toggle the view after tab", func() bool {
+				return strings.Contains(output(), "AGGREGATED")
+			})
+
+			// 'p' still pauses.
+			send("p")
+			waitFor(t, "'p' to still pause after tab", func() bool {
+				return strings.Contains(output(), "PAUSED")
+			})
+
+			// And 'q' still quits — the one that strands a user in the alternate screen.
+			send("q")
+			select {
+			case err := <-exited:
+				if err != nil {
+					t.Fatalf("Run returned %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("'q' did not quit after %d tab(s): the keyboard died on a focus change", tabs)
+			}
+		})
+	}
+}
+
+// TestPTYFastTypingIsNotSwallowed is the regression test for the real "keyboard is dead"
+// bug, driven the way a terminal actually delivers it.
+//
+// Two characters written in ONE write is what fast typing looks like to the input reader,
+// and Bubble Tea hands the event loop a single KeyRunes message for the pair. Dispatching
+// on its String() — "tp" — matched no key, and both keystrokes were dropped. The keys that
+// kept working were the escape sequences (tab, arrows, enter), which never coalesce, and
+// that is why this read as a focus bug for so long.
+func TestPTYFastTypingIsNotSwallowed(t *testing.T) {
+	snaps := make(chan pipeline.Snapshot, 1)
+	snaps <- escalationSnapshot(&model.Explanation{
+		Hash: "aaa", State: model.ExplainDone, Summary: "A handler wrote to a nil map.",
+	})
+
+	send, exited, output := runOnPTY(t, snaps, Options{Explain: true})
+	waitFor(t, "the first frame", func() bool { return strings.Contains(output(), "STREAM") })
+
+	// Tab first, exactly as reported — then type fast.
+	send("\t")
+	waitFor(t, "focus on the cards", func() bool { return strings.Contains(output(), "↵ expand") })
+
+	// ONE write, two keys. Before the fix, both vanished.
+	send("tp")
+	waitFor(t, "'t' from a coalesced burst to toggle the view", func() bool {
+		return strings.Contains(output(), "AGGREGATED")
+	})
+	waitFor(t, "'p' from a coalesced burst to pause", func() bool {
+		return strings.Contains(output(), "PAUSED")
+	})
+
+	// And a burst carrying q must quit — the failure that strands a user on the alternate
+	// screen with a tool that will not close.
+	send("pq")
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("'q' inside a fast-typed burst did not quit: the keystroke was swallowed")
+	}
+}
+
 // TestPTYNarrowTerminalStacks drives the narrow fallback on a real 80-column terminal.
 // Two panes at 80 columns would be two unusable 40-column columns, so the layout stacks
 // instead — and the keyboard, the cards and the quit path all have to keep working there,

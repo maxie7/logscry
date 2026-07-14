@@ -139,6 +139,7 @@ func waitForError(ch <-chan error) tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		traceKey(msg, m.focus, m.mode)
 		return m.handleKey(msg)
 
 	case tea.WindowSizeMsg:
@@ -175,6 +176,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // else — with two panes on screen, an arrow that moves both of them is an arrow that
 // moves neither on purpose.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Bubble Tea coalesces printable characters that arrive in ONE read into a SINGLE
+	// KeyRunes message. Type t and p quickly enough — or on a busy machine, merely
+	// normally — and the event loop gets one key whose String() is "tp": it matches no
+	// case below, and BOTH keystrokes vanish.
+	//
+	// This is the "the keyboard dies" bug, and it is why it was never reproducible. The
+	// dead keys were always the RUNE keys (q, t, p) while tab, the arrows and enter kept
+	// working — those arrive as escape sequences or control bytes, which are never
+	// coalesced. It looked like a focus bug because a user who thinks a key is dead
+	// immediately tries the others, and typing three keys fast is precisely what merges
+	// them into one message that matches nothing.
+	//
+	// So a run of runes is dispatched one rune at a time. A key the user pressed is a key
+	// the user pressed, however fast the terminal handed it over.
+	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && !msg.Alt {
+		var (
+			model tea.Model = m
+			cmds  []tea.Cmd
+		)
+		for _, r := range msg.Runes {
+			var cmd tea.Cmd
+			model, cmd = model.(Model).handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		return model, tea.Batch(cmds...)
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
