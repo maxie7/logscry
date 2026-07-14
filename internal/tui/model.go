@@ -16,27 +16,39 @@ const maxErrors = 20
 // statusHeight is the number of lines the status bar occupies.
 const statusHeight = 2
 
-// escalationPaneMax is how many recent would-be escalations stay pinned in dry-run.
-// Small on purpose: this is a calibration aid, not the M5 cards pane.
-const escalationPaneMax = 5
+// How many recent escalations stay pinned. Fewer with an LLM attached, because an
+// explained escalation is two lines rather than one and the pane must not eat the
+// stream. Small on purpose either way: this is a calibration aid and a "the model is
+// answering" signal, not the M5 cards pane.
+const (
+	escalationPaneMax    = 5
+	escalationPaneMaxLLM = 3
+)
 
-// pinnedCount is how many escalations the pinned pane is currently showing. Zero
-// unless dry-run is on and something has actually escalated, so the pane costs a
-// normal run nothing.
+// pinnedCount is how many escalations the pinned pane is currently showing. Zero until
+// something actually escalates, so the pane costs a quiet run nothing — and zero when
+// there is nothing to say about an escalation anyway: no model to explain it, and no
+// dry run asking what would have been explained.
 func (m Model) pinnedCount() int {
-	if !m.opts.ExplainDryRun {
+	limit := escalationPaneMax
+	switch {
+	case m.opts.ExplainDryRun:
+	case m.opts.Explain:
+		limit = escalationPaneMaxLLM
+	default:
 		return 0
 	}
-	return min(len(m.snap.Escalations), escalationPaneMax)
+	return min(len(m.snap.Escalations), limit)
 }
 
 // chromeHeight is the number of lines not available to the viewport: the status bar,
 // plus the pinned escalation pane and its header when there is one. It grows as
-// escalations arrive, so the viewport is resized on every snapshot (see resize).
+// escalations arrive and as their explanations land, so the viewport is resized on
+// every snapshot (see resize).
 func (m Model) chromeHeight() int {
 	h := statusHeight
-	if n := m.pinnedCount(); n > 0 {
-		h += n + 1 // the escalations, plus their header
+	if rows := m.escalationRows(); len(rows) > 0 {
+		h += len(rows) + 1 // the escalations, plus their header
 	}
 	return h
 }

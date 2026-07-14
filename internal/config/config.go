@@ -18,6 +18,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/maxie7/logscry/internal/llm"
 	"github.com/maxie7/logscry/internal/score"
 )
 
@@ -33,26 +34,18 @@ type Docker struct {
 	Tail      string   `yaml:"tail"`  // trailing lines fetched per container on attach
 }
 
-// LLM is the M4 backend configuration. It is loaded now so the config file has a
-// stable shape, but nothing reads it until the LLM stage exists.
-type LLM struct {
-	BaseURL string `yaml:"base_url"`
-	Model   string `yaml:"model"`
-	// APIKey comes from the environment, never from a flag or the file.
-	APIKey string `yaml:"-"`
-}
-
 // Config is the fully-resolved runtime configuration.
 type Config struct {
 	// Sources / mode.
 	Plain bool `yaml:"plain"`
-	// ExplainDryRun surfaces escalations instead of sending them to a model. It is
-	// how the scoring thresholds get calibrated before an LLM exists (M4).
+	// ExplainDryRun surfaces escalations instead of sending them to a model. It is how
+	// the scoring thresholds get calibrated, and it is the CI mode: with it set, no LLM
+	// stage is built at all, so no request can be made (see main.startLLM).
 	ExplainDryRun bool `yaml:"explain_dry_run"`
 
 	Score  score.Config `yaml:"score"`
 	Docker Docker       `yaml:"docker"`
-	LLM    LLM          `yaml:"llm"`
+	LLM    llm.Config   `yaml:"llm"`
 
 	// Argv is the subprocess to run, i.e. everything after "--". Not configurable
 	// from the file: it is positional by nature.
@@ -60,12 +53,12 @@ type Config struct {
 }
 
 // Defaults returns the zero-config configuration: quiet scoring, no Docker, and a
-// local Ollama for M4.
+// local Ollama. Each section owns its own defaults table, so there is one place to tune.
 func Defaults() Config {
 	return Config{
 		Score:  score.Defaults(),
 		Docker: Docker{Tail: "100"},
-		LLM:    LLM{BaseURL: "http://localhost:11434/v1", Model: "llama3.2"},
+		LLM:    llm.Defaults(),
 	}
 }
 
@@ -104,6 +97,9 @@ func Load(args []string) (Config, error) {
 
 	if err := cfg.Score.Validate(); err != nil {
 		return Config{}, fmt.Errorf("score config: %w", err)
+	}
+	if err := cfg.LLM.Validate(); err != nil {
+		return Config{}, fmt.Errorf("llm config: %w", err)
 	}
 	return cfg, nil
 }
@@ -201,11 +197,25 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 	b.listVar("docker-label", "follow Docker containers with this k=v label (repeatable, AND-combined)",
 		func(c *Config) *[]string { return &c.Docker.Labels })
 
-	// LLM backend (M4).
-	b.stringVar("llm-url", def.LLM.BaseURL, "OpenAI-compatible base URL (default: local Ollama)",
+	// LLM backend and worker pool. The API key is absent on purpose: it is env-only
+	// (LOGSCRY_API_KEY), so it cannot end up in a shell history.
+	l := def.LLM
+	b.stringVar("llm-url", l.BaseURL, "OpenAI-compatible base URL (default: local Ollama)",
 		func(c *Config) *string { return &c.LLM.BaseURL })
-	b.stringVar("llm-model", def.LLM.Model, "model name to ask for explanations",
+	b.stringVar("llm-model", l.Model, "model name to ask for explanations",
 		func(c *Config) *string { return &c.LLM.Model })
+	b.intVar("llm-workers", l.Workers, "LLM worker pool size",
+		func(c *Config) *int { return &c.LLM.Workers })
+	b.durationVar("llm-timeout", l.Timeout, "timeout for one LLM request attempt",
+		func(c *Config) *time.Duration { return &c.LLM.Timeout })
+	b.intVar("llm-max-tokens", l.MaxTokens, "cap on the tokens an explanation may use",
+		func(c *Config) *int { return &c.LLM.MaxTokens })
+	b.floatVar("llm-temperature", l.Temperature, "LLM sampling temperature (low: consistent, parseable output)",
+		func(c *Config) *float64 { return &c.LLM.Temperature })
+	b.boolVar("llm-json-mode", l.JSONMode, "ask the provider for a JSON object (disable for endpoints that reject response_format)",
+		func(c *Config) *bool { return &c.LLM.JSONMode })
+	b.intVar("llm-retries", l.Retries, "extra attempts on a transient LLM failure (timeout, 429, 5xx)",
+		func(c *Config) *int { return &c.LLM.Retries })
 
 	return b.apply
 }

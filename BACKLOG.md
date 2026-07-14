@@ -56,12 +56,30 @@ Repo stays private through M5; flip to public at M6.
       test: thousands of lines of routine traffic → zero escalations
 
 ## Epic M4 — LLM backend  `[private]`
-- [ ] `llm.Backend` interface (`Explain` / `Name`) + `ExplainRequest`/`ExplainResponse`
-- [ ] OpenAI-compatible backend (configurable base URL + model + key via env) — covers OpenAI / Groq / Ollama
-- [ ] Async worker pool consuming the escalation channel; never blocks ingest
-- [ ] Prompt assembly: trigger line + ring-buffer context + template; request structured JSON
-- [ ] Graceful degradation on LLM error (mark card "unavailable", keep tailing)
-- [ ] (stretch) anonymization flag: mask values before remote send, reversible map
+- [x] `llm.Backend` interface (`Explain` / `Name`) + `ExplainRequest`/`ExplainResponse`
+- [x] OpenAI-compatible backend (configurable base URL + model + key via env) — covers OpenAI / Groq / Ollama.
+      JSON mode on by default, with a one-shot downgrade for servers that reject `response_format`
+- [x] Async worker pool consuming the escalation channel; never blocks ingest. Results return on a
+      channel to the pipeline goroutine, which owns the template map — so an explanation lands on
+      its template with no lock anywhere (RDI §3)
+- [x] Prompt assembly: trigger line + ring-buffer context + template; request structured JSON
+- [x] Defensive parsing: fences, leading/trailing prose, truncation, no-JSON-at-all — degrade, never discard
+- [x] Graceful degradation on LLM error (mark card "unavailable", keep tailing). Retry only transient
+      (timeout/429/5xx), never 4xx — a bad key fails identically forever, and retrying it is a storm
+- [x] Config: `--llm-workers/-timeout/-max-tokens/-temperature/-json-mode/-retries` + `logscry.yaml`; key env-only
+- [x] `--explain-dry-run` builds no backend and no pool at all, so no request *can* be made
+- [x] Unit tests incl. the cost guarantee end to end: 1000 escalating events → ≤ rate-limit HTTP calls,
+      asserted against the fake provider's own request count
+
+## Epic M4.5 — LLM follow-ups (deferred out of M4)  `[private]`
+- [ ] Anonymization flag: mask values before sending to a REMOTE backend, with a reversible map to
+      de-anonymize the response (k8sgpt does the same). Default off. Local Ollama needs none, which is
+      why this is not a v1 blocker — but it is the thing that makes a cloud provider acceptable
+- [ ] Streaming responses (the seam is `chatRequest.stream` + the decode in `call`); v1 is non-streaming
+- [ ] README: document `--llm-max-tokens` for **reasoning** models. Found in live testing: a thinking
+      model spends the whole budget on its chain of thought and returns EMPTY content with
+      `finish_reason: length`. The error now names the flag, but the default 300 is too low for such
+      models and the README should say so (rides along with the M6 README task)
 
 ## Epic M5 — TUI polish  `[private]`
 - [ ] Bubble Tea layout: live stream (left) + flagged-event cards (right)

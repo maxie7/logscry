@@ -26,6 +26,10 @@ type Options struct {
 	// ExplainDryRun surfaces the events the scorer would have escalated. Escalations
 	// are decided and counted either way; this only decides whether they are shown.
 	ExplainDryRun bool
+	// Explain is whether an LLM stage is attached, which is what the pinned pane and
+	// the status bar need to know: whether an escalation is a question that is being
+	// answered, or one nobody is going to answer.
+	Explain bool
 	// Output is where the program draws. Nil means os.Stdout, which is what production
 	// wants; the tests point it at a pty so they can drive the real program and read
 	// what it actually rendered.

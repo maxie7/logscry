@@ -8,6 +8,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/maxie7/logscry/internal/model"
+	"github.com/maxie7/logscry/internal/pipeline"
 )
 
 // Styles are package-level: lipgloss resolves the terminal's colour profile once,
@@ -54,32 +57,102 @@ func (m Model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, append(panes, m.viewStatus())...)
 }
 
-// viewEscalations renders the pinned dry-run pane: the most recent would-be
-// escalations, newest first, with the reasons that fired them.
+// viewEscalations renders the pinned pane: the most recent escalations, newest first.
 //
-// It is pinned rather than left inline in the stream because inline is useless: at
-// any real log rate an escalation scrolls off in well under a second, and the whole
-// point of --explain-dry-run is to sit and read the reasons while tuning. The stream
-// still highlights the line in place — this pane is what makes it stay.
+// It is pinned rather than left inline in the stream because inline is useless: at any
+// real log rate an escalation scrolls off in well under a second — and an explanation
+// arrives seconds *after* that, so by the time the model answers, the line it answers
+// about is long gone. Pinning is what lets an escalation appear instantly as
+// "explaining…" and then fill itself in where the user is already looking.
 func (m Model) viewEscalations() string {
+	rows := m.escalationRows()
+	if len(rows) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(styleEscHead.Width(m.width).Render(truncate(m.escalationHeader(), m.width)))
+	for _, row := range rows {
+		b.WriteByte('\n')
+		b.WriteString(row)
+	}
+	return b.String()
+}
+
+// escalationHeader names what the pane is showing, which differs by mode in the one way
+// that matters: in dry-run, nothing was asked of a model, and saying so is the point.
+func (m Model) escalationHeader() string {
+	if m.opts.ExplainDryRun {
+		return fmt.Sprintf(" WOULD ESCALATE · %s total (dry run — no LLM called)",
+			formatCount(m.snap.Stats.Escalations))
+	}
+	return fmt.Sprintf(" ESCALATED · %s total", formatCount(m.snap.Stats.Escalations))
+}
+
+// escalationRows renders the pinned escalations, newest first, already styled and
+// truncated. It returns the rows rather than a block so that chromeHeight can size the
+// pane from the same rendering the view draws — an explained escalation takes two lines
+// and a pending one takes one, so the height cannot be assumed.
+func (m Model) escalationRows() []string {
 	n := m.pinnedCount()
 	if n == 0 {
-		return ""
+		return nil
 	}
 	recent := m.snap.Escalations[len(m.snap.Escalations)-n:]
 
-	var b strings.Builder
-	b.WriteString(styleEscHead.Width(m.width).Render(truncate(
-		fmt.Sprintf(" WOULD ESCALATE · %s total (dry run — no LLM called)",
-			formatCount(m.snap.Stats.Escalations)), m.width)))
+	var rows []string
 	// Newest first: the one that just fired is the one being read.
 	for i := len(recent) - 1; i >= 0; i-- {
 		ev := recent[i]
-		b.WriteByte('\n')
-		b.WriteString(styleEscalate.Render(truncate(fmt.Sprintf(" ⇧ %s │ %s │ score %.2f",
-			ev.Pattern, strings.Join(ev.Reasons, ", "), ev.Score), m.width)))
+		rows = append(rows, styleEscalate.Render(truncate(
+			fmt.Sprintf(" ⇧ %s │ %s", ev.Pattern, m.escalationStatus(ev)), m.width)))
+		if detail := explanationDetail(ev.Explanation); detail != "" {
+			rows = append(rows, styleHint.Render(truncate("   "+detail, m.width)))
+		}
 	}
-	return b.String()
+	return rows
+}
+
+// escalationStatus is the right-hand half of an escalation's line: in dry-run, why the
+// scorer fired; with an LLM attached, where the answer has got to.
+func (m Model) escalationStatus(ev pipeline.Event) string {
+	if m.opts.ExplainDryRun || ev.Explanation == nil {
+		return fmt.Sprintf("%s │ score %.2f", strings.Join(ev.Reasons, ", "), ev.Score)
+	}
+	switch ex := ev.Explanation; ex.State {
+	case model.ExplainDone:
+		return ex.Summary
+	case model.ExplainFailed:
+		return "explanation unavailable"
+	default:
+		return "explaining…"
+	}
+}
+
+// explanationDetail is the indented second line under an escalation: the cause and the
+// check that make it worth having called a model at all, or — when the call failed — why
+// it failed. The reason gets its own line for the same reason the cause does: sharing one
+// with the template means the interesting half is what gets truncated away.
+//
+// Empty while pending, which is what keeps a waiting escalation to a single line.
+func explanationDetail(ex *model.Explanation) string {
+	if ex == nil {
+		return ""
+	}
+	switch ex.State {
+	case model.ExplainFailed:
+		return ex.Err
+	case model.ExplainDone:
+		var parts []string
+		if ex.LikelyCause != "" {
+			parts = append(parts, "cause: "+ex.LikelyCause)
+		}
+		if ex.Suggestion != "" {
+			parts = append(parts, "check: "+ex.Suggestion)
+		}
+		return strings.Join(parts, " · ")
+	default:
+		return ""
+	}
 }
 
 // viewStream renders the live tail: one templated line per event, newest at the
@@ -165,6 +238,7 @@ func (m Model) viewStatus() string {
 	if n := m.snap.Stats.Suppressed; n > 0 {
 		counters += " · supp " + formatCount(n)
 	}
+	counters += m.llmCounters()
 
 	sources := "no sources"
 	if len(m.snap.Stats.Sources) > 0 {
@@ -187,6 +261,27 @@ func (m Model) viewStatus() string {
 		second = styleErr.Render(truncate(" ! "+err, m.width))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, bar, second)
+}
+
+// llmCounters is the status bar's account of the LLM stage: answered, in flight, failed.
+// It is empty when no model is attached, so a dry run's status bar is unchanged.
+//
+// Failures and drops appear only once they have happened. They are the numbers that say
+// "the model is down" or "the model cannot keep up with the anomalies" — the two things
+// that would otherwise look exactly like a tool that has nothing to say.
+func (m Model) llmCounters() string {
+	if !m.opts.Explain {
+		return ""
+	}
+	s := m.snap.Stats
+	out := fmt.Sprintf(" | llm %s✓ %s⏳", formatCount(s.Explained), formatCount(s.Explaining))
+	if s.ExplainFailed > 0 {
+		out += " " + formatCount(s.ExplainFailed) + "✗"
+	}
+	if s.Dropped > 0 {
+		out += " · drop " + formatCount(s.Dropped)
+	}
+	return out
 }
 
 // renderLevel colours a level token for the stream, using "-" when none was

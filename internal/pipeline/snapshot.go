@@ -45,6 +45,14 @@ type Stats struct {
 	// that the cost cap is currently hiding things, rather than silently hiding them.
 	Escalations int
 	Suppressed  int
+
+	// The LLM stage, for the status bar: answered, waiting on the model, and failed.
+	// Dropped is the escalations that never reached the pool at all because the queue
+	// was full — the model falling behind the anomalies, which is worth admitting to.
+	Explained     int
+	Explaining    int
+	ExplainFailed int
+	Dropped       int
 }
 
 // Snapshot is an immutable view of the pipeline state at one instant. The
@@ -140,7 +148,7 @@ func (c *collector) snapshot(p *Pipeline, now time.Time) Snapshot {
 	return Snapshot{
 		Lines:       c.lines(),
 		Templates:   c.summaries(p),
-		Escalations: append([]Event(nil), c.escalated...),
+		Escalations: c.escalations(p),
 		Stats: Stats{
 			TotalLines:      c.total,
 			UniqueTemplates: len(p.templates),
@@ -148,8 +156,33 @@ func (c *collector) snapshot(p *Pipeline, now time.Time) Snapshot {
 			Sources:         c.sourceNames(),
 			Escalations:     scored.Escalated,
 			Suppressed:      scored.Suppressed,
+			Explained:       p.explained,
+			Explaining:      p.explaining,
+			ExplainFailed:   p.explainFailed,
+			Dropped:         p.explainDropped,
 		},
 	}
+}
+
+// escalations copies out the retained escalations, each carrying the template's CURRENT
+// explanation rather than the nothing it had when it fired.
+//
+// This is what makes a pinned card update in place. The explanation arrives seconds after
+// the event, on a different goroutine, with no way to reach back into an Event that has
+// already been rendered — so nothing tries to. The escalations are re-stamped from live
+// template state on every snapshot instead, and a card goes from "explaining…" to an
+// answer simply because the next snapshot found one there. The explanation is copied by
+// value, so the renderer holds nothing the pipeline can later touch.
+func (c *collector) escalations(p *Pipeline) []Event {
+	out := make([]Event, 0, len(c.escalated))
+	for _, ev := range c.escalated {
+		if tmpl, ok := p.templates[ev.Hash]; ok && tmpl.Explanation != nil {
+			ex := *tmpl.Explanation
+			ev.Explanation = &ex
+		}
+		out = append(out, ev)
+	}
+	return out
 }
 
 // lines copies the ring out in chronological order, oldest first.

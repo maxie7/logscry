@@ -45,12 +45,49 @@ const RecentCap = 2048
 // Template is the masked signature of a class of log lines, plus the running
 // state used for dedup, burst detection, and explanation caching.
 type Template struct {
-	Hash        string // signature of the masked line
-	Pattern     string // human-readable masked form, e.g. "user <NUM> failed"
-	FirstSeen   time.Time
-	LastSeen    time.Time
-	Count       int
-	Recent      []time.Time // ring buffer of recent occurrences for burst detection
-	Explained   bool
-	Explanation string // last LLM explanation, if any
+	Hash      string // signature of the masked line
+	Pattern   string // human-readable masked form, e.g. "user <NUM> failed"
+	FirstSeen time.Time
+	LastSeen  time.Time
+	Count     int
+	Recent    []time.Time // ring buffer of recent occurrences for burst detection
+
+	// Explanation is the LLM's verdict on this template, nil until it escalates. It
+	// is set to a pending value the moment the event is handed to the LLM stage and
+	// REPLACED — never mutated in place — when the answer arrives seconds later, so a
+	// pointer already handed to another goroutine can never change underneath it.
+	Explanation *Explanation
+}
+
+// ExplainState is how far an escalated template has got through the LLM stage.
+type ExplainState int
+
+const (
+	// ExplainPending is escalated, waiting on the model. The UI says "explaining…"
+	// from the instant the event fires, rather than showing nothing for a few seconds.
+	ExplainPending ExplainState = iota
+	// ExplainDone is explained.
+	ExplainDone
+	// ExplainFailed is a model that was down, slow, or unusable. The card says so and
+	// the tail keeps flowing; the explanation cache means it will not escalate again.
+	ExplainFailed
+)
+
+// Explanation is the LLM's answer for one template, and the message the worker pool
+// sends back to the pipeline goroutine. Hash is the routing key: it is what lands the
+// answer on the template that asked for it, without any lock on the template map.
+type Explanation struct {
+	Hash string
+	// Pattern is the masked template this explains. The hash routes the answer; the
+	// pattern is what a line-oriented consumer (--plain) prints to say which of the
+	// escalations that scrolled past a few seconds ago this one is about.
+	Pattern     string
+	State       ExplainState
+	Summary     string // one-line "what happened"
+	LikelyCause string
+	Suggestion  string // what to check / try
+	// Err is a short reason when State is ExplainFailed, shown on the card. It is
+	// built only from status codes and provider messages — never from the API key.
+	Err string
+	At  time.Time
 }

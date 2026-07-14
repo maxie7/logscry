@@ -161,7 +161,12 @@ type EscalationRequest struct {
 type Result struct {
 	Score    float64
 	Escalate bool
-	Reasons  []string
+	// Queued reports that the escalation actually reached the LLM stage, rather than
+	// being dropped by a full channel. The two are different outcomes for the user —
+	// "explaining…" versus "explanation unavailable" — and only emit knows which
+	// happened, so a card is never left waiting on an answer that is not coming.
+	Queued  bool
+	Reasons []string
 }
 
 // Stats are the running escalation counters. Suppressed and Dropped exist so the UI
@@ -228,7 +233,7 @@ func (s *Scorer) Evaluate(line model.LogLine, tmpl *model.Template, prevLastSeen
 
 	res.Escalate = s.decide(tmpl, res.Score, now)
 	if res.Escalate {
-		s.emit(line, tmpl, res)
+		res.Queued = s.emit(line, tmpl, res)
 	}
 	// After the emit, so an escalation's context is the lines that *preceded* it.
 	s.ring.Push(line)
@@ -404,12 +409,13 @@ func (s *Scorer) decide(tmpl *model.Template, total float64, now time.Time) bool
 	return true
 }
 
-// emit hands the escalation to the LLM stage without ever blocking on it. A full
-// channel means the model is slower than the anomalies are arriving; dropping is the
-// only acceptable answer, because the alternative is ingestion stalling behind an LLM.
-func (s *Scorer) emit(line model.LogLine, tmpl *model.Template, res Result) {
+// emit hands the escalation to the LLM stage without ever blocking on it, reporting
+// whether it got there. A full channel means the model is slower than the anomalies are
+// arriving; dropping is the only acceptable answer, because the alternative is ingestion
+// stalling behind an LLM.
+func (s *Scorer) emit(line model.LogLine, tmpl *model.Template, res Result) bool {
 	if s.out == nil {
-		return
+		return false
 	}
 	req := EscalationRequest{
 		Trigger:   line,
@@ -423,8 +429,10 @@ func (s *Scorer) emit(line model.LogLine, tmpl *model.Template, res Result) {
 	}
 	select {
 	case s.out <- req:
+		return true
 	default:
 		s.stats.Dropped++
+		return false
 	}
 }
 
