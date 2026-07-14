@@ -56,15 +56,13 @@ func run(ctx context.Context, args []string) error {
 	}
 	sources, stdinOnly := sources(cfg)
 
-	mode, ttyIn := tui.Resolve(cfg.Plain)
-	if ttyIn != nil {
-		defer func() { _ = ttyIn.Close() }()
-	}
+	term := tui.Resolve(cfg.Plain)
+	defer func() { _ = term.Close() }()
 
 	// stdin as the only source, and stdin is the terminal the user is sitting at: no
 	// logs are coming, and none ever will. Say what is missing rather than drawing an
 	// empty screen forever. (--plain has no such problem: it reads typed lines.)
-	if mode == tui.ModeTUI && stdinOnly && tui.StdinIsTerminal() {
+	if term.Mode == tui.ModeTUI && stdinOnly && tui.StdinIsTerminal() {
 		return errors.New("no log source: pipe logs in, run 'logscry -- ./app', or use --docker-all")
 	}
 
@@ -84,10 +82,10 @@ func run(ctx context.Context, args []string) error {
 	escalations, explanations := startLLM(ctx, cfg)
 	sc := score.New(cfg.Score, escalations)
 
-	if mode == tui.ModePlain {
+	if term.Mode == tui.ModePlain {
 		return runPlain(ctx, lines, errs, sc, escalations, explanations, cfg.ExplainDryRun)
 	}
-	return runTUI(ctx, lines, errs, ttyIn, sc, escalations, explanations, cfg.ExplainDryRun)
+	return runTUI(ctx, lines, errs, term, sc, escalations, explanations, cfg.ExplainDryRun)
 }
 
 // startLLM builds the LLM stage: the escalation channel the scorer emits on, and the
@@ -144,7 +142,7 @@ func sources(cfg config.Config) ([]ingest.Source, bool) {
 // The explanations go to the pipeline goroutine, not to the TUI: it owns the template
 // state, so it is the one that attaches an answer to the template that asked for it.
 // The TUI then sees it appear in the next snapshot, and never touches pipeline state.
-func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, ttyIn *os.File,
+func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, term tui.Terminal,
 	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation, dryRun bool,
 ) error {
 	snaps := make(chan pipeline.Snapshot, 1)
@@ -154,7 +152,7 @@ func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, 
 		Escalations:  escalations,
 		Explanations: explanations,
 	})
-	return tui.Run(ctx, snaps, errs, ttyIn, tui.Options{
+	return term.Run(ctx, snaps, errs, tui.Options{
 		ExplainDryRun: dryRun,
 		Explain:       escalations != nil,
 	})

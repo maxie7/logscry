@@ -3,6 +3,7 @@
 package tui
 
 import (
+	"io"
 	"os"
 
 	"github.com/charmbracelet/x/term"
@@ -63,19 +64,34 @@ func Decide(plainFlag, stdinIsTTY, stdoutIsTTY, devTTYAvailable bool) Mode {
 // a terminal attached.
 var openControllingTTY = func() (*os.File, error) { return os.Open("/dev/tty") }
 
-// Resolve inspects the process's actual stdin/stdout and applies Decide, returning the
-// keyboard source for the caller to hand to tea.WithInput and to close afterwards.
+// Terminal is a resolved renderer: the mode to run in, and — bound to it — the keyboard
+// and screen to run it with. Resolve produces one; Terminal.Run consumes it.
 //
-// A nil file means "let Bubble Tea read os.Stdin", which now happens only when there
-// is no controlling terminal to open. Preferring /dev/tty unconditionally is
-// deliberate: it is one input path instead of two, and it is the path that works when
-// stdin is busy carrying logs — so the TUI behaves identically whether logs arrive on
-// stdin, from a subprocess, or from Docker.
-func Resolve(plainFlag bool) (Mode, *os.File) {
+// The binding is the point. The keyboard and the program used to be wired together at
+// the call site, which meant the tests could wire them together differently from main —
+// and did, hand-rolling their own input file. So the pty test that exists precisely to
+// catch a dead keyboard was passing while it was possible for main to hand Bubble Tea an
+// input it could never read a key from. The fields are unexported and there is no other
+// way to start the program: whatever the test drives is what main drives.
+type Terminal struct {
+	Mode Mode
+	in   *os.File  // keyboard; nil means "let Bubble Tea read os.Stdin"
+	out  io.Writer // screen
+}
+
+// Resolve inspects the process's actual stdin/stdout and applies Decide, returning the
+// terminal to render on.
+//
+// A nil keyboard means "let Bubble Tea read os.Stdin", which happens only when there is
+// no controlling terminal to open. Preferring /dev/tty unconditionally is deliberate: it
+// is one input path instead of two, and it is the path that works when stdin is busy
+// carrying logs — so the TUI behaves identically whether logs arrive on stdin, from a
+// subprocess, or from Docker.
+func Resolve(plainFlag bool) Terminal {
 	return resolve(plainFlag, os.Stdin, os.Stdout)
 }
 
-func resolve(plainFlag bool, stdin, stdout *os.File) (Mode, *os.File) {
+func resolve(plainFlag bool, stdin, stdout *os.File) Terminal {
 	stdinIsTTY := isTerminal(stdin)
 	stdoutIsTTY := isTerminal(stdout)
 
@@ -92,7 +108,15 @@ func resolve(plainFlag bool, stdin, stdout *os.File) (Mode, *os.File) {
 		_ = tty.Close()
 		tty = nil
 	}
-	return mode, tty
+	return Terminal{Mode: mode, in: tty, out: stdout}
+}
+
+// Close releases the controlling terminal, if one was opened.
+func (t Terminal) Close() error {
+	if t.in == nil {
+		return nil
+	}
+	return t.in.Close()
 }
 
 // isTerminal reports whether f is a terminal.

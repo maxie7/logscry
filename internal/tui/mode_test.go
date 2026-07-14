@@ -98,11 +98,11 @@ func TestResolveTakesTheKeyboardFromDevTTY(t *testing.T) {
 	defer func() { openControllingTTY = restore }()
 
 	// stdin is a free terminal (the Docker / subprocess case: stdin carries no logs).
-	mode, in := resolve(false, fake, fake)
-	if mode != ModeTUI {
-		t.Fatalf("mode = %v, want ModeTUI", mode)
+	term := resolve(false, fake, fake)
+	if term.Mode != ModeTUI {
+		t.Fatalf("mode = %v, want ModeTUI", term.Mode)
 	}
-	if in == nil {
+	if term.in == nil {
 		t.Fatal("keyboard source is nil: Bubble Tea would fall back to os.Stdin, " +
 			"which is the path that was leaving the keyboard dead")
 	}
@@ -118,9 +118,9 @@ func TestResolveFallsBackToStdin(t *testing.T) {
 	openControllingTTY = func() (*os.File, error) { return nil, errors.New("no controlling terminal") }
 	defer func() { openControllingTTY = restore }()
 
-	mode, in := resolve(false, fake, fake)
-	if mode != ModeTUI || in != nil {
-		t.Errorf("resolve = (%v, %v), want (ModeTUI, nil): stdin is the fallback keyboard", mode, in)
+	term := resolve(false, fake, fake)
+	if term.Mode != ModeTUI || term.in != nil {
+		t.Errorf("resolve = (%v, %v), want (ModeTUI, nil): stdin is the fallback keyboard", term.Mode, term.in)
 	}
 }
 
@@ -136,7 +136,7 @@ func TestResolvePlainWhenOutputIsPiped(t *testing.T) {
 	}
 	defer func() { _ = pipeR.Close(); _ = pipeW.Close() }()
 
-	if mode, in := resolve(false, fake, pipeW); mode != ModePlain || in != nil {
-		t.Errorf("resolve with piped stdout = (%v, %v), want (ModePlain, nil)", mode, in)
+	if term := resolve(false, fake, pipeW); term.Mode != ModePlain || term.in != nil {
+		t.Errorf("resolve with piped stdout = (%v, %v), want (ModePlain, nil)", term.Mode, term.in)
 	}
 }

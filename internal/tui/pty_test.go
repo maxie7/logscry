@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/maxie7/logscry/internal/model"
 	"github.com/maxie7/logscry/internal/pipeline"
 )
 
@@ -88,11 +89,16 @@ func answerQueries(t *testing.T, master *os.File, out *strings.Builder, mu *sync
 	}()
 }
 
-// runOnPTY starts tui.Run against a pty, exactly as main does when the keyboard comes
-// from the controlling terminal — the branch used for a Docker or subprocess source,
-// where stdin is not carrying logs. It returns a function to send keys and a channel
-// that closes when the program exits.
-func runOnPTY(t *testing.T, snaps chan pipeline.Snapshot) (send func(string), exited chan error, output func() string) {
+// runOnPTY starts the TUI on a pty through the PRODUCTION wiring — Resolve, then
+// Terminal.Run — which is the whole point of these tests.
+//
+// The previous version hand-rolled the program: it called Run with a keyboard file of
+// its own choosing, so it proved only that Bubble Tea can read a pty someone hands it.
+// It could not have caught main handing Bubble Tea the wrong input, which IS the
+// dead-keyboard bug. Now the test stands a real pty in for the controlling terminal and
+// for stdin/stdout, and then lets resolve() pick the keyboard exactly as it does in
+// production. Whatever main gets, this gets.
+func runOnPTY(t *testing.T, snaps chan pipeline.Snapshot, opts Options) (send func(string), exited chan error, output func() string) {
 	t.Helper()
 
 	master, slave := newPTY(t)
@@ -103,13 +109,29 @@ func runOnPTY(t *testing.T, snaps chan pipeline.Snapshot) (send func(string), ex
 	done := make(chan struct{})
 	answerQueries(t, master, &out, &mu, done)
 
+	// The test binary has no controlling terminal of its own, so the pty stands in for
+	// /dev/tty. Everything after this line is the production path.
+	restore := openControllingTTY
+	openControllingTTY = func() (*os.File, error) { return slave, nil }
+	t.Cleanup(func() { openControllingTTY = restore })
+
+	// Exactly what main does: resolve the terminal, then run on it. stdin is a free
+	// terminal here — the Docker / subprocess case, where stdin carries no logs.
+	term := resolve(false, slave, slave)
+	if term.Mode != ModeTUI {
+		t.Fatalf("resolve chose %v on a terminal, want ModeTUI", term.Mode)
+	}
+	if term.in == nil {
+		t.Fatal("resolve produced no keyboard: Bubble Tea would fall back to os.Stdin, " +
+			"which is the path that left the keyboard dead")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	errs := make(chan error)
 	exited = make(chan error, 1)
 
 	go func() {
-		// slave is both the keyboard and the screen, which is what a terminal is.
-		exited <- Run(ctx, snaps, errs, slave, Options{Output: slave})
+		exited <- term.Run(ctx, snaps, errs, opts)
 		close(done)
 	}()
 	t.Cleanup(cancel)
@@ -141,7 +163,7 @@ func TestPTYQuitKeyActuallyQuits(t *testing.T) {
 	snaps := make(chan pipeline.Snapshot, 1)
 	snaps <- testSnapshot()
 
-	send, exited, output := runOnPTY(t, snaps)
+	send, exited, output := runOnPTY(t, snaps, Options{})
 
 	waitFor(t, "the first frame", func() bool { return strings.Contains(output(), "user <NUM> failed") })
 
@@ -162,7 +184,7 @@ func TestPTYViewKeysWork(t *testing.T) {
 	snaps := make(chan pipeline.Snapshot, 1)
 	snaps <- testSnapshot()
 
-	send, exited, output := runOnPTY(t, snaps)
+	send, exited, output := runOnPTY(t, snaps, Options{})
 	waitFor(t, "the first frame", func() bool { return strings.Contains(output(), "STREAM") })
 
 	send("t")
@@ -178,5 +200,51 @@ func TestPTYViewKeysWork(t *testing.T) {
 	case <-exited:
 	case <-time.After(5 * time.Second):
 		t.Fatal("'q' did not quit")
+	}
+}
+
+// TestPTYKeysWorkWithTheLLMPaneUp runs the keyboard test in the configuration a real M4
+// run is actually in: an LLM attached, an escalation pinned, and an explanation landing
+// underneath it — which grows the chrome and resizes the viewport out from under the
+// event loop. Every earlier pty test ran with an empty pinned pane, so none of them
+// would have noticed the keyboard dying only once a card was on screen.
+func TestPTYKeysWorkWithTheLLMPaneUp(t *testing.T) {
+	snaps := make(chan pipeline.Snapshot, 1)
+	snaps <- escalationSnapshot(&model.Explanation{Hash: "aaa", State: model.ExplainPending})
+
+	send, exited, output := runOnPTY(t, snaps, Options{Explain: true})
+	waitFor(t, "the pending escalation to be pinned", func() bool {
+		return strings.Contains(output(), "explaining…")
+	})
+
+	// The answer lands seconds later and takes a second line, resizing the viewport.
+	snaps <- escalationSnapshot(&model.Explanation{
+		Hash: "aaa", State: model.ExplainDone,
+		Summary:     "A handler wrote to a nil map.",
+		LikelyCause: "The cache map is never initialised.",
+		Suggestion:  "Make the map in NewServer.",
+	})
+	waitFor(t, "the explanation to land on the card", func() bool {
+		return strings.Contains(output(), "A handler wrote to a nil map.")
+	})
+
+	// And the keyboard still works, which is the whole assertion.
+	send("t")
+	waitFor(t, "'t' to still switch view with a card on screen", func() bool {
+		return strings.Contains(output(), "AGGREGATED")
+	})
+	send("p")
+	waitFor(t, "'p' to still pause with a card on screen", func() bool {
+		return strings.Contains(output(), "PAUSED")
+	})
+
+	send("q")
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("'q' did not quit once an explanation was on screen")
 	}
 }

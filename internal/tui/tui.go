@@ -13,7 +13,6 @@ package tui
 
 import (
 	"context"
-	"io"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -30,10 +29,6 @@ type Options struct {
 	// the status bar need to know: whether an escalation is a question that is being
 	// answered, or one nobody is going to answer.
 	Explain bool
-	// Output is where the program draws. Nil means os.Stdout, which is what production
-	// wants; the tests point it at a pty so they can drive the real program and read
-	// what it actually rendered.
-	Output io.Writer
 }
 
 // StdinIsTerminal reports whether stdin is an interactive terminal rather than a pipe
@@ -41,24 +36,26 @@ type Options struct {
 // were piped in" from "logs are on the way".
 func StdinIsTerminal() bool { return isTerminal(os.Stdin) }
 
-// Run starts the terminal UI and blocks until the user quits or ctx is cancelled.
+// Run starts the terminal UI on t and blocks until the user quits or ctx is cancelled.
 //
-// snaps delivers pipeline state; errs delivers background errors, which are shown
-// in the status bar rather than printed, because any stray write to stdout would
-// corrupt the alternate screen.
+// snaps delivers pipeline state; errs delivers background errors, which are shown in the
+// status bar rather than printed, because any stray write to stdout would corrupt the
+// alternate screen.
 //
-// in is the keyboard source: nil to let Bubble Tea read stdin as usual, or an open
-// /dev/tty when stdin is busy carrying logs (see Resolve). Run does not close it.
-func Run(ctx context.Context, snaps <-chan pipeline.Snapshot, errs <-chan error, in *os.File, o Options) error {
+// The keyboard and the screen come from t — the Terminal that Resolve produced — and
+// from nowhere else. That is deliberate: this is the ONLY way to start the program, so
+// the path a test drives is the path main drives, and a keyboard wired to something
+// Bubble Tea cannot read cannot hide behind a green test. Run does not close t.
+func (t Terminal) Run(ctx context.Context, snaps <-chan pipeline.Snapshot, errs <-chan error, o Options) error {
 	opts := []tea.ProgramOption{
 		tea.WithAltScreen(),
 		tea.WithContext(ctx), // SIGINT/SIGTERM cancels ctx, which stops the program
 	}
-	if in != nil {
-		opts = append(opts, tea.WithInput(in))
+	if t.in != nil {
+		opts = append(opts, tea.WithInput(t.in))
 	}
-	if o.Output != nil {
-		opts = append(opts, tea.WithOutput(o.Output))
+	if t.out != nil {
+		opts = append(opts, tea.WithOutput(t.out))
 	}
 
 	p := tea.NewProgram(New(snaps, errs, o), opts...)
