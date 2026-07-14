@@ -71,16 +71,6 @@ Repo stays private through M5; flip to public at M6.
 - [x] Unit tests incl. the cost guarantee end to end: 1000 escalating events → ≤ rate-limit HTTP calls,
       asserted against the fake provider's own request count
 
-## Epic M4.5 — LLM follow-ups (deferred out of M4)  `[private]`
-- [ ] Anonymization flag: mask values before sending to a REMOTE backend, with a reversible map to
-      de-anonymize the response (k8sgpt does the same). Default off. Local Ollama needs none, which is
-      why this is not a v1 blocker — but it is the thing that makes a cloud provider acceptable
-- [ ] Streaming responses (the seam is `chatRequest.stream` + the decode in `call`); v1 is non-streaming
-- [ ] README: document `--llm-max-tokens` for **reasoning** models. Found in live testing: a thinking
-      model spends the whole budget on its chain of thought and returns EMPTY content with
-      `finish_reason: length`. The error now names the flag, but the default 300 is too low for such
-      models and the README should say so (rides along with the M6 README task)
-
 ## Epic M5 — TUI polish  `[private]`
 - [ ] Bubble Tea layout: live stream (left) + flagged-event cards (right)
 - [ ] Card fields: severity, summary, cause, suggestion, count, first/last seen
@@ -102,3 +92,20 @@ Repo stays private through M5; flip to public at M6.
 - [ ] Clean up commit history if needed (squash / orphan for a clean public debut)
 - [ ] **Flip repo to PUBLIC**
 - [ ] Enable "Include private contributions" in GitHub settings (keep the green squares)
+
+## Epic M7 — Post-launch (after the repo is public)
+Deferred work, not a v1 blocker. Nothing here gates M6.
+- [ ] Anonymization flag: mask values before sending to a REMOTE backend, with a reversible map to
+      de-anonymize the response (k8sgpt does the same). Default off. Local Ollama needs none, which is
+      why this is not a v1 blocker — but it is the thing that makes a cloud provider acceptable
+- [ ] Streaming responses (the seam is `chatRequest.stream` + the decode in `call`); v1 is non-streaming
+- [ ] Multiline / stack-trace grouping: fold a traceback into ONE template instead of one per frame.
+      Found in M4 live testing: a Python FastAPI traceback exploded into ~40 separate templates, each
+      a "novel" frame, which is exactly the noise this tool exists to suppress. v1 templates one line
+      at a time by design; grouping needs a continuation heuristic (indent / no-timestamp / language
+      cues) in `pipeline`. Name it as a known v1 limitation in the README (rides along with the M6
+      README task)
+- [ ] README: document `--llm-max-tokens` for **reasoning** models. Found in live testing: a thinking
+      model spends the whole budget on its chain of thought and returns EMPTY content with
+      `finish_reason: length`. The error now names the flag, but the default 300 is too low for such
+      models and the README should say so (rides along with the M6 README task)
