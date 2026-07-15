@@ -177,7 +177,7 @@ Key flags:
 | `--docker-name <re>` | — | Follow containers whose name matches a regexp |
 | `--docker-tail <n>` | `100` | Lines of history fetched per container on attach (`all` for everything) |
 | `--llm-url <url>` | local Ollama | OpenAI-compatible base URL |
-| `--llm-model <name>` | `llama3.2` | Model to ask for explanations |
+| `--llm-model <name>` | `gemma2:2b` | Model to ask for explanations (`ollama pull gemma2:2b`) |
 | `--llm-max-tokens <n>` | `300` | Cap on tokens per explanation |
 | `--threshold <f>` | `1.0` | Escalate at or above this score |
 | `--rate-limit <n>` | `10` | Global cap on LLM calls per minute (the cost cap) |

@@ -58,7 +58,7 @@ score:
 # --- LLM backend and worker pool (any OpenAI-compatible endpoint; default local Ollama) ---
 llm:
   base_url: "http://localhost:11434/v1"
-  model: "llama3.2"
+  model: "gemma2:2b"
   workers: 2 # pool size; the rate limiter, not the pool, caps cost
   queue: 64 # escalation channel capacity; full means drop, never block ingest
   timeout: 30s # bounds ONE attempt (with retries, worst case is (retries+1) x this)

@@ -21,7 +21,7 @@ import (
 const maxBodyBytes = 1 << 20
 
 // maxErrBodyRunes bounds the provider's error text quoted back to the user. Enough to
-// say "model 'llama3.2' not found", not enough to fill the status bar with a stack of
+// say "model 'gemma2:2b' not found", not enough to fill the status bar with a stack of
 // someone else's HTML.
 const maxErrBodyRunes = 200
 
@@ -275,7 +275,7 @@ type fatalError struct{ msg string }
 func (e fatalError) Error() string { return e.msg }
 
 // apiError is a non-2xx response. It carries the provider's own message — which is what
-// turns "it didn't work" into "model 'llama3.2' not found" — and never anything of ours.
+// turns "it didn't work" into "model 'gemma2:2b' not found" — and never anything of ours.
 type apiError struct {
 	status int
 	body   string

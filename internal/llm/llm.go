@@ -91,7 +91,7 @@ type Config struct {
 func Defaults() Config {
 	return Config{
 		BaseURL:     "http://localhost:11434/v1",
-		Model:       "llama3.2",
+		Model:       "gemma2:2b",
 		Workers:     2,
 		Queue:       64,
 		Timeout:     30 * time.Second,
