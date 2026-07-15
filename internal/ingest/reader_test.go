@@ -86,11 +86,11 @@ func TestReadLinesSurvivesLongLine(t *testing.T) {
 // it pushes the actual log message off the pane.
 func TestSubprocessSourceNameIsTheBaseName(t *testing.T) {
 	tests := map[string]string{
-		"./myapp":                      "proc:myapp",
-		"/home/maxie/code/build/myapp": "proc:myapp",
-		"/usr/bin/python3":             "proc:python3",
-		"myapp":                        "proc:myapp",
-		"":                             "proc",
+		"./myapp":                     "proc:myapp",
+		"/home/user/code/build/myapp": "proc:myapp",
+		"/usr/bin/python3":            "proc:python3",
+		"myapp":                       "proc:myapp",
+		"":                            "proc",
 	}
 	for argv0, want := range tests {
 		if got := NewSubprocessSource([]string{argv0, "--flag"}).Name(); got != want {

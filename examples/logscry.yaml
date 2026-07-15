@@ -1,0 +1,69 @@
+# logscry.yaml — full annotated configuration.
+#
+#   ./bin/logscry --config examples/logscry.yaml --docker-all
+#
+# Every value below is the built-in default, so this file changes nothing as-is — it is a
+# reference you can copy and edit. Precedence is defaults < this file < flags, so any flag
+# you also pass on the command line wins. The one secret, the API key, is NEVER read from
+# here; it comes only from the LOGSCRY_API_KEY environment variable.
+
+# Plain line output instead of the TUI. logscry does this automatically when stdout is
+# not a terminal, so you rarely need to set it.
+plain: false
+
+# Surface what WOULD escalate instead of calling a model. With this on, no LLM backend or
+# worker pool is built at all — useful for calibrating the scoring thresholds and for CI.
+explain_dry_run: false
+
+# --- Which Docker containers to follow (omit all of these to read stdin/subprocess) ---
+docker:
+  all: false # follow every container, auto-attaching to new ones
+  name: "" # ...or only those whose name matches this regexp
+  label: [] # ...or those carrying these k=v labels (AND-combined)
+  tail: "100" # lines of history fetched per container on attach ("all" for everything)
+
+# --- Scoring: the engine that decides what is worth explaining ---
+score:
+  threshold: 1.0 # escalate at or above this summed score
+
+  # Per-signal weights. Severity is additive and capped at severity_max, so routine
+  # "stderr + ERROR" (0.3 + 0.6 = 0.9) sits deliberately below the 1.0 threshold; only a
+  # fatal-class line escalates on severity alone.
+  weights:
+    novelty: 1.0 # a template never seen before (post-warmup)
+    burst: 1.0 # a template's rate spiking above its own baseline
+    stderr: 0.3 # the line arrived on stderr
+    warn: 0.2 # level WARN
+    error: 0.6 # level ERROR / CRITICAL
+    fatal: 1.0 # level FATAL / PANIC
+    severity_max: 1.0 # cap on the summed severity contribution
+
+  # Novelty.
+  cooloff: 15m # a template unseen for longer than this counts as novel again
+  warmup: 30s # mute novelty until this has elapsed AND...
+  warmup_lines: 100 # ...this many lines have been seen (avoids a startup flood)
+
+  # Burst (purely relative to a template's own established baseline).
+  burst_window: 10s # sliding window the rate is measured over
+  burst_multiplier: 5 # fire at this many times the baseline rate
+  burst_min_count: 10 # ...but never on fewer occurrences than this
+  baseline_min_age: 60s # a template has no baseline until it is this old...
+  baseline_min_count: 20 # ...and has been seen this many times
+
+  # Gates and context.
+  rate_limit: 10 # global cap on LLM calls per minute — the cost ceiling
+  cache_ttl: 1h # how long an explained template stays quiet
+  context_lines: 30 # recent lines carried with each escalation for the LLM
+
+# --- LLM backend and worker pool (any OpenAI-compatible endpoint; default local Ollama) ---
+llm:
+  base_url: "http://localhost:11434/v1"
+  model: "llama3.2"
+  workers: 2 # pool size; the rate limiter, not the pool, caps cost
+  queue: 64 # escalation channel capacity; full means drop, never block ingest
+  timeout: 30s # bounds ONE attempt (with retries, worst case is (retries+1) x this)
+  max_tokens: 300 # cap per explanation (raise for reasoning models)
+  temperature: 0.1 # low, for consistent parseable output
+  json_mode: true # ask for a JSON object; downgrades once if the server rejects it
+  retries: 1 # extra attempts on transient failures only (timeout, 429, 5xx)
+  backoff: 500ms # base backoff between retries

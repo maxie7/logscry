@@ -1,0 +1,35 @@
+# logscry demo — a tiny, self-contained log stream you can point logscry at.
+#
+#   Terminal 1:  docker compose -f examples/demo/docker-compose.yml up
+#   Terminal 2:  ./bin/logscry --docker-all --llm-model gemma2:2b
+#
+# Two alpine services emit routine traffic a few lines/sec. About 18s in, the
+# `worker` hits ONE real fault (Postgres unreachable) while `api` keeps humming —
+# logscry stays silent on the noise and escalates only the fault. See README.md.
+name: logscry-demo
+
+services:
+  # Steady, healthy request traffic. Never escalates: routine INFO on stdout and
+  # the occasional ERROR on stderr both score below the escalation threshold.
+  api:
+    image: alpine:3.20
+    container_name: api
+    command: ["sh", "/gen-api.sh"]
+    volumes:
+      - ./gen-api.sh:/gen-api.sh:ro
+    environment:
+      INTERVAL: "1" # seconds between lines
+    restart: "no"
+
+  # Routine job traffic, then one genuine fault at tick FAULT_AFTER, then it keeps
+  # running so the stream stays alive while logscry's card lands.
+  worker:
+    image: alpine:3.20
+    container_name: worker
+    command: ["sh", "/gen-worker.sh"]
+    volumes:
+      - ./gen-worker.sh:/gen-worker.sh:ro
+    environment:
+      INTERVAL: "1" # seconds between lines
+      FAULT_AFTER: "18" # emit the FATAL after this many ticks (~seconds)
+    restart: "no"

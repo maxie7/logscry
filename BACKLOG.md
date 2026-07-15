@@ -87,7 +87,7 @@ Repo stays private through M5; flip to public at M6.
       at the home edge → keep following. The cards pane grows from the top, so its home edge
       is the newest card, and selection is keyed by hash so an arrival cannot move it
 - [x] Shorten the subprocess source name to the base name (`proc:myapp`, not
-      `proc:/home/maxie/code/.../myapp`): the full path crowds the stream out at ~100
+      `proc:/home/user/code/.../myapp`): the full path crowds the stream out at ~100
       columns, and it will look bad in the M6 demo GIF
 - [x] Surface the `--docker-tail` history limit (status bar). Nothing tells the user the
       default `100` is all the backlog they get, so an event further back silently never
@@ -97,9 +97,15 @@ Repo stays private through M5; flip to public at M6.
 
 
 ## Epic M6 — Demo, README, go public
-- [ ] `examples/demo`: docker-compose + tiny buggy service (fails on a specific route)
+- [x] `examples/demo`: docker-compose + tiny buggy service (worker hits one FATAL fault
+      ~18s in while the api service stays quiet). Two alpine services, one `docker
+      compose up`; `RECORDING.md` + `docs/demo.tape` for the GIF; `examples/logscry.yaml`
+      annotated config; `CONTRIBUTING.md`
 - [ ] Record demo GIF: trigger fault → card appears; quiet under normal traffic
-- [ ] README: usage, config, architecture (embed the mermaid diagram), demo GIF
+      <!-- manual: run `vhs docs/demo.tape` per RECORDING.md; output to docs/demo.gif -->
+- [x] README: usage, config, architecture (embed the mermaid diagram), demo GIF
+      (placeholder wired to docs/demo.gif). Also documents the v1 known limitations,
+      discharging the two M7 "rides along with the M6 README" riders
 - [ ] Clean up commit history if needed (squash / orphan for a clean public debut)
 - [ ] **Flip repo to PUBLIC**
 - [ ] Enable "Include private contributions" in GitHub settings (keep the green squares)
