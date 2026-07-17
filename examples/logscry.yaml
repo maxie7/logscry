@@ -22,6 +22,13 @@ docker:
   label: [] # ...or those carrying these k=v labels (AND-combined)
   tail: "100" # lines of history fetched per container on attach ("all" for everything)
 
+# --- Multi-line grouping: fold a stack trace / goroutine dump into ONE event ---
+group:
+  # Idle flush. A buffered multi-line event is emitted this long after its last line
+  # even if no new header follows, so ingestion keeps bounded latency and a partial
+  # trace is never held forever. Set to 0 to disable grouping (lines pass through).
+  timeout: 200ms
+
 # --- Scoring: the engine that decides what is worth explaining ---
 score:
   threshold: 1.0 # escalate at or above this summed score

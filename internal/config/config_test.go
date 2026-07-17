@@ -129,3 +129,30 @@ func TestAPIKeyComesFromEnvOnly(t *testing.T) {
 		t.Error("the config file was allowed to carry an api_key")
 	}
 }
+
+// TestGroupTimeout covers the multi-line coalescing knob: a sensible default, a flag
+// override, a rejected negative, and zero (which is allowed and disables grouping).
+func TestGroupTimeout(t *testing.T) {
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Group.Timeout != 200*time.Millisecond {
+		t.Errorf("default group timeout = %v, want 200ms", cfg.Group.Timeout)
+	}
+
+	cfg, err = Load([]string{"--group-timeout", "500ms"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Group.Timeout != 500*time.Millisecond {
+		t.Errorf("group timeout = %v, want 500ms from the flag", cfg.Group.Timeout)
+	}
+
+	if _, err := Load([]string{"--group-timeout", "-1s"}); err == nil {
+		t.Error("a negative group timeout was accepted")
+	}
+	if _, err := Load([]string{"--group-timeout", "0"}); err != nil {
+		t.Errorf("zero group timeout (disable) was rejected: %v", err)
+	}
+}

@@ -34,6 +34,24 @@ type Docker struct {
 	Tail      string   `yaml:"tail"`  // trailing lines fetched per container on attach
 }
 
+// Group tunes multi-line coalescing: continuation lines (stack-trace frames, goroutine
+// dumps, indented output) are folded into the preceding logical line before templating,
+// so a traceback becomes one event instead of one template per frame.
+type Group struct {
+	// Timeout is the idle flush. A buffered multi-line event is emitted this long after
+	// its last line even if no header follows, so ingestion keeps bounded latency and a
+	// partial event is never held forever. Zero disables coalescing (lines pass through).
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// Validate rejects a negative timeout. Zero is allowed and means coalescing is off.
+func (g Group) Validate() error {
+	if g.Timeout < 0 {
+		return fmt.Errorf("group timeout must not be negative")
+	}
+	return nil
+}
+
 // Config is the fully-resolved runtime configuration.
 type Config struct {
 	// Sources / mode.
@@ -45,6 +63,7 @@ type Config struct {
 
 	Score  score.Config `yaml:"score"`
 	Docker Docker       `yaml:"docker"`
+	Group  Group        `yaml:"group"`
 	LLM    llm.Config   `yaml:"llm"`
 
 	// Argv is the subprocess to run, i.e. everything after "--". Not configurable
@@ -58,6 +77,7 @@ func Defaults() Config {
 	return Config{
 		Score:  score.Defaults(),
 		Docker: Docker{Tail: "100"},
+		Group:  Group{Timeout: 200 * time.Millisecond},
 		LLM:    llm.Defaults(),
 	}
 }
@@ -100,6 +120,9 @@ func Load(args []string) (Config, error) {
 	}
 	if err := cfg.LLM.Validate(); err != nil {
 		return Config{}, fmt.Errorf("llm config: %w", err)
+	}
+	if err := cfg.Group.Validate(); err != nil {
+		return Config{}, fmt.Errorf("group config: %w", err)
 	}
 	return cfg, nil
 }
@@ -196,6 +219,11 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 		func(c *Config) *string { return &c.Docker.Tail })
 	b.listVar("docker-label", "follow Docker containers with this k=v label (repeatable, AND-combined)",
 		func(c *Config) *[]string { return &c.Docker.Labels })
+
+	// Multi-line coalescing: fold stack traces / goroutine dumps into one event.
+	b.durationVar("group-timeout", def.Group.Timeout,
+		"idle flush for multi-line grouping; a buffered stack trace is emitted this long after its last line (0 disables grouping)",
+		func(c *Config) *time.Duration { return &c.Group.Timeout })
 
 	// LLM backend and worker pool. The API key is absent on purpose: it is env-only
 	// (LOGSCRY_API_KEY), so it cannot end up in a shell history.
