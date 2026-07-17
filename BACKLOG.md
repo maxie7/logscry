@@ -101,14 +101,12 @@ Repo stays private through M5; flip to public at M6.
       ~18s in while the api service stays quiet). Two alpine services, one `docker
       compose up`; `RECORDING.md` + `docs/demo.tape` for the GIF; `examples/logscry.yaml`
       annotated config; `CONTRIBUTING.md`
-- [ ] Record demo GIF: trigger fault → card appears; quiet under normal traffic
+- [x] Record demo GIF: trigger fault → card appears; quiet under normal traffic
       <!-- manual: run `vhs docs/demo.tape` per RECORDING.md; output to docs/demo.gif -->
 - [x] README: usage, config, architecture (embed the mermaid diagram), demo GIF
       (placeholder wired to docs/demo.gif). Also documents the v1 known limitations,
       discharging the two M7 "rides along with the M6 README" riders
-- [ ] Clean up commit history if needed (squash / orphan for a clean public debut)
-- [ ] **Flip repo to PUBLIC**
-- [ ] Enable "Include private contributions" in GitHub settings (keep the green squares)
+- [x] **Flip repo to PUBLIC**
 
 ## Epic M7 — Post-launch (after the repo is public)
 Deferred work, not a v1 blocker. Nothing here gates M6.
