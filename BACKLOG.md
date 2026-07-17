@@ -116,7 +116,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       de-anonymize the response (k8sgpt does the same). Default off. Local Ollama needs none, which is
       why this is not a v1 blocker — but it is the thing that makes a cloud provider acceptable
 - [ ] Streaming responses (the seam is `chatRequest.stream` + the decode in `call`); v1 is non-streaming
-- [ ] Multiline / stack-trace grouping: fold a traceback into ONE template instead of one per frame.
+- [x] Multiline / stack-trace grouping: fold a traceback into ONE template instead of one per frame.
       Found in M4 live testing: a Python FastAPI traceback exploded into ~40 separate templates, each
       a "novel" frame, which is exactly the noise this tool exists to suppress. v1 templates one line
       at a time by design; grouping needs a continuation heuristic (indent / no-timestamp / language

@@ -79,13 +79,24 @@ func run(ctx context.Context, args []string) error {
 		}
 	}()
 
+	// Fold multi-line events (stack traces, goroutine dumps) into one logical line
+	// before templating, so a traceback becomes one template instead of one per frame.
+	// A standalone goroutine owns the coalescer's buffer state, so the concurrency model
+	// is unchanged. Timeout 0 disables it: lines pass straight through.
+	grouped := lines
+	if cfg.Group.Timeout > 0 {
+		g := make(chan model.LogLine, 1024)
+		go pipeline.Coalesce(ctx, lines, g, cfg.Group.Timeout)
+		grouped = g
+	}
+
 	escalations, explanations := startLLM(ctx, cfg)
 	sc := score.New(cfg.Score, escalations)
 
 	if term.Mode == tui.ModePlain {
-		return runPlain(ctx, lines, errs, sc, escalations, explanations, cfg.ExplainDryRun)
+		return runPlain(ctx, grouped, errs, sc, escalations, explanations, cfg.ExplainDryRun)
 	}
-	return runTUI(ctx, lines, errs, term, sc, escalations, explanations, cfg)
+	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, cfg)
 }
 
 // startLLM builds the LLM stage: the escalation channel the scorer emits on, and the

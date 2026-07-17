@@ -193,10 +193,13 @@ A full annotated config lives at [`examples/logscry.yaml`](examples/logscry.yaml
 
 ## Known limitations (v1)
 
-- **Multi-line / stack-trace grouping is not done in v1.** logscry templates one line at
-  a time, so a Python or Java traceback becomes several templates rather than one grouped
-  event. Single-line faults (panics with a `file:line`, connection errors) are the sweet
-  spot today; multi-line grouping is planned.
+- **Multi-line grouping is heuristic.** logscry folds stack traces and goroutine dumps
+  into one event before templating — Python, Java, and Go traces each collapse to a
+  single template, so a traceback no longer explodes into dozens of "novel" frames. The
+  heuristic (indentation, frame markers, language cues) errs toward under-grouping, so an
+  unusual continuation style may still split. A buffered event is flushed after
+  `--group-timeout` (`group.timeout`, default `200ms`) of idle; set it to `0` to disable
+  grouping entirely.
 - **`--docker-tail` defaults to 100 lines** of history per container on attach. An event
   further back than that won't appear until it recurs — use `--docker-tail all` for the
   full backlog.
