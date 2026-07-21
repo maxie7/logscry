@@ -117,9 +117,14 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       enough — `go install .../logscry@latest` never runs the Makefile, so it would report "dev";
       BuildInfo is what makes that install path report the real tag. Checked before config validation,
       so it prints even with a missing or broken config
-- [ ] Anonymization flag: mask values before sending to a REMOTE backend, with a reversible map to
+- [x] Anonymization flag: mask values before sending to a REMOTE backend, with a reversible map to
       de-anonymize the response (k8sgpt does the same). Default off. Local Ollama needs none, which is
-      why this is not a v1 blocker — but it is the thing that makes a cloud provider acceptable
+      why this is not a v1 blocker — but it is the thing that makes a cloud provider acceptable.
+      Reversible, type-tagged (`<IP_1>`/`<HOST_1>`/…), per-request in-memory map; masks at the LLM
+      boundary only (pipeline/TUI keep real values), restores all three response fields, and FAILS
+      CLOSED — a masker error skips the escalation rather than sending plaintext. Bare hostnames are
+      masked only on private/infra suffixes (public TLDs would eat Go module paths in stack traces);
+      a startup notice fires when a non-local `--llm-url` is used without masking
 - [ ] Streaming responses (the seam is `chatRequest.stream` + the decode in `call`); v1 is non-streaming
 - [x] Multiline / stack-trace grouping: fold a traceback into ONE template instead of one per frame.
       Found in M4 live testing: a Python FastAPI traceback exploded into ~40 separate templates, each
