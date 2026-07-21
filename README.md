@@ -183,10 +183,17 @@ Key flags:
 | `--rate-limit <n>` | `10` | Global cap on LLM calls per minute (the cost cap) |
 | `--explain-dry-run` | off | Show what *would* escalate; build no LLM stage at all |
 | `--plain` | auto | Plain line output instead of the TUI |
+| `--version` | — | Print the version and exit |
 
 `--explain-dry-run` is the way to calibrate thresholds and to run in CI: it surfaces
 every would-be escalation and, crucially, builds no backend and no worker pool — so no
 request *can* be made.
+
+**Reasoning models need more `--llm-max-tokens`.** A thinking model (e.g. `qwen3`,
+`deepseek-r1`) can spend the whole default 300-token budget on its chain of thought and
+return **empty** content with `finish_reason: length` — the escalation shows as
+unavailable rather than explained. Raise `--llm-max-tokens` (say `1024`) for such models.
+Non-reasoning instruct models like the default `gemma2:2b` are fine at 300.
 
 A full annotated config lives at [`examples/logscry.yaml`](examples/logscry.yaml). Run
 `./bin/logscry -h` for every flag.
@@ -205,7 +212,8 @@ A full annotated config lives at [`examples/logscry.yaml`](examples/logscry.yaml
   full backlog.
 - **Reasoning models need a higher `--llm-max-tokens`.** A thinking model (e.g. `qwen3`,
   `deepseek-r1`) can spend the whole default budget on its chain of thought and return
-  empty content. Prefer a plain instruct model such as `gemma2:2b`, or raise the cap.
+  empty content with `finish_reason: length`. Prefer a plain instruct model such as
+  `gemma2:2b`, or raise the cap (see [Configuration](#configuration)).
 
 ## License
 

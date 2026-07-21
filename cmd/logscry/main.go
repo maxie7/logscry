@@ -54,6 +54,11 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// --version reports and exits before any source, backend, or TUI is constructed.
+	if cfg.Version {
+		fmt.Println("logscry", versionString())
+		return nil
+	}
 	sources, stdinOnly := sources(cfg)
 
 	term := tui.Resolve(cfg.Plain)

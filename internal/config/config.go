@@ -54,6 +54,11 @@ func (g Group) Validate() error {
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
+	// Version is set by --version. It short-circuits Load (see below), so it never comes
+	// from the file and is never validated — asking for the version must work even when
+	// the config is missing or invalid.
+	Version bool `yaml:"-"`
+
 	// Sources / mode.
 	Plain bool `yaml:"plain"`
 	// ExplainDryRun surfaces escalations instead of sending them to a model. It is how
@@ -92,11 +97,22 @@ func Load(args []string) (Config, error) {
 
 	cfg := Defaults()
 	fs := flag.NewFlagSet("logscry", flag.ContinueOnError)
+	// --config and --version are meta-flags controlling Load's flow rather than runtime
+	// tuning, so they are registered here instead of the binder — but on the same flag
+	// set, so -h still lists them alongside everything else.
 	path := fs.String("config", "", "path to a logscry.yaml config file")
+	showVersion := fs.Bool("version", false, "print version and exit")
 	b := bind(fs, cfg)
 
 	if err := fs.Parse(flagArgs); err != nil {
 		return Config{}, err
+	}
+
+	// --version wins before anything can fail: no file is read and nothing is validated,
+	// so `logscry --version` reports the version even with a missing or broken config.
+	if *showVersion {
+		cfg.Version = true
+		return cfg, nil
 	}
 
 	if *path != "" {

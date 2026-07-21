@@ -110,6 +110,13 @@ Repo stays private through M5; flip to public at M6.
 
 ## Epic M7 — Post-launch (after the repo is public)
 Deferred work, not a v1 blocker. Nothing here gates M6.
+- [x] `--version` flag: the binary could not report its own version — `logscry --version` failed
+      with "flag provided but not defined: -version". Resolved hybrid: an `-X main.version` ldflags
+      stamp (git-describe, injected by `make build`) overrides; else the module version from
+      `debug.ReadBuildInfo()` (ignoring the "(devel)" placeholder); else "dev". ldflags alone is not
+      enough — `go install .../logscry@latest` never runs the Makefile, so it would report "dev";
+      BuildInfo is what makes that install path report the real tag. Checked before config validation,
+      so it prints even with a missing or broken config
 - [ ] Anonymization flag: mask values before sending to a REMOTE backend, with a reversible map to
       de-anonymize the response (k8sgpt does the same). Default off. Local Ollama needs none, which is
       why this is not a v1 blocker — but it is the thing that makes a cloud provider acceptable
@@ -120,7 +127,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       at a time by design; grouping needs a continuation heuristic (indent / no-timestamp / language
       cues) in `pipeline`. Name it as a known v1 limitation in the README (rides along with the M6
       README task)
-- [ ] README: document `--llm-max-tokens` for **reasoning** models. Found in live testing: a thinking
+- [x] README: document `--llm-max-tokens` for **reasoning** models. Found in live testing: a thinking
       model spends the whole budget on its chain of thought and returns EMPTY content with
       `finish_reason: length`. The error now names the flag, but the default 300 is too low for such
       models and the README should say so (rides along with the M6 README task)
