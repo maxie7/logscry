@@ -260,6 +260,11 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 		func(c *Config) *bool { return &c.LLM.JSONMode })
 	b.intVar("llm-retries", l.Retries, "extra attempts on a transient LLM failure (timeout, 429, 5xx)",
 		func(c *Config) *int { return &c.LLM.Retries })
+	b.boolVar("llm-anonymize", l.Anonymize,
+		"mask sensitive values (IPs, emails, tokens, hostnames) before sending to the LLM (default off)",
+		func(c *Config) *bool { return &c.LLM.Anonymize })
+	b.listVar("llm-anonymize-suffix", "extra private hostname suffix to mask as a bare host (repeatable)",
+		func(c *Config) *[]string { return &c.LLM.AnonymizeSuffixes })
 
 	return b.apply
 }

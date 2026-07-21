@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -99,6 +100,12 @@ func run(ctx context.Context, args []string) error {
 	sc := score.New(cfg.Score, escalations)
 
 	if term.Mode == tui.ModePlain {
+		// stderr survives in plain mode; in the TUI it would be wiped by the alternate
+		// screen, so that path surfaces the same notice in the status bar (see runTUI).
+		if host := remoteWarnHost(cfg); host != "" {
+			fmt.Fprintf(os.Stderr, "logscry: raw log lines will be sent to %s; "+
+				"pass --llm-anonymize to mask IPs, emails, tokens, and hostnames first\n", host)
+		}
 		return runPlain(ctx, grouped, errs, sc, escalations, explanations, cfg.ExplainDryRun)
 	}
 	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, cfg)
@@ -124,7 +131,14 @@ func startLLM(ctx context.Context, cfg config.Config) (chan score.EscalationRequ
 	// blocking on the way out.
 	explanations := make(chan model.Explanation, cfg.LLM.Queue+cfg.LLM.Workers)
 
-	go llm.Run(ctx, llm.NewOpenAICompatible(cfg.LLM), cfg.LLM, escalations, explanations)
+	// Default off ⇒ the exact unwrapped backend as before. With --llm-anonymize, the
+	// decorator masks the outgoing payload and restores the answer at the LLM boundary,
+	// leaving the pipeline, template state, and TUI on the real values (see internal/llm).
+	var backend llm.Backend = llm.NewOpenAICompatible(cfg.LLM)
+	if cfg.LLM.Anonymize {
+		backend = llm.NewAnonymizing(backend, cfg.LLM.AnonymizeSuffixes...)
+	}
+	go llm.Run(ctx, backend, cfg.LLM, escalations, explanations)
 	return escalations, explanations
 }
 
@@ -170,10 +184,43 @@ func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, 
 		Explanations: explanations,
 	})
 	return term.Run(ctx, snaps, errs, tui.Options{
-		ExplainDryRun: cfg.ExplainDryRun,
-		Explain:       escalations != nil,
-		DockerTail:    cfg.Docker.Tail,
+		ExplainDryRun:  cfg.ExplainDryRun,
+		Explain:        escalations != nil,
+		DockerTail:     cfg.Docker.Tail,
+		RemoteWarnHost: remoteWarnHost(cfg),
 	})
+}
+
+// remoteWarnHost returns the host logscry is about to stream raw logs to, or "" when there
+// is nothing to warn about: masking is on, the endpoint is local, or dry-run builds no
+// backend and so sends nothing at all.
+func remoteWarnHost(cfg config.Config) string {
+	if cfg.ExplainDryRun || cfg.LLM.Anonymize {
+		return ""
+	}
+	host, remote := remoteHost(cfg.LLM.BaseURL)
+	if !remote {
+		return ""
+	}
+	return host
+}
+
+// remoteHost reports a base URL's host and whether it is off-box. A URL we cannot parse is
+// treated as local: staying quiet beats warning wrongly about a host we could not read.
+func remoteHost(baseURL string) (string, bool) {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	host := u.Hostname()
+	switch host {
+	case "localhost", "127.0.0.1", "::1", "0.0.0.0", "":
+		return host, false
+	}
+	if strings.HasSuffix(host, ".localhost") {
+		return host, false
+	}
+	return host, true
 }
 
 // runPlain is the non-TUI escape hatch: one line per event, straight to unbuffered

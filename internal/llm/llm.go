@@ -79,6 +79,17 @@ type Config struct {
 	Retries int           `yaml:"retries"`
 	Backoff time.Duration `yaml:"backoff"`
 
+	// Anonymize masks sensitive values (IPs, emails, tokens, hostnames, home-dir
+	// usernames) out of the outgoing payload and restores them in the answer. Default off:
+	// a local Ollama needs none of it, and with it off the payload is exactly what it was
+	// before the feature existed. It lives under llm: because it is a property of what the
+	// LLM stage sends, sitting with the endpoint and the key.
+	Anonymize bool `yaml:"anonymize"`
+	// AnonymizeSuffixes extends the bare-hostname allowlist with site-specific private
+	// suffixes (e.g. "acmecloud"), for operators whose infra hosts are not covered by the
+	// built-in internal/local/svc/... set. Empty by default.
+	AnonymizeSuffixes []string `yaml:"anonymize_suffixes"`
+
 	// HTTPClient is the transport. Nil means one built from Timeout; the tests inject
 	// their own so no test ever touches the network.
 	HTTPClient *http.Client `yaml:"-"`
