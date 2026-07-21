@@ -156,3 +156,24 @@ func TestGroupTimeout(t *testing.T) {
 		t.Errorf("zero group timeout (disable) was rejected: %v", err)
 	}
 }
+
+// TestVersionFlag: --version is bound and parsed like any other flag, and it short-circuits
+// before the config file is read or validated — so it works even with a broken --config.
+func TestVersionFlag(t *testing.T) {
+	cfg, err := Load([]string{"--version"})
+	if err != nil {
+		t.Fatalf("--version returned an error: %v", err)
+	}
+	if !cfg.Version {
+		t.Error("cfg.Version = false, want true from --version")
+	}
+
+	// The short-circuit must precede loadFile: a nonexistent config is not an error here.
+	cfg, err = Load([]string{"--version", "--config", "/nonexistent.yaml"})
+	if err != nil {
+		t.Fatalf("--version with a missing config errored: %v", err)
+	}
+	if !cfg.Version {
+		t.Error("cfg.Version = false, want true even with a bad --config")
+	}
+}

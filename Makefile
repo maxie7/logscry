@@ -9,13 +9,19 @@ CROSS_DIR   := $(BIN_DIR)/cross
 # linux/darwin x amd64/arm64
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
+# Stamp the version into the binary. `go install ...@latest` picks it up from BuildInfo
+# instead, so this is an explicit override for local/release builds (and the nicest dev
+# string). Override with `make build VERSION=...`.
+VERSION := $(shell git describe --tags --always --dirty)
+LDFLAGS := -ldflags "-X main.version=$(VERSION)"
+
 .PHONY: all build run test lint fmt vet cross clean
 
 all: build
 
 build:
 	@mkdir -p $(BIN_DIR)
-	go build -o $(BIN_DIR)/$(BINARY) $(PKG)
+	go build $(LDFLAGS) -o $(BIN_DIR)/$(BINARY) $(PKG)
 
 run: build
 	./$(BIN_DIR)/$(BINARY)
@@ -40,7 +46,7 @@ cross:
 		os=$${platform%/*}; arch=$${platform#*/}; \
 		out=$(CROSS_DIR)/$(BINARY)-$$os-$$arch; \
 		echo "building $$out"; \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -o $$out $(PKG) || exit 1; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build $(LDFLAGS) -o $$out $(PKG) || exit 1; \
 	done
 
 clean:
