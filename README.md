@@ -220,6 +220,12 @@ domain), bare hostnames on **private/infra suffixes** (`.internal`, `.local`, `.
 `/home/<user>` and `/Users/<user>` paths. If masking a payload fails for any reason, that
 escalation is **skipped** (the card says so) rather than sent in the clear.
 
+An escalation carries both the raw line and the pipeline's template for it, and that
+template has already had numbers and IDs masked (`<NUM>`, `<IP>`). Secrets are recognized in
+both forms, but one value can end up with two placeholders — `<HOST_1>` from the raw line and
+`<HOST_2>` from the pre-masked template — which slightly weakens the "the model sees one host
+recur" signal. Cosmetic, not a leak.
+
 **This is best-effort risk reduction, not a guarantee.** Free-text log messages can
 contain anything, and logscry only masks what it recognizes. Bare **public** hostnames in
 prose (`could not resolve db.acme.com`) are deliberately left alone — masking every dotted
