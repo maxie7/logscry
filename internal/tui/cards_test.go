@@ -109,6 +109,27 @@ func TestCardStatesRender(t *testing.T) {
 			wantNot:  "explaining…",
 			headline: "panic: nil map write in handler <NUM>",
 		},
+		// A streamed summary is promoted to the headline the moment it completes, but the
+		// card must keep saying it is still working — see TestStreamingCardStaysHonest.
+		"streaming": {
+			ex: &model.Explanation{
+				Hash: "aaa", State: model.ExplainPending, Summary: "A handler wrote to a nil map.",
+			},
+			want:     "explaining…",
+			wantNot:  "explanation unavailable",
+			headline: "A handler wrote to a nil map.",
+		},
+		// Salvaged from a stream that died: the fields are real, the answer is short, and
+		// the card says so rather than passing it off as the model's finished verdict.
+		"truncated": {
+			ex: &model.Explanation{
+				Hash: "aaa", State: model.ExplainDone, Truncated: true,
+				Summary: "A handler wrote to a nil map.",
+			},
+			want:     "answer incomplete",
+			wantNot:  "explaining…",
+			headline: "A handler wrote to a nil map.",
+		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -125,6 +146,35 @@ func TestCardStatesRender(t *testing.T) {
 				t.Errorf("headline = %q, want %q", got, tc.headline)
 			}
 		})
+	}
+}
+
+// TestStreamingCardStaysHonest: while an answer streams in, the card shows what has arrived
+// AND still says "explaining…" at the same time.
+//
+// That pairing is the whole point. A card rendering a partial answer while reading as
+// finished is the same dishonesty as an unbadged truncation: the summary is there, but the
+// model has not committed to the cause or the check yet, and the status line is the only
+// thing telling the reader so.
+func TestStreamingCardStaysHonest(t *testing.T) {
+	streaming := &model.Explanation{
+		Hash: "aaa", State: model.ExplainPending,
+		Summary:     "A handler wrote to a nil map.",
+		LikelyCause: "The map was never initialised.",
+	}
+	m := apply(t, explainModel(t), escalationSnapshot(streaming))
+	focused, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	opened, _ := focused.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	view := opened.(Model).View()
+
+	for _, want := range []string{
+		"A handler wrote to a nil map.",  // the summary, already promoted to the headline
+		"The map was never initialised.", // the cause, as soon as that field completed
+		"explaining…",                    // and still plainly unfinished
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("a streaming card does not show %q:\n%s", want, view)
+		}
 	}
 }
 

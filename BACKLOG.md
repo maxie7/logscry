@@ -125,7 +125,16 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       CLOSED — a masker error skips the escalation rather than sending plaintext. Bare hostnames are
       masked only on private/infra suffixes (public TLDs would eat Go module paths in stack traces);
       a startup notice fires when a non-local `--llm-url` is used without masking
-- [ ] Streaming responses (the seam is `chatRequest.stream` + the decode in `call`); v1 is non-streaming
+- [x] Streaming responses (the seam was `chatRequest.stream` + the decode in `call`); v1 was non-streaming.
+      Default OFF: provider support for `stream` alongside `response_format` varies, and a regression in
+      the explanation path is worse than a card that feels slower — a 400 drops streaming first, keeping
+      json mode. Progressive display is a strict SUBSET of the existing parser (completed JSON fields
+      only), so it can never drift from the final authoritative answer, and a half-written field, a fence
+      or a preamble can never reach a card. Updates fire on field completion — ≤3 per escalation, no
+      timer — and DROP rather than block, because a blocking send would let a busy renderer stall the
+      read until the deadline fired and badge a good answer incomplete. A stream that dies is salvaged
+      and marked `answer incomplete`; a tear after the model closed its JSON is not a tear at all;
+      `finish_reason: length` stays a clean end and keeps its `--llm-max-tokens` diagnostic
 - [x] Multiline / stack-trace grouping: fold a traceback into ONE template instead of one per frame.
       Found in M4 live testing: a Python FastAPI traceback exploded into ~40 separate templates, each
       a "novel" frame, which is exactly the noise this tool exists to suppress. v1 templates one line

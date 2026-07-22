@@ -258,6 +258,9 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 		func(c *Config) *float64 { return &c.LLM.Temperature })
 	b.boolVar("llm-json-mode", l.JSONMode, "ask the provider for a JSON object (disable for endpoints that reject response_format)",
 		func(c *Config) *bool { return &c.LLM.JSONMode })
+	b.boolVar("llm-stream", l.Stream,
+		"stream the answer so card fields appear as the model completes them (default off)",
+		func(c *Config) *bool { return &c.LLM.Stream })
 	b.intVar("llm-retries", l.Retries, "extra attempts on a transient LLM failure (timeout, 429, 5xx)",
 		func(c *Config) *int { return &c.LLM.Retries })
 	b.boolVar("llm-anonymize", l.Anonymize,

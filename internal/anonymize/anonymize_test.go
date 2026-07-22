@@ -223,6 +223,27 @@ func TestPreTemplatedSecretsMasked(t *testing.T) {
 	}
 }
 
+// TestTrimDanglingPlaceholder: text salvaged from a stream that died can stop mid-token,
+// leaving "<IP" — a mangled half of a value we hold the real version of and simply never
+// reached the end of. Cutting it beats rendering it; complete text must be left alone.
+func TestTrimDanglingPlaceholder(t *testing.T) {
+	cases := map[string]string{
+		"check the route to <IP":    "check the route to",
+		"check the route to <IP_":   "check the route to",
+		"check the route to <IP_1":  "check the route to",
+		"the host is <":             "the host is",
+		"check the route to <IP_1>": "check the route to <IP_1>", // complete: untouched
+		"nothing to trim here":      "nothing to trim here",
+		"a < b in ordinary prose":   "a < b in ordinary prose",
+		"restored 10.0.0.5 already": "restored 10.0.0.5 already",
+	}
+	for in, want := range cases {
+		if got := TrimDanglingPlaceholder(in); got != want {
+			t.Errorf("TrimDanglingPlaceholder(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestExtraHostSuffixes: a site-specific suffix passed to New extends the bare-host
 // allowlist without disturbing the defaults.
 func TestExtraHostSuffixes(t *testing.T) {

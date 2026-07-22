@@ -89,5 +89,10 @@ type Explanation struct {
 	// Err is a short reason when State is ExplainFailed, shown on the card. It is
 	// built only from status codes and provider messages — never from the API key.
 	Err string
-	At  time.Time
+	// Truncated marks an answer salvaged from a response stream that ended before the
+	// model finished. The fields are genuine but the answer is short, and the card must
+	// say so: a half-written "likely cause" that renders like a finished one is advice
+	// someone will act on believing the model got to the end of it.
+	Truncated bool
+	At        time.Time
 }

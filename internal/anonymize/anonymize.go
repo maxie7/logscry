@@ -91,6 +91,21 @@ func (m *Mapper) Restore(s string) string {
 	return out
 }
 
+// danglingPlaceholder matches an INCOMPLETE placeholder left at the very end of a string —
+// "<", "<IP", "<IP_1" — the shape produced when text is cut off mid-token.
+var danglingPlaceholder = regexp.MustCompile(`<[A-Z]*(?:_\d*)?$`)
+
+// TrimDanglingPlaceholder removes a partial placeholder from the end of s.
+//
+// It exists for salvaged answers only. A field that decoded as complete JSON cannot end
+// mid-placeholder — its closing quote proves the value is whole — but a stream that died is
+// salvaged through the prose fallback, which is raw text and can stop anywhere. Restoring
+// that leaves the user reading "check <IP", a mangled fragment of a value we hold the real
+// version of and simply failed to reach the end of.
+func TrimDanglingPlaceholder(s string) string {
+	return strings.TrimRight(danglingPlaceholder.ReplaceAllString(s, ""), " ")
+}
+
 // apply replaces detector d's target group everywhere in s. FindAllStringSubmatchIndex is
 // used rather than ReplaceAllStringFunc because some detectors mask only a SUBMATCH (the
 // user:pass inside a URL, the token after "Bearer") while leaving the surrounding context —

@@ -156,8 +156,11 @@ func (m Model) whyText(ev pipeline.Event) string {
 // cards pane is ~40 wide, and spending 15 of them on the word "explaining…" would leave
 // the headline too narrow to say what had actually happened.
 func (m Model) cardHeadline(ev pipeline.Event) string {
+	// Any summary beats the template, including one still being streamed in — the whole
+	// point of streaming is that it lands before the rest of the answer does. The status
+	// line, not this, is what says whether the model has finished (see cardStatus).
 	ex := ev.Explanation
-	if ex != nil && ex.State == model.ExplainDone && ex.Summary != "" {
+	if ex != nil && ex.Summary != "" {
 		return ex.Summary
 	}
 	return ev.Pattern
@@ -180,9 +183,14 @@ func (m Model) cardMeta(ev pipeline.Event) string {
 }
 
 // cardStatus is where this card's explanation has got to: waiting on the model, or never
-// getting one. It is empty for an answered card — the answer IS the headline by then —
+// getting one. It is empty for a finished card — the answer IS the headline by then —
 // and empty when no model was ever attached, because "unavailable" would be a lie about
 // a question nobody asked.
+//
+// While an answer streams in, this keeps saying "explaining…" even though the headline
+// already shows a summary. That pairing is deliberate: a card that renders a partial answer
+// while reading as finished is the same dishonesty as an unbadged truncation. Only a
+// terminal update clears it.
 func cardStatus(ev pipeline.Event) string {
 	if ev.Explanation == nil {
 		return ""
@@ -192,6 +200,11 @@ func cardStatus(ev pipeline.Event) string {
 		return "explanation unavailable"
 	case model.ExplainPending:
 		return "explaining…"
+	case model.ExplainDone:
+		if ev.Explanation.Truncated {
+			return "answer incomplete"
+		}
+		return ""
 	default:
 		return ""
 	}
@@ -210,7 +223,9 @@ func (m Model) cardDetail(ev pipeline.Event, width int, indent string) []string 
 
 	if ex := ev.Explanation; ex != nil {
 		switch ex.State {
-		case model.ExplainDone:
+		// Pending shares this arm so a streamed cause and check appear the moment each
+		// completes, rather than all three fields landing at once at the end.
+		case model.ExplainDone, model.ExplainPending:
 			field("cause", ex.LikelyCause)
 			field("check", ex.Suggestion)
 		case model.ExplainFailed:
@@ -218,7 +233,6 @@ func (m Model) cardDetail(ev pipeline.Event, width int, indent string) []string 
 			// — "connection refused" and "bad API key" are both fixable, and neither is
 			// distinguishable from "the tool is broken" if the card just says nothing.
 			field("failed", ex.Err)
-		case model.ExplainPending:
 		}
 	}
 	field("seen", m.seenText(ev))

@@ -26,6 +26,15 @@ type ExplainRequest struct {
 	Template  string
 	Count     int
 	FirstSeen time.Time
+
+	// OnPartial, when set, receives the explanation as it fills in: a backend that streams
+	// calls it each time a FIELD completes, never mid-value. Optional — a backend that does
+	// not stream simply never calls it, which is why this is a field here rather than a
+	// change to the Backend interface.
+	//
+	// It is called synchronously, on the goroutine driving Explain, and must not block:
+	// parking it would stall the response read (see pool.explain).
+	OnPartial func(ExplainResponse) `yaml:"-"`
 }
 
 // ExplainResponse is the structured explanation returned by a Backend.
@@ -33,6 +42,12 @@ type ExplainResponse struct {
 	Summary     string // one-line "what happened"
 	LikelyCause string
 	Suggestion  string // what to check / try
+
+	// Truncated marks an answer salvaged from a stream that died before the model closed
+	// its JSON. The fields are real but the answer is short, and the card says so: rendering
+	// a half-formed "likely cause" as if it were the whole verdict is how someone acts on
+	// advice the model never finished giving.
+	Truncated bool
 }
 
 // Backend is a pluggable LLM provider. Implementations must be safe for
@@ -73,6 +88,12 @@ type Config struct {
 	// it; an unknown OpenAI-compatible server may reject it, so the backend downgrades
 	// once and remembers (see OpenAICompatible.Explain). Parsing never relies on it.
 	JSONMode bool `yaml:"json_mode"`
+	// Stream asks the provider to send the answer as Server-Sent Events, so the card fills
+	// in field by field instead of appearing all at once. Default OFF: provider behaviour
+	// around stream + response_format varies, and a regression in the explanation path is
+	// worse than a card that feels slower. It changes only WHEN fields appear — the final
+	// explanation is identical, parsed by the same code either way.
+	Stream bool `yaml:"stream"`
 	// Retries is the number of EXTRA attempts, made only for transient failures
 	// (timeout, 429, 5xx, network). A 4xx is never retried: a bad key or a bad model
 	// name will fail identically forever, and hammering it is how a retry storm starts.

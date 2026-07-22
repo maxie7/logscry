@@ -180,6 +180,27 @@ func TestAnonymizeFlag(t *testing.T) {
 	}
 }
 
+// TestStreamFlag: --llm-stream is bound and OFF by default. The default is the point —
+// provider behaviour around stream + response_format varies, so the release that introduces
+// it must not change what anyone's explanations look like unless they ask.
+func TestStreamFlag(t *testing.T) {
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.Stream {
+		t.Error("streaming is on by default; it must be opt-in")
+	}
+
+	cfg, err = Load([]string{"--llm-stream"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LLM.Stream {
+		t.Error("--llm-stream did not enable streaming")
+	}
+}
+
 // TestVersionFlag: --version is bound and parsed like any other flag, and it short-circuits
 // before the config file is read or validated — so it works even with a broken --config.
 func TestVersionFlag(t *testing.T) {

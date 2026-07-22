@@ -250,6 +250,12 @@ func runPlain(ctx context.Context, lines <-chan model.LogLine, errs <-chan error
 				explanations = nil // the pool has drained: no answers are outstanding
 				continue
 			}
+			// Progressive updates are a TUI affordance: plain mode has no card to rewrite,
+			// so a streamed answer would print the same explanation three times, each a
+			// little more complete. Only the terminal result is a line worth emitting.
+			if ex.State == model.ExplainPending {
+				continue
+			}
 			if _, err := fmt.Fprint(os.Stdout, explained(ex)); err != nil {
 				return err
 			}
@@ -301,7 +307,14 @@ func explained(ex model.Explanation) string {
 		return fmt.Sprintf("EXPLANATION UNAVAILABLE: %s | %s\n", ex.Pattern, ex.Err)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "EXPLAINED: %s\n", ex.Pattern)
+	if ex.Truncated {
+		// The stream died before the model finished. The fields below are real but the
+		// answer is short, and saying so is the difference between a partial verdict and
+		// one someone acts on believing it was complete.
+		fmt.Fprintf(&b, "EXPLAINED (INCOMPLETE): %s\n", ex.Pattern)
+	} else {
+		fmt.Fprintf(&b, "EXPLAINED: %s\n", ex.Pattern)
+	}
 	fmt.Fprintf(&b, "  what:  %s\n", ex.Summary)
 	if ex.LikelyCause != "" {
 		fmt.Fprintf(&b, "  cause: %s\n", ex.LikelyCause)
