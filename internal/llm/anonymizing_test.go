@@ -53,6 +53,12 @@ func backendTo(srv *httptest.Server, anonymize bool) llm.Backend {
 
 // secretRequest is a request whose trigger and context carry every deterministic-shape
 // value the anonymizer promises to mask.
+//
+// Template deliberately carries PRE-TEMPLATED secrets — the shapes the pipeline masker
+// leaves behind (sk-abcdefghij<NUM>XYZ, AKIAIOSFODNN<NUM>EXAMPLE), not pristine ones. That
+// field is the one that leaked in manual wire testing: it reaches the anonymizer already
+// rewritten, so a detector anchored on an unbroken run of [A-Za-z0-9] misses the secret and
+// the surviving characters go out in the clear.
 func secretRequest() llm.ExplainRequest {
 	return llm.ExplainRequest{
 		Trigger: model.LogLine{
@@ -64,7 +70,7 @@ func secretRequest() llm.ExplainRequest {
 			"request 550e8400-e29b-41d4-a716-446655440000 to db-01.acme.internal",
 			"loaded /home/maxie/go/pkg/mod/x",
 		},
-		Template: "auth failed for <STR> from <IP>",
+		Template: "auth failed for <STR> from <IP> key sk-abcdefghij<NUM>XYZ id AKIAIOSFODNN<NUM>EXAMPLE",
 		Count:    3,
 	}
 }
@@ -90,6 +96,11 @@ func TestAnonymizeHeadlineNoLiteralsOnTheWire(t *testing.T) {
 		"550e8400-e29b-41d4-a716-446655440000",
 		"db-01.acme.internal",
 		"maxie", // the home-dir username, from both Source and a context line
+		// The pre-templated remnants from the Template field. Asserting on the surviving
+		// fragment rather than the whole token is the point: the pipeline already ate the
+		// digits, and it is these leftovers that went over the wire.
+		"abcdefghij",
+		"IOSFODNN",
 	}
 	for _, s := range secrets {
 		if strings.Contains(sent, s) {

@@ -14,10 +14,12 @@
 //
 // Ordering matters for the same reason it does in the pipeline masker: an email contains a
 // host, a URL contains a host and maybe credentials, an IP is digits-and-dots a host regex
-// would grab. The more specific detector runs first (see detectorSpecs). Every detector's
-// character classes exclude '<' and '>', so a placeholder like <USER_1> can never be
-// re-matched by a later detector or by the fail-closed re-scan — that inertness is what
-// keeps a home path in a Go stack trace from tripping the verifier (see Mask).
+// would grab. The more specific detector runs first (see buildDetectors). No detector can
+// match a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is safe to run
+// sequentially and the fail-closed re-scan cannot fire on its own output; that inertness is
+// what keeps a home path in a Go stack trace from tripping the verifier (see Mask).
+//
+// The one deliberate exception is the pipeline's own placeholders: see pipelinePH.
 package anonymize
 
 import (
@@ -187,13 +189,15 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 
 	return []detector{
 		// 1. JWT — three base64url segments; the header always starts "eyJ".
-		{tagToken, regexp.MustCompile(`\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`), 0, true},
-		// 2. AWS access-key id — a fixed, distinctive prefix.
-		{tagToken, regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`), 0, true},
+		{tagToken, regexp.MustCompile(
+			`\beyJ` + tolerant(jwtChar) + `\.eyJ` + tolerant(jwtChar) + `\.` + tolerant(jwtChar)), 0, true},
+		// 2. AWS access-key id — a fixed, distinctive prefix and exactly 16 more characters.
+		{tagToken, regexp.MustCompile(
+			`\b(?:AKIA|ASIA)(?:[0-9A-Z]{16}\b|` + mangled(`[0-9A-Z]`) + `)`), 0, true},
 		// 3a. Bearer token — mask the credential, not the word "Bearer".
-		{tagToken, regexp.MustCompile(`(?i)\bbearer\s+([A-Za-z0-9._~+/=-]+)`), 1, true},
+		{tagToken, regexp.MustCompile(`(?i)\bbearer\s+(` + tolerant(`[A-Za-z0-9._~+/=-]`) + `)`), 1, true},
 		// 3b. sk- style API keys (OpenAI and friends).
-		{tagToken, regexp.MustCompile(`\bsk-[A-Za-z0-9]{16,}\b`), 0, true},
+		{tagToken, regexp.MustCompile(`\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`), 0, true},
 		// 4. Credentials embedded in a URL / connection string: scheme://user:pass@host.
 		//    Runs before host and email so "@host" survives for the host detector and
 		//    "user:pass@host" is not misread as an email.
@@ -216,6 +220,49 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     so /home/<USER_1>/go/pkg/mod/... stays useful in a stack trace.
 		{tagUser, regexp.MustCompile(`(?:/home/|/Users/)([^/<>\s:]+)`), 1, true},
 	}
+}
+
+// pipelinePH matches a placeholder minted by the PIPELINE's template masker
+// (internal/pipeline: TS/UUID/IP/HEX/NUM/STR).
+//
+// An escalation's Template field has already been through that masker, so a secret reaches
+// us shape-broken: sk-livekeyabcdefghij0123456789XYZ arrives as sk-livekeyabcdefghij<NUM>XYZ,
+// AKIAIOSFODNN7EXAMPLE as AKIAIOSFODNN<NUM>EXAMPLE, and a JWT as a dot-separated run riddled
+// with <NUM>. A detector anchored on an unbroken run of [A-Za-z0-9] misses all three and the
+// surviving characters go over the wire in the clear. So the prefix-anchored secret detectors
+// treat a pipeline placeholder as just another character of the token run.
+//
+// This does not weaken the inertness invariant. The alternation names the pipeline's six
+// UNTAGGED placeholders and requires '>' immediately after the name, so it can never match
+// this package's own numbered output — <IP_1> and <UUID_1> have '_' where it demands '>'.
+// Every widened detector also stays anchored on a distinctive secret prefix (eyJ, AKIA/ASIA,
+// sk-, Bearer) that no placeholder of either kind carries, so neither sequential masking nor
+// the fail-closed re-scan can trip on a value already masked. TestPlaceholdersAreInert holds
+// both halves of that to the fire.
+const pipelinePH = `<(?:TS|UUID|IP|HEX|NUM|STR)>`
+
+// jwtChar is the base64url alphabet of a JWT segment.
+const jwtChar = `[A-Za-z0-9_-]`
+
+// tolerant builds a run of one or more units, where a unit is a character from class OR a
+// whole pipeline placeholder. For detectors with no length requirement, that is the entire
+// fix: the run simply steps over the pipeline's damage.
+func tolerant(class string) string {
+	return `(?:` + class + `|` + pipelinePH + `)+`
+}
+
+// mangled builds a run that contains AT LEAST ONE pipeline placeholder.
+//
+// It exists for the two detectors carrying a length requirement — {16,} after "sk-", exactly
+// {16} after AKIA/ASIA — which a placeholder breaks by collapsing a whole digit run into one
+// token. Rather than lower those thresholds (which would widen false positives on ordinary
+// prose for every payload, masked or not), the shortened form is accepted only when the run
+// provably came out of the pipeline masker. A false positive here costs one <TOKEN_n> in a
+// template that is already a lossy restatement of the trigger line; a false negative leaks a
+// live key.
+func mangled(class string) string {
+	unit := `(?:` + class + `|` + pipelinePH + `)`
+	return unit + `*` + pipelinePH + unit + `*`
 }
 
 // ipv6Pattern is the standard comprehensive IPv6 matcher, covering the "::" elision forms

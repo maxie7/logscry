@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/maxie7/logscry/internal/pipeline"
 )
 
 // mustMask fails the test if masking errors — most tests are about WHAT gets masked, not
@@ -178,6 +180,49 @@ func TestHomePathNoSpuriousFailClose(t *testing.T) {
 	}
 }
 
+// TestPreTemplatedSecretsMasked covers the leak found in manual wire testing: the Template
+// field reaches the anonymizer AFTER the pipeline masker has rewritten it, so a secret's
+// shape is already broken — sk-livekeyabcdefghij0123456789XYZ arrives as
+// sk-livekeyabcdefghij<NUM>XYZ — and a detector anchored on an unbroken [A-Za-z0-9] run
+// misses it, sending the surviving characters in the clear.
+//
+// The inputs are produced by the REAL pipeline.Templatize rather than hand-written mangled
+// forms: the coupling between the two maskers is what caused the bug, so the test pins the
+// actual interaction and fails if either side's rules move.
+func TestPreTemplatedSecretsMasked(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		remnant string // a distinctive fragment that must not survive
+	}{
+		// The exact shape found on the wire: only 10 characters survive ahead of the <NUM>,
+		// so the {16,} run length is what fails, not just the charset.
+		{"sk- key", "key sk-abcdefghij0123456789XYZ rejected", "abcdefghij"},
+		{"aws key", "creds AKIAIOSFODNN7EXAMPLE denied", "IOSFODNN"},
+		{"jwt", "auth eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r", "dBjftJeZ"},
+		{"bearer jwt", "hdr Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u", "dBjftJeZ"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			templated, _ := pipeline.Templatize(c.raw)
+			if !strings.Contains(templated, "<NUM>") {
+				t.Fatalf("premise broken: %q was not mangled by the pipeline masker", templated)
+			}
+			m := New()
+			out := mustMask(t, m, templated)
+			if !strings.Contains(out, "<TOKEN_1>") {
+				t.Errorf("pre-templated secret not masked:\n in:  %q\n out: %q", templated, out)
+			}
+			if strings.Contains(out, c.remnant) {
+				t.Errorf("secret remnant %q survived:\n in:  %q\n out: %q", c.remnant, templated, out)
+			}
+			if got := m.Restore(out); got != templated {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", templated, got)
+			}
+		})
+	}
+}
+
 // TestExtraHostSuffixes: a site-specific suffix passed to New extends the bare-host
 // allowlist without disturbing the defaults.
 func TestExtraHostSuffixes(t *testing.T) {
@@ -192,14 +237,27 @@ func TestExtraHostSuffixes(t *testing.T) {
 // what makes sequential masking and the fail-closed re-scan safe. Asserted structurally so a
 // new detector with a sloppy char class is caught.
 func TestPlaceholdersAreInert(t *testing.T) {
-	placeholders := "<IP_1> <EMAIL_2> <TOKEN_3> <UUID_4> <HOST_5> <USER_6>"
-	for _, d := range baseDetectors {
-		if loc := d.re.FindStringSubmatchIndex(placeholders); loc != nil && loc[2*d.group] >= 0 {
-			t.Errorf("detector %s matched placeholder syntax %q", d.tag, placeholders)
+	inert := []string{
+		"<IP_1> <EMAIL_2> <TOKEN_3> <UUID_4> <HOST_5> <USER_6>",
+		// Adversarial: our own placeholders sitting directly behind the very prefixes the
+		// secret detectors were widened to anchor on. Widening them to step over PIPELINE
+		// placeholders must not let them chew on ours — <TOKEN_1> has '_' where the pipeline
+		// alternation demands '>', so none of these may match.
+		"Bearer <TOKEN_1> AKIA<TOKEN_2> sk-<TOKEN_3> eyJ<TOKEN_4>.eyJ<TOKEN_5>.<TOKEN_6>",
+	}
+	for _, s := range inert {
+		for _, d := range baseDetectors {
+			if loc := d.re.FindStringSubmatchIndex(s); loc != nil && loc[2*d.group] >= 0 {
+				t.Errorf("detector %s matched placeholder syntax %q", d.tag, s)
+			}
+		}
+		// The same claim from the fail-closed side: re-scanning masked output is clean.
+		if tag := New().residue(s); tag != "" {
+			t.Errorf("residue() false-positived on placeholders %q, got %q", s, tag)
 		}
 	}
 	// Belt and suspenders: the tag pattern the detectors must avoid.
-	if regexp.MustCompile(`<[A-Z]+_\d+>`).FindString(placeholders) == "" {
+	if regexp.MustCompile(`<[A-Z]+_\d+>`).FindString(inert[0]) == "" {
 		t.Fatal("test placeholder string is malformed")
 	}
 }
