@@ -31,6 +31,11 @@ type Options struct {
 	// Docker source is attached. Empty when there is none. It is a string because "all"
 	// is a legal value alongside a line count.
 	DockerTail string
+	// RemoteWarnHost is the off-box endpoint raw logs are being sent to with masking off.
+	// Empty when there is nothing to warn about. Surfaced in the status bar because a
+	// stderr line printed before the alternate screen starts would be wiped unseen — the
+	// one place a TUI user would learn their logs are leaving the machine.
+	RemoteWarnHost string
 }
 
 // StdinIsTerminal reports whether stdin is an interactive terminal rather than a pipe

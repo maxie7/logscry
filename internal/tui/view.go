@@ -261,6 +261,11 @@ func (m Model) viewStatus() string {
 		counters += " · supp " + formatCount(n)
 	}
 	counters += m.llmCounters()
+	// Part of the protected segment, not the elastic source list: a notice that raw logs
+	// are leaving the machine must not be the first thing a narrow terminal drops.
+	if h := m.opts.RemoteWarnHost; h != "" {
+		counters += " · ⚠ raw logs → " + h + " (--llm-anonymize)"
+	}
 
 	sources := "no sources"
 	if len(m.snap.Stats.Sources) > 0 {

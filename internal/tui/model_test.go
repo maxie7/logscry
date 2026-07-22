@@ -229,6 +229,32 @@ func TestStatusBarKeepsModeOnNarrowTerminal(t *testing.T) {
 	}
 }
 
+// TestStatusBarShowsRemoteWarning: with masking off against a remote endpoint, the status
+// bar carries the notice — the only place a TUI user would see it, since a stderr line would
+// be wiped by the alternate screen.
+func TestStatusBarShowsRemoteWarning(t *testing.T) {
+	m := New(nil, nil, Options{RemoteWarnHost: "api.openai.com"})
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	m = sized.(Model)
+	applied, _ := m.Update(snapshotMsg(testSnapshot()))
+	m = applied.(Model)
+
+	status := m.viewStatus()
+	if !strings.Contains(status, "api.openai.com") || !strings.Contains(status, "--llm-anonymize") {
+		t.Errorf("remote warning missing from the status bar:\n%s", status)
+	}
+
+	// And absent when there is nothing to warn about.
+	m2 := New(nil, nil, Options{})
+	sized2, _ := m2.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	m2 = sized2.(Model)
+	applied2, _ := m2.Update(snapshotMsg(testSnapshot()))
+	m2 = applied2.(Model)
+	if strings.Contains(m2.viewStatus(), "raw logs") {
+		t.Error("status bar warned with no remote host set")
+	}
+}
+
 func TestFormatCount(t *testing.T) {
 	tests := map[int]string{0: "0", 7: "7", 999: "999", 1000: "1,000", 12431: "12,431", 1234567: "1,234,567"}
 	for n, want := range tests {

@@ -182,6 +182,7 @@ Key flags:
 | `--threshold <f>` | `1.0` | Escalate at or above this score |
 | `--rate-limit <n>` | `10` | Global cap on LLM calls per minute (the cost cap) |
 | `--explain-dry-run` | off | Show what *would* escalate; build no LLM stage at all |
+| `--llm-anonymize` | off | Mask sensitive values before sending to the LLM (see below) |
 | `--plain` | auto | Plain line output instead of the TUI |
 | `--version` | — | Print the version and exit |
 
@@ -197,6 +198,41 @@ Non-reasoning instruct models like the default `gemma2:2b` are fine at 300.
 
 A full annotated config lives at [`examples/logscry.yaml`](examples/logscry.yaml). Run
 `./bin/logscry -h` for every flag.
+
+### Anonymization (`--llm-anonymize`)
+
+By default logscry sends the escalated line and its surrounding context to the model
+**verbatim**. Against the default **local Ollama that is fine — nothing leaves the
+machine, and this flag is unnecessary.** The moment `--llm-url` points at a remote
+provider (OpenAI, Groq, …) those raw lines leave your network; logscry prints a one-line
+notice at startup when that is the case.
+
+`--llm-anonymize` masks the outgoing payload and restores the model's answer on the way
+back, so the terminal and the cards always show the real values while the provider sees
+only type-tagged placeholders (`<IP_1>`, `<HOST_2>`). The tag is kept on purpose: the
+model still needs to know it is reasoning about *an IP* or *a host that recurs*. The
+mapping is per-request and in memory only — never written to disk, never reused.
+
+What it masks: IPv4/IPv6, email addresses, hosts inside URLs and connection strings (any
+domain), bare hostnames on **private/infra suffixes** (`.internal`, `.local`, `.svc`,
+`.lan`, `.corp`, …; extend with `--llm-anonymize-suffix`), UUIDs, known-shape secrets
+(JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, `user:pass@` credentials), and the username in
+`/home/<user>` and `/Users/<user>` paths. If masking a payload fails for any reason, that
+escalation is **skipped** (the card says so) rather than sent in the clear.
+
+An escalation carries both the raw line and the pipeline's template for it, and that
+template has already had numbers and IDs masked (`<NUM>`, `<IP>`). Secrets are recognized in
+both forms, but one value can end up with two placeholders — `<HOST_1>` from the raw line and
+`<HOST_2>` from the pre-masked template — which slightly weakens the "the model sees one host
+recur" signal. Cosmetic, not a leak.
+
+**This is best-effort risk reduction, not a guarantee.** Free-text log messages can
+contain anything, and logscry only masks what it recognizes. Bare **public** hostnames in
+prose (`could not resolve db.acme.com`) are deliberately left alone — masking every dotted
+name would eat Go module paths and stack frames for no privacy gain — so a public hostname
+you consider sensitive may still be sent. The fail-closed check catches detector bugs, not
+unknown data. Treat this as a way to lower exposure to a remote provider, and do not send
+logs you cannot afford to send.
 
 ## Known limitations (v1)
 

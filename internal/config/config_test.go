@@ -157,6 +157,29 @@ func TestGroupTimeout(t *testing.T) {
 	}
 }
 
+// TestAnonymizeFlag: --llm-anonymize is bound and off by default, and its repeatable
+// suffix flag appends like the other list flags.
+func TestAnonymizeFlag(t *testing.T) {
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.Anonymize {
+		t.Error("anonymization is on by default; it must be opt-in")
+	}
+
+	cfg, err = Load([]string{"--llm-anonymize", "--llm-anonymize-suffix", "acmecloud", "--llm-anonymize-suffix", "corp1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LLM.Anonymize {
+		t.Error("--llm-anonymize did not enable masking")
+	}
+	if len(cfg.LLM.AnonymizeSuffixes) != 2 || cfg.LLM.AnonymizeSuffixes[0] != "acmecloud" {
+		t.Errorf("AnonymizeSuffixes = %v, want both repeats", cfg.LLM.AnonymizeSuffixes)
+	}
+}
+
 // TestVersionFlag: --version is bound and parsed like any other flag, and it short-circuits
 // before the config file is read or validated — so it works even with a broken --config.
 func TestVersionFlag(t *testing.T) {
