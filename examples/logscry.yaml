@@ -72,5 +72,8 @@ llm:
   max_tokens: 300 # cap per explanation (raise for reasoning models)
   temperature: 0.1 # low, for consistent parseable output
   json_mode: true # ask for a JSON object; downgrades once if the server rejects it
+  stream: false # fill card fields in as the model completes them; same final answer
   retries: 1 # extra attempts on transient failures only (timeout, 429, 5xx)
   backoff: 500ms # base backoff between retries
+  anonymize: false # mask IPs, emails, tokens, hostnames on the way out; restored back
+  anonymize_suffixes: [] # extra private host suffixes to mask (e.g. ["acmecloud"])

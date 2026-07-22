@@ -183,6 +183,7 @@ Key flags:
 | `--rate-limit <n>` | `10` | Global cap on LLM calls per minute (the cost cap) |
 | `--explain-dry-run` | off | Show what *would* escalate; build no LLM stage at all |
 | `--llm-anonymize` | off | Mask sensitive values before sending to the LLM (see below) |
+| `--llm-stream` | off | Fill card fields in as the model completes them (see below) |
 | `--plain` | auto | Plain line output instead of the TUI |
 | `--version` | — | Print the version and exit |
 
@@ -198,6 +199,32 @@ Non-reasoning instruct models like the default `gemma2:2b` are fine at 300.
 
 A full annotated config lives at [`examples/logscry.yaml`](examples/logscry.yaml). Run
 `./bin/logscry -h` for every flag.
+
+### Streaming (`--llm-stream`)
+
+By default logscry waits for the whole answer and the card flips from "explaining…" to
+explained in one step. `--llm-stream` asks the provider for the answer as it is generated,
+so each card field appears the moment the model finishes writing it — usually the summary
+first, then the cause and the check.
+
+**What it does not do: make the model faster.** The final explanation is identical either
+way, parsed by the same code; only the moment fields appear changes. What you get is a
+summary a few seconds earlier and a visible sign that a slow model is producing something
+rather than hanging.
+
+Two honest caveats. Intermediate updates depend on the model actually emitting the JSON
+object it was asked for: a model that answers in prose has no completed *fields* to show, so
+the card simply stays "explaining…" until the end (the final answer is unaffected). And if
+the stream dies partway, logscry keeps whatever fields arrived and marks the card **`answer
+incomplete`** — a half-finished verdict is worth reading, but not worth mistaking for the
+model's final word.
+
+`--plain` prints only the finished answer: a line-oriented consumer cannot rewrite a line it
+has already printed.
+
+It is off by default because support for streaming alongside `response_format` varies
+between OpenAI-compatible servers. If yours rejects the combination logscry notices, drops
+streaming, and retries without it, so the explanation still arrives.
 
 ### Anonymization (`--llm-anonymize`)
 
