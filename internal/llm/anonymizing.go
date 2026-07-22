@@ -54,6 +54,15 @@ func (a *anonymizing) Explain(ctx context.Context, req ExplainRequest) (ExplainR
 	m := a.newMask()
 
 	masked := req // copy; the caller's request keeps its real values
+	if req.OnPartial != nil {
+		// Restore over each PROGRESSIVE update too, or the card would show <IP_1> until the
+		// answer finished. A placeholder split across chunks is not a hazard here: a partial
+		// carries only fields the JSON decoder saw closed, so any placeholder inside one is
+		// necessarily whole. That is a property of where the seam sits, not a special case.
+		masked.OnPartial = func(p ExplainResponse) {
+			req.OnPartial(a.restore(m, p))
+		}
+	}
 	var err error
 	if masked.Trigger.Raw, err = m.Mask(req.Trigger.Raw); err != nil {
 		return ExplainResponse{}, maskErr(err)
@@ -78,12 +87,28 @@ func (a *anonymizing) Explain(ctx context.Context, req ExplainRequest) (ExplainR
 		return resp, err
 	}
 
+	return a.restore(m, resp), nil
+}
+
+// restore puts the real values back into every field of one response.
+//
+// A TRUNCATED answer gets one extra step: it was salvaged from a stream that stopped
+// wherever the connection died, so its text can end mid-placeholder ("check <IP"), which
+// matches nothing and would render as that fragment. Cutting the stub is limited to the
+// salvage case on purpose — a complete answer cannot produce one, and the non-streaming
+// path must stay exactly as it was.
+func (a *anonymizing) restore(m masker, resp ExplainResponse) ExplainResponse {
 	// The model echoes placeholders back ("check connectivity to <IP_1>"): restore all
 	// three fields before the card renders.
 	resp.Summary = m.Restore(resp.Summary)
 	resp.LikelyCause = m.Restore(resp.LikelyCause)
 	resp.Suggestion = m.Restore(resp.Suggestion)
-	return resp, nil
+	if resp.Truncated {
+		resp.Summary = anonymize.TrimDanglingPlaceholder(resp.Summary)
+		resp.LikelyCause = anonymize.TrimDanglingPlaceholder(resp.LikelyCause)
+		resp.Suggestion = anonymize.TrimDanglingPlaceholder(resp.Suggestion)
+	}
+	return resp
 }
 
 // maskErr marks an anonymization failure as fatal: no retry can fix it (the same input

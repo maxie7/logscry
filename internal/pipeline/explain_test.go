@@ -111,6 +111,80 @@ func TestExplanationLandsOnItsTemplate(t *testing.T) {
 	}
 }
 
+// TestStreamedPartialsKeepTheCardPending: a streamed answer arrives as several PENDING
+// updates before its terminal one, and the "explaining N" counter must move only on the
+// transition out of pending.
+//
+// Decrementing on every update — which is what the counter did before streaming existed,
+// because a second pending update could not happen — would drive it to zero, and then
+// negative, while cards were still visibly filling in.
+func TestStreamedPartialsKeepTheCardPending(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	lines := make(chan model.LogLine, 4)
+	snaps := make(chan Snapshot, 1)
+	escalations := make(chan score.EscalationRequest, 4)
+	explanations := make(chan model.Explanation, 4)
+
+	go Run(ctx, lines, Options{
+		Snapshots:    snaps,
+		Interval:     time.Millisecond,
+		Scorer:       score.New(escalateAlways(), escalations),
+		Escalations:  escalations,
+		Explanations: explanations,
+	})
+
+	lines <- model.LogLine{Source: "proc:app", Stream: model.Stderr, Raw: "PANIC: nil map write in handler 42"}
+	req := <-escalations
+
+	// Two progressive updates, as the summary and then the cause complete.
+	explanations <- model.Explanation{
+		Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainPending,
+		Summary: "A handler wrote to a nil map.",
+	}
+	partial := waitFor(t, snaps, "the streamed summary to appear", func(s Snapshot) bool {
+		return len(s.Escalations) == 1 && s.Escalations[0].Explanation != nil &&
+			s.Escalations[0].Explanation.Summary != ""
+	})
+	if got := partial.Escalations[0].Explanation.State; got != model.ExplainPending {
+		t.Errorf("state = %v, want pending: the model has not finished", got)
+	}
+	if partial.Stats.Explaining != 1 {
+		t.Errorf("Stats.Explaining = %d after a partial, want 1", partial.Stats.Explaining)
+	}
+	if partial.Stats.Explained != 0 {
+		t.Errorf("Stats.Explained = %d after a partial, want 0", partial.Stats.Explained)
+	}
+
+	explanations <- model.Explanation{
+		Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainPending,
+		Summary: "A handler wrote to a nil map.", LikelyCause: "The cache map is never initialised.",
+	}
+	second := waitFor(t, snaps, "the streamed cause to appear", func(s Snapshot) bool {
+		return len(s.Escalations) == 1 && s.Escalations[0].Explanation != nil &&
+			s.Escalations[0].Explanation.LikelyCause != ""
+	})
+	if second.Stats.Explaining != 1 {
+		t.Errorf("Stats.Explaining = %d after two partials, want 1", second.Stats.Explaining)
+	}
+
+	// Only the terminal update moves the counters.
+	explanations <- model.Explanation{
+		Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainDone,
+		Summary: "A handler wrote to a nil map.", LikelyCause: "The cache map is never initialised.",
+		Suggestion: "Make the map in NewServer.",
+	}
+	done := waitFor(t, snaps, "the terminal explanation", func(s Snapshot) bool {
+		return len(s.Escalations) == 1 && s.Escalations[0].Explanation != nil &&
+			s.Escalations[0].Explanation.State == model.ExplainDone
+	})
+	if done.Stats.Explaining != 0 || done.Stats.Explained != 1 {
+		t.Errorf("stats = %d explaining / %d explained, want 0 / 1",
+			done.Stats.Explaining, done.Stats.Explained)
+	}
+}
+
 // TestExplanationForUnknownTemplateIsIgnored: a result for a template the pipeline does
 // not know about is dropped, not a nil-map panic that takes the tail with it.
 func TestExplanationForUnknownTemplateIsIgnored(t *testing.T) {

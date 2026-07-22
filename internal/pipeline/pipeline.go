@@ -135,7 +135,11 @@ func (p *Pipeline) attach(ex model.Explanation) {
 	if !ok {
 		return // a template we no longer know about; nothing to show it on
 	}
-	if tmpl.Explanation != nil && tmpl.Explanation.State == model.ExplainPending {
+	// A streamed answer arrives as several pending updates before its terminal one, so the
+	// counter must move only on the transition OUT of pending — decrementing on every
+	// update would leave "explaining N" at zero while cards were still filling in.
+	if tmpl.Explanation != nil && tmpl.Explanation.State == model.ExplainPending &&
+		ex.State != model.ExplainPending {
 		p.explaining--
 	}
 	tmpl.Explanation = &ex

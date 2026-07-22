@@ -17,8 +17,23 @@ import (
 
 // maxBodyBytes bounds what we read back. A misconfigured base URL can point at
 // anything — including something that streams forever — and that must not become
-// logscry's memory problem.
+// logscry's memory problem. When streaming, it bounds the accumulated ANSWER rather than
+// the wire (see maxStreamBytes), which is the quantity that actually grows in memory.
 const maxBodyBytes = 1 << 20
+
+// maxStreamBytes bounds the WIRE when streaming, and is deliberately much larger than
+// maxBodyBytes because SSE inflates the same answer by roughly an order of magnitude: every
+// token arrives wrapped in a whole chat.completion.chunk envelope (id, object, created,
+// model, system_fingerprint, choices, finish_reason) of ~250 bytes. A 300-token answer that
+// is ~1.5 KiB complete is ~72 KiB streamed, and at --llm-max-tokens 4096 — well within what
+// the README recommends for reasoning models — it is ~984 KiB, which would sit just under
+// maxBodyBytes and trip it the moment the model also streams `reasoning`.
+//
+// Reusing the 1 MiB cap here would therefore report a perfectly normal answer as torn, and
+// hand the user a retried, incomplete-badged card for a response that arrived fine. 8 MiB
+// covers ~32k tokens — past any practical max_tokens — while still cutting off a runaway
+// endpoint in seconds.
+const maxStreamBytes = 8 << 20
 
 // maxErrBodyRunes bounds the provider's error text quoted back to the user. Enough to
 // say "model 'gemma2:2b' not found", not enough to fill the status bar with a stack of
@@ -38,6 +53,9 @@ type OpenAICompatible struct {
 	// this session omits it. Set at most once per worker that hits the rejection, and
 	// never unset: the capability cannot come back mid-run.
 	jsonOff atomic.Bool
+	// streamOff is the same downgrade for `stream`, which not every OpenAI-compatible
+	// server accepts alongside response_format.
+	streamOff atomic.Bool
 }
 
 // NewOpenAICompatible constructs a backend for the configured endpoint.
@@ -66,16 +84,34 @@ func (b *OpenAICompatible) Name() string { return "openai-compatible" }
 //   - a 400/422 while response_format was sent: the one exception. Some OpenAI-compatible
 //     servers reject the unknown field, so we drop it, remember that for the session, and
 //     try once more. This is a capability downgrade, not a retry: it cannot loop.
+//
+// It downgrades in that order — streaming first, then response_format — because a server
+// that rejects the pair gives no clue which field it disliked, and JSON mode is
+// load-bearing for parse quality while streaming only changes when fields appear. Giving up
+// the cosmetic capability to keep the functional one is the right way round.
 func (b *OpenAICompatible) Explain(ctx context.Context, req ExplainRequest) (ExplainResponse, error) {
-	sentJSONMode := b.jsonMode()
+	opts := callOpts{stream: b.streaming(), jsonMode: b.jsonMode()}
 
-	resp, err := b.attempt(ctx, req, sentJSONMode)
-	if err == nil || !sentJSONMode || !rejectsRequest(err) {
+	resp, err := b.attempt(ctx, req, opts)
+	if err == nil || !rejectsRequest(err) {
 		return resp, err
 	}
 
+	if opts.stream {
+		b.streamOff.Store(true)
+		opts.stream = false
+		resp, err = b.attempt(ctx, req, opts)
+		if err == nil || !rejectsRequest(err) {
+			return resp, err
+		}
+	}
+
+	if !opts.jsonMode {
+		return resp, err
+	}
 	b.jsonOff.Store(true)
-	resp, err = b.attempt(ctx, req, false)
+	opts.jsonMode = false
+	resp, err = b.attempt(ctx, req, opts)
 	if rejectsRequest(err) {
 		// The field was not the problem after all, so the user is now looking at a
 		// request the server dislikes for another reason — but they may also want to
@@ -89,15 +125,32 @@ func (b *OpenAICompatible) Explain(ctx context.Context, req ExplainRequest) (Exp
 // and not already refused by this server.
 func (b *OpenAICompatible) jsonMode() bool { return b.cfg.JSONMode && !b.jsonOff.Load() }
 
+// streaming reports whether this request should ask for SSE: configured on, and not
+// already refused by this server.
+func (b *OpenAICompatible) streaming() bool { return b.cfg.Stream && !b.streamOff.Load() }
+
+// callOpts are the per-attempt capability flags, carried together so that a downgrade of
+// one cannot silently reset the other.
+type callOpts struct {
+	stream   bool
+	jsonMode bool
+}
+
 // attempt makes the call, retrying only transient failures with a short backoff.
-func (b *OpenAICompatible) attempt(ctx context.Context, req ExplainRequest, jsonMode bool) (ExplainResponse, error) {
+//
+// Every exit path runs through the salvage check, not just exhaustion: a stream can die
+// for a reason that must not be retried (our own deadline, our own byte budget) while
+// still having delivered a usable partial answer, and that answer beats an empty card.
+// Nothing but a streamed call ever carries salvage, so with streaming off this is exactly
+// the loop it always was — a 4xx still returns its error untouched.
+func (b *OpenAICompatible) attempt(ctx context.Context, req ExplainRequest, opts callOpts) (ExplainResponse, error) {
 	var lastErr error
 	for i := 0; i <= b.cfg.Retries; i++ {
 		if i > 0 && !sleep(ctx, b.cfg.Backoff) {
 			return ExplainResponse{}, ctx.Err()
 		}
 
-		resp, err := b.call(ctx, req, jsonMode)
+		resp, err := b.call(ctx, req, opts)
 		if err == nil {
 			return resp, nil
 		}
@@ -107,8 +160,11 @@ func (b *OpenAICompatible) attempt(ctx context.Context, req ExplainRequest, json
 		}
 		lastErr = err
 		if !transient(err) {
-			return ExplainResponse{}, err
+			break
 		}
+	}
+	if resp, ok := salvaged(lastErr); ok {
+		return resp, nil
 	}
 	return ExplainResponse{}, lastErr
 }
@@ -116,11 +172,11 @@ func (b *OpenAICompatible) attempt(ctx context.Context, req ExplainRequest, json
 // call makes one HTTP request, bounded by its own timeout. The context it derives is
 // the request's: cancelling the parent aborts the connection mid-flight rather than
 // leaving the tail waiting on a model that is never going to answer.
-func (b *OpenAICompatible) call(ctx context.Context, req ExplainRequest, jsonMode bool) (ExplainResponse, error) {
+func (b *OpenAICompatible) call(ctx context.Context, req ExplainRequest, opts callOpts) (ExplainResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.Timeout)
 	defer cancel()
 
-	body, err := json.Marshal(b.chatRequest(req, jsonMode))
+	body, err := json.Marshal(b.chatRequest(req, opts))
 	if err != nil {
 		return ExplainResponse{}, fmt.Errorf("encoding request: %w", err)
 	}
@@ -144,14 +200,21 @@ func (b *OpenAICompatible) call(ctx context.Context, req ExplainRequest, jsonMod
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
+	// An error status is a complete body either way, so it is read the same way for both
+	// modes — a provider reports "model not found" as JSON, not as an event stream.
+	if httpResp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxBodyBytes))
+		return ExplainResponse{}, &apiError{status: httpResp.StatusCode, body: b.redact(string(payload))}
+	}
+
+	if opts.stream {
+		return b.consumeStream(ctx, httpResp.Body, req.OnPartial)
+	}
+
 	payload, err := io.ReadAll(io.LimitReader(httpResp.Body, maxBodyBytes))
 	if err != nil {
 		return ExplainResponse{}, fmt.Errorf("reading response: %w", err)
 	}
-	if httpResp.StatusCode != http.StatusOK {
-		return ExplainResponse{}, &apiError{status: httpResp.StatusCode, body: b.redact(string(payload))}
-	}
-
 	var decoded chatResponse
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		return ExplainResponse{}, fmt.Errorf("decoding response: %w", err)
@@ -160,6 +223,128 @@ func (b *OpenAICompatible) call(ctx context.Context, req ExplainRequest, jsonMod
 		return ExplainResponse{}, errors.New("model returned no choices")
 	}
 	return content(decoded.Choices[0])
+}
+
+// consumeStream reads an SSE answer, reporting each completed field through onPartial and
+// returning the same result the non-streaming path would have produced.
+//
+// The accumulator is local, so each ATTEMPT gets a fresh buffer. That is not incidental: a
+// retry appending to the previous attempt's partial JSON would splice two half-objects into
+// garbage ({"summary": "Cannot re{"summary": "Cannot reach...).
+func (b *OpenAICompatible) consumeStream(ctx context.Context, body io.Reader, onPartial func(ExplainResponse)) (ExplainResponse, error) {
+	var answer, reasoning strings.Builder
+	var finish string
+	var sent ExplainResponse
+	overflow := false
+
+	err := readSSE(io.LimitReader(body, maxStreamBytes), maxStreamBytes,
+		func() bool { return finish != "" },
+		func(data []byte) {
+			var chunk streamChunk
+			if err := json.Unmarshal(data, &chunk); err != nil || len(chunk.Choices) == 0 {
+				return // a malformed chunk is skipped, never fatal: degrade, don't discard
+			}
+			c := chunk.Choices[0]
+			if c.FinishReason != "" {
+				finish = c.FinishReason
+			}
+			if answer.Len()+reasoning.Len() > maxBodyBytes {
+				overflow = true
+				return
+			}
+			answer.WriteString(c.Delta.Content)
+			reasoning.WriteString(c.Delta.Reasoning)
+
+			// A string field can only become complete when its closing quote arrives, so
+			// re-parsing on anything else would be wasted work on every token.
+			if onPartial == nil || !hasQuote(c.Delta.Content) {
+				return
+			}
+			if p := partialExplanation(answer.String()); p.found && p.resp != sent {
+				sent = p.resp
+				onPartial(p.resp)
+			}
+		})
+	if overflow && err == nil {
+		err = errStreamLimit
+	}
+
+	final := choice{FinishReason: finish}
+	final.Message.Content = answer.String()
+	final.Message.Reasoning = reasoning.String()
+
+	if err == nil {
+		return content(final) // clean end: byte-for-byte the non-streaming result
+	}
+
+	// A tear AFTER the model closed its JSON is not a tear at all: the answer was whole and
+	// the connection merely dropped on the way out. Returning it as an ordinary result is
+	// what stops a disconnect one byte before [DONE] costing a retry and a badge.
+	if partialExplanation(answer.String()).closed {
+		return content(final)
+	}
+	return ExplainResponse{}, b.torn(ctx, err, final)
+}
+
+// torn classifies a stream that ended before the model closed its answer, carrying anything
+// worth showing along with the error so attempt can fall back to it.
+func (b *OpenAICompatible) torn(ctx context.Context, err error, final choice) error {
+	te := &tornError{err: err}
+	// Deterministic causes must not be retried. Our own per-attempt deadline reproduces
+	// after another full --llm-timeout, and our own byte budget reproduces after another
+	// full read and another full generation — the second burning real provider tokens for
+	// an identical outcome. A genuine transport tear is a different thing and stays
+	// retryable. ctx.Err() distinguishes OUR deadline from a parent cancelled by Ctrl+C,
+	// which attempt handles separately.
+	te.fatal = errors.Is(err, errStreamLimit) ||
+		(errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded))
+
+	if resp, ok := salvageable(final); ok {
+		resp.Truncated = true
+		te.salvage, te.complete = resp, true
+	}
+	return te
+}
+
+// salvageable decides whether a torn answer is worth showing at all.
+//
+// A completed field always is. Prose is too — a model that ignored the format still said
+// something useful, and half a sentence beats an empty card. But a JSON answer torn before
+// its first field completed is neither: parseExplanation's prose fallback would hand back
+// the raw fragment, and rendering `{"summ` as the model's summary is worse than admitting
+// the explanation is unavailable.
+func salvageable(final choice) (ExplainResponse, bool) {
+	text := final.Message.Content
+	if p := partialExplanation(text); p.found {
+		return p.resp, true
+	}
+	if strings.Contains(text, "{") {
+		return ExplainResponse{}, false // torn JSON with nothing finished
+	}
+	resp, err := content(final)
+	return resp, err == nil && resp != ExplainResponse{}
+}
+
+// tornError is a stream that ended before the model finished, carrying whatever was
+// salvageable so that a failure need not cost the user the part that did arrive.
+type tornError struct {
+	err      error
+	salvage  ExplainResponse
+	complete bool // salvage is usable
+	fatal    bool // deterministic: retrying reproduces it exactly
+}
+
+func (e *tornError) Error() string { return e.err.Error() }
+func (e *tornError) Unwrap() error { return e.err }
+
+// salvaged returns the partial answer carried by a torn stream, if there is one worth
+// showing. Only streaming ever produces these, so every other path is unaffected.
+func salvaged(err error) (ExplainResponse, bool) {
+	var te *tornError
+	if !errors.As(err, &te) || !te.complete {
+		return ExplainResponse{}, false
+	}
+	return te.salvage, true
 }
 
 // content extracts what the model actually said, which is not always in the obvious place.
@@ -219,17 +404,17 @@ func (b *OpenAICompatible) endpoint() string {
 
 // chatRequest builds the wire payload: a low temperature for consistent, parseable
 // output, and a hard cap on tokens that bounds both cost and card length.
-func (b *OpenAICompatible) chatRequest(req ExplainRequest, jsonMode bool) chatRequest {
+func (b *OpenAICompatible) chatRequest(req ExplainRequest, opts callOpts) chatRequest {
 	out := chatRequest{
 		Model:       b.cfg.Model,
 		Messages:    buildMessages(req),
 		Temperature: b.cfg.Temperature,
 		MaxTokens:   b.cfg.MaxTokens,
+		Stream:      opts.stream,
 	}
 	// Asked for when available, relied on never: parseExplanation assumes the model
-	// ignores it. Streaming is the other field deliberately absent — v1 is
-	// non-streaming, and this struct plus the decode in call() is where it would go.
-	if jsonMode {
+	// ignores it.
+	if opts.jsonMode {
 		out.ResponseFormat = &responseFormat{Type: "json_object"}
 	}
 	return out
@@ -243,6 +428,9 @@ type (
 		Temperature    float64         `json:"temperature"`
 		MaxTokens      int             `json:"max_tokens"`
 		ResponseFormat *responseFormat `json:"response_format,omitempty"`
+		// Stream is omitted entirely when false, so a request with streaming off is
+		// byte-for-byte the one this backend has always sent.
+		Stream bool `json:"stream,omitempty"`
 	}
 	message struct {
 		Role    string `json:"role"`
@@ -313,6 +501,12 @@ func transient(err error) bool {
 	var fatal fatalError
 	if errors.As(err, &fatal) {
 		return false
+	}
+	// A torn stream is transient only when something outside our control cut it. Our own
+	// deadline and our own byte budget are deterministic — see torn.
+	var te *tornError
+	if errors.As(err, &te) {
+		return !te.fatal
 	}
 	var apiErr *apiError
 	if !errors.As(err, &apiErr) {

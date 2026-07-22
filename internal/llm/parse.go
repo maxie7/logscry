@@ -26,11 +26,42 @@ const maxSummaryRunes = 400
 // NEVER DISCARD: pull out whatever structure survives, and if none does, hand back the
 // prose as the summary. An empty body is the only thing that can fail.
 func parseExplanation(raw string) (ExplainResponse, error) {
-	text := strings.TrimSpace(raw)
-	if text == "" {
+	if strings.TrimSpace(raw) == "" {
 		return ExplainResponse{}, errEmptyResponse
 	}
-	text = stripFences(text)
+	if p := partialExplanation(raw); p.found {
+		return p.resp, nil
+	}
+
+	// No JSON survived. The model still said something, and something is worth more to
+	// the person watching the tail than an empty card.
+	text := stripFences(strings.TrimSpace(raw))
+	return ExplainResponse{Summary: truncateRunes(collapse(text), maxSummaryRunes)}, nil
+}
+
+// parsed is what one attempt at reading a JSON object out of model output yielded.
+type parsed struct {
+	resp ExplainResponse
+	// found reports that at least one field was COMPLETE — decoded key and value both.
+	found bool
+	// closed reports that the object's closing '}' was reached, i.e. the model finished
+	// writing it. On a stream that is the difference between "the answer is complete and
+	// the connection merely dropped afterwards" and "the answer is genuinely cut short".
+	closed bool
+}
+
+// partialExplanation extracts the COMPLETED fields of a possibly-truncated body.
+//
+// It is parseExplanation without the prose fallback, and that is the point: a stream can be
+// re-read after every chunk, and only whole field values may ever reach the card. Raw buffer
+// text, a half-written value, an opening fence, a preamble — none of it can escape here,
+// because nothing is returned that json did not finish decoding.
+//
+// Being a strict subset of the final parse rather than a parallel implementation is
+// deliberate: progressive display cannot drift from the authoritative answer, because it is
+// the same code reading the same bytes.
+func partialExplanation(raw string) parsed {
+	text := stripFences(strings.TrimSpace(raw))
 
 	// Every '{' is a candidate opening brace, tried in order: the first one may belong
 	// to prose ("...as shown in {this example}"), and the real object may follow it.
@@ -38,14 +69,11 @@ func parseExplanation(raw string) (ExplainResponse, error) {
 		if c != '{' {
 			continue
 		}
-		if resp, ok := decodeObject(text[i:]); ok {
-			return resp, nil
+		if p := decodeObject(text[i:]); p.found {
+			return p
 		}
 	}
-
-	// No JSON survived. The model still said something, and something is worth more to
-	// the person watching the tail than an empty card.
-	return ExplainResponse{Summary: truncateRunes(collapse(text), maxSummaryRunes)}, nil
+	return parsed{}
 }
 
 // stripFences unwraps a ```json ... ``` block, which is the single most common thing a
@@ -69,28 +97,31 @@ func stripFences(s string) string {
 }
 
 // decodeObject reads the JSON object starting at s[0] and maps it onto the response,
-// reporting whether it found any usable field.
+// reporting which fields survived and whether the object was ever closed.
 //
 // It streams tokens rather than unmarshalling the whole document, which is what makes
 // truncation survivable: a response cut off mid-object still yields every key/value
 // pair the model finished, and the decoder simply stops at the tear. Trailing prose
 // after the closing brace is never read at all.
-func decodeObject(s string) (ExplainResponse, bool) {
+func decodeObject(s string) parsed {
 	dec := json.NewDecoder(strings.NewReader(s))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return ExplainResponse{}, false
+		return parsed{}
 	}
 
-	var resp ExplainResponse
-	found := false
+	var p parsed
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			break // truncated, or the closing brace: either way, we are done reading
+			break // truncated: the model stopped mid-object
 		}
 		key, ok := tok.(string)
 		if !ok {
-			break // a closing delimiter, not a key
+			// A closing delimiter, not a key: the model finished the object. This is the
+			// only place that fact is observable, and a streamed answer needs it to tell a
+			// complete response from a torn one.
+			p.closed = tok == json.Delim('}')
+			break
 		}
 		var val any
 		if err := dec.Decode(&val); err != nil {
@@ -101,11 +132,11 @@ func decodeObject(s string) (ExplainResponse, bool) {
 			continue
 		}
 		if field := fieldFor(key); field != nil {
-			*field(&resp) = strings.TrimSpace(text)
-			found = true
+			*field(&p.resp) = strings.TrimSpace(text)
+			p.found = true
 		}
 	}
-	return resp, found
+	return p
 }
 
 // fieldFor maps a key the model used onto the field it meant, or nil if it meant none
