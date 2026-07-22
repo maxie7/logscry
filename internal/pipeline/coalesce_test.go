@@ -180,7 +180,12 @@ func TestCoalesceFlushesPartialAfterIdleTimeout(t *testing.T) {
 
 	in := make(chan model.LogLine)
 	out := make(chan model.LogLine, 1)
-	go Coalesce(ctx, in, out, 50*time.Millisecond)
+	// 500ms rather than something snappier because the two sends below must BOTH land
+	// inside this window: a stall between them flushes the header on its own and the test
+	// fails on missing content. Under -race, or on a loaded CI runner, tens of milliseconds
+	// of scheduling delay is ordinary. The 2s deadline does not protect against that
+	// direction — it only catches a flush that never happens — so the margin has to be here.
+	go Coalesce(ctx, in, out, 500*time.Millisecond)
 
 	// A header plus one continuation, then silence — the input is never closed.
 	in <- model.LogLine{Source: "proc:app", Stream: model.Stderr, Raw: "Traceback (most recent call last):"}

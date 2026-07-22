@@ -7,5 +7,7 @@ Run these in order and report pass/fail for each; stop and fix on the first fail
 2. `go vet ./...`
 3. `golangci-lint run`
 4. `go test ./...`
-5. `go build ./...`
+5. `go test -race ./...`  (the concurrency model is load-bearing: pipeline goroutine owns
+   the template map, the pool never blocks ingest. Takes ~4x as long as step 4)
+6. `go build ./...`
 

@@ -37,3 +37,10 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      # Separate from the plain test run rather than replacing it: -race is several times
+      # slower, and keeping both means a failure says whether it is a logic bug or a data
+      # race. The concurrency model is load-bearing here — one goroutine owns the template
+      # map and the LLM pool must never block ingest — so it is worth the extra minute.
+      - name: Test (race detector)
+        run: go test -race ./...
