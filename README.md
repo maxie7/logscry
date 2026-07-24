@@ -182,6 +182,7 @@ Key flags:
 | `--threshold <f>` | `1.0` | Escalate at or above this score |
 | `--rate-limit <n>` | `10` | Global cap on LLM calls per minute (the cost cap) |
 | `--explain-dry-run` | off | Show what *would* escalate; build no LLM stage at all |
+| `--export <path>` | off | Append one JSON object per flagged anomaly to a file (see below) |
 | `--llm-anonymize` | off | Mask sensitive values before sending to the LLM (see below) |
 | `--llm-stream` | off | Fill card fields in as the model completes them (see below) |
 | `--plain` | auto | Plain line output instead of the TUI |
@@ -260,6 +261,72 @@ name would eat Go module paths and stack frames for no privacy gain — so a pub
 you consider sensitive may still be sent. The fail-closed check catches detector bugs, not
 unknown data. Treat this as a way to lower exposure to a remote provider, and do not send
 logs you cannot afford to send.
+
+### Export (`--export <path>`)
+
+Everything above puts anomalies on a screen. `--export anomalies.jsonl` puts them in a
+file, one JSON object per line, so another program can have them:
+
+```console
+$ logscry --plain --export anomalies.jsonl -- ./myapp
+$ jq -r 'select(.explanation.state == "explained") | .pattern' anomalies.jsonl
+connection refused to <IP>:<NUM>
+```
+
+It works the same in the TUI and in `--plain`, and the file is appended to, never
+truncated — a second run adds to the first. Without the flag no file is opened at all.
+
+**One line per flagged anomaly, written when its explanation resolves.** An anomaly gets
+its line when it reaches a terminal state: explained, explanation-unavailable, or
+incomplete. Progressive `--llm-stream` updates never produce a line, and a template that
+keeps recurring does *not* get a second one — it only bumps a counter in memory.
+
+**The numbers are as-of-flag-time, not final totals.** `count_at_flag` and
+`last_seen_at_flag` are what they were at the instant the anomaly crossed the threshold,
+which is what the record is *about*. If that template has fired two hundred more times
+since, the file will not say so — the keys are named the way they are so nothing pretends
+otherwise.
+
+#### Schema
+
+Every key is always present (no `omitempty`), so a consumer can index without checking.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `kind` | string | `anomaly`, or `would_escalate` in `--explain-dry-run` |
+| `template_hash` | string | The dedup key: the template's signature hash |
+| `pattern` | string | The masked signature, e.g. `connection refused to <IP>:<NUM>` |
+| `level` | string | Level of the line that fired, `""` if none was detected |
+| `source` | string | e.g. `docker:api`, `stdin`, `proc:myapp` |
+| `count_at_flag` | number | Occurrences of this template **when it was flagged** |
+| `first_seen` | string | RFC3339; the template's first occurrence |
+| `last_seen_at_flag` | string | RFC3339; its last occurrence **when it was flagged** |
+| `score` | number | The escalation score |
+| `reasons` | array | Why it escalated, e.g. `["novel template (first seen)", "level ERROR"]` |
+| `explanation.state` | string | `explained`, `unavailable`, or `not_requested` (dry-run) |
+| `explanation.summary` | string | One-line "what happened" |
+| `explanation.likely_cause` | string | |
+| `explanation.suggestion` | string | What to check or try |
+| `explanation.truncated` | bool | `true` when the answer was salvaged from a stream that died — real, but short |
+| `explanation.error` | string | Why the state is `unavailable`; `""` otherwise |
+| `explanation.at` | string | RFC3339; when that state was reached |
+
+**In `--explain-dry-run` the file records what *would* have escalated.** That mode calls no
+model — it builds no backend at all — so those records carry `kind: "would_escalate"`,
+`state: "not_requested"`, and no summary, cause, or suggestion. They are the calibration
+artifact: sort by `score`, diff two threshold settings, without a model in the loop.
+`jq 'select(.kind == "anomaly")'` keeps them out of anything counting real anomalies.
+
+**The values are real, even with `--llm-anonymize`.** That flag masks what goes to a
+*remote model*; it is not a redaction of logscry's own output. The terminal keeps the real
+addresses and hostnames, and this file is just as local, so it keeps them too. The one
+thing the record does not carry is a raw log line: `pattern` is the masked signature, which
+is what lets the whole file go into a ticket or a CI artifact without auditing it first.
+
+**Durability.** Each record is written and synced as it resolves, in full, so a run killed
+mid-flight leaves a file whose every line still parses. If a write fails part-way the
+partial bytes are rolled back and that one record is lost rather than the file's validity;
+logscry says so on stderr on the way out.
 
 ## Known limitations (v1)
 

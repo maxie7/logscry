@@ -9,6 +9,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/maxie7/logscry/internal/export"
 	"github.com/maxie7/logscry/internal/model"
 	"github.com/maxie7/logscry/internal/score"
 )
@@ -59,6 +60,12 @@ type Pipeline struct {
 	// renders exactly as it did before there was a model to call.
 	explain bool
 
+	// export appends flagged anomalies to a JSONL file, or is nil when --export is off —
+	// which is the default, and a nil *export.Writer is inert, so nothing below branches on
+	// it. Its methods are channel sends to a goroutine that owns the file: this goroutine
+	// owns the template map and must never wait on a disk (RDI §3).
+	export *export.Writer
+
 	// LLM counters, maintained here rather than in the pool: the pipeline goroutine
 	// already sees every escalation on the way out and every explanation on the way
 	// back, so the numbers need no atomics and no coupling to the LLM package.
@@ -91,11 +98,44 @@ func (p *Pipeline) Process(line model.LogLine, now time.Time) Event {
 	if p.scorer != nil {
 		res := p.scorer.Evaluate(line, tmpl, prevLastSeen, now)
 		ev.Score, ev.Escalate, ev.Queued, ev.Reasons = res.Score, res.Escalate, res.Queued, res.Reasons
-		if p.explain && ev.Escalate {
-			p.escalated(tmpl, ev.Queued, now)
+		if ev.Escalate {
+			p.flagged(tmpl, ev, now)
 		}
 	}
 	return ev
+}
+
+// flagged handles an event that has just crossed the threshold: it records the anomaly for
+// the export file, then marks its explanation state.
+//
+// The export half runs in every mode — TUI, --plain, and dry-run — because this is the one
+// place all three pass through, and it captures the anomaly's fields at THIS instant. That
+// is the point-in-time semantics the file promises: a record describes the event "this
+// template escalated", so its count and last-seen are the ones that were true when it did,
+// not the ones that are true when a model finishes answering seconds later.
+func (p *Pipeline) flagged(tmpl *model.Template, ev Event, now time.Time) {
+	p.export.Flag(export.Flag{
+		Hash:      tmpl.Hash,
+		Pattern:   tmpl.Pattern,
+		Level:     ev.Line.Level,
+		Source:    ev.Line.Source,
+		Count:     tmpl.Count,
+		FirstSeen: tmpl.FirstSeen,
+		LastSeen:  tmpl.LastSeen,
+		Score:     ev.Score,
+		Reasons:   ev.Reasons,
+	})
+
+	// No LLM stage attached (--explain-dry-run): nothing will ever explain this, so the
+	// flag is terminal the moment it fires and the record can be completed right here. The
+	// condition is deliberately "no explainer" rather than "the dry-run flag" — it is the
+	// honest reason, and it keeps the queue-full branch below unreachable in dry-run, where
+	// Queued is false only because the scorer emits to a nil channel (see score.emit).
+	if !p.explain {
+		p.export.WouldEscalate(tmpl.Hash, now)
+		return
+	}
+	p.escalated(tmpl, ev.Queued, now)
 }
 
 // escalated marks the template's explanation state the instant the event fires, so the
@@ -111,6 +151,7 @@ func (p *Pipeline) escalated(tmpl *model.Template, queued bool, now time.Time) {
 			Err:     "escalation queue full — the model is slower than the anomalies",
 			At:      now,
 		}
+		p.export.Resolve(*tmpl.Explanation)
 		p.explainFailed++
 		p.explainDropped++
 		return
@@ -131,6 +172,13 @@ func (p *Pipeline) escalated(tmpl *model.Template, queued bool, now time.Time) {
 // The pointer is REPLACED, never mutated: a value copy of the old one may already be in a
 // Snapshot that the renderer is reading.
 func (p *Pipeline) attach(ex model.Explanation) {
+	// The export file's terminal-state hook for the TUI, where explanations are routed
+	// through this goroutine. (--plain reads them itself and taps them there instead; see
+	// main.runPlain.) It sits above the template lookup because completing a record depends
+	// on the answer, not on the template still being displayable — and Resolve ignores a
+	// PENDING update, so a streamed answer still writes exactly one line.
+	p.export.Resolve(ex)
+
 	tmpl, ok := p.templates[ex.Hash]
 	if !ok {
 		return // a template we no longer know about; nothing to show it on
@@ -229,6 +277,12 @@ type Options struct {
 	// Explanations delivers the pool's answers back to the goroutine that owns the
 	// template map. Nil to skip: a plain run prints them itself, and a dry run has none.
 	Explanations <-chan model.Explanation
+
+	// Export appends one JSONL record per flagged anomaly. Nil (the default, no --export)
+	// disables it, and a nil writer's methods are no-ops, so the code path is otherwise
+	// identical either way. The writes happen on the writer's own goroutine — this one must
+	// never block on a disk.
+	Export *export.Writer
 }
 
 // Run reads lines from in and processes each through a single goroutine-confined
@@ -250,6 +304,7 @@ func Run(ctx context.Context, in <-chan model.LogLine, opts Options) {
 
 	p := New(opts.Scorer)
 	p.explain = opts.Escalations != nil
+	p.export = opts.Export
 	c := newCollector(opts.RingSize)
 
 	// Without a snapshot consumer there is nothing to tick for; a nil channel

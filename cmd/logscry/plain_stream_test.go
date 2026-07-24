@@ -61,7 +61,7 @@ func TestPlainSuppressesStreamedPartials(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			_ = runPlain(ctx, lines, errs, sc, escalations, explanations, false)
+			_ = runPlain(ctx, lines, errs, sc, escalations, explanations, nil, false)
 		}()
 
 		lines <- model.LogLine{Source: "proc:app", Stream: model.Stderr, Level: "PANIC",
