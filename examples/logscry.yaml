@@ -15,6 +15,12 @@ plain: false
 # worker pool is built at all — useful for calibrating the scoring thresholds and for CI.
 explain_dry_run: false
 
+# Append one JSON object per flagged anomaly to this file (JSONL), for anything downstream
+# that wants to parse a run instead of watch it. Empty disables it and no file is opened.
+# The file is appended to, never truncated. Counts in it are as-of-flag-time, not final
+# totals — see the Export section of the README for the schema.
+export: ""
+
 # --- Which Docker containers to follow (omit all of these to read stdin/subprocess) ---
 docker:
   all: false # follow every container, auto-attaching to new ones

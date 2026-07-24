@@ -145,3 +145,32 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       model spends the whole budget on its chain of thought and returns EMPTY content with
       `finish_reason: length`. The error now names the flag, but the default 300 is too low for such
       models and the README should say so (rides along with the M6 README task)
+
+## Epic M8 — Export & persistence  `[v0.6.0]`
+- [x] `--export <path>`: JSONL dump of flagged anomalies. Until this, an anomaly was pixels — a TUI card
+      or a `--plain` line — and nothing else could consume it, so logscry could be watched but not run
+      inside a pipeline. RDI §2 permits exactly one form of persistence ("an optional JSONL dump of
+      flagged events"), which is this and nothing more: no DB, no query layer, no rotation, one
+      append-only file. Default off, and off means no file opened and no goroutine started.
+      One line per flagged anomaly, written when its explanation reaches a TERMINAL state — the streaming
+      landmine, since v0.5.0 delivers an answer as several pending updates first, and a file that took
+      each of them would carry the same anomaly three times, each slightly more complete. A record is a
+      POINT-IN-TIME snapshot: `count_at_flag` / `last_seen_at_flag` are named for the fact that they are
+      the values at the instant the template crossed the threshold, not running totals. An anomaly IS the
+      event "this escalated", and the explanation arriving seconds later explains that event, not the
+      state of the world when the model finished; welding the two instants into one object would be a
+      line that looks like one snapshot and is not. Both renderers capture at the same instant, so the
+      file is a property of the run rather than of what happened to be watching it.
+      Values are REAL: `--llm-anonymize` masks what goes to a remote model, and this file is local
+      exactly like the terminal. Deliberately no raw trigger line — `pattern` is the masked signature,
+      which is what lets the whole file go into a ticket or a CI artifact without auditing it first, and
+      a record about a template that fired N times has no non-arbitrary "the" raw line anyway.
+      `--explain-dry-run` writes too, marked `kind: "would_escalate"` / `state: "not_requested"`: that
+      mode exists to calibrate thresholds, and a greppable, score-sortable, diffable file is the artifact
+      it was missing. It still builds no backend, so the cost guarantee is untouched.
+      Placement: the file is owned by its own goroutine behind a non-blocking send. The pipeline
+      goroutine owns the template map and must never wait on a disk — the same rule that kept the LLM
+      call off it. Line integrity is built rather than assumed: `write(2)` may return short with the
+      bytes it did write already on disk, so each record goes out as one complete buffer through a loop
+      over short writes, and a failed write is rolled back with `Truncate` to the last record boundary —
+      that one record is lost, the file stays valid JSONL
