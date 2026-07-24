@@ -66,6 +66,11 @@ type Config struct {
 	// stage is built at all, so no request can be made (see main.startLLM).
 	ExplainDryRun bool `yaml:"explain_dry_run"`
 
+	// Export is the path to append flagged anomalies to, one JSON object per line. Empty
+	// (the default) disables it and no file is opened at all. A flat top-level key rather
+	// than a block: the sections below each hold a set of knobs, and this is one path.
+	Export string `yaml:"export"`
+
 	Score  score.Config `yaml:"score"`
 	Docker Docker       `yaml:"docker"`
 	Group  Group        `yaml:"group"`
@@ -178,6 +183,9 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 	b.boolVar("explain-dry-run", def.ExplainDryRun,
 		"show what would be escalated instead of calling the LLM (threshold calibration)",
 		func(c *Config) *bool { return &c.ExplainDryRun })
+	b.stringVar("export", def.Export,
+		"append one JSON object per flagged anomaly to this file (JSONL; empty disables)",
+		func(c *Config) *string { return &c.Export })
 
 	// Scoring: the threshold and the weights.
 	s := def.Score

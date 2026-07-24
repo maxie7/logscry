@@ -19,6 +19,11 @@
 // pipeline goroutine, which owns the template state and attaches them there. A slow or
 // dead model can therefore never stall the tail — and in dry-run no LLM stage is built
 // at all, so no request can be made (see startLLM).
+//
+// M8: --export appends one JSON object per flagged anomaly to a file, so a run can be
+// consumed by another program instead of only read. The file is owned by its own goroutine
+// (see internal/export); this file only opens it and taps the two places a terminal
+// explanation is already consumed for display.
 package main
 
 import (
@@ -32,6 +37,7 @@ import (
 	"syscall"
 
 	"github.com/maxie7/logscry/internal/config"
+	"github.com/maxie7/logscry/internal/export"
 	"github.com/maxie7/logscry/internal/ingest"
 	"github.com/maxie7/logscry/internal/llm"
 	"github.com/maxie7/logscry/internal/model"
@@ -60,6 +66,16 @@ func run(ctx context.Context, args []string) error {
 		fmt.Println("logscry", versionString())
 		return nil
 	}
+	// Opened before the terminal is taken over, so a bad --export path is a plain startup
+	// error rather than something discovered from inside the alternate screen. The deferred
+	// close is registered first and therefore runs LAST, after the TUI has restored the
+	// terminal — which is what makes its warnings readable.
+	exp, err := openExport(cfg)
+	if err != nil {
+		return err
+	}
+	defer closeExport(exp)
+
 	sources, stdinOnly := sources(cfg)
 
 	term := tui.Resolve(cfg.Plain)
@@ -106,9 +122,36 @@ func run(ctx context.Context, args []string) error {
 			fmt.Fprintf(os.Stderr, "logscry: raw log lines will be sent to %s; "+
 				"pass --llm-anonymize to mask IPs, emails, tokens, and hostnames first\n", host)
 		}
-		return runPlain(ctx, grouped, errs, sc, escalations, explanations, cfg.ExplainDryRun)
+		return runPlain(ctx, grouped, errs, sc, escalations, explanations, exp, cfg.ExplainDryRun)
 	}
-	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, cfg)
+	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, exp, cfg)
+}
+
+// openExport opens the JSONL export file, or returns nil when --export was not given. A nil
+// *export.Writer is inert, so "disabled" needs no further branching anywhere.
+func openExport(cfg config.Config) (*export.Writer, error) {
+	if cfg.Export == "" {
+		return nil, nil
+	}
+	w, err := export.Open(cfg.Export)
+	if err != nil {
+		return nil, fmt.Errorf("export: %w", err)
+	}
+	return w, nil
+}
+
+// closeExport drains and closes the export file, reporting anything it has to admit to.
+//
+// Both messages go to stderr rather than being swallowed: a tool whose whole job is to not
+// miss anomalies must say so when it has missed one on the way to disk, and a file the
+// consumer is about to parse deserves to be described honestly.
+func closeExport(w *export.Writer) {
+	if err := w.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, "logscry: export:", err)
+	}
+	if n := w.Dropped(); n > 0 {
+		fmt.Fprintf(os.Stderr, "logscry: export: %d record(s) dropped — the export file could not keep up\n", n)
+	}
 }
 
 // startLLM builds the LLM stage: the escalation channel the scorer emits on, and the
@@ -174,7 +217,7 @@ func sources(cfg config.Config) ([]ingest.Source, bool) {
 // The TUI then sees it appear in the next snapshot, and never touches pipeline state.
 func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, term tui.Terminal,
 	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation,
-	cfg config.Config,
+	exp *export.Writer, cfg config.Config,
 ) error {
 	snaps := make(chan pipeline.Snapshot, 1)
 	go pipeline.Run(ctx, lines, pipeline.Options{
@@ -182,6 +225,7 @@ func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, 
 		Scorer:       sc,
 		Escalations:  escalations,
 		Explanations: explanations,
+		Export:       exp,
 	})
 	return term.Run(ctx, snaps, errs, tui.Options{
 		ExplainDryRun:  cfg.ExplainDryRun,
@@ -230,10 +274,13 @@ func remoteHost(baseURL string) (string, bool) {
 // mode has no card to update in place, so an explanation is simply another line to print
 // when it arrives, a few seconds after the escalation it belongs to.
 func runPlain(ctx context.Context, lines <-chan model.LogLine, errs <-chan error,
-	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation, dryRun bool,
+	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation,
+	exp *export.Writer, dryRun bool,
 ) error {
 	events := make(chan pipeline.Event, 1024)
-	go pipeline.Run(ctx, lines, pipeline.Options{Events: events, Scorer: sc, Escalations: escalations})
+	go pipeline.Run(ctx, lines, pipeline.Options{
+		Events: events, Scorer: sc, Escalations: escalations, Export: exp,
+	})
 
 	for events != nil || explanations != nil {
 		select {
@@ -256,6 +303,10 @@ func runPlain(ctx context.Context, lines <-chan model.LogLine, errs <-chan error
 			if ex.State == model.ExplainPending {
 				continue
 			}
+			// The export file's terminal-state hook for plain mode, deliberately on the far
+			// side of the skip above: whatever reaches here is the answer, and the file gets
+			// exactly one line per anomaly for the same reason stdout gets one block.
+			exp.Resolve(ex)
 			if _, err := fmt.Fprint(os.Stdout, explained(ex)); err != nil {
 				return err
 			}
