@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <img src="docs/logo-light.svg" alt="logscry" width="440">
+  </picture>
+</p>
+
 # logscry
 
 **Real-time, AI-assisted log triage. Silent on noise, speaks on signal.**

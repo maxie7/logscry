@@ -23,7 +23,7 @@ scope defined there (§2) without asking first.
 - Before finishing a task, run the verify loop: `gofmt`, `go vet`, `golangci-lint run`,
   `go test ./...`, `go build ./...` (the `/verify` skill does this).
 - Commit with Conventional Commits: `feat:`, `fix:`, `chore:`, `test:`, `docs:`, `refactor:`.
-- Repo is **PRIVATE until milestone M6**. Never commit secrets; API keys via env only.
+- **Never commit secrets**; API keys via env only.
 
 ## Definition of done (v1)
 Single static binary; runs offline against a local Ollama; the demo in `examples/demo`
