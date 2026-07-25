@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="logscry">
+  <title>logscry mark</title>
+  <path d="M8 22 Q32 -6 56 22 Q32 50 8 22 Z" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linejoin="round"/>
+  <circle cx="32" cy="22" r="6.5" fill="var(--logscry-accent, #12A594)"/>
+  <path d="M10 48 H54" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+  <path d="M10 58 H34" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+</svg>
