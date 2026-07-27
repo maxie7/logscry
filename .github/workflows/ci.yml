@@ -44,3 +44,27 @@ jobs:
       # map and the LLM pool must never block ingest — so it is worth the extra minute.
       - name: Test (race detector)
         run: go test -race ./...
+
+      # Coverage is measured here and only here: the number comes from this run, never from
+      # a checked-in constant. Deliberately separate from the upload below, so a Codecov
+      # outage, a rate limit, or a missing token still leaves the percentage in the log.
+      # atomic covermode is what Codecov wants and the right mode for concurrent code; it
+      # changes counter accounting, not the percentage.
+      - name: Test (coverage)
+        run: |
+          go test -covermode=atomic -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -1
+          echo "Total coverage: $(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')" >> "$GITHUB_STEP_SUMMARY"
+
+      # Reporting, never a gate: fail_ci_if_error stays false so an external service cannot
+      # turn this build red, and there is no minimum-coverage threshold on purpose.
+      # A public repo uploads tokenless only while the Codecov org has "tokens required"
+      # off. If the README coverage badge still reads "unknown" after this lands on the
+      # default branch, the fix is to add a CODECOV_TOKEN repository secret — the reference
+      # below is empty until then and picks it up with no change here.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
