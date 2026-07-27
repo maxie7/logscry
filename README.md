@@ -7,6 +7,16 @@
 
 # logscry
 
+<p align="center">
+  <img src="https://img.shields.io/github/go-mod/go-version/maxie7/logscry" alt="Go version">
+  <img src="https://img.shields.io/github/license/maxie7/logscry" alt="License: Apache-2.0">
+  <a href="https://github.com/maxie7/logscry/releases/latest"><img src="https://img.shields.io/github/v/release/maxie7/logscry" alt="Latest release"></a>
+  <a href="https://github.com/maxie7/logscry/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/maxie7/logscry/ci.yml?label=CI" alt="CI status"></a>
+  <a href="https://codecov.io/gh/maxie7/logscry"><img src="https://img.shields.io/codecov/c/github/maxie7/logscry" alt="Coverage"></a>
+  <img src="https://img.shields.io/github/last-commit/maxie7/logscry" alt="Last commit">
+  <img src="https://img.shields.io/github/languages/code-size/maxie7/logscry" alt="Code size">
+</p>
+
 **Real-time, AI-assisted log triage. Silent on noise, speaks on signal.**
 
 logscry tails a log or event stream as it happens, does cheap local scoring to tell
