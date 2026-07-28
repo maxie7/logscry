@@ -1,0 +1,61 @@
+name: Release
+
+# Release-only, and separate from ci.yml on purpose: this job writes to the repository and
+# publishes artifacts, so it must never be reachable from a branch push or a pull request.
+# A tag is the single trigger, and the tag is what GoReleaser stamps into the binary.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write      # create the Release and upload its assets
+  id-token: write      # OIDC token for keyless attestation — no secret, nothing to store
+  attestations: write  # record the provenance attestation against this repo
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # GoReleaser derives the version from the tag, so a shallow clone leaves it with
+          # nothing to release from.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          # Same source of truth as ci.yml: the toolchain that releases is the toolchain
+          # that is tested.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          # The built-in token is enough to create a release in this repo — no PAT.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Provenance, not signing: GitHub's keyless attestation (Sigstore via OIDC) records
+      # that these exact bytes came out of this workflow, at this commit, in this repo. A
+      # checksum only proves a download was not corrupted; it says nothing about who
+      # produced the file it describes. There is no key to manage or rotate.
+      #
+      # The subjects are the archives users actually download, plus checksums.txt itself,
+      # which gives one attestation per artifact — so `gh attestation verify
+      # logscry_X.Y.Z_linux_amd64.tar.gz --repo maxie7/logscry` works on the downloaded file
+      # alone. (Attesting only checksums.txt would make every verification a two-file
+      # exercise.) Runs after GoReleaser so ./dist exists; `--clean` wipes dist at the start
+      # of that step, not the end.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt

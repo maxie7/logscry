@@ -1,0 +1,69 @@
+# GoReleaser builds the prebuilt binaries attached to each GitHub Release, so getting
+# logscry needs no Go toolchain, no make, and no git checkout. It is a parallel path to the
+# Makefile, not a replacement: both stamp the same `main.version` symbol, and local builds
+# keep going through `make build`.
+#
+# Cut a release by pushing a tag; .github/workflows/release.yml does the rest. Validate
+# changes here without publishing anything:
+#   goreleaser check
+#   goreleaser release --snapshot --clean
+version: 2
+
+project_name: logscry
+
+before:
+  hooks:
+    # A release must not be cut from failing code. Deliberately not -race: CI already runs
+    # the race detector on every push, and repeating it here would only slow the tag build.
+    - go test ./...
+
+builds:
+  - id: logscry
+    main: ./cmd/logscry
+    binary: logscry
+    env:
+      # No cgo anywhere in the tree, and disabling it is what makes the shipped binary
+      # genuinely static — no libc version coupling on the machine that downloads it.
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      # windows/arm64 is included rather than skipped: the plain goos x goarch cross product
+      # covers it, Go cross-compiles it cleanly with cgo off, and excluding it would cost an
+      # `ignore:` rule to save one archive.
+      - amd64
+      - arm64
+    ldflags:
+      # THE point of this file. `main.version` is the exact symbol cmd/logscry/version.go
+      # declares and resolveVersion() prefers over BuildInfo — get the path wrong and the
+      # build still succeeds while `logscry --version` prints nothing, which is the failure
+      # prebuilt binaries exist to avoid. {{.Tag}} rather than {{.Version}}: the tag already
+      # carries the `v`, so the binary reports it verbatim instead of relying on GoReleaser
+      # stripping exactly one leading `v` and this file adding it back. -s -w strips the
+      # symbol table and DWARF.
+      - -s -w -X main.version={{.Tag}}
+
+archives:
+  - id: logscry
+    # Plural `formats:` is the current schema (v2.6+); singular `format:` /
+    # `format_overrides.format` are deprecated.
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # Apache-2.0 expects the NOTICE to travel with the distribution, and a downloaded
+    # archive is a distribution.
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+
+checksum:
+  # sha256 is the default algorithm. Integrity only — provenance comes from the keyless
+  # build attestation in the release workflow, which is a different guarantee.
+  name_template: checksums.txt
