@@ -222,3 +222,58 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       TS→UUID→IP→HEX→NUM→STR order are untouched — and the anonymizer stays a separate masker, as it was
       always meant to be. Pretty-printed multi-line JSON stays out of scope: the coalescer's joined output
       does not parse, so it takes the text path
+
+## Epic M10 — Release automation
+- [x] Attach PREBUILT BINARIES to every GitHub Release, so getting logscry stops requiring a Go toolchain.
+      Until now the only two ways in were `go install` and building from source — both of which ask someone
+      who merely wants to RUN the tool to install Go first. That is a strange toll for a project whose whole
+      pitch is "single static binary", and it is the last step of the loop the Makefile fix started: that fix
+      made a release SOURCE ARCHIVE buildable outside a git checkout; this removes the need to build at all.
+      Download one file, `chmod +x`, run.
+      GoReleaser rather than a hand-rolled build matrix. A matrix workflow is six `GOOS/GOARCH` lines and then
+      an ever-growing tail of the things GoReleaser already does correctly — archive naming, per-OS zip vs
+      tar.gz, checksums, uploading to the right release, LICENSE/NOTICE inclusion — each of which is a place
+      to be subtly wrong once a year at tag time, which is exactly when nobody wants to debug YAML. Config
+      lives in `.goreleaser.yaml` (schema `version: 2`, plural `formats:` — the singular `format:` is
+      deprecated) and can be exercised locally with `goreleaser check` and `goreleaser release --snapshot
+      --clean`, which builds every target into `./dist` and touches nothing on GitHub. Six targets:
+      linux/darwin/windows x amd64/arm64. windows/arm64 is kept rather than skipped — the plain cross product
+      covers it and cgo is off, so EXCLUDING it would be the thing that costs an extra rule. `CGO_ENABLED=0`
+      is what makes the shipped binary genuinely static instead of quietly coupled to the libc of whatever
+      runner built it.
+      The load-bearing line is the ldflag: `-X main.version={{.Tag}}`. `main.version` is the exact symbol
+      `cmd/logscry/version.go` declares and `resolveVersion()` prefers over BuildInfo — the same symbol the
+      Makefile stamps, so the two paths agree rather than compete. Get that path wrong and NOTHING fails
+      loudly: the build succeeds, the release publishes, and `logscry --version` prints an empty string —
+      which is precisely the failure a downloadable binary exists to prevent, since a downloaded binary has
+      no git checkout to fall back on and BuildInfo's module version is absent for a non-`go install` build.
+      `{{.Tag}}` and not `{{.Version}}`: the tag already carries the `v`, so the binary reports the tag
+      verbatim instead of depending on GoReleaser stripping exactly one leading `v` and this config gluing it
+      back on — the tag is the source of truth, and the reported version matches `go install` (BuildInfo →
+      `v0.8.0`) and `make build` (git describe) in style. The tradeoff, accepted: under `--snapshot` there is
+      no new tag, so a dry-run binary reports the PREVIOUS tag rather than a snapshot string. That is a
+      property of local dry runs only, and it still proves the thing the dry run is for — that the symbol
+      path resolves and `--version` is non-empty.
+      A separate `release.yml` triggered by `v*` TAG PUSHES ONLY, never merged into `ci.yml`. This job has
+      `contents: write` and publishes artifacts; the reason it is its own file is so that permission can
+      never be reachable from a branch push or a pull request. It uses the built-in `GITHUB_TOKEN` — no PAT
+      to mint, scope, or rotate — with `fetch-depth: 0`, without which GoReleaser sees no tag and has nothing
+      to release. A `go test ./...` before-hook means a release cannot be cut from failing code; deliberately
+      not `-race`, since CI already runs the race detector on every push and repeating it would only make tag
+      time slower.
+      Binaries also carry KEYLESS BUILD PROVENANCE (GitHub/Sigstore via OIDC, `id-token: write`). This is not
+      the code signing that stayed out of scope — there is no key to generate, store, or rotate, and no
+      secret in the repo. It closes a gap that `checksums.txt` does not: a checksum proves a download was not
+      corrupted in transit, but it is published alongside the artifact and says nothing about WHO produced
+      the file it describes, so it is no help at all against someone with write access swapping both. The
+      attestation binds these exact bytes to this workflow, this commit, this repo, verifiable with
+      `gh attestation verify <file> --repo maxie7/logscry`. Handing out unattested executables would sit
+      badly with a tool that markets itself on keeping your logs local and ships an anonymizer. The subjects
+      are the ARCHIVES plus `checksums.txt` — one attestation per artifact, so verification works on the file
+      a user actually downloaded rather than making it a two-file exercise. Checksums stay: integrity and
+      provenance are complementary, not substitutes.
+      Untouched on purpose: `ci.yml`, the Makefile and its version resolution (local builds keep working
+      exactly as before; GoReleaser is a PARALLEL path, not a replacement), and every line of Go — the
+      ldflags-override branch `resolveVersion()` already had is the entire integration surface. Left out as
+      separate decisions rather than oversights: package managers (Homebrew/apt/scoop), Docker image
+      publishing, cosign/GPG signing, and SBOM generation
