@@ -3,8 +3,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"encoding/json"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/maxie7/logscry/internal/model"
@@ -68,9 +70,10 @@ func normalizeJSON(s string) (level, message string, ok bool) {
 		return "", "", false
 	}
 
+	idx := jsonKeyIndex(obj)
 	for _, k := range jsonLevelKeys {
-		if raw, present := obj[k]; present {
-			if v, ok := jsonString(raw); ok {
+		if actual, present := idx[k]; present {
+			if v, ok := jsonString(obj[actual]); ok {
 				level = canonicalLevel(v)
 				break
 			}
@@ -79,8 +82,8 @@ func normalizeJSON(s string) (level, message string, ok bool) {
 
 	message = s // fall back to the raw JSON when no message field is present
 	for _, k := range jsonMessageKeys {
-		if raw, present := obj[k]; present {
-			if v, ok := jsonString(raw); ok {
+		if actual, present := idx[k]; present {
+			if v, ok := jsonString(obj[actual]); ok {
 				message = v
 				break
 			}
@@ -89,9 +92,40 @@ func normalizeJSON(s string) (level, message string, ok bool) {
 	return level, message, true
 }
 
+// jsonKeyIndex maps the lowercased form of every key in a JSON object to the key as it
+// actually appears, so the probes above match "LEVEL" and "Msg" as readily as "level" and
+// "msg" — case is a logger's choice, not a different field.
+//
+// Keys are sorted before the index is built and the first occurrence of a lowercased form
+// wins, so an object carrying both "level" and "Level" resolves the same way on every run
+// rather than by map iteration order.
+func jsonKeyIndex(obj map[string]json.RawMessage) map[string]string {
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	idx := make(map[string]string, len(keys))
+	for _, k := range keys {
+		lower := strings.ToLower(k)
+		if _, dup := idx[lower]; !dup {
+			idx[lower] = k
+		}
+	}
+	return idx
+}
+
 // jsonString decodes a RawMessage as a JSON string, reporting ok=false for
 // non-string values (numbers, objects, etc.).
+//
+// null is checked separately because it unmarshals into a string WITHOUT error, leaving
+// it empty — so a `"msg": null` would otherwise be adopted as an empty message instead of
+// falling back like the absent field it is.
 func jsonString(raw json.RawMessage) (string, bool) {
+	if v := bytes.TrimSpace(raw); len(v) == 0 || v[0] != '"' {
+		return "", false
+	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return "", false

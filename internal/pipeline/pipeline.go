@@ -84,7 +84,7 @@ func New(sc *score.Scorer) *Pipeline {
 // returns the event to emit. now is the observation time (injected for testability).
 func (p *Pipeline) Process(line model.LogLine, now time.Time) Event {
 	line = Normalize(line)
-	pattern, hash := Templatize(line.Message)
+	pattern, hash := TemplatizeLine(line)
 	tmpl, prevLastSeen := p.upsert(hash, pattern, now)
 
 	ev := Event{
