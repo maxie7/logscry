@@ -26,6 +26,12 @@ func TestNormalizeJSONLevelAndMessage(t *testing.T) {
 		{"leading space", `   {"level":"panic","msg":"x"}`, "PANIC", "x"},
 		{"no message field falls back to raw", `{"level":"info","k":"v"}`, "INFO", `{"level":"info","k":"v"}`},
 		{"unknown level dropped", `{"level":"verbose","msg":"x"}`, "", "x"},
+		// Case is a logger's choice, not a different field (M9).
+		{"uppercase keys", `{"LEVEL":"error","MSG":"boom"}`, "ERROR", "boom"},
+		{"mixed-case keys", `{"Severity":"warn","Message":"slow"}`, "WARN", "slow"},
+		// A null value is not a message: fall back rather than adopt an empty one.
+		{"null message falls back to raw", `{"level":"info","msg":null}`, "INFO", `{"level":"info","msg":null}`},
+		{"null level", `{"level":null,"msg":"x"}`, "", "x"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

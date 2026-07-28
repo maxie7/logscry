@@ -174,3 +174,51 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       bytes it did write already on disk, so each record goes out as one complete buffer through a loop
       over short writes, and a failed write is rolled back with `Truncate` to the last record boundary —
       that one record is lost, the file stays valid JSONL
+
+## Epic M9 — JSON-per-line templating  `[v0.7.0]`
+- [x] Template a JSON line on its KEY STRUCTURE instead of running the text masker over it. Found while
+      dogfooding logscry against MCP servers: they log nested JSON objects, one per physical line, and
+      they carry no `level`/`msg` where RDI §5.1 looks — so normalization declined them, the message fell
+      back to the whole raw JSON, and the line went through a masker built for `user 4821 failed`. Every
+      string value became `<STR>`, keys included, and the signature degraded to brace soup
+      (`{<STR>:{<STR>:<STR>,<STR>:{<STR>:{}},...}`). Visible in the AGGREGATED pane, and wrong twice over:
+      unreadable, and broken for dedup in BOTH directions — two genuinely different events with the same
+      shape collapsed into one template, while the same event logged with a different key order or nesting
+      split into several. Not a crash; the masker followed its rules. But JSON-per-line is common now and
+      deserves a real branch.
+      Field NAMES are the stable, meaningful part of a structured event — they are what makes two lines
+      "the same event" — so keys are kept literally and only values are masked, into the existing
+      `<STR>/<NUM>/<BOOL>/<NULL>` vocabulary rather than a second one a reader would have to learn. Keys
+      are SORTED before rendering: without that, key order alone still splits a template, which was half
+      the original bug. The result reads like `{"level":<STR>,"msg":<STR>,"ts":<NUM>}` — a human can see
+      what the event was. Top-level arrays take the branch too (keys inside their elements would otherwise
+      be masked away) and render as their DISTINCT element shapes, because array LENGTH is a value-like
+      property, not structure, and folding it in would split a template by how many items happened to be
+      logged. Top-level scalars stay on the text path: a line that is a bare `42` is ordinary text.
+      The one exception, and the whole reason this does not just move the dedup bug: the recognized
+      message field is run through the TEXT masker and kept, not blanked. That value is the human payload
+      and is where the variable parts live — masking it to `<STR>` would merge `{"msg":"disk full"}` with
+      `{"msg":"connection refused"}` and leave novelty unable to ever fire on a JSON-logging app. The
+      boundary is deliberately narrow: the text masker touches the message field and NOTHING else, since
+      running it over arbitrary values would bring the soup straight back and couple key-structure
+      templating to value-masking. Because the fragment is computed by the same function the plain-text
+      path uses, it comes out byte-identical to that path's template — asserted by a test — while the full
+      hashes still DIFFER: a structured event and an unstructured one are genuinely different events, and
+      merging them would erase the wrapper, the sibling fields, and where severity came from. Ambiguity
+      (both `msg` and `message`) or a non-string value falls back to a plain placeholder rather than
+      guessing.
+      Bounded by construction — depth cap 6, a shared 128-value budget, truncation deterministic because
+      keys are sorted first — so a pathological producer degrades rather than hangs; and `encoding/json`
+      rejects absurd nesting itself, which simply falls back to the text path. Two edges are pinned rather
+      than left to chance: an empty object `{}` dedups ALL field-less heartbeat/ack lines from ALL sources
+      into one template, which is accepted because they ARE structurally identical and a line with no
+      fields carries nothing to tell it apart by; and a message value that is itself JSON-as-a-string is
+      NOT re-parsed — it is text-masked like any other string, since recursing into message values is a
+      different feature.
+      §5.1 keeps working: level/message extraction holds its key sets and priority order and gains
+      case-insensitive lookup (resolved deterministically, not by map iteration), so severity still fires
+      on a JSON FATAL line; an object with no level field gets no severity signal, which is correct rather
+      than a gap. Non-JSON lines reach the text masker byte for byte — its regexes and their
+      TS→UUID→IP→HEX→NUM→STR order are untouched — and the anonymizer stays a separate masker, as it was
+      always meant to be. Pretty-printed multi-line JSON stays out of scope: the coalescer's joined output
+      does not parse, so it takes the text path

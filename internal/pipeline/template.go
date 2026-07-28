@@ -7,6 +7,8 @@ import (
 	"hash/fnv"
 	"regexp"
 	"strings"
+
+	"github.com/maxie7/logscry/internal/model"
 )
 
 // A masker replaces variable substrings of one kind with a typed placeholder. The
@@ -84,6 +86,22 @@ func maskHex(match string) string {
 		return "<HEX>"
 	}
 	return match
+}
+
+// TemplatizeLine produces the signature for a whole log line, choosing between two
+// branches. A line whose raw form is a single JSON object or array is templated on its KEY
+// STRUCTURE (see jsonshape.go); anything else runs the text masker over the normalized
+// message, exactly as it always has.
+//
+// The JSON branch parses the line a second time — Normalize already parsed it for level
+// and message. That is one extra shallow decode per JSON line, and it is the price of
+// keeping "detect level/message" and "build a signature" two independent functions rather
+// than one that does both.
+func TemplatizeLine(line model.LogLine) (pattern, hash string) {
+	if pattern, ok := jsonShapeSignature(strings.TrimSpace(line.Raw)); ok {
+		return pattern, hashTemplate(pattern)
+	}
+	return Templatize(line.Message)
 }
 
 // Templatize produces a masked signature for a log message by replacing variable
