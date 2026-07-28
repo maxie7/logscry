@@ -60,7 +60,44 @@ The closest comparable, [k8sgpt](https://github.com/k8sgpt-ai/k8sgpt), proves th
 for AI-explained errors but is Kubernetes-specific and scan-based. logscry deliberately
 takes the real-time, source-agnostic, dev-time lane it leaves open.
 
+## Installation
+
+**Download a binary** — no Go toolchain needed. Grab the archive for your OS and
+architecture from the [latest release](https://github.com/maxie7/logscry/releases/latest)
+and put `logscry` on your `PATH`:
+
+```sh
+VERSION=0.8.0   # the version on the releases page, without the leading v
+ARCHIVE=logscry_${VERSION}_linux_amd64.tar.gz   # or darwin_arm64, linux_arm64, …
+
+curl -sSLO "https://github.com/maxie7/logscry/releases/download/v${VERSION}/${ARCHIVE}"
+tar xzf "$ARCHIVE" logscry
+chmod +x logscry
+./logscry --version
+```
+
+Windows archives are `.zip`; macOS and Linux are `.tar.gz`. Every release also carries a
+`checksums.txt`. Optionally confirm a download really came from this repo's release
+pipeline — the archives ship with keyless GitHub build provenance:
+`gh attestation verify "$ARCHIVE" --repo maxie7/logscry`.
+
+**With Go** — if you already have a toolchain:
+
+```sh
+go install github.com/maxie7/logscry/cmd/logscry@latest
+```
+
+**From source** — for contributors, or to build a specific commit:
+
+```sh
+git clone https://github.com/maxie7/logscry.git && cd logscry
+make build          # -> ./bin/logscry
+```
+
 ## Quick start
+
+The examples below use `./bin/logscry` (the from-source path); a downloaded or `go
+install`ed binary is just `logscry`.
 
 ```sh
 # build the single binary -> ./bin/logscry
