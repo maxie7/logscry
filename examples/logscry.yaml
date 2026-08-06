@@ -28,6 +28,14 @@ docker:
   label: [] # ...or those carrying these k=v labels (AND-combined)
   tail: "100" # lines of history fetched per container on attach ("all" for everything)
 
+# --- Sources: the systemd journal (Linux; runs `journalctl -f -o json`) ---
+# Reading the SYSTEM journal needs membership of the systemd-journal group, or root —
+# without it journalctl still follows, but only your own session. See the README.
+journald:
+  enabled: false # follow the journal
+  unit: [] # ...or only these units (OR-combined); naming one is enough to enable
+  priority: 7 # priority floor: 0 emerg .. 7 debug (3 = errors and worse)
+
 # --- Multi-line grouping: fold a stack trace / goroutine dump into ONE event ---
 group:
   # Idle flush. A buffered multi-line event is emitted this long after its last line

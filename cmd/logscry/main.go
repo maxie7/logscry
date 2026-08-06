@@ -89,7 +89,12 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	lines := make(chan model.LogLine, 1024)
-	errs := make(chan error, 1)
+	// Capacity 2 so the journald notice below and a later source error can both be put
+	// down without either sender blocking.
+	errs := make(chan error, 2)
+	if notice := journaldNotice(cfg); notice != nil {
+		errs <- notice
+	}
 	go func() {
 		defer close(lines)
 		defer close(errs)
@@ -202,10 +207,39 @@ func sources(cfg config.Config) ([]ingest.Source, bool) {
 		src.Tail = cfg.Docker.Tail
 		out = append(out, src)
 	}
+	if journaldEnabled(cfg) {
+		out = append(out, ingest.NewJournaldSource(cfg.Journald.Units, cfg.Journald.Priority))
+	}
 	if len(out) == 0 {
 		return []ingest.Source{ingest.NewStdinSource()}, true
 	}
 	return out, false
+}
+
+// journaldEnabled reports whether to follow the systemd journal. Naming a unit is enough
+// on its own, the way --docker-name and --docker-label imply Docker without --docker-all;
+// --journald-priority alone is not, the way --docker-tail alone is not — it tunes a
+// source rather than asking for one.
+func journaldEnabled(cfg config.Config) bool {
+	return cfg.Journald.Enabled || len(cfg.Journald.Units) > 0
+}
+
+// journaldNotice reports a journal the user can only partially see, or nil.
+//
+// This is the failure --journald is most likely to hit and the only one that arrives
+// without an error: journalctl runs fine for a user outside the systemd-journal group,
+// it just follows their own session instead of the system, so the tool looks broken
+// while working exactly as instructed. It is not an error and must not end the run — it
+// goes down the background-notice channel, which the TUI shows in its status line and
+// --plain prints to stderr.
+func journaldNotice(cfg config.Config) error {
+	if !journaldEnabled(cfg) {
+		return nil
+	}
+	if w := ingest.SystemJournalWarning(); w != "" {
+		return errors.New(w)
+	}
+	return nil
 }
 
 // runTUI renders pipeline snapshots in Bubble Tea. The snapshot channel has

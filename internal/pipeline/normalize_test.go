@@ -99,3 +99,83 @@ func TestNormalizeMalformedJSONFallsBack(t *testing.T) {
 		t.Errorf("Message = %q, want the raw line", got.Message)
 	}
 }
+
+// TestNormalizeSourceLevelWinsOverTheText is the journald case, and the reason a Source
+// may set Level at all. journald's PRIORITY is recorded by systemd at the journal
+// protocol level; a level token in the message body is a regex guess about prose. When
+// they disagree the structured value is the one that is not guessing.
+//
+// The message must still be normalized: the source supplies a level, not a parse, so the
+// line goes through the same format detection as any other and still gets its recognized
+// prefix stripped.
+func TestNormalizeSourceLevelWinsOverTheText(t *testing.T) {
+	tests := []struct {
+		name        string
+		in          model.LogLine
+		wantMessage string
+	}{
+		{
+			"a disagreeing plaintext token loses",
+			model.LogLine{Level: "ERROR", Raw: "[INFO] db connection dropped"},
+			"db connection dropped",
+		},
+		{
+			"a disagreeing JSON level loses",
+			model.LogLine{Level: "ERROR", Raw: `{"level":"info","msg":"db connection dropped"}`},
+			"db connection dropped",
+		},
+		{
+			"text with no level of its own is simply filled in",
+			model.LogLine{Level: "ERROR", Raw: "db connection dropped"},
+			"db connection dropped",
+		},
+		{
+			"an agreeing token changes nothing",
+			model.LogLine{Level: "ERROR", Raw: "error: db connection dropped"},
+			"db connection dropped",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Normalize(tc.in)
+			if got.Level != "ERROR" {
+				t.Errorf("Level = %q, want the source's ERROR", got.Level)
+			}
+			if got.Message != tc.wantMessage {
+				t.Errorf("Message = %q, want %q — message normalization must still run",
+					got.Message, tc.wantMessage)
+			}
+			if got.Raw != tc.in.Raw {
+				t.Errorf("Raw = %q, want it untouched", got.Raw)
+			}
+		})
+	}
+}
+
+// TestNormalizeDetectsLevelWhenTheSourceSuppliesNone is the regression guard for every
+// source that predates journald: stdin, subprocess, and Docker never set Level, so they
+// must reach the detection path and come out exactly as they always did.
+func TestNormalizeDetectsLevelWhenTheSourceSuppliesNone(t *testing.T) {
+	tests := []struct {
+		raw         string
+		wantLevel   string
+		wantMessage string
+	}{
+		{"[WARN] disk at 91%", "WARN", "disk at 91%"},
+		{"error: db connection dropped", "ERROR", "db connection dropped"},
+		{`{"level":"fatal","msg":"out of memory"}`, "FATAL", "out of memory"},
+		{"just a line", "", "just a line"},
+		{"http://example.com/x failed", "", "http://example.com/x failed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.raw, func(t *testing.T) {
+			got := Normalize(model.LogLine{Raw: tc.raw}) // Level empty, as every source leaves it
+			if got.Level != tc.wantLevel {
+				t.Errorf("Level = %q, want %q", got.Level, tc.wantLevel)
+			}
+			if got.Message != tc.wantMessage {
+				t.Errorf("Message = %q, want %q", got.Message, tc.wantMessage)
+			}
+		})
+	}
+}

@@ -5,6 +5,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -219,5 +220,63 @@ func TestVersionFlag(t *testing.T) {
 	}
 	if !cfg.Version {
 		t.Error("cfg.Version = false, want true even with a bad --config")
+	}
+}
+
+// TestJournaldFlags: the source is off by default, its flags bind, and the priority
+// floor is validated — an out-of-range -p is a journalctl invocation that fails at
+// startup, which is better caught next to the flag that set it.
+func TestJournaldFlags(t *testing.T) {
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Journald.Enabled || len(cfg.Journald.Units) > 0 {
+		t.Errorf("journald is on by default: %+v", cfg.Journald)
+	}
+	if cfg.Journald.Priority != 7 {
+		t.Errorf("default priority = %d, want 7 (everything)", cfg.Journald.Priority)
+	}
+
+	cfg, err = Load([]string{"--journald", "--journald-priority", "4",
+		"--journald-unit", "nginx", "--journald-unit", "sshd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Journald.Enabled {
+		t.Error("--journald did not enable the source")
+	}
+	if cfg.Journald.Priority != 4 {
+		t.Errorf("priority = %d, want 4", cfg.Journald.Priority)
+	}
+	if want := []string{"nginx", "sshd"}; !slices.Equal(cfg.Journald.Units, want) {
+		t.Errorf("units = %q, want %q", cfg.Journald.Units, want)
+	}
+
+	for _, bad := range []string{"8", "-1"} {
+		if _, err := Load([]string{"--journald-priority", bad}); err == nil {
+			t.Errorf("priority %s was accepted, want a range error", bad)
+		}
+	}
+	for _, ok := range []string{"0", "7"} {
+		if _, err := Load([]string{"--journald-priority", ok}); err != nil {
+			t.Errorf("priority %s was rejected: %v", ok, err)
+		}
+	}
+}
+
+// TestJournaldFromFile: the block is reachable from logscry.yaml like every other
+// section, including the repeatable unit list.
+func TestJournaldFromFile(t *testing.T) {
+	path := writeConfig(t, "journald:\n  enabled: true\n  priority: 3\n  unit:\n    - nginx\n")
+	cfg, err := Load([]string{"--config", path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Journald.Enabled || cfg.Journald.Priority != 3 {
+		t.Errorf("journald = %+v, want enabled at priority 3", cfg.Journald)
+	}
+	if want := []string{"nginx"}; !slices.Equal(cfg.Journald.Units, want) {
+		t.Errorf("units = %q, want %q", cfg.Journald.Units, want)
 	}
 }

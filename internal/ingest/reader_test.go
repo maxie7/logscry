@@ -4,6 +4,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -78,6 +79,79 @@ func TestReadLinesSurvivesLongLine(t *testing.T) {
 	}
 	if got[0].Raw != long {
 		t.Fatalf("long line truncated: got %d bytes, want %d", len(got[0].Raw), len(long))
+	}
+}
+
+// TestMapLinesAppliesTheTransformToEveryLine covers the shared loop on its own, so the
+// Docker and journald tests are free to cover only their own transforms.
+func TestMapLinesAppliesTheTransformToEveryLine(t *testing.T) {
+	got := collect(t, func(ctx context.Context, out chan<- model.LogLine) error {
+		return mapLines(ctx, strings.NewReader("a\nb\nc\n"), "test", model.Stderr, out,
+			func(ll model.LogLine) model.LogLine {
+				ll.Raw = strings.ToUpper(ll.Raw)
+				return ll
+			})
+	})
+
+	want := []string{"A", "B", "C"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines, want %d: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i].Raw != w {
+			t.Errorf("line %d = %q, want %q", i, got[i].Raw, w)
+		}
+		// The tagging readLines does must survive the transform.
+		if got[i].Source != "test" || got[i].Stream != model.Stderr {
+			t.Errorf("line %d tagged source=%q stream=%v", i, got[i].Source, got[i].Stream)
+		}
+	}
+}
+
+// TestMapLinesIdentityTransformIsReadLines pins that routing a source through mapLines
+// costs it nothing: with fn as identity the output is what readLines alone would emit.
+func TestMapLinesIdentityTransformIsReadLines(t *testing.T) {
+	const input = "alpha\nbeta\ngamma" // no trailing newline: the final-line edge case too
+	identity := func(ll model.LogLine) model.LogLine { return ll }
+
+	via := collect(t, func(ctx context.Context, out chan<- model.LogLine) error {
+		return mapLines(ctx, strings.NewReader(input), "test", model.Stdout, out, identity)
+	})
+	direct := collect(t, func(ctx context.Context, out chan<- model.LogLine) error {
+		return readLines(ctx, strings.NewReader(input), "test", model.Stdout, out)
+	})
+
+	if len(via) != len(direct) {
+		t.Fatalf("mapLines emitted %d lines, readLines emitted %d", len(via), len(direct))
+	}
+	for i := range via {
+		if via[i].Raw != direct[i].Raw || via[i].Source != direct[i].Source || via[i].Stream != direct[i].Stream {
+			t.Errorf("line %d: mapLines %+v, readLines %+v", i, via[i], direct[i])
+		}
+	}
+}
+
+// TestMapLinesStopsOnContextCancel: a cancelled context must end the loop rather than
+// block forever on a consumer that has already gone — the shutdown path every source
+// inherits from this helper.
+func TestMapLinesStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// An unbuffered out with no reader: the only way to return is the ctx.Done() case.
+	done := make(chan error, 1)
+	go func() {
+		done <- mapLines(ctx, strings.NewReader("one\ntwo\n"), "test", model.Stdout,
+			make(chan model.LogLine), func(ll model.LogLine) model.LogLine { return ll })
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mapLines did not return on a cancelled context")
 	}
 }
 

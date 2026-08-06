@@ -214,26 +214,15 @@ func streamLogs(ctx context.Context, r io.Reader, tty bool, source string, out c
 	return errors.Join(demuxErr, outErr, errErr)
 }
 
-// readDockerStream reads lines from r via the shared readLines helper, then
-// strips and parses each line's RFC3339Nano timestamp prefix (readLines itself
-// cannot, since it hardcodes receipt Time and the raw line). It reuses readLines
-// through an interim channel to avoid reimplementing line buffering.
+// readDockerStream reads lines from r via the shared mapLines helper, then strips and
+// parses each line's RFC3339Nano timestamp prefix (readLines itself cannot, since it
+// hardcodes receipt Time and the raw line). Docker's wire format IS that prefix, so the
+// transform is all this source has to supply.
 func readDockerStream(ctx context.Context, r io.Reader, source string, stream model.Stream, out chan<- model.LogLine) error {
-	interim := make(chan model.LogLine)
-	var readErr error
-	go func() {
-		defer close(interim)
-		readErr = readLines(ctx, r, source, stream, interim)
-	}()
-	for ll := range interim {
+	return mapLines(ctx, r, source, stream, out, func(ll model.LogLine) model.LogLine {
 		ll.Time, ll.Raw = parseDockerTS(ll.Time, ll.Raw)
-		select {
-		case out <- ll:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return readErr
+		return ll
+	})
 }
 
 // parseDockerTS splits a Docker "<RFC3339Nano> <message>" line into its parsed

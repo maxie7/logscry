@@ -51,8 +51,8 @@ logs understandable.
 
 - **Real-time / streaming-native** — a live tail that flags anomalies as they appear, not
   a scan-on-demand report you run after the fact.
-- **Source-agnostic** — stdin, a subprocess, or Docker containers in v1 (NATS/Kafka/
-  journald later). Not tied to Kubernetes.
+- **Source-agnostic** — stdin, a subprocess, Docker containers, or the systemd journal
+  (NATS/Kafka later). Not tied to Kubernetes.
 - **Local-first** — runs offline against a local [Ollama](https://ollama.com); your logs
   stay on your machine. No cluster, no SaaS, no account.
 
@@ -112,6 +112,12 @@ make build
 # tail a log file (keys come from /dev/tty, so stdin stays free for logs)
 tail -f /var/log/app.log | ./bin/logscry
 
+# follow the systemd journal (Linux; see the note below on journal access)
+./bin/logscry --journald
+
+# ...or just some units, at warning and above
+./bin/logscry --journald-unit nginx --journald-unit sshd --journald-priority 4
+
 # see what WOULD escalate without calling an LLM (no model needed)
 ./bin/logscry --docker-all --explain-dry-run
 ```
@@ -150,6 +156,7 @@ flowchart TD
         A1["stdin<br/>e.g. tail -f file"]
         A2["subprocess<br/>logscry -- ./app"]
         A3["Docker logs<br/>ContainerLogs + Events<br/>stdcopy demux"]
+        A4["journald<br/>journalctl -f -o json<br/>PRIORITY to level"]
     end
 
     subgraph CORE["Pipeline core — single goroutine, owns state"]
@@ -187,6 +194,7 @@ flowchart TD
     A1 --> ING
     A2 --> ING
     A3 --> ING
+    A4 --> ING
     ING -->|chan LogLine| NORM
     NORM -. feeds context .-> RING
     RL -. gate .-> DECIDE
@@ -230,6 +238,9 @@ Key flags:
 | `--docker-all` | off | Follow all Docker containers, auto-attaching to new ones |
 | `--docker-name <re>` | — | Follow containers whose name matches a regexp |
 | `--docker-tail <n>` | `100` | Lines of history fetched per container on attach (`all` for everything) |
+| `--journald` | off | Follow the systemd journal (Linux; see below) |
+| `--journald-unit <u>` | — | Follow only these units (repeatable, OR-combined); implies `--journald` |
+| `--journald-priority <n>` | `7` | Priority floor: `0` emerg … `7` debug (`3` = errors and worse) |
 | `--llm-url <url>` | local Ollama | OpenAI-compatible base URL |
 | `--llm-model <name>` | `gemma2:2b` | Model to ask for explanations (`ollama pull gemma2:2b`) |
 | `--llm-max-tokens <n>` | `300` | Cap on tokens per explanation |
@@ -254,6 +265,44 @@ Non-reasoning instruct models like the default `gemma2:2b` are fine at 300.
 
 A full annotated config lives at [`examples/logscry.yaml`](examples/logscry.yaml). Run
 `./bin/logscry -h` for every flag.
+
+### journald (`--journald`, Linux only)
+
+`--journald` follows the systemd journal, so logscry can triage the host itself — units,
+the kernel, the boot — and not only what runs inside a container. It works by running
+`journalctl -f -o json` and decoding one entry per line, which is why the binary stays
+pure Go and `CGO_ENABLED=0`: binding libsystemd would need cgo and would break the
+cross-compiled darwin/windows builds. It needs `journalctl` on `PATH`, and journald
+exists only on Linux.
+
+Journal `PRIORITY` becomes the level severity scoring uses, so a unit that logs nothing
+resembling a level token still gets scored honestly:
+
+| PRIORITY | 0 emerg | 1 alert | 2 crit | 3 err | 4 warning | 5 notice | 6 info | 7 debug |
+|---|---|---|---|---|---|---|---|---|
+| level | `FATAL` | `FATAL` | `CRITICAL` | `ERROR` | `WARN` | `INFO` | `INFO` | `DEBUG` |
+
+Entries at priority 3 and below are also tagged as **stderr**, matching how systemd
+forwards a unit's stderr at 3 and its stdout at 6 — the same severity weight a container
+line on stderr picks up. Because the journal's priority is structured metadata, it wins
+over any level token in the message text: a unit that prints `INFO: shutting down` but
+was recorded at priority 3 scores as the error it is.
+
+Lines are tagged `journald:<unit>` (`journald:nginx`, `journald:kernel`), and `--journald`
+composes with the other sources — `logscry --journald --docker-all` follows both.
+
+> **Journal access.** Reading the **system** journal requires membership of the
+> `systemd-journal` group, or root. Without it `journalctl` still runs and still
+> streams — but only *your own session's* logs, with nothing from any system service.
+> Nothing errors; you just see far less than you expected. Grant access once with:
+>
+> ```sh
+> sudo usermod -aG systemd-journal $USER    # then log out and back in
+> ```
+>
+> logscry checks for this at startup and says so in the status bar (or on stderr with
+> `--plain`) when it detects a reduced view, but the check stays quiet when it cannot
+> tell — so if `--journald` looks unexpectedly thin, this is the first thing to check.
 
 ### Streaming (`--llm-stream`)
 
@@ -351,7 +400,7 @@ Every key is always present (no `omitempty`), so a consumer can index without ch
 | `template_hash` | string | The dedup key: the template's signature hash |
 | `pattern` | string | The masked signature, e.g. `connection refused to <IP>:<NUM>` |
 | `level` | string | Level of the line that fired, `""` if none was detected |
-| `source` | string | e.g. `docker:api`, `stdin`, `proc:myapp` |
+| `source` | string | e.g. `docker:api`, `stdin`, `proc:myapp`, `journald:nginx` |
 | `count_at_flag` | number | Occurrences of this template **when it was flagged** |
 | `first_seen` | string | RFC3339; the template's first occurrence |
 | `last_seen_at_flag` | string | RFC3339; its last occurrence **when it was flagged** |
@@ -391,6 +440,13 @@ logscry says so on stderr on the way out.
   unusual continuation style may still split. A buffered event is flushed after
   `--group-timeout` (`group.timeout`, default `200ms`) of idle; set it to `0` to disable
   grouping entirely.
+- **`--journald` needs `journalctl`, and journal access is a permission thing.** The
+  source is Linux-only and shells out to `journalctl`, so it fails at startup on a host
+  without it. More often it does something subtler: a user outside the `systemd-journal`
+  group gets a *working* follow of their own session only, with no system-service logs
+  and no error to explain why. See [journald](#journald---journald-linux-only) for the
+  one-line fix. There is no cursor or replay: `-f` picks up from roughly now, so an event
+  further back won't appear until it recurs.
 - **`--docker-tail` defaults to 100 lines** of history per container on attach. An event
   further back than that won't appear until it recurs — use `--docker-tail all` for the
   full backlog.

@@ -34,6 +34,23 @@ type Docker struct {
 	Tail      string   `yaml:"tail"`  // trailing lines fetched per container on attach
 }
 
+// Journald selects what to follow in the systemd journal.
+type Journald struct {
+	Enabled  bool     `yaml:"enabled"`
+	Units    []string `yaml:"unit"`     // -u, OR-combined
+	Priority int      `yaml:"priority"` // 0..7; 7 (the default) shows everything
+}
+
+// Validate rejects a priority outside syslog's 0..7. Out of range is not a stricter or
+// looser filter, it is a journalctl invocation that fails at startup — better caught
+// here, next to the flag that set it.
+func (j Journald) Validate() error {
+	if j.Priority < 0 || j.Priority > 7 {
+		return fmt.Errorf("priority must be between 0 (emerg) and 7 (debug), got %d", j.Priority)
+	}
+	return nil
+}
+
 // Group tunes multi-line coalescing: continuation lines (stack-trace frames, goroutine
 // dumps, indented output) are folded into the preceding logical line before templating,
 // so a traceback becomes one event instead of one template per frame.
@@ -71,10 +88,11 @@ type Config struct {
 	// than a block: the sections below each hold a set of knobs, and this is one path.
 	Export string `yaml:"export"`
 
-	Score  score.Config `yaml:"score"`
-	Docker Docker       `yaml:"docker"`
-	Group  Group        `yaml:"group"`
-	LLM    llm.Config   `yaml:"llm"`
+	Score    score.Config `yaml:"score"`
+	Docker   Docker       `yaml:"docker"`
+	Journald Journald     `yaml:"journald"`
+	Group    Group        `yaml:"group"`
+	LLM      llm.Config   `yaml:"llm"`
 
 	// Argv is the subprocess to run, i.e. everything after "--". Not configurable
 	// from the file: it is positional by nature.
@@ -85,10 +103,11 @@ type Config struct {
 // local Ollama. Each section owns its own defaults table, so there is one place to tune.
 func Defaults() Config {
 	return Config{
-		Score:  score.Defaults(),
-		Docker: Docker{Tail: "100"},
-		Group:  Group{Timeout: 200 * time.Millisecond},
-		LLM:    llm.Defaults(),
+		Score:    score.Defaults(),
+		Docker:   Docker{Tail: "100"},
+		Journald: Journald{Priority: 7},
+		Group:    Group{Timeout: 200 * time.Millisecond},
+		LLM:      llm.Defaults(),
 	}
 }
 
@@ -144,6 +163,9 @@ func Load(args []string) (Config, error) {
 	}
 	if err := cfg.Group.Validate(); err != nil {
 		return Config{}, fmt.Errorf("group config: %w", err)
+	}
+	if err := cfg.Journald.Validate(); err != nil {
+		return Config{}, fmt.Errorf("journald config: %w", err)
 	}
 	return cfg, nil
 }
@@ -243,6 +265,15 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 		func(c *Config) *string { return &c.Docker.Tail })
 	b.listVar("docker-label", "follow Docker containers with this k=v label (repeatable, AND-combined)",
 		func(c *Config) *[]string { return &c.Docker.Labels })
+
+	// journald selection (Linux only: it drives journalctl, see internal/ingest).
+	b.boolVar("journald", def.Journald.Enabled, "follow the systemd journal",
+		func(c *Config) *bool { return &c.Journald.Enabled })
+	b.listVar("journald-unit", "follow this systemd unit (repeatable, OR-combined); implies --journald",
+		func(c *Config) *[]string { return &c.Journald.Units })
+	b.intVar("journald-priority", def.Journald.Priority,
+		"journald priority floor: 0 emerg .. 7 debug (7 shows everything)",
+		func(c *Config) *int { return &c.Journald.Priority })
 
 	// Multi-line coalescing: fold stack traces / goroutine dumps into one event.
 	b.durationVar("group-timeout", def.Group.Timeout,
