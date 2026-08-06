@@ -277,3 +277,82 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       ldflags-override branch `resolveVersion()` already had is the entire integration surface. Left out as
       separate decisions rather than oversights: package managers (Homebrew/apt/scoop), Docker image
       publishing, cosign/GPG signing, and SBOM generation
+
+## Epic M11 — journald source
+- [x] Follow the SYSTEMD JOURNAL, so logscry can triage a Linux host and not just what runs on it.
+      stdin, subprocess and Docker between them cover application logs; none of them covers the class
+      of logs a box actually fails on — systemd units, the kernel, the host. This is the first of
+      issue #10's three sources (NATS and Kafka are separate, later, and untouched here) and the first
+      real test of the claim RDI §10 makes: that the `ingest` seam is clean enough for a new source to
+      slot in without a rewrite. It is — a journald entry becomes an ordinary `model.LogLine` at the
+      source and flows through the identical pipeline, scorer, templater, anonymizer, TUI and export.
+      The `Source` interface did not move; journald is a new IMPLEMENTER, not a reshaped contract.
+      `journalctl -f -o json` as a SUBPROCESS, not a cgo binding, and the release story is what decides
+      it rather than taste. The alternative is `coreos/go-systemd/sdjournal`, which binds `libsystemd`
+      through cgo — and M10 ships six targets cross-compiled at `CGO_ENABLED=0`, which is the line that
+      makes the shipped binary genuinely static. Adopting cgo would cost the static linux build, both
+      non-linux targets outright (there is no libsystemd to link against on either), and the absence of
+      build tags anywhere in this package, all to avoid depending on a binary that is present on every
+      host that HAS a journal to read. journald is Linux-only by nature, so the source being unusable
+      elsewhere is correct rather than a gap — and because nothing platform-specific enters the Go, the
+      whole feature needs no build tags at all. `-o json` and not `json-pretty`: compact output is one
+      entry per line, which is exactly the newline-delimited shape `readLines` already handles.
+      PRIORITY maps to a level — 0/1 FATAL, 2 CRITICAL, 3 ERROR, 4 WARN, 5/6 INFO, 7 DEBUG — and at 3
+      and below to STDERR as well. emerg and alert are the crash class the fatal weight exists to
+      interrupt for; crit is weighed as ERROR, serious without being an interrupt. The stream half is
+      faithful rather than invented: systemd forwards a unit's stderr at priority 3 and its stdout at 6.
+      It is also what keeps journald at PARITY with the other sources — without it an ERROR from a unit
+      would score 0.6 where the byte-identical ERROR from a container scores 0.9, making one source
+      quietly less alarming than another for no reason the user could see. It cannot over-fire either:
+      `SeverityMax` still caps the stream+level sum, so severity alone never escalates. An absent or
+      unparseable PRIORITY assigns NOTHING rather than guessing, since the guess would feed the scorer.
+      `Normalize` now lets a level the SOURCE supplied outrank one detected from the text — the one edit
+      outside `ingest`/`config`, and the piece that made the mapping reach scoring at all, since
+      `Normalize` had always overwritten `Level` unconditionally. The precedence is the point: PRIORITY
+      is recorded by systemd at the journal protocol level, while a leading `[INFO]` is a regex guess
+      about prose, and they DO disagree — a unit logging "INFO: shutting down" at PRIORITY=3 is telling
+      us through the channel that cannot be fooled. Message extraction still runs either way, so the
+      line goes through the same format detection as any other and still gets its recognized prefix
+      stripped; only the level is overridden. Genuinely additive: every source that predates journald
+      leaves `Level` empty and reaches the unchanged detection path, which is pinned by its own
+      regression test rather than assumed.
+      The failure this feature is most likely to hit is SILENT, which is why it gets a probe of its own
+      rather than only an error path. A user outside the `systemd-journal` group runs `--journald` and
+      journalctl starts, follows, and streams perfectly happily — their own session's journal, and
+      nothing from any system service. There is no error to report and no exit code to check, so logscry
+      looks broken while doing exactly what it was told, which is the worst possible failure for a tool
+      whose entire promise is noticing things. `SystemJournalWarning` OPENS the files journalctl would,
+      rather than checking group membership: access is also granted by ACL — Debian and Ubuntu hand it
+      to `adm` that way — so a membership check would warn users whose setup works. It stays SILENT when
+      it cannot tell (no system journal files at all means volatile-only journald, a container, or
+      forwarding elsewhere, none of which is a permission problem), because a warning that fires on a
+      working setup is the noise this project is built to avoid. It rides the existing background-notice
+      channel, which the TUI already renders in its status line and `--plain` already prints to stderr —
+      so a soft warning reached both renderers without one line of TUI or pipeline change.
+      Hard failures stay hard and NAMED. `exec.LookPath` runs before `Start`, so "not installed" is
+      reported as itself instead of surfacing from inside `Start` as a generic exec failure. A non-zero
+      exit carries the first line of journalctl's stderr, which is the only place the real cause ever
+      appears ("Failed to open files in /var/log/journal: Permission denied", "No journal files were
+      found") and which a bare `exit status 1` throws away — plus the exact `usermod` remedy when it
+      reads as permission denied. That stderr is captured in a 4KB-capped buffer and NEVER emitted as
+      log content: unlike `SubprocessSource`, which emits a child's stderr as lines because that IS the
+      log, journalctl's stderr is diagnostics ABOUT the journal and feeding it to the pipeline would
+      have the journal appear to say it.
+      `mapLines` came out of `docker.go` first, as its own commit. `readLines` was already the shared
+      line-buffering primitive, but the loop around it — read into an interim channel, rewrite each
+      line, forward, give up on cancellation — existed only inside `readDockerStream`, and every source
+      richer than "one line, one event" needs exactly it and differs only in the transform. Docker
+      passes its timestamp parse, journald passes its JSON decode, and NATS/Kafka will pass theirs. The
+      extraction was kept honest by refusing to touch the Docker tests: had one needed editing, the
+      refactor would have changed behaviour rather than moved it.
+      Flags mirror `--docker-*` rather than inventing a mode: `--journald`, `--journald-unit`
+      (repeatable and OR-combined like journalctl's own `-u`, and enough on its own to select the
+      source the way `--docker-name` is), and `--journald-priority` (a floor, which does NOT imply the
+      source — it tunes one, exactly as `--docker-tail` does). Sources still compose: `--journald`
+      alongside a subprocess or Docker fans into the one channel through `ingest.Run`. `-p` is omitted
+      entirely at 7, since journalctl's least-severe priority already includes every entry and passing
+      a no-op flag is a thing to have to explain.
+      Left out as decisions rather than oversights: journal CURSORS and persistence, historical replay
+      beyond what `-f` gives, a full PRIORITY→level syslog specification, `--journald-tail` (`-f`
+      already shows the last entries before following, and a history knob is its own call), and any new
+      module dependency — journalctl is a subprocess, not an import. Targets v0.8.0
