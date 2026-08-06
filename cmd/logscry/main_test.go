@@ -4,10 +4,12 @@ package main
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/maxie7/logscry/internal/config"
+	"github.com/maxie7/logscry/internal/ingest"
 	"github.com/maxie7/logscry/internal/model"
 	"github.com/maxie7/logscry/internal/pipeline"
 )
@@ -104,5 +106,104 @@ func TestPlainExplanationLines(t *testing.T) {
 	})
 	if !strings.Contains(failed, "EXPLANATION UNAVAILABLE") || !strings.Contains(failed, "model not loaded") {
 		t.Errorf("failed explanation output = %q, want it to say what went wrong", failed)
+	}
+}
+
+// sourceNames is the observable shape of a source set: which sources were built, in
+// order. Names are what the Source contract exposes, and they are what lines get tagged
+// with, so asserting on them tests the thing the user sees.
+func sourceNames(srcs []ingest.Source) []string {
+	names := make([]string, len(srcs))
+	for i, s := range srcs {
+		names[i] = s.Name()
+	}
+	return names
+}
+
+// TestSourcesJournald: the new flag composes the way Docker's do rather than inventing a
+// mode. Naming a unit is enough on its own (as --docker-name is), tuning the priority is
+// not (as --docker-tail is not), and journald stacks with a subprocess the way Docker
+// already does — ingest.Run fans them into one channel.
+func TestSourcesJournald(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		want          []string
+		wantStdinOnly bool
+	}{
+		{"no flags is unchanged: stdin only", nil, []string{"stdin"}, true},
+		{"--journald selects the journal", []string{"--journald"}, []string{"journald"}, false},
+		{
+			"a unit implies the source",
+			[]string{"--journald-unit", "nginx"},
+			[]string{"journald"}, false,
+		},
+		{
+			"a priority floor alone does not",
+			[]string{"--journald-priority", "3"},
+			[]string{"stdin"}, true,
+		},
+		{
+			"it composes with a subprocess",
+			[]string{"--journald", "--", "./myapp"},
+			[]string{"proc:myapp", "journald"}, false,
+		},
+		{
+			"and with Docker",
+			[]string{"--journald", "--docker-all"},
+			[]string{"docker", "journald"}, false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := config.Load(tc.args)
+			if err != nil {
+				t.Fatalf("config.Load: %v", err)
+			}
+			got, stdinOnly := sources(cfg)
+			if !slices.Equal(sourceNames(got), tc.want) {
+				t.Errorf("sources = %q, want %q", sourceNames(got), tc.want)
+			}
+			if stdinOnly != tc.wantStdinOnly {
+				t.Errorf("stdinOnly = %v, want %v", stdinOnly, tc.wantStdinOnly)
+			}
+		})
+	}
+}
+
+// TestJournaldSelectorPassesThrough: the unit filter and priority floor have to reach
+// the source, or the flags are decoration.
+func TestJournaldSelectorPassesThrough(t *testing.T) {
+	cfg, err := config.Load([]string{"--journald-unit", "nginx", "--journald-unit", "sshd",
+		"--journald-priority", "4"})
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	srcs, _ := sources(cfg)
+	if len(srcs) != 1 {
+		t.Fatalf("built %d sources, want 1", len(srcs))
+	}
+	js, ok := srcs[0].(*ingest.JournaldSource)
+	if !ok {
+		t.Fatalf("source is %T, want *ingest.JournaldSource", srcs[0])
+	}
+	if want := []string{"nginx", "sshd"}; !slices.Equal(js.Units, want) {
+		t.Errorf("Units = %q, want %q", js.Units, want)
+	}
+	if js.Priority != 4 {
+		t.Errorf("Priority = %d, want 4", js.Priority)
+	}
+}
+
+// TestJournaldNoticeOnlyWhenJournaldIsOn: the reduced-view warning is about a source
+// that is running. Without the flag there is nothing to warn about, and a notice on a
+// Docker-only run would be pure noise.
+func TestJournaldNoticeOnlyWhenJournaldIsOn(t *testing.T) {
+	cfg, err := config.Load(nil)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if notice := journaldNotice(cfg); notice != nil {
+		t.Errorf("journaldNotice without --journald = %v, want nil", notice)
 	}
 }

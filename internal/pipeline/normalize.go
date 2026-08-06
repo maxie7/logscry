@@ -48,17 +48,39 @@ var leadingLevelRe = regexp.MustCompile(`(?i)^\s*(?:\[\s*([a-z]+)\s*\]|([a-z]+)\
 
 // Normalize detects the line format (JSON vs plain text) and fills in Level and
 // Message on the LogLine. Raw is never modified — display uses it.
+//
+// A Level the SOURCE already set wins over anything detected from the text. Such a level
+// comes from structured metadata the message body has no trace of — journald's PRIORITY,
+// recorded by systemd itself at the journal protocol level — whereas a leading "[INFO]"
+// token is a regex guess about prose. The two genuinely disagree in practice: a unit
+// logging "INFO: shutting down" at PRIORITY=3 is telling us, through the channel that
+// cannot be fooled, that this is an error.
+//
+// Message extraction runs either way. The source supplies a level, not a parse, so the
+// line still goes through the same format detection as every other line and still gets
+// its recognized prefix stripped — only the level is overridden.
+//
+// Sources that know no level leave it empty and reach the detection below unchanged,
+// which is every source that existed before journald.
 func Normalize(line model.LogLine) model.LogLine {
-	trimmed := strings.TrimSpace(line.Raw)
+	given := line.Level
+	line.Level, line.Message = detectLevelAndMessage(line.Raw)
+	if given != "" {
+		line.Level = given
+	}
+	return line
+}
+
+// detectLevelAndMessage runs the format detection: a JSON object yields its level and
+// message fields, anything else falls to the plaintext heuristics.
+func detectLevelAndMessage(raw string) (level, message string) {
+	trimmed := strings.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		if level, msg, ok := normalizeJSON(trimmed); ok {
-			line.Level = level
-			line.Message = msg
-			return line
+			return level, msg
 		}
 	}
-	line.Level, line.Message = normalizePlain(line.Raw)
-	return line
+	return normalizePlain(raw)
 }
 
 // normalizeJSON parses a JSON object and extracts a canonical level and message.
