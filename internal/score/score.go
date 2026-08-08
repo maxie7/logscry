@@ -7,8 +7,9 @@
 // The bias is deliberate and everywhere in this file: a tool that cries wolf gets
 // uninstalled after one day. Under-alerting is a mild annoyance; over-alerting kills
 // the product. When a signal is ambiguous, it does not escalate — so novelty is muted
-// during warmup, burst refuses to fire without an established baseline, and severity
-// alone (short of a crash) can raise the score but never trigger on its own.
+// during warmup, burst refuses to fire without an established baseline, and neither
+// novelty nor severity (short of a crash) can trigger on its own: they are BOOSTERS,
+// weighted below the threshold so that they only escalate in combination.
 //
 // Everything here is pure logic with time passed in as an argument: no clock, no
 // sleeps, and therefore tests that pin down the behaviour exactly. Like the pipeline
@@ -24,12 +25,20 @@ import (
 )
 
 // Weights tunes each signal's contribution to the score. The defaults are chosen so
-// that novelty, burst, and a fatal-class level each reach the threshold on their own,
-// while stderr, WARN, and ERROR only ever nudge a score toward it — see Defaults.
+// that a burst and a fatal-class level reach the threshold on their own, while novelty,
+// stderr, WARN, and ERROR only ever nudge a score toward it — see Defaults.
+//
+// Nothing here hardcodes which signals may trigger: "booster" versus "trigger" is
+// entirely a matter of a weight being below or at the threshold, so raising Novelty back
+// to 1.0 restores the old behaviour without a code change.
+//
 // The yaml tags name the knobs in logscry.yaml (RDI §9). They are inert struct tags:
 // this package takes no dependency on a YAML library — internal/config does the
 // decoding.
 type Weights struct {
+	// Novelty is a booster, not a trigger: it sits below the threshold so that a
+	// first-seen template escalates only in combination with severity or a burst. On a
+	// real host, new-and-harmless is the steady state — see Defaults.
 	Novelty float64 `yaml:"novelty"`
 	Burst   float64 `yaml:"burst"`
 
@@ -73,16 +82,40 @@ type Config struct {
 // Defaults are the tuned-quiet defaults, in one place so that tuning is one edit.
 //
 // The numbers encode a specific policy, which is easiest to read as what each
-// situation scores against the 1.0 threshold:
+// situation scores against the 1.0 threshold (decide escalates at or above it):
 //
-//	stderr alone                   0.3   no
-//	ERROR alone                    0.6   no
-//	stderr + ERROR                 0.9   no  — deliberately just under: routine
-//	                                          error chatter must not escalate
-//	novel template (post-warmup)   1.0   yes — the single strongest signal
-//	rate at 5x its own baseline    1.0   yes — a CHANGE in rate, not a high rate
-//	FATAL / PANIC                  1.0   yes — a crash is worth interrupting for,
-//	                                          even during warmup
+//	stderr alone                     0.30   no
+//	ERROR alone                      0.60   no
+//	stderr + ERROR                   0.90   no  — deliberately under: routine error
+//	                                              chatter must not escalate
+//	novel template (post-warmup)     0.45   no  — a BOOSTER, see below
+//	novel + stderr                   0.75   no
+//	novel + WARN                     0.65   no
+//	novel + WARN + stderr            0.95   no  — the loudest a merely-new line gets
+//	novel + ERROR                    1.05   yes — a new FAILURE is the real signal
+//	novel + ERROR + stderr           1.35   yes
+//	novel + FATAL                    1.45   yes
+//	rate at 5x its own baseline      1.00   yes — a CHANGE in rate, not a high rate
+//	FATAL / PANIC                    1.00   yes — a crash is worth interrupting for,
+//	                                              even during warmup
+//
+// Novelty is 0.45 and not 1.0 because of what four hours of a real laptop's journal
+// showed: 179 escalations in 2304 lines, almost every one of them "novel template
+// (first seen) · score 1.00". A working host emits hundreds of distinct-but-benign
+// templates over hours — browser internals, NetworkManager, cron, docker veth churn,
+// the kernel, VPN handshakes — each novel exactly once. Novelty assumes a stream with
+// an established template set, where new means suspicious; on a real host new-and-
+// harmless is the steady state, so novelty alone must not be enough. It is now the
+// same kind of signal severity always was: it raises the score, it does not cross the
+// line by itself.
+//
+// 0.45 rather than 0.4 or 0.5, given the severity weights either side of it: 0.4 would
+// put novel + ERROR exactly ON the threshold, and a decision boundary that depends on
+// float equality is one retune away from silently never firing. 0.5 would put novel +
+// WARN + stderr exactly on it, which starts escalating new warnings on stderr-only
+// sources — a large population, and the same cry-wolf failure in a new place. 0.45
+// leaves margin on both sides: 0.95 is the quiet ceiling, 1.05 the first combination
+// that fires.
 //
 // Note what is absent: a steady stream escalates at no rate whatsoever. A service
 // emitting one line a second and one emitting ten thousand are both simply running.
@@ -90,7 +123,7 @@ func Defaults() Config {
 	return Config{
 		Threshold: 1.0,
 		Weights: Weights{
-			Novelty:     1.0,
+			Novelty:     0.45,
 			Burst:       1.0,
 			Stderr:      0.3,
 			Warn:        0.2,
@@ -244,10 +277,16 @@ func (s *Scorer) Evaluate(line model.LogLine, tmpl *model.Template, prevLastSeen
 func (s *Scorer) Stats() Stats { return s.stats }
 
 // novelty reports whether the template has never been seen, or has not been seen for
-// longer than the cooloff. A brand-new template in a running system is the strongest
-// signal there is — but in the first seconds of a run *every* template is new, so
-// novelty stays silent until warmup is over. Without that, starting the tool would
-// flood the user instantly, and they would never start it again.
+// longer than the cooloff.
+//
+// Two separate things keep it from crying wolf, and they compose rather than overlap.
+// Warmup gates the SIGNAL: in the first seconds of a run every template is new, so
+// novelty contributes nothing at all until warmup is over — without that, starting the
+// tool would flood the user instantly and they would never start it again. The weight
+// then bounds what the signal is WORTH once it is trusted: 0.45 against a threshold of
+// 1.0, so a template that is merely new is never enough on its own (see Defaults).
+// "Do not trust novelty yet" and "novelty is never the whole story" are different
+// claims, and both are true.
 func (s *Scorer) novelty(tmpl *model.Template, prevLastSeen, now time.Time) (bool, string) {
 	if !s.warmedUp(now) {
 		return false, ""
@@ -389,6 +428,11 @@ func (s *Scorer) levelWeight(level string) float64 {
 // decide applies the three gates: over threshold, not already explained, and allowed
 // by the global rate limiter. The order is load-bearing — an already-explained
 // template must not spend a token it has no use for.
+//
+// The threshold is INCLUSIVE, as RDI §6 specifies: score >= threshold escalates. That
+// is not a detail — the weights are calibrated against it, and a fatal-class line
+// scores exactly 1.00 against a threshold of exactly 1.00. Flip this to a strict
+// comparison and a crash goes silent. TestThresholdIsInclusive pins it.
 //
 // Everything that fails a gate is counted, never dropped from the data: it still
 // flows to the stream and the aggregated view, it just does not interrupt anyone.

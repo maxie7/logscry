@@ -85,10 +85,11 @@ func TestCostCapHoldsUnderFlood(t *testing.T) {
 	cfg.RatePerMin = perMin
 	f := newFixture(t, cfg, nil)
 
-	// Every single line is a brand-new template, i.e. every single line escalates on
-	// novelty. This is the worst case the scorer can be handed.
+	// Every single line is a brand-new ERROR template, i.e. every single line clears the
+	// threshold. This is the worst case the scorer can be handed: novelty alone would be
+	// absorbed by the weights, so the flood is made of genuine faults instead.
 	for i := range lines {
-		f.feed(line("distinct failure "+strconv.Itoa(i)),
+		f.feed(fault("distinct failure "+strconv.Itoa(i)),
 			t0.Add(time.Duration(i)*time.Second*spanSec/lines))
 	}
 

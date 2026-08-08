@@ -90,6 +90,14 @@ func line(msg string) model.LogLine {
 	return model.LogLine{Source: "test", Raw: msg, Message: msg}
 }
 
+// fault builds a line a healthy system would not emit: an ERROR on stderr. Novelty is
+// a booster rather than a trigger, so a test that needs a FIRST occurrence to escalate
+// has to give it a real signal to add to — a merely-new line scores 0.45 and stays
+// quiet, which is the whole point of the calibration.
+func fault(msg string) model.LogLine {
+	return stderr(level(line(msg), "ERROR"))
+}
+
 // stderr marks a line as coming from stderr.
 func stderr(l model.LogLine) model.LogLine {
 	l.Stream = model.Stderr
