@@ -47,11 +47,22 @@ group:
 score:
   threshold: 1.0 # escalate at or above this summed score
 
-  # Per-signal weights. Severity is additive and capped at severity_max, so routine
-  # "stderr + ERROR" (0.3 + 0.6 = 0.9) sits deliberately below the 1.0 threshold; only a
-  # fatal-class line escalates on severity alone.
+  # Per-signal weights, and the whole calibration in one idea: most signals are BOOSTERS,
+  # weighted below the threshold so they raise a score without crossing it alone. Only a
+  # burst and a fatal-class level are triggers.
+  #
+  #   novel alone .............. 0.45   quiet   a new template is not, by itself, news:
+  #                                             a working host emits hundreds of new
+  #                                             benign templates over a day
+  #   stderr + ERROR ........... 0.90   quiet   routine error chatter
+  #   novel + WARN + stderr .... 0.95   quiet   the loudest a merely-new line gets
+  #   novel + ERROR ............ 1.05   FIRES   a new failure is the real signal
+  #   burst / FATAL / PANIC .... 1.00   FIRES   on their own
+  #
+  # Severity is additive across stream and level, capped at severity_max. Raise novelty
+  # back to 1.0 for the old behaviour, where any first-seen template escalated on sight.
   weights:
-    novelty: 1.0 # a template never seen before (post-warmup)
+    novelty: 0.45 # a template never seen before (post-warmup) — a booster, not a trigger
     burst: 1.0 # a template's rate spiking above its own baseline
     stderr: 0.3 # the line arrived on stderr
     warn: 0.2 # level WARN

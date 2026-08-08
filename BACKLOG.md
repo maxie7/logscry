@@ -356,3 +356,75 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       beyond what `-f` gives, a full PRIORITY→level syslog specification, `--journald-tail` (`-f`
       already shows the last entries before following, and a history knob is its own call), and any new
       module dependency — journalctl is a subprocess, not an import. Targets v0.8.0
+
+## Fixes — post-release corrections
+
+Not milestone work and not new capability: recalibrations and bug fixes found by USING the
+tool, recorded here so the reasoning survives. Epic numbers stay reserved for features.
+
+- [x] **Novelty is a BOOSTER, not a threshold-crosser** — found by dogfooding, and the same
+      class of failure the burst detector was fixed for at M4, now in novelty. Four hours of
+      `--journald` on a real working laptop produced `WOULD ESCALATE · 179 out of 2304 lines`,
+      and nearly every one of them read `novel template (first seen) · score 1.00`. The cause
+      was arithmetic rather than a bug: `Weights.Novelty` was 1.0, `Threshold` was 1.0, and
+      `Evaluate` sums the signals — so ANY first-seen template crossed the line ALONE, with
+      nothing else about it being remarkable. Novelty was designed for a stream with an
+      established template set, where new means suspicious. On a real host — browser
+      internals, NetworkManager, cron, docker veth churn, the kernel, VPN handshakes — new
+      and harmless IS the steady state, and hundreds of distinct templates appear over a few
+      hours, each novel exactly once.
+      The fix applies the principle severity already used: ERROR and stderr RAISE a score but
+      never cross the threshold by themselves, and only a fatal-class level fires alone.
+      Novelty joins them. `Weights.Novelty` 1.0 → 0.45 and nothing else — threshold, burst,
+      and every severity weight untouched. No structural change was needed or made, because
+      the model already expresses "booster, not trigger" exactly as `weight < threshold`; the
+      number was simply wrong. So the knobs survive intact (`--weight-novelty`, `--threshold`,
+      the `score:` block), and dialling novelty back to 1.0 restores the old behaviour without
+      a code change — pinned by a test, because "configurable" is a claim like any other.
+      0.45 and not 0.4 or 0.5, which is where the severity weights either side of it decide
+      the answer. 0.4 and 0.45 produce IDENTICAL escalate/quiet outcomes across the whole
+      matrix, but 0.4 puts novel+ERROR (0.4 + 0.6) exactly ON the threshold, and a decision
+      boundary that depends on float equality is one retune, config override, or change in
+      summation order away from silently never firing — with no test able to see it coming.
+      0.5 fails at the other end: it puts novel + WARN + stderr at exactly 1.00 and starts
+      escalating new WARN-on-stderr templates, a large population on any source that writes
+      everything to stderr, which is the same cry-wolf failure relocated rather than fixed.
+      0.45 leaves margin on both sides — 0.95 is the quiet ceiling, 1.05 the first combination
+      that fires. What still escalates is deliberately unchanged: a new ERROR (1.05), a new
+      FATAL (1.45), FATAL/PANIC alone (1.00), and a burst (1.00). What goes quiet is exactly
+      the 179: new, info-level, unbursting, unremarkable.
+      Warmup COMPOSES with this rather than duplicating it, because the two act at different
+      points. Warmup is a gate on the SIGNAL — for the first 30s/100 lines novelty contributes
+      0, meaning "do not trust novelty at startup", which is what stops an attach-time backlog
+      replay from being a flood. The weight bounds what the signal is WORTH once it is trusted,
+      meaning "novelty is never the whole story". Sequentially: 0 during warmup, 0.45 after.
+      Neither weakens the other and there is no double-counting.
+      Novelty and burst, it turns out, can never fire on the same line — a property that
+      predates this change and survives it. First-seen novelty needs `Count == 1` while a
+      baseline needs 20 occurrences over a minute; cooloff novelty needs a 15m gap while a
+      burst needs 10 occurrences inside 10s. So "new AND bursting" is not a combination the
+      weights have to account for: a new template that later bursts escalates on the BURST, at
+      the moment it bursts, which is the honest reason. Pinned by a test rather than left as a
+      comment.
+      The tests are the deliverable as much as the constant. `TestNoveltyAloneNeverEscalates`
+      replays the exact scenario that produced the 179 — 300 distinct benign info-level
+      first-seen templates — and asserts not just zero escalations but zero SUPPRESSED and zero
+      CACHED, so the quiet is the score's doing and not the rate limiter's; it also asserts the
+      novelty reason is still REPORTED, since a scorer that had merely stopped detecting
+      novelty would pass a weaker version of the test and be a worse tool. `TestSignalMatrix`
+      then enumerates all ten combinations with their exact scores, so any future weight change
+      fails a test instead of silently shifting what interrupts people — the two calibration
+      bugs this package has had were both invisible until someone ran it for hours.
+      `TestThresholdIsInclusive` pins RDI §6's `score >= threshold` on the one combination that
+      lands exactly on 1.00 (a fatal-class line), because flipping that to a strict comparison
+      would silence crashes and nothing else would notice.
+      Seven existing tests asserted "a plain, unremarkable novel line escalates" — precisely
+      the behaviour being removed — and were updated to use a novel ERROR instead, which is
+      what they were each really about. That is the behaviour change, stated rather than
+      smuggled. `RDI §6` gained a calibration note so the spec stops disagreeing with the code.
+      Out of scope, deliberately: issue #24 (journald PRIORITY). Worth naming because this
+      change removes what was masking it — `Normalize` lets a source-supplied level override
+      the text heuristic, so a unit logging `ERROR: ...` at PRIORITY=6 is recorded INFO on
+      stdout and now scores 0.45 and stays quiet, where before it escalated at 1.00 on novelty
+      alone. That escalation was an accident (novelty firing, not severity), but it was doing
+      real work, and #24 is now load-bearing. Targets v0.8.1
