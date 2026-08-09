@@ -152,16 +152,18 @@ func TestProcessAttachesScore(t *testing.T) {
 	p := New(score.New(scoringConfig(), nil))
 	base := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 
-	novel := p.Process(model.LogLine{Raw: "shard 7 unreachable"}, base)
+	// A novel ERROR: novelty is a booster, so the level is what carries it over the
+	// threshold — and detecting that level from the raw line is the pipeline's own job.
+	novel := p.Process(model.LogLine{Raw: "ERROR: shard 7 unreachable"}, base)
 	if !novel.Escalate {
-		t.Fatalf("a novel template did not escalate: score %.2f", novel.Score)
+		t.Fatalf("a novel error did not escalate: score %.2f", novel.Score)
 	}
 	if len(novel.Reasons) == 0 {
 		t.Error("Event.Reasons is empty; the UI would show an escalation with no explanation")
 	}
 
 	// The second occurrence is neither novel nor news.
-	again := p.Process(model.LogLine{Raw: "shard 7 unreachable"}, base.Add(time.Second))
+	again := p.Process(model.LogLine{Raw: "ERROR: shard 7 unreachable"}, base.Add(time.Second))
 	if again.Escalate {
 		t.Errorf("the same template escalated twice: reasons %v", again.Reasons)
 	}
@@ -180,7 +182,7 @@ func TestNilScorerLeavesEventsUnscored(t *testing.T) {
 	p := New(nil)
 	base := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 
-	ev := p.Process(model.LogLine{Raw: "shard 7 unreachable"}, base)
+	ev := p.Process(model.LogLine{Raw: "ERROR: shard 7 unreachable"}, base)
 	if ev.Escalate || ev.Score != 0 || ev.Reasons != nil {
 		t.Errorf("event = %+v, want no scoring at all", ev)
 	}
@@ -218,7 +220,9 @@ func TestSnapshotCarriesEscalationCounters(t *testing.T) {
 	c := newCollector(10)
 	base := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 
-	for i, raw := range []string{"first novel thing", "second novel thing"} {
+	// Novel ERRORs, not merely novel lines: novelty is a booster, so it takes a level to
+	// reach the threshold and give the rate limiter something to refuse.
+	for i, raw := range []string{"ERROR: first novel thing", "ERROR: second novel thing"} {
 		ev := p.Process(model.LogLine{Raw: raw}, base.Add(time.Duration(i)*time.Second))
 		c.observe(ev, base)
 	}

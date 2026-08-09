@@ -48,15 +48,15 @@ func TestCacheReExplainsAfterTTL(t *testing.T) {
 	cfg.CacheTTL = time.Hour
 	f := newFixture(t, cfg, nil)
 
-	if res := f.feed(line("upstream refused the connection"), t0); !res.Escalate {
+	if res := f.feed(fault("upstream refused the connection"), t0); !res.Escalate {
 		t.Fatal("first occurrence did not escalate")
 	}
 	// Well past the novelty cooloff, but inside the cache TTL: still quiet.
-	if res := f.feed(line("upstream refused the connection"), t0.Add(30*time.Minute)); res.Escalate {
+	if res := f.feed(fault("upstream refused the connection"), t0.Add(30*time.Minute)); res.Escalate {
 		t.Fatal("re-escalated inside the cache TTL")
 	}
 	// Past the TTL: novel again (long unseen) and no longer explained.
-	res := f.feed(line("upstream refused the connection"), t0.Add(2*time.Hour))
+	res := f.feed(fault("upstream refused the connection"), t0.Add(2*time.Hour))
 	if !res.Escalate {
 		t.Errorf("did not re-escalate after the cache TTL expired: score %.2f, reasons %v",
 			res.Score, res.Reasons)

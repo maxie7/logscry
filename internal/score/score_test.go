@@ -14,12 +14,16 @@ import (
 
 // --- Novelty ---------------------------------------------------------------------
 
-// TestNovelTemplateFiresOnceThenGoesQuiet is the core promise: an unseen template is
-// the strongest signal there is, and the second occurrence of it is not news.
+// TestNovelTemplateFiresOnceThenGoesQuiet is the core promise: an unseen FAULT is news
+// exactly once, and the second occurrence of it is not.
+//
+// The line is an ERROR on stderr rather than a plain one because novelty is a booster:
+// new on its own scores 0.45 and stays quiet (TestNoveltyAloneNeverEscalates). What
+// escalates is new AND bad.
 func TestNovelTemplateFiresOnceThenGoesQuiet(t *testing.T) {
 	f := newFixture(t, liveConfig(), nil)
 
-	first := f.feed(line("connection to shard 7 refused"), t0)
+	first := f.feed(fault("connection to shard 7 refused"), t0)
 	if !first.Escalate {
 		t.Fatalf("a novel template did not escalate: score %.2f, reasons %v", first.Score, first.Reasons)
 	}
@@ -27,7 +31,7 @@ func TestNovelTemplateFiresOnceThenGoesQuiet(t *testing.T) {
 		t.Errorf("reasons = %v, want a novelty reason", first.Reasons)
 	}
 
-	second := f.feed(line("connection to shard 7 refused"), t0.Add(time.Second))
+	second := f.feed(fault("connection to shard 7 refused"), t0.Add(time.Second))
 	if second.Escalate {
 		t.Errorf("the same template escalated twice: score %.2f, reasons %v", second.Score, second.Reasons)
 	}
@@ -43,18 +47,18 @@ func TestNoveltyRefiresAfterCooloff(t *testing.T) {
 	cfg.CacheTTL = time.Minute
 	f := newFixture(t, cfg, nil)
 
-	if res := f.feed(line("cache miss for user <NUM>"), t0); !res.Escalate {
+	if res := f.feed(fault("cache miss for user <NUM>"), t0); !res.Escalate {
 		t.Fatal("first occurrence did not escalate")
 	}
 
 	// Still within the cooloff: seen recently, so not novel.
-	within := f.feed(line("cache miss for user <NUM>"), t0.Add(10*time.Minute))
+	within := f.feed(fault("cache miss for user <NUM>"), t0.Add(10*time.Minute))
 	if within.Escalate {
 		t.Errorf("re-fired inside the cooloff: score %.2f, reasons %v", within.Score, within.Reasons)
 	}
 
 	// Gone for longer than the cooloff: novel again.
-	after := f.feed(line("cache miss for user <NUM>"), t0.Add(10*time.Minute).Add(cfg.Cooloff+time.Second))
+	after := f.feed(fault("cache miss for user <NUM>"), t0.Add(10*time.Minute).Add(cfg.Cooloff+time.Second))
 	if !after.Escalate {
 		t.Fatalf("did not re-fire after the cooloff elapsed: score %.2f, reasons %v", after.Score, after.Reasons)
 	}
@@ -70,11 +74,11 @@ func TestNoveltyRefiresAfterCooloff(t *testing.T) {
 func TestExplainedTemplateStaysQuietPastCooloff(t *testing.T) {
 	f := newFixture(t, liveConfig(), nil) // Defaults: cooloff 15m, cache TTL 1h
 
-	if res := f.feed(line("disk almost full"), t0); !res.Escalate {
+	if res := f.feed(fault("disk almost full"), t0); !res.Escalate {
 		t.Fatal("first occurrence did not escalate")
 	}
 
-	back := f.feed(line("disk almost full"), t0.Add(30*time.Minute)) // novel again, but explained
+	back := f.feed(fault("disk almost full"), t0.Add(30*time.Minute)) // novel again, but explained
 	if back.Escalate {
 		t.Errorf("an already-explained template re-escalated inside the cache TTL: reasons %v", back.Reasons)
 	}
@@ -105,10 +109,14 @@ func TestStartupFloodIsImpossible(t *testing.T) {
 	}
 
 	// Past warmup — both guards satisfied: >30s elapsed, >100 lines seen — a genuinely
-	// new template is now news.
-	res := f.feed(line("shard 7 is unreachable"), t0.Add(31*time.Second))
+	// new fault is now news. (New on its own still is not: novelty is a booster, and
+	// warmup is about whether to trust it at all. The two are separate.)
+	res := f.feed(fault("shard 7 is unreachable"), t0.Add(31*time.Second))
 	if !res.Escalate {
-		t.Errorf("a novel template after warmup did not escalate: score %.2f, reasons %v", res.Score, res.Reasons)
+		t.Errorf("a novel error after warmup did not escalate: score %.2f, reasons %v", res.Score, res.Reasons)
+	}
+	if !hasReason(res.Reasons, "novel template") {
+		t.Errorf("reasons = %v, want novelty to contribute once warmup is over", res.Reasons)
 	}
 }
 
@@ -279,7 +287,7 @@ func TestSeverityRaisesTheScore(t *testing.T) {
 	if !res.Escalate {
 		t.Fatalf("novel + stderr + ERROR did not escalate: score %.2f", res.Score)
 	}
-	if want := 1.0 + 0.3 + 0.6; math.Abs(res.Score-want) > 1e-9 {
+	if want := 0.45 + 0.3 + 0.6; math.Abs(res.Score-want) > 1e-9 {
 		t.Errorf("score = %.2f, want %.2f (novelty + stderr + ERROR)", res.Score, want)
 	}
 	for _, want := range []string{"novel template", "stderr", "level ERROR"} {
@@ -337,7 +345,7 @@ func TestEscalationChannelFullDropsAndCounts(t *testing.T) {
 
 	const n = 5
 	for i := range n {
-		res := f.feed(line("novel failure "+strconv.Itoa(i)), t0.Add(time.Duration(i)*time.Second))
+		res := f.feed(fault("novel failure "+strconv.Itoa(i)), t0.Add(time.Duration(i)*time.Second))
 		if !res.Escalate {
 			t.Fatalf("line %d did not escalate: reasons %v", i, res.Reasons)
 		}
@@ -356,17 +364,17 @@ func TestEscalationChannelFullDropsAndCounts(t *testing.T) {
 // escalation carries what came before it — and not the trigger itself, which travels
 // separately.
 func TestEscalationRequestCarriesContext(t *testing.T) {
-	// Roomy enough to hold both escalations: the chatter's own first occurrence is
-	// novel too, and this test is about the second one.
 	out := make(chan EscalationRequest, 8)
 	cfg := liveConfig()
 	cfg.ContextLines = 5
 	f := newFixture(t, cfg, out)
 
+	// The chatter is routine and stays quiet, so the only thing on the channel is the
+	// fault — which is what the escalation's context should be made of.
 	for i := range 20 {
 		f.feed(line("routine chatter"), t0.Add(time.Duration(i)*time.Second))
 	}
-	f.feed(line("everything is broken"), t0.Add(30*time.Second))
+	f.feed(fault("everything is broken"), t0.Add(30*time.Second))
 
 	var req EscalationRequest
 	select {
@@ -409,7 +417,7 @@ func TestEscalationRequestCarriesContext(t *testing.T) {
 func TestNilChannelStillDecidesAndCounts(t *testing.T) {
 	f := newFixture(t, liveConfig(), nil)
 
-	res := f.feed(line("something novel"), t0)
+	res := f.feed(fault("something novel"), t0)
 	if !res.Escalate {
 		t.Fatal("did not escalate with a nil out channel")
 	}

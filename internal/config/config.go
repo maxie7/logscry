@@ -213,7 +213,8 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 	s := def.Score
 	b.floatVar("threshold", s.Threshold, "escalate at or above this score",
 		func(c *Config) *float64 { return &c.Score.Threshold })
-	b.floatVar("weight-novelty", s.Weights.Novelty, "score weight of a novel template",
+	b.floatVar("weight-novelty", s.Weights.Novelty,
+		"score weight of a novel template (a booster: below the threshold, so new alone stays quiet)",
 		func(c *Config) *float64 { return &c.Score.Weights.Novelty })
 	b.floatVar("weight-burst", s.Weights.Burst, "score weight of a burst",
 		func(c *Config) *float64 { return &c.Score.Weights.Burst })

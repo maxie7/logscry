@@ -185,6 +185,10 @@ On escalation, assemble context for the LLM: the trigger line + the last `M` lin
 
 > The signal-to-noise quality of this module matters more than the prompt. A tool that cries wolf gets uninstalled after one day. Bias toward **fewer, higher-confidence** escalations in v1.
 
+> **Calibration notes (post-v1).** The *signals* above are as shipped; two of their *weightings* were corrected by running the tool against real systems, and `internal/score` is the source of truth for the numbers.
+> - **Burst** has no absolute "N in the window" trigger (M4). A steady stream escalates at no rate whatsoever — "busy" is not "changed" — so only k× a template's own established baseline fires.
+> - **Novelty** is a **booster, not a threshold-crosser** (v0.8.1, issue #27). It is weighted *below* the threshold, so a first-seen template escalates only in combination with severity or a burst. Four hours of a real laptop's journal produced 179 escalations in 2304 lines, almost all "novel template (first seen)": this section's assumption that new means suspicious holds for a stream with an established template set, but on a working host new-and-harmless is the steady state.
+
 ---
 
 ## 7. LLM backend (`internal/llm`)
