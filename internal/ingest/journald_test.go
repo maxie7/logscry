@@ -48,9 +48,11 @@ func TestJournaldDecodesACapturedEntry(t *testing.T) {
 	if want := "Finished sysstat-collect.service - system activity accounting tool."; got.Raw != want {
 		t.Errorf("Raw = %q, want %q", got.Raw, want)
 	}
-	// PRIORITY "6" is info: a level, and NOT error-class, so the stream is untouched.
-	if got.Level != "INFO" {
-		t.Errorf("Level = %q, want INFO", got.Level)
+	// PRIORITY "6" is the default systemd records captured stdout at, so it assigns no
+	// level and leaves the text detection to the pipeline — and it is not error-class, so
+	// the stream is untouched either.
+	if got.Level != "" {
+		t.Errorf("Level = %q, want empty at the default priority", got.Level)
 	}
 	if got.Stream != model.Stdout {
 		t.Errorf("Stream = %v, want Stdout", got.Stream)
@@ -68,6 +70,10 @@ func TestJournaldDecodesACapturedEntry(t *testing.T) {
 // TestJournaldPriorityMapping pins the whole table, including which priorities are
 // error-class enough to be tagged stderr — the mapping is the only thing that carries
 // journald severity into scoring.
+//
+// The stream column is pinned exactly as it always was: systemd does not distinguish a
+// unit's captured stdout from its captured stderr by priority, so unlike the level there
+// is no signal to recover at 6 and nothing to change.
 func TestJournaldPriorityMapping(t *testing.T) {
 	tests := []struct {
 		priority   string
@@ -80,8 +86,11 @@ func TestJournaldPriorityMapping(t *testing.T) {
 		{"3", "ERROR", model.Stderr},    // err
 		{"4", "WARN", model.Stdout},     // warning
 		{"5", "INFO", model.Stdout},     // notice
-		{"6", "INFO", model.Stdout},     // info
-		{"7", "DEBUG", model.Stdout},    // debug
+		// info, the DEFAULT: systemd records captured stdout at 6 whatever the text says,
+		// so the priority carries no severity and no level is assigned — the pipeline
+		// detects one from the text instead. See TestJournaldDefaultPriorityDefersToTheText.
+		{"6", "", model.Stdout},
+		{"7", "DEBUG", model.Stdout}, // debug
 	}
 	for _, tc := range tests {
 		t.Run("priority "+tc.priority, func(t *testing.T) {
@@ -339,7 +348,11 @@ func TestJournaldStopsOnContextCancel(t *testing.T) {
 		t.Skip("sh not available")
 	}
 	script := filepath.Join(t.TempDir(), "journalctl")
-	body := "#!/bin/sh\nwhile :; do echo '{\"MESSAGE\":\"tick\",\"PRIORITY\":\"6\"}'; sleep 0.05; done\n"
+	// Priority 4 rather than the default 6, so the assertion below stays a POSITIVE one:
+	// a level that could only have come from the mapping proves decode ran inside the
+	// pipe path. At 6 no level is assigned by design (see TestJournaldPriorityMapping),
+	// which would tie this cancellation test to a rule it is not about.
+	body := "#!/bin/sh\nwhile :; do echo '{\"MESSAGE\":\"tick\",\"PRIORITY\":\"4\"}'; sleep 0.05; done\n"
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write stand-in: %v", err)
 	}
@@ -357,8 +370,8 @@ func TestJournaldStopsOnContextCancel(t *testing.T) {
 	// running follow rather than a race with startup.
 	select {
 	case ll := <-out:
-		if ll.Raw != "tick" || ll.Level != "INFO" {
-			t.Errorf("decoded line = %+v, want the message at INFO", ll)
+		if ll.Raw != "tick" || ll.Level != "WARN" {
+			t.Errorf("decoded line = %+v, want the message at WARN", ll)
 		}
 	case <-time.After(5 * time.Second):
 		cancel()

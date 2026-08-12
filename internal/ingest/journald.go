@@ -37,6 +37,14 @@ const priorityCount = 8
 // this is also the line between the two streams — see decode.
 const errPriority = 3
 
+// defaultPriority is what systemd records a unit's captured STDOUT at, whatever the text
+// of the line says. It is therefore the one priority that carries no severity at all: a
+// service printing "ERROR: connection refused" and one printing "starting up" are both
+// recorded at 6. Every OTHER priority had to be set deliberately through the journal
+// protocol, which is what makes it worth more than a regex guess about prose — see decode
+// and issue #24.
+const defaultPriority = 6
+
 // priorityLevels maps journald's numeric PRIORITY onto the canonical level set the
 // pipeline produces and the scorer weighs. Deliberately a plain table and not a syslog
 // implementation: it is the one piece of journald metadata that carries severity, and
@@ -46,6 +54,10 @@ const errPriority = 3
 // immediately" are the crash class the fatal weight exists to interrupt for. crit is
 // CRITICAL, which the scorer weighs as ERROR: serious, but not on its own worth an
 // interrupt.
+//
+// Index 6 is never read — decode skips the default priority entirely — but it stays here
+// with its syslog meaning intact, because this table's job is to say what each priority
+// MEANS. Which of them logscry believes is a separate question, answered in decode.
 var priorityLevels = [priorityCount]string{
 	0: "FATAL",    // emerg
 	1: "FATAL",    // alert
@@ -173,7 +185,14 @@ func decode(ll model.LogLine) model.LogLine {
 	ll.Raw = msg
 
 	if p, ok := journalPriority(entry["PRIORITY"]); ok {
-		ll.Level = priorityLevels[p]
+		// PRIORITY is authoritative only where it is not the default. At 6 systemd is
+		// saying "this came off stdout", not "this is informational", so no level is set
+		// and pipeline.Normalize falls through to detecting one from the text — which is
+		// how a service that merely PRINTS "ERROR: ..." is scored as the error it is,
+		// instead of being flattened to INFO and staying silent (issue #24).
+		if p != defaultPriority {
+			ll.Level = priorityLevels[p]
+		}
 		// Error-class entries are tagged stderr, which is faithful rather than
 		// invented: systemd forwards a unit's stderr at priority 3 and its stdout at 6.
 		// It also keeps journald at parity with the other sources — without it an

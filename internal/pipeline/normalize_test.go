@@ -100,10 +100,16 @@ func TestNormalizeMalformedJSONFallsBack(t *testing.T) {
 	}
 }
 
-// TestNormalizeSourceLevelWinsOverTheText is the journald case, and the reason a Source
-// may set Level at all. journald's PRIORITY is recorded by systemd at the journal
-// protocol level; a level token in the message body is a regex guess about prose. When
-// they disagree the structured value is the one that is not guessing.
+// TestNormalizeSourceLevelWinsOverTheText pins the precedence rule itself, which is the
+// reason a Source may set Level at all: a level that came from structured metadata is
+// recorded by the system, while a level token in the message body is a regex guess about
+// prose. When they disagree the structured value is the one that is not guessing.
+//
+// The rule is general and belongs to no particular source, which is why this test builds
+// its lines by hand. What a source does with it is the source's own decision — journald,
+// for instance, supplies a level only for priorities it was given deliberately, and stays
+// out of the way at the default one (issue #24) — but that choice is made before
+// Normalize is ever called, and must never change the rule below.
 //
 // The message must still be normalized: the source supplies a level, not a parse, so the
 // line goes through the same format detection as any other and still gets its recognized
