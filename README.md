@@ -293,18 +293,35 @@ pure Go and `CGO_ENABLED=0`: binding libsystemd would need cgo and would break t
 cross-compiled darwin/windows builds. It needs `journalctl` on `PATH`, and journald
 exists only on Linux.
 
-Journal `PRIORITY` becomes the level severity scoring uses, so a unit that logs nothing
-resembling a level token still gets scored honestly:
+Journal `PRIORITY` becomes the level severity scoring uses, so a unit that records a real
+priority is scored honestly even when its text says nothing resembling a level token:
 
 | PRIORITY | 0 emerg | 1 alert | 2 crit | 3 err | 4 warning | 5 notice | 6 info | 7 debug |
 |---|---|---|---|---|---|---|---|---|
-| level | `FATAL` | `FATAL` | `CRITICAL` | `ERROR` | `WARN` | `INFO` | `INFO` | `DEBUG` |
+| level | `FATAL` | `FATAL` | `CRITICAL` | `ERROR` | `WARN` | `INFO` | *from the text* | `DEBUG` |
 
 Entries at priority 3 and below are also tagged as **stderr**, matching how systemd
 forwards a unit's stderr at 3 and its stdout at 6 — the same severity weight a container
 line on stderr picks up. Because the journal's priority is structured metadata, it wins
 over any level token in the message text: a unit that prints `INFO: shutting down` but
 was recorded at priority 3 scores as the error it is.
+
+Priority 6 is the exception, and it is the reason the column above says *from the text*.
+Only services speaking the journal protocol set a priority themselves; a service that
+merely prints to stdout has systemd record **everything** it says at 6, `ERROR:` lines
+included. At 6 the journal is telling us where a line came from, not how bad it is — so
+that is the one priority logscry does not treat as a level, falling back to reading the
+message instead. Everywhere else the priority still wins.
+
+> **What reading the message does and does not recover.** The fallback finds a level at
+> the *start* of a line — `ERROR: ...`, `[ERROR] ...`, `level=error ...` — and inside a
+> JSON payload, under any of `level`, `lvl`, `severity`, or `log.level`. It does **not**
+> find one in the middle of a line, which is the usual console format for a JVM or Spring
+> service (`2026-01-15 10:23:45.123 ERROR 12345 --- [http-nio-8080] com.example.Foo : ...`)
+> — the level sits after the service's own timestamp and is missed. Configure such a
+> service to log JSON and it is read correctly. Levels at priority **5** (notice) and **7**
+> (debug) are also left alone: both are non-default, so both are taken at their word, and a
+> unit logging at either still loses a level its text reports.
 
 Lines are tagged `journald:<unit>` (`journald:nginx`, `journald:kernel`), and `--journald`
 composes with the other sources — `logscry --journald --docker-all` follows both.

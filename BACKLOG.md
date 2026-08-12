@@ -428,3 +428,39 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       stdout and now scores 0.45 and stays quiet, where before it escalated at 1.00 on novelty
       alone. That escalation was an accident (novelty firing, not severity), but it was doing
       real work, and #24 is now load-bearing. Targets v0.8.1
+
+- [x] **journald's DEFAULT priority is not a level** — #24, and the debt the entry above named
+      when it took novelty away from these lines. systemd records a unit's captured stdout at
+      `PRIORITY=6` whatever the text of the line says, so at 6 the priority is not severity at
+      all: a service printing `ERROR: connection refused` and one printing `starting up` arrive
+      byte-identically labelled. The source mapped 6 to INFO anyway, and `Normalize` gives a
+      source-supplied level precedence over its own text detection, so the heuristic's ERROR was
+      thrown away for the ONE case where the heuristic was the only thing that knew anything.
+      The result: 0.45 on novelty alone, and silence. Severity scoring was blind to every
+      service that merely PRINTS leveled text to stdout, which is most of the enterprise ones.
+
+      The fix is one branch in the source and nothing else: `PRIORITY` is authoritative only
+      where it is NOT the default, so at 6 the source sets no level and the existing
+      `given != ""` test in `Normalize` falls through to detection on its own. Every other
+      priority had to be set deliberately through the journal protocol and still wins. The
+      general precedence rule is untouched — stdin, subprocess and Docker behave exactly as
+      before, which `TestNormalizeDetectsLevelWhenTheSourceSuppliesNone` and
+      `TestNormalizeSourceLevelWinsOverTheText` both still prove. No weight and no threshold
+      moved: a first-seen text ERROR from a stdout service goes 0.45 → 1.05 and escalates, the
+      same line from a known template sits at 0.60 and stays quiet. That is the whole point.
+
+      `TestJournaldDefaultPriorityDefersToTheText` is the regression guard, deliberately in an
+      external `ingest_test` package so it runs `decode` AND `Normalize` back to back — either
+      half alone would have missed a bug that was a disagreement BETWEEN them. It covers the
+      JSON payload path as well as the text one, since JSON-on-stdout is the larger real-world
+      class. `TestJournaldNonDefaultPriorityStillWinsOverTheText` pins the other half.
+
+      Out of scope, deliberately: the STREAM mapping (`PRIORITY <= 3` → stderr) is unchanged,
+      because systemd does not distinguish captured stdout from captured stderr by priority and
+      there is nothing there to recover. Priorities 5 (notice) and 7 (debug) stay authoritative
+      and are pinned as tests rather than special-cased — both are non-default, so both were
+      somebody's decision, and second-guessing those is exactly what this change chose not to
+      do. And the text detector is ANCHORED to the start of a line, which this fix does not
+      touch: a JVM/Spring console line carries its level mid-line, after the service's own
+      timestamp, and is still not detected by any source. Its own issue, not smuggled in here.
+      Targets v0.8.2
