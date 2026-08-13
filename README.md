@@ -226,12 +226,20 @@ fatal-class level fire by themselves. That distinction is the whole calibration:
 | Routine `stderr` + `ERROR` chatter | 0.90 | no |
 | A new template, at `WARN`, on stderr | 0.95 | no — the loudest a merely-*new* line gets |
 | **A new template at `ERROR`** | **1.05** | **yes** — a new *failure* is the real signal |
-| A template running at 5× its own baseline | 1.00 | yes |
+| 25+ of one template in 10s, at 5× its own baseline | 1.00 | yes — a *change* in rate |
 | `FATAL` / `PANIC` | 1.00 | yes — even during warmup |
 
-Every number is a knob (`--weight-novelty`, `--threshold`, or the `score:` block in
-`logscry.yaml`); nothing is hardcoded. Turn novelty back up to `1.0` if you want every
-unseen template escalated on sight.
+A burst needs the count as well as the ratio. The baseline is a template's lifetime
+average, so one that appears every few minutes has a denominator near zero and *any*
+clustering of it reads as a huge multiple — and event-driven systems log in clusters by
+construction: a CI job starts ten containers inside a second. Ten lines in ten seconds is
+not a flood. At the default multiplier the count gate is the same statement as *"don't
+trust a ratio measured against a baseline below 0.5/s"*; templates busier than that are
+unaffected by it.
+
+Every number is a knob (`--weight-novelty`, `--threshold`, `--burst-min-count`, or the
+`score:` block in `logscry.yaml`); nothing is hardcoded. Turn novelty back up to `1.0` if
+you want every unseen template escalated on sight.
 
 Only events at or above the threshold escalate — and even then only if they aren't
 already explained (an **explanation cache** keyed by template hash) and a **global rate
@@ -263,6 +271,7 @@ Key flags:
 | `--llm-max-tokens <n>` | `300` | Cap on tokens per explanation |
 | `--threshold <f>` | `1.0` | Escalate at or above this score |
 | `--weight-novelty <f>` | `0.45` | Weight of a never-seen template — below the threshold, so new alone stays quiet |
+| `--burst-min-count <n>` | `25` | Fewer than this many occurrences in the burst window is never a burst, whatever the ratio |
 | `--rate-limit <n>` | `10` | Global cap on LLM calls per minute (the cost cap) |
 | `--explain-dry-run` | off | Show what *would* escalate; build no LLM stage at all |
 | `--export <path>` | off | Append one JSON object per flagged anomaly to a file (see below) |

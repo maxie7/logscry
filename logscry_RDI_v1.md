@@ -185,9 +185,10 @@ On escalation, assemble context for the LLM: the trigger line + the last `M` lin
 
 > The signal-to-noise quality of this module matters more than the prompt. A tool that cries wolf gets uninstalled after one day. Bias toward **fewer, higher-confidence** escalations in v1.
 
-> **Calibration notes (post-v1).** The *signals* above are as shipped; two of their *weightings* were corrected by running the tool against real systems, and `internal/score` is the source of truth for the numbers.
+> **Calibration notes (post-v1).** The *signals* above are as shipped; several of their *weightings and thresholds* were corrected by running the tool against real systems, and `internal/score` is the source of truth for the numbers.
 > - **Burst** has no absolute "N in the window" trigger (M4). A steady stream escalates at no rate whatsoever — "busy" is not "changed" — so only k× a template's own established baseline fires.
 > - **Novelty** is a **booster, not a threshold-crosser** (v0.8.1, issue #27). It is weighted *below* the threshold, so a first-seen template escalates only in combination with severity or a burst. Four hours of a real laptop's journal produced 179 escalations in 2304 lines, almost all "novel template (first seen)": this section's assumption that new means suspicious holds for a stream with an established template set, but on a working host new-and-harmless is the steady state.
+> - **Burst** additionally requires a **minimum absolute count in the window**, not the ratio alone (v0.8.3, issue #32). This is a gate and not the absolute trigger deleted above: it can only ever suppress. The baseline is a template's lifetime average, so one appearing every few minutes has a denominator near zero and any clustering of it yields an unbounded multiple — six hours of a real laptop's journal produced 16 burst escalations, none an incident, every one a cluster of ten or sixteen lines at 20×–340× baseline. Event-driven systems log in clusters by construction; ten lines in ten seconds is not a flood. At the default multiplier and window the gate is equivalent to distrusting any baseline below 0.5/s. It is a **workaround, not a fix**: the root cause is that `baseline()` never forgets, tracked as issue #37.
 
 ---
 

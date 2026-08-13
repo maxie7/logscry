@@ -464,3 +464,86 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       touch: a JVM/Spring console line carries its level mid-line, after the service's own
       timestamp, and is still not detected by any source. Its own issue, not smuggled in here.
       Targets v0.8.2
+
+- [x] **A cluster is not a flood** — #32, and the third dogfooding recalibration. Six hours of
+      `--journald --explain-dry-run` on the same working laptop: 5,631 lines, 1,831 templates,
+      32 escalations, SIXTEEN of them burst-driven and not one an incident. GNOME compositor
+      redraws (`Can't update stage views actor`, `Negative content width`), a CI runner's
+      container churn across `init.scope`/`containerd`/`docker`, and a VPN client reacting to
+      the veth pairs that churn creates. Every one was a cluster of ten or sixteen lines
+      reported at 20×–340× baseline.
+
+      The cause is the DENOMINATOR, not the weight. `baseline()` is a lifetime average,
+      `Count / (now - FirstSeen)`, so a template appearing once every few minutes sits near
+      0.005/s and ANY clustering of it produces an arbitrarily large multiple. Event-driven
+      systems log in clusters by construction — a CI job starts ten containers inside one
+      second, a compositor redraws and emits sixteen warnings — so the ratio path converts
+      every regular-but-rare template into a trigger. Ten lines in ten seconds is not a flood.
+
+      Demoting `Weights.Burst` the way #27 demoted novelty was considered and REJECTED, and the
+      arithmetic is why: at 0.45 the recorded 1.20s become 0.65 and the 1.00s become 0.45, so
+      the evidence clears — but the only surviving path is burst+ERROR at 1.05, which
+      novel+ERROR already covers without burst. An INFO-level retry storm, the exact incident
+      burst exists for, would score 0.45 and stay silent forever. A genuine flood IS
+      self-sufficient evidence; what was broken is the definition of one.
+
+      So the fix is `BurstMinCount` 10 → 25 and nothing else — one literal, no new knob, no
+      function body touched. It is a GATE and not the absolute trigger deleted at M4: an OR
+      trigger fires on "this system is busy", an AND gate only ever refuses. Read through the
+      arithmetic it binds exactly when `baseline < BurstMinCount/(BurstMultiplier*BurstWindow)`,
+      which at the defaults is 0.5/s — so it is the same statement as "do not trust a ratio
+      measured against a baseline below half a line a second", and that is precisely why there
+      is no separate baseline-floor knob: it would be this constraint expressed twice, in a
+      less legible unit, with a second thing to keep in sync when the multiplier moves.
+      Templates averaging 0.5/s or more are unaffected; the old value bound only below 0.2/s.
+
+      25 and not a rounder neighbour: the admissible band is [17, 32] — below it the recorded
+      noise survives, above it a spike the package already calls genuine dies. 25 sits inside
+      with margin either side. Going higher buys nothing real: no constant can bound an
+      unbounded cluster (a 64-way CI build lands 64 lines and clears any value), so paying a
+      live detection for that defence is paying for nothing. That failure belongs to the
+      baseline, not to this gate.
+
+      The band is ENFORCED, not merely documented, which is the part worth keeping:
+      `TestRecordedNoiseDoesNotBurst` fails at `BurstMinCount` 16 or lower and
+      `TestGenuineSpikeBursts` fails at 33 or higher, verified by sweeping the constant across
+      10/16/17/18/25/32/33 and running both. Reverting to 10 breaks a test; raising to 35 — the
+      value this change first proposed — breaks a different one. Neither edge can be crossed
+      silently again.
+
+      But the two edges are NOT equivalent evidence, and saying otherwise would be the more
+      comfortable lie. The lower edge is MEASURED: a real GNOME compositor clump of 16 from the
+      six-hour run. The upper edge is the peak of a SYNTHETIC fixture — 32 is whatever
+      `TestGenuineSpikeBursts` happened to be written with, asserted by its author and never
+      validated against a real incident. No genuine flood has yet been observed on a real
+      system, so "the smallest spike worth firing on" remains an assumption wearing a test's
+      clothing. The band is one measurement and one guess. That asymmetry is another argument
+      for #35: only replay can put a real number on the upper edge.
+
+      `TestRecordedNoiseDoesNotBurst` replays all sixteen, each row named for the source it
+      actually came from. Its file comment is deliberate and says the table is ONE ASSERTION
+      REPEATED ELEVEN TIMES: the ratio gate passes in every recorded row, so only the count is
+      load-bearing, and the row count must not be read as coverage. The real burden is on
+      `TestFloodFloorIsExactlyPinned`, which is two-sided on purpose — a volume gate invites
+      being set beyond what any real machine reaches, and THAT failure produces silence, which
+      on a healthy host is indistinguishable from success. It derives both edges from the
+      config handed to the scorer, never from a literal, so the pin follows the constant.
+      `TestRetryStormEscalates` gives the number a shape: an INFO-level line carrying no
+      severity weight at all, which is the case only burst can catch. No existing test was
+      modified — that is what choosing inside the band bought.
+
+      Out of scope, deliberately: this is a WORKAROUND and is documented as one in `RDI §6`.
+      The root cause is that `baseline()` never forgets — a lifetime average has no decay, so a
+      formerly rare template stays burst-prone forever and a formerly chatty one can never
+      burst again. That is #37; any replacement (EWMA, windowed baseline) needs #35 replay to
+      be evaluated honestly against real rate histories rather than synthetic fixtures. Also
+      noted and not acted on: after this change `BurstMultiplier` is the ONLY control for
+      templates at or above 0.5/s, and this run carries no evidence about that regime.
+      Targets v0.8.3
+
+- [ ] **`baseline()` never forgets** — #37, the root cause the entry above routes around: a
+      lifetime average with no decay, so rate history is permanent in both directions — a
+      formerly rare template stays burst-prone forever, a formerly chatty one can never burst
+      again. Blocked on #35 (replay): neither direction can be evaluated against synthetic
+      fixtures, since the failure is about real rate histories. Fixing it is also what would
+      let the upper edge of #32's admissible band be measured rather than assumed.

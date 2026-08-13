@@ -57,7 +57,8 @@ score:
   #   stderr + ERROR ........... 0.90   quiet   routine error chatter
   #   novel + WARN + stderr .... 0.95   quiet   the loudest a merely-new line gets
   #   novel + ERROR ............ 1.05   FIRES   a new failure is the real signal
-  #   burst / FATAL / PANIC .... 1.00   FIRES   on their own
+  #   burst / FATAL / PANIC .... 1.00   FIRES   on their own (see burst_min_count below
+  #                                             for what counts as a burst)
   #
   # Severity is additive across stream and level, capped at severity_max. Raise novelty
   # back to 1.0 for the old behaviour, where any first-seen template escalated on sight.
@@ -76,9 +77,19 @@ score:
   warmup_lines: 100 # ...this many lines have been seen (avoids a startup flood)
 
   # Burst (purely relative to a template's own established baseline).
+  #
+  # burst_min_count can only suppress, never fire. Because the baseline is a lifetime
+  # average, a template seen once every few minutes has a denominator near zero and any
+  # clustering of it reads as a huge multiple — which is how a CI runner's container
+  # churn and a compositor's redraws got reported as floods. At multiplier 5 and a 10s
+  # window the gate is the same thing as refusing to trust a baseline below 0.5/s:
+  #
+  #   binds when   baseline < burst_min_count / (burst_multiplier * burst_window)
+  #
+  # Templates averaging half a line a second or more are unaffected by it.
   burst_window: 10s # sliding window the rate is measured over
   burst_multiplier: 5 # fire at this many times the baseline rate
-  burst_min_count: 10 # ...but never on fewer occurrences than this
+  burst_min_count: 25 # ...but never on fewer occurrences in the window than this
   baseline_min_age: 60s # a template has no baseline until it is this old...
   baseline_min_count: 20 # ...and has been seen this many times
 
