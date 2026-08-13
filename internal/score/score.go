@@ -65,12 +65,17 @@ type Config struct {
 	WarmupLines int           `yaml:"warmup_lines"` // this many lines have been seen
 
 	// Burst. There is no absolute "N in the window" trigger by design: see burst.
-	BurstWindow      time.Duration `yaml:"burst_window"`       // sliding window the rate is measured over
-	BurstMultiplier  float64       `yaml:"burst_multiplier"`   // fire at this many times the established baseline rate
-	BurstMinCount    int           `yaml:"burst_min_count"`    // ...but never on fewer occurrences than this (volume gate)
+	BurstWindow     time.Duration `yaml:"burst_window"`     // sliding window the rate is measured over
+	BurstMultiplier float64       `yaml:"burst_multiplier"` // fire at this many times the established baseline rate
+
+	// BurstMinCount is a volume gate, not a trigger: it can only ever suppress. At the
+	// default multiplier it is equivalent to refusing to trust any ratio computed
+	// against a baseline below BurstMinCount/(BurstMultiplier*BurstWindow) — which is
+	// the honest way to read it, and the reason there is no separate baseline floor.
+	BurstMinCount int `yaml:"burst_min_count"`
+
 	BaselineMinAge   time.Duration `yaml:"baseline_min_age"`   // a template has no baseline until it is this old
 	BaselineMinCount int           `yaml:"baseline_min_count"` // ...and has been seen this many times
-
 	// Gates.
 	RatePerMin int           `yaml:"rate_limit"` // global cap on LLM calls per minute
 	CacheTTL   time.Duration `yaml:"cache_ttl"`  // how long an explained template stays quiet
@@ -95,7 +100,7 @@ type Config struct {
 //	novel + ERROR                    1.05   yes — a new FAILURE is the real signal
 //	novel + ERROR + stderr           1.35   yes
 //	novel + FATAL                    1.45   yes
-//	rate at 5x its own baseline      1.00   yes — a CHANGE in rate, not a high rate
+//	25+ in 10s at 5x its baseline    1.00   yes — a CHANGE in rate, not a high rate
 //	FATAL / PANIC                    1.00   yes — a crash is worth interrupting for,
 //	                                              even during warmup
 //
@@ -119,6 +124,32 @@ type Config struct {
 //
 // Note what is absent: a steady stream escalates at no rate whatsoever. A service
 // emitting one line a second and one emitting ten thousand are both simply running.
+//
+// BurstMinCount is 25 and not 10 because of what six hours of that same journal showed:
+// 32 escalations, sixteen of them burst-driven and not one an incident — GNOME
+// compositor redraws, a CI runner's container churn, and a VPN client reacting to the
+// veth pairs that churn creates. Every one was a cluster of ten or sixteen lines against
+// a baseline near zero. Event-driven systems log in clusters by construction, and ten
+// lines in ten seconds is not a flood; the near-zero denominator is what turned each
+// cluster into a multiplier in the hundreds. See burst for what the number means.
+//
+// 25 rather than a rounder neighbour, bracketed at [17,32] — below it the recorded noise
+// survives, above it a spike this package already calls genuine dies. The suite enforces
+// both edges: TestRecordedNoiseDoesNotBurst fails at 16 or lower, TestGenuineSpikeBursts
+// at 33 or higher. 25 sits inside with margin either side.
+//
+// The two edges are NOT equivalent evidence, and the gap matters more than the band. The
+// lower one is measured: a real GNOME compositor clump of 16 from the six-hour run. The
+// upper one is the peak of a synthetic fixture — 32 is whatever TestGenuineSpikeBursts
+// happened to be written with, asserted by its author and never validated against a real
+// incident. Nobody has yet observed a genuine flood on a real system, so the smallest one
+// worth firing on is still an assumption. Treat the upper edge as provisional.
+//
+// A larger value would buy nothing anyway: no constant can bound an unbounded cluster (a
+// 64-way CI build lands 64 lines and clears any of them), so raising it past the band
+// pays a real detection for a defence that does not work. That failure belongs to the
+// baseline, not to this gate — baseline is a lifetime average and never forgets, which is
+// the root cause this calibration routes around rather than fixes (issue #37).
 func Defaults() Config {
 	return Config{
 		Threshold: 1.0,
@@ -136,7 +167,7 @@ func Defaults() Config {
 		WarmupLines:      100,
 		BurstWindow:      10 * time.Second,
 		BurstMultiplier:  5,
-		BurstMinCount:    10,
+		BurstMinCount:    25,
 		BaselineMinAge:   60 * time.Second,
 		BaselineMinCount: 20,
 		RatePerMin:       10,
@@ -324,6 +355,21 @@ func (s *Scorer) warmedUp(now time.Time) bool {
 // It fires only for templates with an established baseline, which is also what stops a
 // template that is new *and* chatty from "bursting" on top of already being novel —
 // the same fact counted twice.
+//
+// The volume gate is the other half, and it is not a weakened version of the absolute
+// trigger above: an OR trigger fires on "this system is busy", while an AND gate only
+// ever refuses. What it refuses is a ratio it has no business trusting. baseline is a
+// lifetime average, so a template seen once every few minutes has a denominator near
+// zero and ANY clustering of it produces an arbitrarily large multiple. Read the gate
+// through the arithmetic and it says so directly: it binds exactly when
+//
+//	baseline < BurstMinCount / (BurstMultiplier * BurstWindow)
+//
+// which at the defaults is 25/(5*10s) = 0.5/s. Templates averaging half a line a second
+// or more are unaffected by it; below that, the ratio alone is not evidence and the
+// occurrence count has to carry the claim. This is also why there is no separate
+// baseline-floor knob: it would be this same constraint expressed twice, in a less
+// legible unit, with a second thing to keep in sync whenever the multiplier moves.
 func (s *Scorer) burst(tmpl *model.Template, now time.Time) (bool, string) {
 	base, ok := s.baseline(tmpl, now)
 	if !ok {
@@ -333,7 +379,9 @@ func (s *Scorer) burst(tmpl *model.Template, now time.Time) (bool, string) {
 	n, rate := s.windowRate(tmpl.Recent, now)
 	// A minimum-volume gate, not a trigger: without it a template that normally appears
 	// once a minute would "burst" at 10x on the strength of two occurrences —
-	// technically a spike, in practice two log lines.
+	// technically a spike, in practice two log lines. See the doc comment for why the
+	// default sits where it does; TestRecordedNoiseDoesNotBurst carries the evidence and
+	// TestFloodFloorIsExactlyPinned keeps the gate reachable.
 	if n < s.cfg.BurstMinCount || rate < s.cfg.BurstMultiplier*base {
 		return false, ""
 	}

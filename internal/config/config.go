@@ -242,7 +242,7 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 		func(c *Config) *time.Duration { return &c.Score.BurstWindow })
 	b.floatVar("burst-multiplier", s.BurstMultiplier, "burst when the rate exceeds this many times the template's own baseline",
 		func(c *Config) *float64 { return &c.Score.BurstMultiplier })
-	b.intVar("burst-min-count", s.BurstMinCount, "never call fewer than this many occurrences a burst",
+	b.intVar("burst-min-count", s.BurstMinCount, "never call fewer than this many occurrences in the window a burst, however far above baseline the rate is",
 		func(c *Config) *int { return &c.Score.BurstMinCount })
 	b.durationVar("baseline-min-age", s.BaselineMinAge, "a template has no baseline until it is this old",
 		func(c *Config) *time.Duration { return &c.Score.BaselineMinAge })
