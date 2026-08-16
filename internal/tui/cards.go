@@ -166,8 +166,17 @@ func (m Model) cardHeadline(ev pipeline.Event) string {
 	return ev.Pattern
 }
 
+// flagGlyph marks a template that has escalated more than once. It is one cell wide, which
+// TestFlagGlyphIsOneCell pins — the meta line is measured in cells, not runes.
+const flagGlyph = "⚑"
+
 // cardMeta is the provenance line: how often, from where, how long ago — and where the
 // explanation has got to.
+//
+// Every number on it is the TEMPLATE's live state, re-stamped from the template map on
+// every snapshot (see pipeline.collector.escalations). It used to be the state captured at
+// the instant the event was flagged, so a card sat at "x2 · 1h ago" while the aggregated
+// pane beside it showed nine occurrences twenty minutes old — issue #34.
 func (m Model) cardMeta(ev pipeline.Event) string {
 	parts := []string{"x" + formatCount(ev.Count)}
 	if ev.Line.Source != "" {
@@ -175,6 +184,12 @@ func (m Model) cardMeta(ev pipeline.Event) string {
 	}
 	if rel := relTime(ev.LastSeen, m.now()); rel != "" {
 		parts = append(parts, rel)
+	}
+	// Suppressed at one flag, which is almost every card: a badge that is always there
+	// carries no information, and the badge APPEARING is the signal — this template went
+	// quiet and came back.
+	if ev.FlagCount > 1 {
+		parts = append(parts, flagGlyph+formatCount(ev.FlagCount))
 	}
 	if status := cardStatus(ev); status != "" {
 		parts = append(parts, status)
@@ -197,6 +212,12 @@ func cardStatus(ev pipeline.Event) string {
 	}
 	switch ev.Explanation.State {
 	case model.ExplainFailed:
+		// A failed RE-explanation still has the previous answer on it, which is being
+		// rendered above this line. Calling that "unavailable" would be a card denying
+		// what it is showing; what failed is the newest attempt, and only that.
+		if ev.Explanation.Summary != "" {
+			return "retry failed"
+		}
 		return "explanation unavailable"
 	case model.ExplainPending:
 		return "explaining…"
@@ -222,6 +243,12 @@ func (m Model) cardDetail(ev pipeline.Event, width int, indent string) []string 
 	}
 
 	if ex := ev.Explanation; ex != nil {
+		// Which flag the answer below belongs to, and only when that is not the newest one.
+		// An answer carried across a re-escalation is a real answer and worth showing, but
+		// it was written about an earlier firing and the card has to say so.
+		if answerPredatesLastFlag(ev) {
+			field("answer", "from the flag at "+ex.At.Format("15:04:05"))
+		}
 		switch ex.State {
 		// Pending shares this arm so a streamed cause and check appear the moment each
 		// completes, rather than all three fields landing at once at the end.
@@ -229,6 +256,10 @@ func (m Model) cardDetail(ev pipeline.Event, width int, indent string) []string 
 			field("cause", ex.LikelyCause)
 			field("check", ex.Suggestion)
 		case model.ExplainFailed:
+			// A failed retry keeps the answer it already had, so the fields come first and
+			// the failure is reported under them rather than instead of them.
+			field("cause", ex.LikelyCause)
+			field("check", ex.Suggestion)
 			// The reason a model could not answer is as operationally useful as an answer
 			// — "connection refused" and "bad API key" are both fixable, and neither is
 			// distinguishable from "the tool is broken" if the card just says nothing.
@@ -236,6 +267,7 @@ func (m Model) cardDetail(ev pipeline.Event, width int, indent string) []string 
 		}
 	}
 	field("seen", m.seenText(ev))
+	field("flags", flagsText(ev))
 
 	if len(ev.Context) > 0 {
 		lines = append(lines, indent+styleHint.Render("context:"))
@@ -257,11 +289,41 @@ func (m Model) seenText(ev pipeline.Event) string {
 		ev.FirstSeen.Format("15:04:05"), ev.LastSeen.Format("15:04:05"))
 }
 
+// answerPredatesLastFlag reports whether the explanation on this card was written about an
+// earlier firing than the newest one. Explanation.At is when the ANSWER was produced and
+// survives a re-escalation unchanged (see pipeline.reexplaining), so the comparison against
+// the newest flag is the whole test — no extra state, and no flag to keep in sync.
+func answerPredatesLastFlag(ev pipeline.Event) bool {
+	ex := ev.Explanation
+	return ex != nil && ex.Summary != "" && !ex.At.IsZero() && ex.At.Before(ev.LastFlagged)
+}
+
+// flagsText is when this template escalated, as against when it merely occurred. The two
+// are different questions and the expanded card answers both: "seen" is the template's
+// life, "flags" is the handful of moments it was judged worth interrupting someone over.
+//
+// It always says something, including for a card flagged once — that single timestamp is
+// what stops the "why" line above it from reading as a claim about now.
+func flagsText(ev pipeline.Event) string {
+	switch {
+	case ev.FlagCount <= 0:
+		return ""
+	case ev.FlagCount == 1:
+		return ev.FirstFlagged.Format("15:04:05")
+	default:
+		return fmt.Sprintf("%s× · first %s · last %s", formatCount(ev.FlagCount),
+			ev.FirstFlagged.Format("15:04:05"), ev.LastFlagged.Format("15:04:05"))
+	}
+}
+
 // wrapField renders "label: value" wrapped to width, with continuation lines aligned
 // under the value rather than under the label — prose that re-indents itself every line
 // is prose nobody reads.
 func wrapField(label, value string, width int, indent string) []string {
-	head := fmt.Sprintf("%-7s", label+":")
+	// Eight, not seven: the longest labels here are "failed" and "answer", which at seven
+	// fill the column exactly and leave no gap before the value ("failed:connection
+	// refused"). The column is as wide as the longest label plus its separator.
+	head := fmt.Sprintf("%-8s", label+":")
 	body := max(width-visWidth(head), 10)
 
 	wrapped := lipgloss.NewStyle().Width(body).Render(value)
@@ -319,13 +381,37 @@ func plural(n int, one, many string) string {
 // nothing was asked of a model: the whole point of the flag is that these are the events
 // that WOULD have been escalated, and quietly calling them "anomalies" would imply an
 // answer was sought and none came.
+//
+// It counts CARDS, and states the flag count beside them only when the two differ — one
+// card can stand for several flags now that a returning template reuses the card it
+// already has. The bracket is suppressed when they agree, which they do until something
+// re-escalates: a difference shown on every run is a difference nobody sees when it
+// finally means something. Only the plural form exists, because the suppression makes
+// "(1 flag)" unreachable.
+//
+// The status bar's "esc" is a different number on purpose and is left alone: it counts
+// escalation decisions, which is what matches the JSONL export line for line.
 func (m Model) cardsTitle() string {
-	n := m.snap.Stats.Escalations
+	n := len(m.snap.Escalations)
+	flags := ""
+	if f := m.snap.Stats.Escalations; f != n {
+		flags = fmt.Sprintf("%s flags", formatCount(f))
+	}
+
 	if m.opts.ExplainDryRun {
+		// Shorter once the bracket has to carry the flag count too: the full wording plus a
+		// flag count is 53 cells and the cards pane is 52 at a 120-column terminal, so it
+		// truncated away "no LLM called" — the one claim the dry-run title exists to make.
+		if flags != "" {
+			return fmt.Sprintf("WOULD ESCALATE · %s (%s · dry run — no LLM)", formatCount(n), flags)
+		}
 		return fmt.Sprintf("WOULD ESCALATE · %s (dry run — no LLM called)", formatCount(n))
 	}
 	if n == 0 {
 		return "ANOMALIES"
+	}
+	if flags != "" {
+		return fmt.Sprintf("ANOMALIES · %s (%s)", formatCount(n), flags)
 	}
 	return fmt.Sprintf("ANOMALIES · %s", formatCount(n))
 }

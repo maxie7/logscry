@@ -186,28 +186,28 @@ func TestExpandCollapse(t *testing.T) {
 	focused, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	m = focused.(Model)
 
-	if strings.Contains(m.View(), "cause: Cause 2") {
+	if strings.Contains(m.View(), "cause:  Cause 2") {
 		t.Fatal("the card is expanded before anything was pressed")
 	}
 
 	opened, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = opened.(Model)
-	if !strings.Contains(m.View(), "cause: Cause 2") {
+	if !strings.Contains(m.View(), "cause:  Cause 2") {
 		t.Errorf("enter did not expand the selected card:\n%s", m.View())
 	}
-	if !strings.Contains(m.View(), "check: Check 2") {
+	if !strings.Contains(m.View(), "check:  Check 2") {
 		t.Errorf("the expanded card is missing the suggestion:\n%s", m.View())
 	}
 
 	closed, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = closed.(Model)
-	if strings.Contains(m.View(), "cause: Cause 2") {
+	if strings.Contains(m.View(), "cause:  Cause 2") {
 		t.Errorf("enter did not collapse the card again:\n%s", m.View())
 	}
 
 	// Space is the other half of the advertised binding.
 	spaced, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
-	if !strings.Contains(spaced.(Model).View(), "cause: Cause 2") {
+	if !strings.Contains(spaced.(Model).View(), "cause:  Cause 2") {
 		t.Error("space did not expand the selected card")
 	}
 }
@@ -330,4 +330,248 @@ func stripANSI(s string) string {
 		b.WriteByte(s[i])
 	}
 	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Flag history (issue #34): a card is a TEMPLATE, and it says how often it has fired.
+// ---------------------------------------------------------------------------
+
+// The clock the flag-history tests read against. Every value is distinct so an assertion
+// on one timestamp cannot pass because a different field happened to print the same one.
+var (
+	cardNow       = time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	cardFirstSeen = cardNow.Add(-3 * time.Hour)    // 09:00:00
+	cardFirstFlag = cardNow.Add(-2 * time.Hour)    // 10:00:00
+	cardLastFlag  = cardNow.Add(-time.Hour)        // 11:00:00
+	cardLastSeen  = cardNow.Add(-30 * time.Second) // 11:59:30
+)
+
+// flaggedModel is a sized model showing ONE card for a template flagged `flags` times.
+// A single flag sits at cardFirstFlag; more than one spans cardFirstFlag..cardLastFlag.
+func flaggedModel(t *testing.T, flags int, ex *model.Explanation) Model {
+	t.Helper()
+	m := New(nil, nil, Options{Explain: true})
+	m.now = func() time.Time { return cardNow }
+	// Wide on purpose: this card carries every optional field at once (a source, a relative
+	// time, a flag badge and a status), which no real card does, and these tests are about
+	// what the card SAYS rather than about where the pane truncates it.
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+
+	lastFlag := cardLastFlag
+	if flags < 2 {
+		lastFlag = cardFirstFlag
+	}
+	ev := pipeline.Event{
+		Hash:      "aaa",
+		Pattern:   "panic: nil map write in handler <NUM>",
+		Line:      model.LogLine{Source: "docker:api", Level: "PANIC"},
+		Count:     9,
+		FirstSeen: cardFirstSeen,
+		LastSeen:  cardLastSeen,
+		Score:     1.35,
+		Escalate:  true,
+		Queued:    true,
+		Reasons: []string{
+			"novel template (unseen for 1h41m7s, cooloff 15m0s)", "level PANIC",
+		},
+		FlagCount:    flags,
+		FirstFlagged: cardFirstFlag,
+		LastFlagged:  lastFlag,
+		Explanation:  ex,
+	}
+	applied, _ := sized.(Model).Update(snapshotMsg(pipeline.Snapshot{
+		Lines:       []pipeline.Event{ev},
+		Escalations: []pipeline.Event{ev},
+		Stats:       pipeline.Stats{TotalLines: 20, UniqueTemplates: 1, Escalations: flags},
+	}))
+	return applied.(Model)
+}
+
+// TestReescalationIsVisibleOnTheCard: merging the two cards a re-escalation used to
+// produce must not lose the fact that it fired twice. The card carries it instead — and
+// the numbers beside it are the template's live ones, which is issue #34's actual ask.
+func TestReescalationIsVisibleOnTheCard(t *testing.T) {
+	m := flaggedModel(t, 2, nil)
+
+	collapsed := m.View()
+	for _, want := range []string{
+		"⚑2",         // it has fired twice
+		"x9",         // and this is how often the template has occurred, live
+		"30s ago",    // last seen 30s ago, not two hours ago when it was flagged
+		"docker:api", // where from
+	} {
+		if !strings.Contains(collapsed, want) {
+			t.Errorf("the collapsed card is missing %q:\n%s", want, collapsed)
+		}
+	}
+
+	expanded := expandSelected(t, m).View()
+	for _, want := range []string{
+		"2× · first 10:00:00 · last 11:00:00", // the flag history
+		"first 09:00:00 · last 11:59:30",      // and the occurrence history, which is different
+	} {
+		if !strings.Contains(expanded, want) {
+			t.Errorf("the expanded card is missing %q:\n%s", want, expanded)
+		}
+	}
+}
+
+// TestSingleFlagCarriesNoBadge pins the suppression rule. A badge on every card carries no
+// information; the badge APPEARING is the signal that a template came back.
+func TestSingleFlagCarriesNoBadge(t *testing.T) {
+	m := flaggedModel(t, 1, nil)
+
+	if collapsed := m.View(); strings.Contains(collapsed, "⚑") {
+		t.Errorf("a card flagged once wears a flag badge:\n%s", collapsed)
+	}
+
+	// The flag time is still stated when expanded: it is what says the "why" above it is a
+	// verdict from a moment rather than a claim about now.
+	expanded := expandSelected(t, m).View()
+	if !strings.Contains(expanded, "10:00:00") {
+		t.Errorf("the expanded card does not say when it was flagged:\n%s", expanded)
+	}
+	if strings.Contains(expanded, "×") {
+		t.Errorf("a card flagged once shows a multiplier:\n%s", expanded)
+	}
+}
+
+// TestCardsTitleCountsCardsAndFlags: the title counts what is in the pane, and states the
+// flag count only when the two differ — the bracket appearing is itself the information
+// that a template came back. The status bar's "esc" is untouched and keeps counting flags.
+func TestCardsTitleCountsCardsAndFlags(t *testing.T) {
+	title := func(cards, flags int, dry bool) string {
+		m := New(nil, nil, Options{Explain: true, ExplainDryRun: dry})
+		m.snap = pipeline.Snapshot{
+			Escalations: make([]pipeline.Event, cards),
+			Stats:       pipeline.Stats{Escalations: flags},
+		}
+		return m.cardsTitle()
+	}
+
+	tests := []struct {
+		name         string
+		cards, flags int
+		dry          bool
+		want         string
+	}{
+		{"none", 0, 0, false, "ANOMALIES"},
+		{"equal", 3, 3, false, "ANOMALIES · 3"},
+		{"reescalated", 3, 6, false, "ANOMALIES · 3 (6 flags)"},
+		{"dry equal", 3, 3, true, "WOULD ESCALATE · 3 (dry run — no LLM called)"},
+		{"dry reescalated", 3, 6, true, "WOULD ESCALATE · 3 (6 flags · dry run — no LLM)"},
+	}
+	for _, tc := range tests {
+		if got := title(tc.cards, tc.flags, tc.dry); got != tc.want {
+			t.Errorf("%s: cardsTitle() = %q, want %q", tc.name, got, tc.want)
+		}
+		// The cards pane is 52 cells at a 120-column terminal. A title that truncates there
+		// loses the dry-run disclaimer, which is the one thing it exists to say.
+		if got := title(tc.cards, tc.flags, tc.dry); visWidth(got) > 52 {
+			t.Errorf("%s: title is %d cells and truncates in a 120-column terminal: %q",
+				tc.name, visWidth(got), got)
+		}
+	}
+}
+
+// TestReescalationKeepsTheEarlierAnswer: a re-escalation asks the model a new question, so
+// the card goes back to "explaining…" — but it must not throw away the answer it already
+// has while the new one is in flight. Before the merge this cost nothing, because the OLD
+// card kept its answer and a second card carried the pending state.
+func TestReescalationKeepsTheEarlierAnswer(t *testing.T) {
+	m := flaggedModel(t, 2, &model.Explanation{
+		Hash:        "aaa",
+		State:       model.ExplainPending,
+		Summary:     "A handler wrote to a nil map.",
+		LikelyCause: "The cache map is never initialised.",
+		Suggestion:  "Make the map in NewServer.",
+		At:          cardFirstFlag, // the answer to the FIRST flag
+	})
+
+	collapsed := m.View()
+	for _, want := range []string{
+		"A handler wrote to a nil map.", // the answer is still the headline
+		"explaining…",                   // and a new one is on its way
+		"⚑2",
+	} {
+		if !strings.Contains(collapsed, want) {
+			t.Errorf("the collapsed card is missing %q:\n%s", want, collapsed)
+		}
+	}
+
+	expanded := expandSelected(t, m).View()
+	for _, want := range []string{
+		"The cache map is never initialised.",
+		"Make the map in NewServer.",
+		"from the flag at 10:00:00", // and it says WHICH flag the answer belongs to
+	} {
+		if !strings.Contains(expanded, want) {
+			t.Errorf("the expanded card is missing %q:\n%s", want, expanded)
+		}
+	}
+}
+
+// TestFailedRetryKeepsTheEarlierAnswer is the failure path, and the regression the merge
+// would otherwise have introduced: a single card dropping a good answer for "explanation
+// unavailable" the moment a re-explain fails. RDI §7 says a dead model degrades a card, it
+// does not empty one.
+func TestFailedRetryKeepsTheEarlierAnswer(t *testing.T) {
+	t.Run("with an earlier answer", func(t *testing.T) {
+		m := flaggedModel(t, 2, &model.Explanation{
+			Hash:        "aaa",
+			State:       model.ExplainFailed,
+			Summary:     "A handler wrote to a nil map.",
+			LikelyCause: "The cache map is never initialised.",
+			Err:         "connection refused",
+			At:          cardFirstFlag,
+		})
+
+		collapsed := m.View()
+		if !strings.Contains(collapsed, "A handler wrote to a nil map.") {
+			t.Errorf("a failed retry threw away the answer the card already had:\n%s", collapsed)
+		}
+		if !strings.Contains(collapsed, "retry failed") {
+			t.Errorf("the card does not say the retry failed:\n%s", collapsed)
+		}
+		if strings.Contains(collapsed, "explanation unavailable") {
+			t.Errorf("the card claims to have no explanation while showing one:\n%s", collapsed)
+		}
+
+		expanded := expandSelected(t, m).View()
+		for _, want := range []string{
+			"The cache map is never initialised.", // the answer survives
+			"connection refused",                  // and so does the reason the retry failed
+			"from the flag at 10:00:00",
+		} {
+			if !strings.Contains(expanded, want) {
+				t.Errorf("the expanded card is missing %q:\n%s", want, expanded)
+			}
+		}
+	})
+
+	// Nothing changes for the case that has no answer to keep: the first explanation of a
+	// template failing still reads exactly as it always has.
+	t.Run("with no answer at all", func(t *testing.T) {
+		m := flaggedModel(t, 1, &model.Explanation{
+			Hash: "aaa", State: model.ExplainFailed, Err: "connection refused", At: cardFirstFlag,
+		})
+		view := m.View()
+		if !strings.Contains(view, "explanation unavailable") {
+			t.Errorf("a card with no answer at all stopped saying so:\n%s", view)
+		}
+		if strings.Contains(view, "retry failed") {
+			t.Errorf("a first failed explanation is not a failed retry:\n%s", view)
+		}
+	})
+}
+
+// TestFlagGlyphIsOneCell: the meta line is measured in CELLS, and a glyph counted as one
+// that paints two is how a pane silently loses a column (see visWidth's note on "⏳").
+//
+// This cannot tell whether the terminal FONT has the glyph — a missing one renders as a box
+// and still measures one cell — so the flag is also confirmed by eye in the smoke test.
+func TestFlagGlyphIsOneCell(t *testing.T) {
+	if got := visWidth(flagGlyph); got != 1 {
+		t.Errorf("visWidth(%q) = %d, want 1", flagGlyph, got)
+	}
 }

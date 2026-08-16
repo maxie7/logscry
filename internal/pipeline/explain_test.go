@@ -241,6 +241,134 @@ func TestDryRunSetsNoExplanationState(t *testing.T) {
 	}
 }
 
+// answeredTemplate returns a pipeline holding one template that has already been explained
+// once, at answeredAt — the starting position for every re-escalation test below.
+func answeredTemplate(t *testing.T, answeredAt time.Time) (*Pipeline, *model.Template) {
+	t.Helper()
+	p := New(nil) // no scorer: these tests drive the explanation lifecycle directly
+	ev := p.Process(model.LogLine{Source: "proc:app", Stream: model.Stderr, Raw: "PANIC: nil map write"}, answeredAt)
+	tmpl := p.templates[ev.Hash]
+	tmpl.Explanation = &model.Explanation{
+		Hash:        tmpl.Hash,
+		Pattern:     tmpl.Pattern,
+		State:       model.ExplainDone,
+		Summary:     "A handler wrote to a nil map.",
+		LikelyCause: "The cache map is never initialised.",
+		Suggestion:  "Make the map in NewServer.",
+		At:          answeredAt,
+	}
+	return p, tmpl
+}
+
+// TestReescalationCarriesTheAnswerForward: asking the model again must not take the answer
+// already on screen off it. There is one card per template now (issue #34), so the pending
+// state and the previous answer share a card — where they used to have one each, the old
+// card keeping its answer and a new card carrying the spinner.
+//
+// The preserved At is load-bearing rather than incidental: it is the whole of how the card
+// knows the answer it is showing belongs to an earlier flag.
+func TestReescalationCarriesTheAnswerForward(t *testing.T) {
+	answeredAt := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)
+	p, tmpl := answeredTemplate(t, answeredAt)
+
+	p.escalated(tmpl, true, answeredAt.Add(time.Hour))
+
+	ex := tmpl.Explanation
+	if ex.State != model.ExplainPending {
+		t.Errorf("state = %v, want pending: a new answer was asked for", ex.State)
+	}
+	if ex.Summary != "A handler wrote to a nil map." || ex.LikelyCause == "" || ex.Suggestion == "" {
+		t.Errorf("the re-escalation blanked the answer the card already had: %+v", ex)
+	}
+	if !ex.At.Equal(answeredAt) {
+		t.Errorf("At = %v, want %v: the card can no longer say which flag the answer belongs to",
+			ex.At, answeredAt)
+	}
+}
+
+// TestFailedRetryKeepsTheAnswerOnTheTemplate is the failure path of the same thing, and the
+// regression merging the cards would otherwise have introduced: a single card dropping a
+// good answer for "explanation unavailable" the moment a re-explain fails. RDI §7 — a dead
+// model degrades a card, it does not empty one.
+func TestFailedRetryKeepsTheAnswerOnTheTemplate(t *testing.T) {
+	answeredAt := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)
+	p, tmpl := answeredTemplate(t, answeredAt)
+	p.escalated(tmpl, true, answeredAt.Add(time.Hour))
+
+	p.attach(model.Explanation{
+		Hash: tmpl.Hash, Pattern: tmpl.Pattern,
+		State: model.ExplainFailed, Err: "connection refused", At: answeredAt.Add(time.Hour),
+	})
+
+	ex := tmpl.Explanation
+	if ex.State != model.ExplainFailed {
+		t.Errorf("state = %v, want failed: the retry did fail", ex.State)
+	}
+	if ex.Summary != "A handler wrote to a nil map." {
+		t.Errorf("a failed retry threw away the answer the template already had: %+v", ex)
+	}
+	if ex.Err != "connection refused" {
+		t.Errorf("Err = %q, want the reason the retry failed", ex.Err)
+	}
+	if !ex.At.Equal(answeredAt) {
+		t.Errorf("At = %v, want %v: the kept answer must keep its own timestamp", ex.At, answeredAt)
+	}
+
+	// A FIRST explanation failing is untouched by any of this: there is nothing to keep,
+	// so the card goes on saying it has no explanation.
+	p2 := New(nil)
+	ev := p2.Process(model.LogLine{Source: "proc:app", Stream: model.Stderr, Raw: "PANIC: other write"}, answeredAt)
+	p2.templates[ev.Hash].Explanation = &model.Explanation{Hash: ev.Hash, State: model.ExplainPending, At: answeredAt}
+	p2.explaining++
+	p2.attach(model.Explanation{Hash: ev.Hash, State: model.ExplainFailed, Err: "connection refused"})
+	if got := p2.templates[ev.Hash].Explanation; got.Summary != "" || got.State != model.ExplainFailed {
+		t.Errorf("a first failed explanation gained something it never had: %+v", got)
+	}
+}
+
+// TestADroppedRetryTellsTheCardAndTheFileDifferentThings: the two halves of a re-escalation
+// that never reaches a worker are deliberately different, and this is the only place that is
+// asserted. The CARD keeps the answer it has — nothing about the queue being full makes the
+// previous answer wrong. The FILE gets the bare failure, because a record describes one flag
+// and this flag produced no answer; writing the earlier one into it would claim the model
+// replied when it was never asked.
+func TestADroppedRetryTellsTheCardAndTheFileDifferentThings(t *testing.T) {
+	answeredAt := time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC)
+	p, tmpl := answeredTemplate(t, answeredAt)
+	exp, read := exportTo(t)
+	p.export = exp
+	p.explain = true
+
+	// The real path: the flag opens the record, and the drop closes it.
+	retriedAt := answeredAt.Add(time.Hour)
+	p.flagged(tmpl, Event{Line: model.LogLine{Source: "proc:app"}, Score: 1.35}, retriedAt) // Queued false: the queue is full
+
+	ex := tmpl.Explanation
+	if ex.Summary != "A handler wrote to a nil map." {
+		t.Errorf("a dropped retry blanked the card: %+v", ex)
+	}
+	if ex.State != model.ExplainFailed || ex.Err == "" {
+		t.Errorf("the card does not say the retry failed: %+v", ex)
+	}
+
+	recs := read()
+	if len(recs) != 1 {
+		t.Fatalf("got %d exported records, want 1", len(recs))
+	}
+	rec, ok := recs[0]["explanation"].(map[string]any)
+	if !ok {
+		t.Fatalf("the record carries no explanation: %v", recs[0])
+	}
+	for _, field := range []string{"summary", "likely_cause", "suggestion"} {
+		if got := rec[field]; got != "" {
+			t.Errorf("the export claims the model answered a request that was never sent: %s = %v", field, got)
+		}
+	}
+	if rec["error"] == "" || rec["error"] == nil {
+		t.Errorf("the exported failure carries no reason: %v", rec)
+	}
+}
+
 // TestRunWaitsForExplanationsAfterEOF: ingestion ending is not the run ending. The last
 // escalations are still with the model, and dropping their answers on the floor would
 // mean the most interesting thing in the log never gets explained.

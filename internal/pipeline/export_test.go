@@ -272,3 +272,66 @@ func TestExportOffChangesNothing(t *testing.T) {
 		t.Errorf("explaining = %d, want 1", p.explaining)
 	}
 }
+
+// TestExportStaysFrozenWhileTheCardMoves asserts the two deliberately OPPOSITE semantics
+// side by side, which is the only reason they are one test.
+//
+// An export record describes a decision at a moment: count_at_flag and last_seen_at_flag
+// are named for what they are and must never move once written, so a second flag of the
+// same template writes a SECOND record rather than editing the first. A card describes a
+// template now: one card, live count, and a flag history saying it has fired twice.
+//
+// Getting either half wrong is invisible from the other, and issue #34 was exactly the
+// card half having quietly adopted the export's semantics.
+func TestExportStaysFrozenWhileTheCardMoves(t *testing.T) {
+	exp, read := exportTo(t)
+	r := newCardRun(64)
+	r.p.export = exp
+
+	r.mustEscalate(t, escalatingLine, cardBase)
+	for i := 1; i < 5; i++ {
+		r.feed(escalatingLine, cardBase.Add(time.Duration(i)*2*time.Second))
+	}
+	back := cardBase.Add(61 * time.Minute)
+	r.mustEscalate(t, escalatingLine, back)
+
+	// The card: one of it, live.
+	snap := r.snap(back)
+	if len(snap.Escalations) != 1 {
+		t.Fatalf("got %d cards for one template, want 1", len(snap.Escalations))
+	}
+	card := snap.Escalations[0]
+	if card.Count != 6 || card.FlagCount != 2 {
+		t.Errorf("card = x%d / %d flags, want x6 / 2 flags", card.Count, card.FlagCount)
+	}
+	if !card.LastSeen.Equal(back) {
+		t.Errorf("card LastSeen = %s, want the live %s",
+			card.LastSeen.Format(time.TimeOnly), back.Format(time.TimeOnly))
+	}
+
+	// The file: two records, each frozen at its own flag.
+	recs := read()
+	if len(recs) != 2 {
+		t.Fatalf("wrote %d records for two flags, want 2 — a card merging must not merge the file",
+			len(recs))
+	}
+	wantCounts := []float64{1, 6} // JSON numbers decode as float64
+	wantLastSeen := []time.Time{cardBase, back}
+	for i, rec := range recs {
+		if got := rec["count_at_flag"]; got != wantCounts[i] {
+			t.Errorf("record %d count_at_flag = %v, want %v", i, got, wantCounts[i])
+		}
+		got, err := time.Parse(time.RFC3339Nano, rec["last_seen_at_flag"].(string))
+		if err != nil {
+			t.Fatalf("record %d last_seen_at_flag does not parse: %v", i, err)
+		}
+		if !got.Equal(wantLastSeen[i]) {
+			t.Errorf("record %d last_seen_at_flag = %s, want %s — an export record never moves",
+				i, got.Format(time.TimeOnly), wantLastSeen[i].Format(time.TimeOnly))
+		}
+	}
+	// And the first record must NOT have been dragged up to the card's live numbers.
+	if recs[0]["count_at_flag"] == recs[1]["count_at_flag"] {
+		t.Error("both records carry the same count_at_flag: the export followed the card")
+	}
+}
