@@ -46,6 +46,14 @@ type Event struct {
 	// renderer (see collector.observe) — never on the events in the stream ring, which
 	// number in the thousands and would each be carrying a copy of their predecessors.
 	Context []string
+
+	// The template's flag history, copied out of live template state at snapshot time
+	// alongside Count and LastSeen (see collector.escalations). Like Context it is filled
+	// in only on the escalations a Snapshot carries: it is what a CARD needs, and the
+	// thousands of ordinary events in the stream ring have no use for it.
+	FlagCount    int
+	FirstFlagged time.Time
+	LastFlagged  time.Time
 }
 
 // Pipeline holds the template dedup/count state and the scorer that reads it. Its
@@ -114,6 +122,17 @@ func (p *Pipeline) Process(line model.LogLine, now time.Time) Event {
 // template escalated", so its count and last-seen are the ones that were true when it did,
 // not the ones that are true when a model finishes answering seconds later.
 func (p *Pipeline) flagged(tmpl *model.Template, ev Event, now time.Time) {
+	// The flag history, which is the CARD's half of this moment and the exact opposite of
+	// the record below: it accumulates on the template and stays live, where the record is
+	// written once and frozen. Stamped here because this is the one place every mode passes
+	// through, so a card and a JSONL file can never disagree about how often a template
+	// fired (issue #34).
+	tmpl.FlagCount++
+	if tmpl.FirstFlagged.IsZero() {
+		tmpl.FirstFlagged = now
+	}
+	tmpl.LastFlagged = now
+
 	p.export.Flag(export.Flag{
 		Hash:      tmpl.Hash,
 		Pattern:   tmpl.Pattern,
@@ -142,27 +161,48 @@ func (p *Pipeline) flagged(tmpl *model.Template, ev Event, now time.Time) {
 // card appears immediately rather than after the model has thought about it for five
 // seconds. A dropped escalation resolves right here instead: nothing is coming for it,
 // and a card stuck at "explaining…" forever would be a lie.
+//
+// On a RE-escalation the answer the template already has is carried forward rather than
+// blanked. There is one card per template now (issue #34), so blanking would take a good
+// answer off the screen for as long as the model takes to produce another — and for good
+// if it never does. The state moves to pending; the answer stays visible underneath it,
+// with its original At, which is what lets the card say the answer predates the new flag.
 func (p *Pipeline) escalated(tmpl *model.Template, queued bool, now time.Time) {
+	const queueFull = "escalation queue full — the model is slower than the anomalies"
+
+	next := p.reexplaining(tmpl, now)
 	if !queued {
-		tmpl.Explanation = &model.Explanation{
-			Hash:    tmpl.Hash,
-			Pattern: tmpl.Pattern,
-			State:   model.ExplainFailed,
-			Err:     "escalation queue full — the model is slower than the anomalies",
-			At:      now,
-		}
-		p.export.Resolve(*tmpl.Explanation)
+		next.State = model.ExplainFailed
+		next.Err = queueFull
+		tmpl.Explanation = next
+		// The FILE gets the bare failure, never the answer carried forward onto the card.
+		// A record describes one flag, and this flag produced no answer: writing the
+		// previous one into it would claim the model replied when it was never asked.
+		p.export.Resolve(model.Explanation{
+			Hash: tmpl.Hash, Pattern: tmpl.Pattern,
+			State: model.ExplainFailed, Err: queueFull, At: now,
+		})
 		p.explainFailed++
 		p.explainDropped++
 		return
 	}
-	tmpl.Explanation = &model.Explanation{
-		Hash:    tmpl.Hash,
-		Pattern: tmpl.Pattern,
-		State:   model.ExplainPending,
-		At:      now,
-	}
+	next.State = model.ExplainPending
+	tmpl.Explanation = next
 	p.explaining++
+}
+
+// reexplaining builds the explanation a fresh escalation starts from: a copy of the answer
+// the template already holds, or an empty one if it has none. The caller sets the state.
+//
+// The copy preserves At — the moment the ANSWER was produced, not this flag — because that
+// is the whole of how a card knows the answer it is showing belongs to an earlier flag.
+func (p *Pipeline) reexplaining(tmpl *model.Template, now time.Time) *model.Explanation {
+	next := model.Explanation{Hash: tmpl.Hash, Pattern: tmpl.Pattern, At: now}
+	if prev := tmpl.Explanation; prev != nil && prev.Summary != "" {
+		next = *prev
+		next.Err = "" // whatever went wrong last time is not this attempt's news
+	}
+	return &next
 }
 
 // attach lands an explanation on the template that asked for it, seconds after the fact.
@@ -183,6 +223,7 @@ func (p *Pipeline) attach(ex model.Explanation) {
 	if !ok {
 		return // a template we no longer know about; nothing to show it on
 	}
+	ex = keepEarlierAnswer(tmpl.Explanation, ex)
 	// A streamed answer arrives as several pending updates before its terminal one, so the
 	// counter must move only on the transition OUT of pending — decrementing on every
 	// update would leave "explaining N" at zero while cards were still filling in.
@@ -199,6 +240,30 @@ func (p *Pipeline) attach(ex model.Explanation) {
 		p.explainFailed++
 	case model.ExplainPending:
 	}
+}
+
+// keepEarlierAnswer stops a failed re-explanation from emptying a card that already has a
+// good answer on it (RDI §7: a dead model degrades a card, it does not blank one).
+//
+// It applies only when the incoming answer is a FAILURE and the template holds a real one.
+// A successful answer replaces its predecessor outright — that is the point of asking
+// again — and a failure with nothing behind it is still just a failure. The kept answer's
+// At is preserved, so the card can go on saying which flag it belongs to; Err carries the
+// reason the retry failed, which is as operationally useful as the answer itself.
+//
+// This is a pure function over two values: the pointer discipline in attach is unaffected,
+// because what it returns is a new value the caller stores behind a new pointer.
+func keepEarlierAnswer(prev *model.Explanation, ex model.Explanation) model.Explanation {
+	if ex.State != model.ExplainFailed || ex.Summary != "" {
+		return ex
+	}
+	if prev == nil || prev.Summary == "" {
+		return ex
+	}
+	kept := *prev
+	kept.State = model.ExplainFailed
+	kept.Err = ex.Err
+	return kept
 }
 
 // Stats returns the scorer's running escalation counters, or the zero value when the

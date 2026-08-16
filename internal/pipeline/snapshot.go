@@ -12,6 +12,10 @@ const (
 	// escalationsKept bounds the retained escalations. They are held apart from the
 	// stream ring because they must outlive it: an escalation that scrolled past a
 	// second ago is exactly the one the user is trying to read.
+	//
+	// It bounds distinct flagged TEMPLATES, not flags: a template that escalates again
+	// reuses the entry it already has (see collector.retain), so the pane retains twenty
+	// separate faults rather than twenty rows that might be seven faults over again.
 	escalationsKept = 20
 	// cardContext is how many preceding raw lines an escalation carries for its card.
 	// Enough to show what was happening around the anomaly, few enough that the whole
@@ -127,10 +131,7 @@ func (c *collector) observe(ev Event, now time.Time) {
 		// ring above without it, so the thousands of ordinary events in the ring stay
 		// exactly as cheap as they were.
 		ev.Context = c.preceding(cardContext)
-		c.escalated = append(c.escalated, ev)
-		if len(c.escalated) > escalationsKept {
-			c.escalated = c.escalated[len(c.escalated)-escalationsKept:]
-		}
+		c.retain(ev)
 	}
 	if ev.Line.Level != "" {
 		c.levels[ev.Hash] = ev.Line.Level
@@ -143,6 +144,36 @@ func (c *collector) observe(ev Event, now time.Time) {
 	}
 	c.windowN++
 	c.dirty = true
+}
+
+// retain records an escalation for the cards pane, keyed by TEMPLATE. A template that
+// escalates a second time — which the explanation cache is designed to allow once its TTL
+// expires — replaces the entry it already has rather than adding a second one beside it
+// (issue #34).
+//
+// One card per template is not a display preference: the renderer keys its selection, its
+// expand/collapse map and its index lookup by hash, so two entries sharing one would put
+// two selection markers on screen and make the older of the pair unreachable with the
+// arrow keys. See TestSnapshotNeverRepeatsAHash.
+//
+// The newest escalation wins the entry outright: its trigger line, its reasons, its score
+// and its context lines are the freshest evidence, and a card is about what is happening
+// now. The flag history is not lost with the old entry — it lives on the template (see
+// model.Template.FlagCount) and is stamped back on at snapshot time.
+//
+// Removing and re-appending is what makes a returning template rise to the top of the
+// pane, which is the display order coming back is worth.
+func (c *collector) retain(ev Event) {
+	for i, prev := range c.escalated {
+		if prev.Hash == ev.Hash {
+			c.escalated = append(c.escalated[:i], c.escalated[i+1:]...)
+			break
+		}
+	}
+	c.escalated = append(c.escalated, ev)
+	if len(c.escalated) > escalationsKept {
+		c.escalated = c.escalated[len(c.escalated)-escalationsKept:]
+	}
 }
 
 // preceding returns the raw text of the n lines before the one just written, oldest
@@ -200,21 +231,31 @@ func (c *collector) snapshot(p *Pipeline, now time.Time) Snapshot {
 	}
 }
 
-// escalations copies out the retained escalations, each carrying the template's CURRENT
-// explanation rather than the nothing it had when it fired.
+// escalations copies out the retained escalations, each re-stamped from the template's
+// CURRENT state rather than the state it had at the instant it fired.
 //
-// This is what makes a pinned card update in place. The explanation arrives seconds after
-// the event, on a different goroutine, with no way to reach back into an Event that has
-// already been rendered — so nothing tries to. The escalations are re-stamped from live
-// template state on every snapshot instead, and a card goes from "explaining…" to an
-// answer simply because the next snapshot found one there. The explanation is copied by
-// value, so the renderer holds nothing the pipeline can later touch.
+// This is what makes a pinned card update in place. Everything a card says about a
+// template — how often it has occurred, when it was last seen, how many times it has been
+// flagged, and what the model eventually said — happens after the event has been rendered,
+// on a different goroutine, with no way to reach back into the Event the renderer holds.
+// So nothing tries to: the retained escalations are re-stamped here on every snapshot, and
+// a card goes from "x1 · 1h ago · explaining…" to "x9 · just now" with an answer simply
+// because the next snapshot read the live template. Everything is copied by value, so the
+// renderer holds nothing the pipeline can later touch.
+//
+// The event's own fields are deliberately NOT all refreshed: Line, Reasons, Score and
+// Context describe the escalation that produced the card and stay as they were. The
+// numbers are about the template; the evidence is about the moment.
 func (c *collector) escalations(p *Pipeline) []Event {
 	out := make([]Event, 0, len(c.escalated))
 	for _, ev := range c.escalated {
-		if tmpl, ok := p.templates[ev.Hash]; ok && tmpl.Explanation != nil {
-			ex := *tmpl.Explanation
-			ev.Explanation = &ex
+		if tmpl, ok := p.templates[ev.Hash]; ok {
+			ev.Count, ev.FirstSeen, ev.LastSeen = tmpl.Count, tmpl.FirstSeen, tmpl.LastSeen
+			ev.FlagCount, ev.FirstFlagged, ev.LastFlagged = tmpl.FlagCount, tmpl.FirstFlagged, tmpl.LastFlagged
+			if tmpl.Explanation != nil {
+				ex := *tmpl.Explanation
+				ev.Explanation = &ex
+			}
 		}
 		out = append(out, ev)
 	}

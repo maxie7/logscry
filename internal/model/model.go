@@ -52,6 +52,19 @@ type Template struct {
 	Count     int
 	Recent    []time.Time // ring buffer of recent occurrences for burst detection
 
+	// The flag history: how many times this template has escalated, and when it first
+	// and last did. It lives here rather than on the retained event the renderer holds
+	// because a card is bounded and a template is not — a template whose card aged out of
+	// the retained set and then escalated again must not claim to be firing for the first
+	// time.
+	//
+	// FirstFlagged and LastFlagged are the flag INSTANTS, which are not FirstSeen and
+	// LastSeen: a template is usually seen many more times than it is flagged, and the
+	// distance between the two pairs is what a card exists to show.
+	FlagCount    int
+	FirstFlagged time.Time
+	LastFlagged  time.Time
+
 	// Explanation is the LLM's verdict on this template, nil until it escalates. It
 	// is set to a pending value the moment the event is handed to the LLM stage and
 	// REPLACED — never mutated in place — when the answer arrives seconds later, so a

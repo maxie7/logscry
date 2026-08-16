@@ -111,8 +111,8 @@ func TestExplanationUpdatesTheCardInPlace(t *testing.T) {
 	// live behind the expand, so that a pane of cards stays scannable.
 	expanded := expandSelected(t, m).View()
 	for _, want := range []string{
-		"cause: The cache map is never initialised.",
-		"check: Make the map in NewServer.",
+		"cause:  The cache map is never initialised.",
+		"check:  Make the map in NewServer.",
 	} {
 		if !strings.Contains(expanded, want) {
 			t.Errorf("the expanded card is missing %q:\n%s", want, expanded)

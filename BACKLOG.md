@@ -547,3 +547,92 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       again. Blocked on #35 (replay): neither direction can be evaluated against synthetic
       fixtures, since the failure is about real rate histories. Fixing it is also what would
       let the upper edge of #32's admissible band be measured rather than assumed.
+
+- [x] **A card is a TEMPLATE, and its numbers are live** — #34, found by dogfooding, and a
+      display bug rather than a scoring one: no weight, threshold or gate moved, and
+      `git diff --stat internal/score/ internal/export/` is empty by design.
+      A 4.5-hour `--journald --explain-dry-run` run put the anomaly pane and the aggregated
+      pane in one screenshot and they disagreed. Three cards read `x2 · 1h ago`; the
+      aggregated rows for the same templates read count 9, last seen 22 minutes earlier. An
+      earlier six-hour run had a card at `x371` against a live count of 505. The cause is
+      that a card was rendered from the `pipeline.Event` retained at the instant the
+      template escalated and never refreshed, while the pane beside it was built from live
+      template state — the same map, the same snapshot, two different answers.
+      The fix is small because the mechanism already existed. `collector.escalations` was
+      already re-stamping each retained escalation from `p.templates[hash]` on every
+      snapshot — that is what makes a pinned card go from "explaining…" to an answer in
+      place — and it had `tmpl.Count` and `tmpl.LastSeen` in hand and copied neither. No new
+      channel, no new message type, no TUI plumbing.
+      **Identity had to be settled first, and it is the real content of this change.** The
+      pane drew one card per ESCALATION, not per template: that run's six JSONL records over
+      three hashes rendered six cards. Making six cards live would have shown two rows per
+      template both claiming count 9 and the same last-seen — worse than the frozen version,
+      and the same failure as #28 one level down. A card is now a template, keyed by hash,
+      and a re-escalation reuses the card it already has, moving it to the top of the pane
+      because coming back is news.
+      The decisive argument was not RDI §6, though §6 already said this and the explanation
+      cache key already implied it. It was that the renderer was ALREADY written for one
+      card per template and duplicate hashes were already breaking it. Three symptoms, all
+      live on exactly this data, all closed here and none of them independently actionable
+      afterwards, so they get no separate issue: (1) `renderCards` marks every card whose
+      hash equals `selKey`, so both twins drew the selection marker and the pane showed two
+      selections; (2) `expanded` is keyed by hash, so opening one twin opened the other;
+      (3) `indexOfCard` returns the first match, so `selectBy` could not reach the older
+      twin — the selection snapped back to the top and scroll-lock silently engaged, making
+      the down-arrow look dead. The guard is `TestSnapshotNeverRepeatsAHash`, a named
+      invariant at the COLLECTOR under a mixed workload, not in the TUI: after this change a
+      duplicate hash is unreachable from the renderer, so a TUI test would have to build a
+      snapshot the collector can no longer produce — a test of an impossible state.
+      **What the second escalation's information costs, decided knowingly.** Three scalars
+      on `model.Template` — `FlagCount`, `FirstFlagged`, `LastFlagged` — stamped in
+      `Pipeline.flagged`, which every mode passes through. They live on the template and not
+      on the retained event so a card that ages past `escalationsKept` and comes back does
+      not claim to be firing for the first time. They describe the LATEST flag, so the
+      earlier flags' reasons and scores are **discarded from memory**: once a template
+      re-escalates its `why:` line shows the newest reason only, and the distinction between
+      "first seen" and "returned after 1h41m of silence" is gone from the card. Recorded here
+      so it is not rediscovered later as a bug. Keeping the freshest reason is the right
+      call, and the full per-flag history is already in the JSONL export, which is what the
+      export is for. A bounded `[]Escalation` of every flag was rejected as unbounded memory
+      per template growing with run length — a template re-escalating on cooloff accumulates
+      ~100 entries a day, none of which anyone reads — where everything else in v1 (ring
+      caps, bounded channels) is bounded on purpose.
+      **The export does not change and must not.** `count_at_flag` and `last_seen_at_flag`
+      are correctly named and correctly frozen: a record describes a decision at a moment, so
+      a second flag writes a SECOND record rather than editing the first. The card describes
+      a template now. `TestExportStaysFrozenWhileTheCardMoves` asserts both halves side by
+      side, which is the only reason they are one test — each is invisible from the other,
+      and #34 was exactly the card half having quietly adopted the export's semantics.
+      **A merged card must never lose an answer it already has**, which the merge would
+      otherwise have regressed against RDI §7. Before it, a re-escalation left the old card
+      showing its finished answer and put the pending state on a NEW card, so a failed second
+      explain cost nothing; after it, a single card would have dropped a good answer for
+      "explanation unavailable". So `Pipeline.escalated` carries the previous answer forward
+      into the new pending explanation, and `attach` keeps it when a retry fails, recording
+      only why the retry failed. `Explanation.At` is preserved across both, which is the
+      whole of how the card knows the answer predates the newest flag — no new state and no
+      flag to keep in sync. Collapsed, a failed retry says `retry failed` rather than
+      `explanation unavailable`, which would be a card denying what it is showing; expanded,
+      an `answer: from the flag at 10:00:00` line scopes the fields under it. The FILE still
+      records the bare failure: a record describes one flag, and that flag produced no
+      answer.
+      **Display rules, both suppressed when they would carry no information.** The `⚑N` chip
+      on the collapsed card and the `(N flags)` bracket in the pane title appear only when
+      the flag count exceeds the card count — a badge present on every card is a badge nobody
+      sees when it finally means something, and the bracket APPEARING is itself the signal
+      that a template came back. Only the plural `flags` form exists, because the suppression
+      makes `(1 flag)` unreachable. The title counts CARDS; the status bar's `esc` is
+      untouched and keeps counting flags, which is what matches the JSONL export line for
+      line. Two numbers measuring different things is fine as long as each is labelled.
+      Also in the diff and stated rather than smuggled: `wrapField` pads its label column to
+      8 instead of 7. The new `answer:` label is 7 characters and would have rendered with no
+      gap before its value — which the existing `failed:` label had been doing all along, so
+      this fixes that too and shifts every detail value right by one column.
+      `escalationsKept` is unchanged at 20 but now bounds distinct flagged TEMPLATES rather
+      than flags, so the pane retains twenty separate faults instead of twenty rows that
+      might be seven faults over again. Its comment says so.
+      Out of scope, deliberately: #28 (card grouping), which this unblocks without
+      implementing — grouping needs cards addressable by a stable key and updatable from the
+      stream, and per-template cards are that where per-escalation cards were not. Also
+      untouched: the aggregated pane, which could mark flagged templates and does not.
+      Targets v0.8.4
