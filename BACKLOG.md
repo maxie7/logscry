@@ -636,3 +636,69 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       stream, and per-template cards are that where per-escalation cards were not. Also
       untouched: the aggregated pane, which could mark flagged templates and does not.
       Targets v0.8.4
+
+- [x] **The IPv6 mask ate C++ scope resolution operators** — found by dogfooding, and the
+      most direct hit on the product yet: the card is the output, and the card was naming
+      functions that do not exist. One hour of `--journald` on a work laptop escalated
+      fifteen patterns, ten of which carried an `<IP>`, and NONE of those ten was an
+      address. All were `::`. Two failure modes, the second much worse than the first:
+      `CDBusNMHelper::GetDNSConfig` masked to `CDBusNMHelper<IP>GetDNSConfig`, and — because
+      the match ate the hex characters adjacent to it — `CNSSCertStore::CNSSCertStore` masked
+      to `CNSSCertStor<IP>NSSCertStore` and `CCertificateInfoTlv::Assign` to
+      `CCertificateInfoTlv<IP>ssign`. The regex was not wrong by the letter: `::` and `::A`
+      really are valid IPv6. It was wrong about the world it runs in.
+      A later grep over the same capture turned up a shape the issue never recorded, and a
+      worse one: the run after `::` is eaten WHOLE, up to four characters, so a Qt paint call
+      lost two (`QPainter::begin` → `QPainter<IP>gin`) and a certificate store lost five
+      across both sides (`…CertStore::addCert` → `…CertStor<IP>ert`). Same mechanism, more
+      damage than the single-letter cases the fix was written against; both are test rows.
+      The fix is two clauses on the IPv6 pattern, and they do different jobs. A boundary
+      before the match (start of text, or a character outside `[0-9A-Za-z:.]`, consumed and
+      re-emitted by `maskIP` because RE2 has no lookbehind) forbids a match that BEGINS
+      inside a token — which ends the character-eating outright and rejects every
+      `Class::Method`, since a qualified name always has identifier characters running up to
+      its `::`. A minimum of TWO hex groups then covers what the boundary cannot: a `::` that
+      legitimately sits at a boundary, as in `operator :: used`, `call ::AddRef`, or a message
+      that BEGINS `Cafe::draw`. Nothing else moved — not the masker order, not `mustLongest`,
+      not `ipv4Pat`, not the other five patterns.
+      **The two-group rule is not corpus-fitting**, and the distinction matters because the
+      capture was convenient. Every real address in the 612 records is fully expanded and
+      every `::` in it is C++, so the corpus applies no pressure at the compressed end — it
+      cannot tell "≥2 groups" from "require all eight". The rule comes from the collision
+      structure instead: a qualified name is `identifier :: identifier`, exactly one `::` and
+      no single `:` anywhere, while every IPv6 form with two or more groups needs either a
+      single-colon separator or a group on each side of the `::` (and the boundary disposes of
+      the second). Verified against compressed forms absent from the capture: `2001:db8::1`,
+      `fe80::1`, `fe80::1%eth0`, `2001:db8::/32`, `::ffff:0:0`, `[2001:db8::1]:8080` all still
+      mask. Where it does NOT generalise is exactly where the corpus is convenient — the
+      one-group forms — which is why those are recorded as limitations rather than hidden.
+      **Three deliberate losses, all fragmentation, none corruption**, in README "Known
+      limitations" and pinned as `KNOWN_GAP` rows so widening the mask back is a visible diff:
+      `fe80::/64` → `fe<NUM>::/<NUM>` (one group; indistinguishable from `Cafe::draw`, and
+      absent from the capture); `::1` → `::<NUM>` (a C++ identifier cannot begin with a digit,
+      so `::` plus an all-decimal group WOULD be a sound discriminator — deliberately not
+      taken, because it widens the match for a shape no capture has measured; reopen it with
+      evidence); and `peer:2001:db8::1` → `peer:<NUM>:db<NUM>::<NUM>`, an address glued onto
+      the token before it, which would be the costliest of the three because the NUM fallback
+      keeps the hex groups and those lines fragment per-address instead of collapsing — so it
+      was measured before being accepted, and all 38 address-shaped tokens in the capture
+      (a host running Docker, a VPN client and a desktop session) are preceded by a space,
+      bracket or comma, none glued. Recorded as a loss no run has yet shown us paying. One
+      residual false positive survives and cannot be fixed textually: hex-only segments of
+      four characters or fewer on both sides (`dec::add`) ARE an address shape. Pinned as a
+      test row rather than papered over.
+      **Template hashes reshuffle once.** `hashTemplate` is a pure function of the pattern, so
+      every template that carried a corrupted `<IP>` gets a new hash. No semantic content — the
+      hash is an opaque dedup key — but a RUNNING instance loses continuity with its own
+      history: the explanation cache misses on the new hashes and those templates read as novel
+      exactly once (bounded by the same rate limiter as everything else), and JSONL exported
+      before the change will not join by hash to exports after it.
+      **#36's fragmentation figure was measured on a corpus this changes.** Ten of fifteen
+      escalated patterns in that run carried a corrupted `<IP>`; their patterns and their hashes
+      both move. #36 needs its numbers re-measured after this lands, or its conclusions carry a
+      known error term.
+      Out of scope and left alone: #31a (ANSI stripping — the capture contains zero escape
+      sequences, so there is nothing to validate it against), #36's `<NUM>`-inside-tokens
+      problem, and `internal/anonymize`, which carries a near-verbatim copy of the same IPv6
+      alternation. That copy is now the durable finding: this change makes the two DIVERGE.
+      Filed separately.

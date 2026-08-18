@@ -491,6 +491,20 @@ logscry says so on stderr on the way out.
   and no error to explain why. See [journald](#journald---journald-linux-only) for the
   one-line fix. There is no cursor or replay: `-f` picks up from roughly now, so an event
   further back won't appear until it recurs.
+- **Three IPv6 shapes are deliberately not masked.** The `<IP>` mask requires a boundary
+  before the match and at least two hex groups, because without that a C++ scope resolution
+  operator reads as an address — `CNSSCertStore::CNSSCertStore` used to template as
+  `CNSSCertStor<IP>NSSCertStore`, naming a function that does not exist. Three real shapes pay
+  for that: single-group prefixes (`fe80::/64` templates as `fe<NUM>::/<NUM>`), the bare
+  loopback (`::1` → `::<NUM>`), and an address glued straight onto the token before it
+  (`peer:2001:db8::1` → `peer:<NUM>:db<NUM>::<NUM>`, which fragments per address rather than
+  collapsing). All three mask *less* than ideal; none corrupts an identifier, which is the
+  trade being made. The third was measured rather than assumed: in a 612-record journald
+  capture from a host running Docker, a VPN client and a desktop session, all 38
+  address-shaped tokens were preceded by a space, bracket or comma and none was glued to the
+  token before it — so that gap is one no run has yet shown us paying, rather than a known
+  cost we accepted. Expanded addresses, compressed addresses after a space or bracket,
+  bracketed `[addr]:port`, CIDR suffixes, and all IPv4 are unaffected.
 - **`--docker-tail` defaults to 100 lines** of history per container on attach. An event
   further back than that won't appear until it recurs — use `--docker-tail all` for the
   full backlog.

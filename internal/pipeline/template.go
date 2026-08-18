@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/maxie7/logscry/internal/model"
 )
@@ -33,18 +34,69 @@ const (
 	tsPat   = `\b\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:?\d{2})?`
 	uuidPat = `\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`
 	ipv4Pat = `\b\d{1,3}(?:\.\d{1,3}){3}\b`
-	ipv6Pat = `(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}` + // 1:2:3:4:5:6:7:8
-		`|(?:[0-9a-fA-F]{1,4}:){1,7}:` + // 1::            1:2:3:4:5:6:7::
-		`|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}` + // 1::8    1:2:3:4:5:6::8
-		`|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}` +
-		`|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}` +
-		`|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}` +
-		`|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}` +
-		`|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}` +
-		`|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)`
-	hexPat = `0x[0-9a-fA-F]+|\b[0-9a-fA-F]{8,}\b`
-	numPat = `[+-]?\d+(?:\.\d+)?`
-	strPat = `"[^"]*"|'[^']*'`
+	hexPat  = `0x[0-9a-fA-F]+|\b[0-9a-fA-F]{8,}\b`
+	numPat  = `[+-]?\d+(?:\.\d+)?`
+	strPat  = `"[^"]*"|'[^']*'`
+)
+
+// The IPv6 pattern, in two parts, because on its own the address grammar also
+// describes a C++ scope resolution operator: "::" alone and "::" with one adjacent
+// hex group are both legal IPv6, so "CDBusNMHelper::GetDNSConfig" masked to
+// "CDBusNMHelper<IP>GetDNSConfig" — and, since the match ate the hex characters
+// beside it, "CNSSCertStore::CNSSCertStore" masked to "CNSSCertStor<IP>NSSCertStore",
+// naming a function that does not exist on the card that is the whole product (#33).
+//
+// A match must therefore satisfy BOTH clauses below, which do different jobs:
+//
+//   - ipv6Boundary — the match may not begin inside a token. This is what ends the
+//     character-eating: a match that cannot start mid-word cannot swallow the letter
+//     before it. Because a qualified C++ name always has identifier characters
+//     running up to its "::", it also rejects every "Class::Method" outright. RE2
+//     has no lookbehind, so the boundary character is CONSUMED and re-emitted by
+//     maskIP.
+//   - at least TWO hex groups — covers what the boundary alone does not, namely a
+//     "::" that legitimately sits at a boundary: "operator :: used", "call ::AddRef",
+//     and a message that BEGINS "Cafe::draw" all pass the boundary and fail here.
+//
+// The two-group minimum is not an artefact of the capture it was measured on. A
+// qualified name is `identifier :: identifier`: exactly one "::" and no single ":"
+// anywhere. Every IPv6 form carrying two or more groups needs either a single-colon
+// separator or a group on each side of the "::", and the boundary clause disposes of
+// the second case. That argument holds off the corpus.
+//
+// Known and deliberate, all three fragmentation rather than corruption (README,
+// "Known limitations"):
+//
+//   - One-group forms are lost: "fe80::/64" and "::1". "::" plus an all-decimal group
+//     WOULD be a sound discriminator for the loopback, since no C++ identifier begins
+//     with a digit — not taken, because it widens the match for a shape no capture has
+//     yet measured. Reopen it with evidence, not with taste.
+//   - An address glued straight onto the preceding token is lost ("peer:2001:db8::1",
+//     "upstream.2001:db8::1"): ':' and '.' are excluded from the boundary class, so
+//     there is no legal start position. The costliest of the three — the NUM fallback
+//     keeps the hex groups, so those lines fragment per-address instead of collapsing.
+//   - Residual false positive, unfixable by any textual rule: hex-only segments of
+//     four characters or fewer on both sides ("dec::add") ARE an address shape.
+const (
+	ipv6Group    = `[0-9a-fA-F]{1,4}`
+	ipv6Boundary = `(?:^|[^0-9A-Za-z:.])`
+
+	// Forms ending in a hex group, closed with \b so a trailing identifier character
+	// cannot be absorbed either. Each carries two groups or more.
+	ipv6Body = `(?:` + ipv6Group + `:){7}` + ipv6Group + // 1:2:3:4:5:6:7:8
+		`|(?:` + ipv6Group + `:){1,6}:` + ipv6Group + // 1::8    1:2:3:4:5:6::8
+		`|(?:` + ipv6Group + `:){1,5}(?::` + ipv6Group + `){1,2}` +
+		`|(?:` + ipv6Group + `:){1,4}(?::` + ipv6Group + `){1,3}` +
+		`|(?:` + ipv6Group + `:){1,3}(?::` + ipv6Group + `){1,4}` +
+		`|(?:` + ipv6Group + `:){1,2}(?::` + ipv6Group + `){1,5}` +
+		`|` + ipv6Group + `:(?::` + ipv6Group + `){1,6}` +
+		`|::(?:` + ipv6Group + `:){1,6}` + ipv6Group // ::ffff:0:0
+
+	// Trailing "::" ends on a colon, where \b would assert the wrong thing, so it is
+	// held to two groups explicitly: "1:2::" masks, "Cafe::" does not.
+	ipv6Trailing = `(?:` + ipv6Group + `:){2,7}:`
+
+	ipv6Pat = ipv6Boundary + `(?:(?:` + ipv6Body + `)\b|` + ipv6Trailing + `)`
 )
 
 // hexLetterRe detects whether a hex run carries a letter (a–f). Pure-decimal runs
@@ -70,10 +122,22 @@ func mustLongest(pat string) *regexp.Regexp {
 var maskers = []masker{
 	{"TS", regexp.MustCompile(tsPat), constMask("<TS>")},
 	{"UUID", regexp.MustCompile(uuidPat), constMask("<UUID>")},
-	{"IP", mustLongest(ipv4Pat + `|` + ipv6Pat), constMask("<IP>")},
+	{"IP", mustLongest(ipv4Pat + `|` + ipv6Pat), maskIP},
 	{"HEX", regexp.MustCompile(hexPat), maskHex},
 	{"NUM", regexp.MustCompile(numPat), constMask("<NUM>")},
 	{"STR", regexp.MustCompile(strPat), constMask("<STR>")},
+}
+
+// maskIP emits <IP>, re-emitting the boundary character that ipv6Boundary had to
+// consume — RE2 has no lookbehind, so the character before the address is part of the
+// match. An IPv4 match, and any match at the start of the string, carries no such
+// character: those begin with a hex digit or a colon and are replaced whole.
+func maskIP(match string) string {
+	r, n := utf8.DecodeRuneInString(match)
+	if r == ':' || strings.ContainsRune("0123456789abcdefABCDEF", r) {
+		return "<IP>"
+	}
+	return match[:n] + "<IP>"
 }
 
 // maskHex masks 0x-prefixed literals and hex runs that contain a letter, but

@@ -157,14 +157,20 @@ Selection flags: `--docker-all`, `--docker-label k=v`, `--docker-name <regex>`, 
 2. **Template (signature):** produce a masked form by replacing variable substrings with typed placeholders:
    - integers/floats → `<NUM>`
    - hex / UUIDs → `<HEX>` / `<UUID>`
-   - IPv4/IPv6 → `<IP>`
+   - IPv4/IPv6 → `<IP>` — the IPv6 half must also require a boundary before the match and at least
+     two hex groups, or a C++ scope resolution operator reads as an address: `::` alone and `::` with
+     one adjacent group are both legal IPv6, and a match that starts mid-token eats the letter beside
+     it (`CNSSCertStore::CNSSCertStore` → `CNSSCertStor<IP>NSSCertStore`). The cost is that one-group
+     compressed forms (`fe80::`, `::1`) and addresses glued onto the preceding token (`peer:2001:db8::1`)
+     are deliberately not masked. Masking less is fragmentation; masking an identifier is a card that
+     names a function which does not exist.
    - quoted strings → `<STR>`
    - timestamps already stripped during ingestion
    - (file paths optional → `<PATH>`)
    So `user 4821 failed` and `user 9933 failed` collapse to `user <NUM> failed`. The template hash is the dedup key and the unit of "seen before vs new".
 3. **Update template state:** upsert into `map[string]*Template`, bump `Count`, push to `Recent`, update `LastSeen`.
 
-Implementation note: keep the masking regexes ordered and compiled once; expose them so they can be tuned later. Aim for "good enough to collapse noise", not perfect log parsing.
+Implementation note: keep the masking regexes ordered and compiled once; expose them so they can be tuned later. The order (`TS`, `UUID`, `IP`, `HEX`, `NUM`, `STR`) is load-bearing in both directions: `IP` runs before `NUM` so an address is not shredded into `<NUM>.<NUM>.<NUM>.<NUM>`, and what `IP` declines does not stay literal — it falls through to `HEX` and `NUM`, so narrowing the IP pattern must be judged on the end of the pipeline, not on the one step. Aim for "good enough to collapse noise", not perfect log parsing.
 
 ---
 
