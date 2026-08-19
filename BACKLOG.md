@@ -702,3 +702,72 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       problem, and `internal/anonymize`, which carries a near-verbatim copy of the same IPv6
       alternation. That copy is now the durable finding: this change makes the two DIVERGE.
       Filed separately.
+
+- [x] **A partial match is a leak, not a near miss** — #41, the disclosure defect in the one
+      package whose job is preventing disclosure. `--llm-anonymize` sent part of every
+      COMPRESSED IPv6 address to the configured model endpoint in the clear:
+      `peer 2001:db8::dead:beef down` masked to `peer <IP_1>dead:beef down`, and
+      `peer fe80::1` to `peer <IP_1>1`. `Mask` returned a nil error, `residue()` returned
+      `""`, no escalation was skipped, and the card looked normal.
+      The cause is one call. `ipv6Pattern` was compiled with plain `regexp.MustCompile`, so
+      Go's default leftmost-FIRST matching took the first alternative that succeeded at the
+      earliest position — `(?:[0-9a-f]{1,4}:){1,7}:`, which stops at the `::` — over the
+      alternative that would have taken the whole address. `internal/pipeline` compiles the
+      same alternation through `mustLongest` for exactly this reason and its doc comment
+      names the failure; this package never had the call. Not a regression: `git log -S
+      "Longest()" -- internal/anonymize/` is empty, and `git show
+      v0.4.0:internal/anonymize/anonymize.go` carries the identical nine alternatives. It
+      dates from the introduction of `--llm-anonymize` in **v0.4.0** and shipped in **eleven**
+      tagged releases (v0.4.0 → v0.8.5, `git tag --contains 2da31be`), all with prebuilt
+      binaries. Severity is bounded — the recipient is an endpoint the operator configured,
+      nothing left the machine on a local Ollama, and no credential material is involved —
+      but the README's promise was unqualified and was not being met.
+      **The fail-closed re-scan could not have caught this, and not because it is written
+      badly.** The leftover of a partial match is BY CONSTRUCTION a shape the detector no
+      longer matches: `dead:beef` has no `::` and fewer than eight groups, so the very
+      detector that produced it reads it as clean. `residue()` can catch a detector that
+      missed a value ENTIRELY; it cannot catch one that matched a value INCOMPLETELY. The old
+      comment asserted the opposite ("by construction it can only catch what the detectors
+      already match"), so the comment was corrected rather than merely fixed underneath.
+      **`TestRoundTrip` was green the whole time, on top of the live leak.** Its inputs
+      already included `peer fe80::1 unreachable`. `Mask` produced `peer <IP_1>1` and
+      `Restore` mapped `<IP_1>` back to `fe80::`, reassembling the original byte-for-byte —
+      the round trip succeeded BECAUSE of the leftover. That is the same shape of blindness as
+      `residue()`: the check cannot see the failure because the failure preserves the property
+      the check tests. The test is kept, with a comment naming what it cannot see.
+      **The fix is applied to all twelve detectors, not to the one known to need it.** A
+      single `mustLongest` compile site replaces twelve inline `regexp.MustCompile` calls, so
+      the mode cannot be forgotten when a detector is added. Which detectors need it is not a
+      property inspection can keep true: IPv4 is also an alternation and is saved today only
+      incidentally, by its literal `.` separators and its trailing `\b`. Submatch cost checked
+      rather than assumed — `ipv6Pattern` has no capture groups at all, and Go's
+      leftmost-longest changes which parse wins only where a LONGER whole match exists by
+      another route, which none of the four submatch detectors (Bearer, URL credentials, URL
+      host, home dir) admits.
+      **Tests assert completeness as a PROPERTY, because this bug was precisely a case nobody
+      thought of.** `TestMaskingIsComplete` rows declare only inputs — prefix, secret, suffix
+      — and the expected output is derived: the secret must come back as exactly one
+      placeholder with the surrounding text untouched. A substring-survival threshold was
+      considered and rejected: `fe80::1` leaks a SINGLE character, which no defensible
+      threshold catches. The anchors also prove the detector did not overreach, which is the
+      hazard `Longest()` creates, so several rows put a port or a path flush against the
+      secret. `TestEveryDetectorHasACompletenessRow` requires every detector's target group to
+      land exactly on some row's declared secret, so a detector added without a row goes red.
+      **Two accepted over-masks, pinned as expected outputs in `TestAcceptedOverMasking`.**
+      Unbracketed `2001:db8::dead:beef:443` now masks whole, port included — `:443` is a valid
+      final hex group and RFC 3986 wants the brackets for exactly this ambiguity; bracketed,
+      the mask still stops at `]`. And `CNSSCertStore::CNSSCertStore` masks `e::C` where it
+      used to mask `e::`, one character more of #33's collision. Both are the cheap direction
+      here: this package's asymmetry is the REVERSE of the pipeline's — matching too much
+      costs one placeholder in a restatement that is already lossy, matching too little is
+      disclosure.
+      **#33's narrowing was deliberately NOT ported.** Its boundary and two-group rules would
+      drop `::1`, `fe80::/64` and an address glued onto the preceding token — fragmentation in
+      the pipeline, a leak here. The pattern's SHAPE is untouched; only how it is compiled
+      changed. `internal/pipeline` does not appear in the diff. The two IPv6 patterns have now
+      diverged in both directions (#40 narrowed one, #41 widened the other), which is #42's
+      material, not this change's. README "Known limitations" was corrected to name which mask
+      it describes: before this change both copies behaved the same way, so the unqualified
+      sentence was true; this change is what makes it false.
+      No template hashes move: this package runs at the LLM boundary and does not feed
+      `hashTemplate`. Release note version marked `TODO-VERSION` in the README pending the tag.

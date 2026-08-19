@@ -63,9 +63,15 @@ func New(extraHostSuffixes ...string) *Mapper {
 // "do not send this payload" (see internal/llm/anonymizing.go) — a privacy feature that
 // silently degrades to plaintext is worse than none.
 //
-// Honest scope: this re-scan guards against a detector-ordering or implementation bug — by
-// construction it can only catch what the detectors already match. It is NOT a guarantee
-// about arbitrary unknown data; free-text logs can carry anything.
+// Honest scope, and it is narrower than it looks. This re-scan catches a detector that
+// missed a value ENTIRELY — a raw 10.0.0.5 the ordering skipped. It CANNOT catch a detector
+// that matched a value INCOMPLETELY, because the leftover of a partial match is by
+// construction a shape the detector no longer matches: mask 2001:db8::dead:beef down to
+// 2001:db8:: and the surviving "dead:beef" carries no "::" and fewer than eight groups, so
+// the very detector that produced it reads it as clean. That was #41, live in every release
+// from v0.4.0 to v0.8.5. Nothing at runtime rescues an under-matching pattern — only the
+// pattern and the mode it is compiled in (see mustLongest). It is also NOT a guarantee about
+// arbitrary unknown data; free-text logs can carry anything.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -148,6 +154,10 @@ func (m *Mapper) placeholder(tag, original string) string {
 // value still present, or "" if the text is clean. The fuzzy host detectors are excluded:
 // their job is best-effort coverage of bare hostnames, and a missed bare host must not mute
 // an otherwise-safe escalation.
+//
+// It sees whole values, not fragments. A partially masked value leaves a remainder that no
+// longer has the shape the detector looks for, so residue reports "clean" on precisely the
+// failure a verifier is wanted for. TestMaskingIsComplete is the check that does see it.
 func (m *Mapper) residue(s string) string {
 	for _, d := range m.dets {
 		if !d.verify {
@@ -195,45 +205,70 @@ var defaultHostSuffixes = []string{
 	"internal", "local", "lan", "corp", "intranet", "svc", "private",
 }
 
+// mustLongest compiles pat in leftmost-longest mode. EVERY detector goes through here, and
+// the rule has no exceptions on purpose.
+//
+// Go's default is leftmost-FIRST: the engine takes the first alternative that matches at the
+// earliest position and stops. For a detector written as an alternation of shapes, that
+// means the shortest listed form can beat the complete one — ipv6Pattern's
+// "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
+// Longest mode picks the complete match instead.
+//
+// It is applied to all twelve rather than to the one detector known to need it, because
+// which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
+// an alternation, and today it is saved only incidentally, by its literal "." separators and
+// its trailing \b. A single compile site is what makes the mode impossible to forget when a
+// detector is added. The cost of over-matching is one placeholder in a restatement that is
+// already lossy; the cost of under-matching is disclosure. See the package comment.
+//
+// Submatches are unaffected here: leftmost-longest changes which parse wins only when a
+// LONGER whole match exists by another route, and the four detectors that mask a submatch
+// each have a single greedy capture with no such alternative.
+func mustLongest(pat string) *regexp.Regexp {
+	re := regexp.MustCompile(pat)
+	re.Longest()
+	return re
+}
+
 // buildDetectors assembles the ordered rule set. Everything except the bare-host detector
 // is constant; only the bare-host suffix alternation varies with config.
 func buildDetectors(extraHostSuffixes []string) []detector {
 	suffixes := append(append([]string{}, defaultHostSuffixes...), extraHostSuffixes...)
-	bareHost := regexp.MustCompile(
+	bareHost := mustLongest(
 		`(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:` + strings.Join(escapeAll(suffixes), "|") + `)\b`)
 
 	return []detector{
 		// 1. JWT — three base64url segments; the header always starts "eyJ".
-		{tagToken, regexp.MustCompile(
+		{tagToken, mustLongest(
 			`\beyJ` + tolerant(jwtChar) + `\.eyJ` + tolerant(jwtChar) + `\.` + tolerant(jwtChar)), 0, true},
 		// 2. AWS access-key id — a fixed, distinctive prefix and exactly 16 more characters.
-		{tagToken, regexp.MustCompile(
+		{tagToken, mustLongest(
 			`\b(?:AKIA|ASIA)(?:[0-9A-Z]{16}\b|` + mangled(`[0-9A-Z]`) + `)`), 0, true},
 		// 3a. Bearer token — mask the credential, not the word "Bearer".
-		{tagToken, regexp.MustCompile(`(?i)\bbearer\s+(` + tolerant(`[A-Za-z0-9._~+/=-]`) + `)`), 1, true},
+		{tagToken, mustLongest(`(?i)\bbearer\s+(` + tolerant(`[A-Za-z0-9._~+/=-]`) + `)`), 1, true},
 		// 3b. sk- style API keys (OpenAI and friends).
-		{tagToken, regexp.MustCompile(`\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`), 0, true},
+		{tagToken, mustLongest(`\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`), 0, true},
 		// 4. Credentials embedded in a URL / connection string: scheme://user:pass@host.
 		//    Runs before host and email so "@host" survives for the host detector and
 		//    "user:pass@host" is not misread as an email.
-		{tagToken, regexp.MustCompile(`://([^:/@\s<>]+:[^@/\s<>]+)@`), 1, true},
+		{tagToken, mustLongest(`://([^:/@\s<>]+:[^@/\s<>]+)@`), 1, true},
 		// 5. Email — before host, since an address contains a domain.
-		{tagEmail, regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`), 0, true},
+		{tagEmail, mustLongest(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`), 0, true},
 		// 6. UUID — before IP/host; a fixed 8-4-4-4-12 shape.
-		{tagUUID, regexp.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), 0, true},
+		{tagUUID, mustLongest(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), 0, true},
 		// 7. IPv6 — before host and IPv4. The alternatives cover the :: elisions; forms
 		//    without "::" and fewer than eight groups (times, MACs) do not match.
-		{tagIP, regexp.MustCompile(ipv6Pattern), 0, true},
+		{tagIP, mustLongest(ipv6Pattern), 0, true},
 		// 8. IPv4 — validated octets, and a leading \b so v1.2.3.4 (a version) is left alone.
-		{tagIP, regexp.MustCompile(`\b(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\b`), 0, true},
+		{tagIP, mustLongest(`\b(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\b`), 0, true},
 		// 9a. Host inside a URL/URI authority — masked regardless of TLD. The optional
 		//     userinfo run skips a (possibly already-masked) credential to reach the host.
-		{tagHost, regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/@\s]*@)?([a-z0-9.-]+)`), 1, false},
+		{tagHost, mustLongest(`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/@\s]*@)?([a-z0-9.-]+)`), 1, false},
 		// 9b. Bare hostname — only the private/infra suffixes above (fuzzy: verify off).
 		{tagHost, bareHost, 0, false},
 		// 10. Home directory — mask only the username segment, keeping the rest of the path
 		//     so /home/<USER_1>/go/pkg/mod/... stays useful in a stack trace.
-		{tagUser, regexp.MustCompile(`(?:/home/|/Users/)([^/<>\s:]+)`), 1, true},
+		{tagUser, mustLongest(`(?:/home/|/Users/)([^/<>\s:]+)`), 1, true},
 	}
 }
 

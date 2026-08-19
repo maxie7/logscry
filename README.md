@@ -383,17 +383,29 @@ provider (OpenAI, Groq, …) those raw lines leave your network; logscry prints 
 notice at startup when that is the case.
 
 `--llm-anonymize` masks the outgoing payload and restores the model's answer on the way
-back, so the terminal and the cards always show the real values while the provider sees
-only type-tagged placeholders (`<IP_1>`, `<HOST_2>`). The tag is kept on purpose: the
-model still needs to know it is reasoning about *an IP* or *a host that recurs*. The
-mapping is per-request and in memory only — never written to disk, never reused.
+back, so the terminal and the cards always show the real values while the provider sees a
+type-tagged placeholder (`<IP_1>`, `<HOST_2>`) in place of every value logscry recognizes.
+The tag is kept on purpose: the model still needs to know it is reasoning about *an IP* or
+*a host that recurs*. The mapping is per-request and in memory only — never written to
+disk, never reused.
 
 What it masks: IPv4/IPv6, email addresses, hosts inside URLs and connection strings (any
 domain), bare hostnames on **private/infra suffixes** (`.internal`, `.local`, `.svc`,
 `.lan`, `.corp`, …; extend with `--llm-anonymize-suffix`), UUIDs, known-shape secrets
 (JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, `user:pass@` credentials), and the username in
-`/home/<user>` and `/Users/<user>` paths. If masking a payload fails for any reason, that
-escalation is **skipped** (the card says so) rather than sent in the clear.
+`/home/<user>` and `/Users/<user>` paths. If masking a payload fails, that escalation is
+**skipped** (the card says so) rather than sent in the clear. That check re-scans the masked
+text and so catches a value a detector missed entirely; it cannot catch a value a detector
+masked only in part, because the leftover no longer has the shape the detector looks for.
+Completeness is enforced by the detectors' own tests, not at runtime.
+
+**Compressed IPv6 was masked only in part before TODO-VERSION.** From v0.4.0 — the release
+that introduced `--llm-anonymize` — through v0.8.5, an address written with `::` was masked
+up to the `::` and the remainder was sent to the configured model endpoint as literal text.
+Eleven tagged releases carry that behaviour. Expanded addresses and all IPv4 were never
+affected, and nothing left the machine if the endpoint was local. If you pointed
+`--llm-anonymize` at a remote provider on any of those releases, that provider received the
+tail of every compressed IPv6 address in the escalated lines.
 
 An escalation carries both the raw line and the pipeline's template for it, and that
 template has already had numbers and IDs masked (`<NUM>`, `<IP>`). Secrets are recognized in
@@ -405,9 +417,10 @@ recur" signal. Cosmetic, not a leak.
 contain anything, and logscry only masks what it recognizes. Bare **public** hostnames in
 prose (`could not resolve db.acme.com`) are deliberately left alone — masking every dotted
 name would eat Go module paths and stack frames for no privacy gain — so a public hostname
-you consider sensitive may still be sent. The fail-closed check catches detector bugs, not
-unknown data. Treat this as a way to lower exposure to a remote provider, and do not send
-logs you cannot afford to send.
+you consider sensitive may still be sent. The fail-closed check catches a detector that
+misses a value entirely, not one that matches a value only partly and not unknown data.
+Treat this as a way to lower exposure to a remote provider, and do not send logs you cannot
+afford to send.
 
 ### Export (`--export <path>`)
 
@@ -491,9 +504,9 @@ logscry says so on stderr on the way out.
   and no error to explain why. See [journald](#journald---journald-linux-only) for the
   one-line fix. There is no cursor or replay: `-f` picks up from roughly now, so an event
   further back won't appear until it recurs.
-- **Three IPv6 shapes are deliberately not masked.** The `<IP>` mask requires a boundary
-  before the match and at least two hex groups, because without that a C++ scope resolution
-  operator reads as an address — `CNSSCertStore::CNSSCertStore` used to template as
+- **Three IPv6 shapes are deliberately not masked in the pipeline's `<IP>` template mask.**
+  The template mask requires a boundary before the match and at least two hex groups, because
+  without that a C++ scope resolution operator reads as an address — `CNSSCertStore::CNSSCertStore` used to template as
   `CNSSCertStor<IP>NSSCertStore`, naming a function that does not exist. Three real shapes pay
   for that: single-group prefixes (`fe80::/64` templates as `fe<NUM>::/<NUM>`), the bare
   loopback (`::1` → `::<NUM>`), and an address glued straight onto the token before it
@@ -504,7 +517,11 @@ logscry says so on stderr on the way out.
   address-shaped tokens were preceded by a space, bracket or comma and none was glued to the
   token before it — so that gap is one no run has yet shown us paying, rather than a known
   cost we accepted. Expanded addresses, compressed addresses after a space or bracket,
-  bracketed `[addr]:port`, CIDR suffixes, and all IPv4 are unaffected.
+  bracketed `[addr]:port`, CIDR suffixes, and all IPv4 are unaffected. **This is the template
+  mask only.** The `--llm-anonymize` anonymizer is a separate detector set and masks all three
+  shapes in full — it must, because there under-masking is disclosure rather than
+  fragmentation. The two IPv6 patterns diverged in #40 and #41; #42 decides whether they stay
+  two.
 - **`--docker-tail` defaults to 100 lines** of history per container on attach. An event
   further back than that won't appear until it recurs — use `--docker-tail all` for the
   full backlog.
