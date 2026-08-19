@@ -23,6 +23,15 @@ func mustMask(t *testing.T, m *Mapper, s string) string {
 
 // TestRoundTrip: every supported type masks to a placeholder and restores to the original
 // byte-for-byte. This is the core contract the whole feature rests on.
+//
+// WHAT THIS TEST CANNOT SEE: whether the value was masked in FULL. A round trip succeeds on
+// a PARTIAL mask — that is not a gap in the assertion, it is structural. "peer fe80::1"
+// masked to "peer <IP_1>1" restores to "peer fe80::1" byte-for-byte, because Restore maps
+// <IP_1> back to "fe80::" and the leaked "1" was never removed. The leftover is precisely
+// what makes the round trip succeed, so the check cannot fail on it. That row sat green here
+// from v0.4.0 to v0.8.5 on top of a live leak (#41) — the same blindness residue() has, for
+// the same reason. TestMaskingIsComplete is the check that does see it; this one stays for
+// what it does prove, which is that Restore is a true inverse of Mask.
 func TestRoundTrip(t *testing.T) {
 	inputs := []string{
 		"connection refused to 10.0.0.5 from user alice@corp.example.com",
@@ -280,5 +289,211 @@ func TestPlaceholdersAreInert(t *testing.T) {
 	// Belt and suspenders: the tag pattern the detectors must avoid.
 	if regexp.MustCompile(`<[A-Z]+_\d+>`).FindString(inert[0]) == "" {
 		t.Fatal("test placeholder string is malformed")
+	}
+}
+
+// ---------------------------------------------------------------------------------------
+// Completeness: a value is masked WHOLE, or it is a leak.
+// ---------------------------------------------------------------------------------------
+
+// TestIssue41CompressedIPv6 is the named regression guard for #41. ipv6Pattern was compiled
+// with plain regexp.MustCompile, so Go's default leftmost-FIRST matching took alternative 2
+// — (?:[0-9a-f]{1,4}:){1,7}: — which stops at the "::" and wins over the alternative that
+// would have taken the whole address. Everything downstream reported success: Mask returned
+// a nil error, residue() returned "", no escalation was skipped, and the card looked normal
+// while the tail of the address went to the configured model endpoint as literal text.
+func TestIssue41CompressedIPv6(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"tail after elision", "peer 2001:db8::dead:beef down", "peer <IP_1> down"},
+		{"multi-group tail", "peer fe80::c0ff:ee00:1234 down", "peer <IP_1> down"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			if got := mustMask(t, m, c.in); got != c.want {
+				t.Errorf("compressed IPv6 masked in part:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// phMark DELIMITS, inside a completeness row's prefix or suffix, a span that is ordinary
+// text in the payload but must come out as a placeholder — the host of a connection string
+// whose credentials are the row's secret, say. Written in pairs: "@\x00db.acme.com\x00/prod"
+// sends "@db.acme.com/prod" through Mask and expects "@<HOST_n>/prod" back.
+//
+// It keeps the row declarative about WHERE placeholders land without pinning which tag or
+// which number lands there.
+const phMark = "\x00"
+
+// phPat is the shape of every placeholder this package mints.
+const phPat = `<[A-Z]+_\d+>`
+
+// payloadOf strips the markers, leaving the text actually fed to Mask.
+func payloadOf(s string) string { return strings.ReplaceAll(s, phMark, "") }
+
+// expand turns a row's prefix or suffix into a regexp fragment: text outside the markers is
+// quoted literally, each marked span becomes the placeholder shape.
+func expand(s string) string {
+	parts := strings.Split(s, phMark)
+	for i, p := range parts {
+		if i%2 == 1 { // inside a marked span
+			parts[i] = phPat
+			continue
+		}
+		parts[i] = regexp.QuoteMeta(p)
+	}
+	return strings.Join(parts, "")
+}
+
+// completenessRow declares INPUTS only: text around a sensitive value, and the value. What
+// the output should look like is derived, never hand-written — that is the whole point. A
+// table of expected outputs only catches the cases someone thought of, and #41 was precisely
+// a case nobody thought of.
+type completenessRow struct {
+	name           string
+	prefix, secret string
+	suffix         string
+}
+
+// completenessRows covers every detector in baseDetectors — enforced by
+// TestEveryDetectorHasACompletenessRow, so a detector added without a row goes red.
+//
+// The prefix and suffix are not decoration. They anchor the assertion at both ends, which is
+// what lets it prove masking was COMPLETE without a "surviving fragment" threshold to
+// defend: a threshold could not have caught fe80::1, whose leftover is a single character.
+// They also prove the detector did not OVERREACH, which is the hazard that grows once every
+// detector is compiled leftmost-longest — so several rows deliberately put text flush
+// against the secret with no separator (a port, a path) rather than a comfortable space.
+var completenessRows = []completenessRow{
+	// #41 itself. The first three are red under leftmost-first.
+	{"ipv6/compressed-tail", "peer ", "2001:db8::dead:beef", " down"},
+	{"ipv6/compressed-multi", "peer ", "fe80::c0ff:ee00:1234", " down"},
+	// The one-character leak, green under TestRoundTrip since v0.4.0. Keep it prominent.
+	{"ipv6/loopback-short-tail", "peer ", "fe80::1", " unreachable"},
+	// The control: an expanded address takes alternative 1 and was never affected.
+	{"ipv6/expanded", "peer ", "2001:db8:0:0:0:0:2:1", " down"},
+	// Greed guard: the address must stop at "]", not swallow the port.
+	{"ipv6/bracketed-port", "peer [", "2001:db8::dead:beef", "]:443 refused"},
+	// Greed guard: IPv4's trailing \b and char class must stop before ":".
+	{"ipv4/with-port", "connect ", "10.0.0.5", ":8080 refused"},
+	{"email", "mail to ", "bob@team.example.org", " bounced"},
+	{"uuid", "request ", "550e8400-e29b-41d4-a716-446655440000", " timed out"},
+	{"jwt", "auth ", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u", " rejected"},
+	{"aws-key", "creds ", "AKIAIOSFODNN7EXAMPLE", " denied"},
+	{"bearer", "hdr Bearer ", "abc123DEF456ghi789JKL", " expired"},
+	{"sk-key", "key ", "sk-abcdefghij0123456789XYZ", " rejected"},
+	// The credential detector masks a SUBMATCH: its whole match spans "://svcuser:hunter2@",
+	// but its target group is exactly the credentials, which is what the row declares. The
+	// phMark is the <HOST_n> the URL-host detector mints for the host that follows.
+	{"url-credentials", "dsn=postgres://", "svcuser:hunter2", "@" + phMark + "db.acme.com" + phMark + "/prod"},
+	// Greed guard: the host must stop at "/", not eat the path.
+	{"url-host", "call https://", "internal.acme.com", "/v1"},
+	{"bare-host", "host ", "worker.svc", " failed"},
+	{"home-dir", "loaded from /home/", "maxie", "/go/pkg/mod"},
+}
+
+// TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
+// replaced ENTIRELY by one placeholder, and the text around it is returned untouched.
+//
+// It is stated as a property rather than a table of outputs so it holds for detectors nobody
+// has examined — a partial match in any of them fails here without anyone having thought of
+// that particular shape first.
+func TestMaskingIsComplete(t *testing.T) {
+	for _, r := range completenessRows {
+		t.Run(r.name, func(t *testing.T) {
+			payload := payloadOf(r.prefix) + r.secret + payloadOf(r.suffix)
+			m := New()
+			masked := mustMask(t, m, payload)
+
+			want := regexp.MustCompile(`^` + expand(r.prefix) + phPat + expand(r.suffix) + `$`)
+			if !want.MatchString(masked) {
+				t.Errorf("value not masked whole, or surrounding text disturbed:\n in:   %q\n got:  %q\n want: %v",
+					payload, masked, want)
+			}
+			if strings.Contains(masked, r.secret) {
+				t.Errorf("the secret survived verbatim: %q still in %q", r.secret, masked)
+			}
+			if got := m.Restore(masked); got != payload {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", payload, got)
+			}
+		})
+	}
+}
+
+// TestEveryDetectorHasACompletenessRow is what makes the property above a PROPERTY rather
+// than a fact about the rows someone happened to write. For every detector, some row's
+// target group must land EXACTLY on that row's declared secret — so a new detector without a
+// row turns this red, and a detector whose group lands only PARTLY on a secret is caught by
+// TestMaskingIsComplete instead.
+//
+// The span is checked on the target group, not on match 0: three detectors deliberately mask
+// a submatch and leave their surrounding context — the scheme, the word "Bearer", the rest
+// of the path — for a later detector or for the reader.
+func TestEveryDetectorHasACompletenessRow(t *testing.T) {
+	for i, d := range baseDetectors {
+		covered := false
+		for _, r := range completenessRows {
+			prefix := payloadOf(r.prefix)
+			payload := prefix + r.secret + payloadOf(r.suffix)
+			start, end := len(prefix), len(prefix)+len(r.secret)
+			for _, loc := range d.re.FindAllStringSubmatchIndex(payload, -1) {
+				if loc[2*d.group] == start && loc[2*d.group+1] == end {
+					covered = true
+					break
+				}
+			}
+			if covered {
+				break
+			}
+		}
+		if !covered {
+			t.Errorf("detector %d (%s, group %d) has no completeness row; add one to completenessRows.\n pattern: %s",
+				i, d.tag, d.group, d.re.String())
+		}
+	}
+}
+
+// TestAcceptedOverMasking pins the cost of compiling every detector leftmost-longest, in the
+// one direction the completeness rows cannot express: text that legitimately reads as part
+// of an address gets absorbed into the placeholder.
+//
+// These are expected OUTPUTS on purpose. They are behaviour claims, not properties, and the
+// point of writing them down is that widening the mask further shows up as a diff here
+// rather than passing silently.
+//
+// Both are the cheap direction. This package's asymmetry is the reverse of the pipeline's
+// (see the package comment): matching too much costs one placeholder in a restatement that
+// is already lossy, while matching too little is disclosure. The second row is the shape #33
+// fixed in the pipeline; this package has always over-masked it and now over-masks it by one
+// more character. Whether the two IPv6 patterns should be one is #42's question, not this
+// change's.
+func TestAcceptedOverMasking(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// Unbracketed, ":443" IS a valid final hex group, so the port is absorbed. Bracketed
+		// (see the ipv6/bracketed-port completeness row) it is not. RFC 3986 requires the
+		// brackets for exactly this ambiguity.
+		{"ipv6 port absorbed when unbracketed",
+			"peer 2001:db8::dead:beef:443 refused", "peer <IP_1> refused"},
+		// A C++ scope operator between two hex-ish identifiers reads as an address. #33's
+		// boundary and two-group rules would reject it, but porting them here would drop
+		// ::1, fe80::/64 and glued addresses — fragmentation there, a leak here.
+		{"c++ scope operator", "CNSSCertStore::CNSSCertStore", "CNSSCertStor<IP_1>NSSCertStore"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			if got := mustMask(t, m, c.in); got != c.want {
+				t.Errorf("accepted over-masking moved:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+		})
 	}
 }

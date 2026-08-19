@@ -47,6 +47,10 @@ func (a *anonymizing) Name() string { return a.inner.Name() + "+anonymized" }
 // unavailable" card with the reason. A privacy feature that silently sends plaintext on
 // error would be worse than none.
 //
+// What "masked" covers is the anonymizer's business, not this seam's: see anonymize.Mask's
+// honest-scope note for what the detectors do and do not reach. Fail-closed is a claim about
+// the error path, not a claim of completeness.
+//
 // One mapper serves the whole request, so a value that appears in both the trigger and the
 // context gets the same placeholder and the model can see it recur. The mapper holds the
 // only copy of the token→original map, in memory, and is discarded when Explain returns.
