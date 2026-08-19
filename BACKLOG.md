@@ -770,4 +770,4 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       it describes: before this change both copies behaved the same way, so the unqualified
       sentence was true; this change is what makes it false.
       No template hashes move: this package runs at the LLM boundary and does not feed
-      `hashTemplate`. Release note version marked `TODO-VERSION` in the README pending the tag.
+      `hashTemplate`. Released as v0.8.6 (the README note was written against a pending tag).

@@ -399,7 +399,7 @@ text and so catches a value a detector missed entirely; it cannot catch a value 
 masked only in part, because the leftover no longer has the shape the detector looks for.
 Completeness is enforced by the detectors' own tests, not at runtime.
 
-**Compressed IPv6 was masked only in part before TODO-VERSION.** From v0.4.0 — the release
+**Compressed IPv6 was masked only in part before v0.8.6.** From v0.4.0 — the release
 that introduced `--llm-anonymize` — through v0.8.5, an address written with `::` was masked
 up to the `::` and the remainder was sent to the configured model endpoint as literal text.
 Eleven tagged releases carry that behaviour. Expanded addresses and all IPv4 were never
