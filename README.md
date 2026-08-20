@@ -408,7 +408,7 @@ affected, and nothing left the machine if the endpoint was local. If you pointed
 `--llm-anonymize` at a remote provider on any of those releases, that provider received the
 tail of every compressed IPv6 address in the escalated lines.
 
-**The pipeline's template was sent in the clear before TODO-VERSION.** An escalation carries
+**The pipeline's template was sent in the clear before v0.8.7.** An escalation carries
 both the raw line and the pipeline's template for it, and that template has already had numbers
 and IDs masked (`<NUM>`, `<IP>`, `<HEX>`). Nine of the twelve detectors therefore have to
 recognize a value in that damaged form, and from v0.4.0 — the release that introduced
