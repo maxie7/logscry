@@ -72,6 +72,13 @@ func New(extraHostSuffixes ...string) *Mapper {
 // from v0.4.0 to v0.8.5. Nothing at runtime rescues an under-matching pattern — only the
 // pattern and the mode it is compiled in (see mustLongest). It is also NOT a guarantee about
 // arbitrary unknown data; free-text logs can carry anything.
+//
+// #43 NARROWS that note by one class rather than widening it. A value the pipeline's template
+// masker had already rewritten used to be invisible here for the same structural reason — the
+// detector did not match hunter<NUM> at all, so the re-scan read it as clean. Every detector
+// now recognizes its value in that form too, so for the verify-eligible ones a templatized
+// credential, address or home path that survived masking IS caught on the re-scan. The
+// blindness that remains is specifically "matched incompletely", not "arrived reshaped".
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -234,8 +241,12 @@ func mustLongest(pat string) *regexp.Regexp {
 // is constant; only the bare-host suffix alternation varies with config.
 func buildDetectors(extraHostSuffixes []string) []detector {
 	suffixes := append(append([]string{}, defaultHostSuffixes...), extraHostSuffixes...)
+	// A hostname label is a grammar rather than a flat run — it may not begin or end with a
+	// hyphen — so tolerance goes on both halves of it rather than through tolerant().
+	label, inner := `(?:[a-z0-9]|`+pipelinePH+`)`, `(?:[a-z0-9-]|`+pipelinePH+`)`
 	bareHost := mustLongest(
-		`(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:` + strings.Join(escapeAll(suffixes), "|") + `)\b`)
+		`(?i)\b(?:` + label + `(?:` + inner + `*` + label + `)?\.)+(?:` +
+			strings.Join(escapeAll(suffixes), "|") + `)\b`)
 
 	return []detector{
 		// 1. JWT — three base64url segments; the header always starts "eyJ".
@@ -250,10 +261,30 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		{tagToken, mustLongest(`\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`), 0, true},
 		// 4. Credentials embedded in a URL / connection string: scheme://user:pass@host.
 		//    Runs before host and email so "@host" survives for the host detector and
-		//    "user:pass@host" is not misread as an email.
-		{tagToken, mustLongest(`://([^:/@\s<>]+:[^@/\s<>]+)@`), 1, true},
-		// 5. Email — before host, since an address contains a domain.
-		{tagEmail, mustLongest(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`), 0, true},
+		//    "user:pass@host" is not misread as an email. Both halves are placeholder-tolerant:
+		//    the pipeline turns hunter2 into hunter<NUM>, and a run that stops at '<' can never
+		//    reach the '@' that ends the credential, so the whole detector went quiet (#43).
+		{tagToken, mustLongest(
+			`://(` + tolerant(`[^:/@\s<>]`) + `:` + tolerant(`[^@/\s<>]`) + `)@`), 1, true},
+		// 5. Email — before host, since an address contains a domain. Both halves are
+		//    placeholder-tolerant: a digit ANYWHERE on either side of the '@' is enough for the
+		//    pipeline to split the address, and ordinary corporate addresses have digits, so
+		//    this was the likeliest of #43's five to fire. The TLD needs no tolerance — a TLD
+		//    has no digits for the pipeline to mask.
+		//
+		//    The leading \b is gone with the widening, and what it excluded is a finite set
+		//    rather than a judgement call. A match begins either with a local-class character
+		//    or with a pipeline placeholder. Beginning with a WORD character (letter, digit,
+		//    '_'), \b could only fail where the character before is also a word character —
+		//    itself in the class, so leftmost matching would have started there and the span is
+		//    identical. So \b excluded exactly the four NON-word members of the class as a
+		//    leading character (. % + -), which now get absorbed into the placeholder and are
+		//    enumerated one row each in TestAcceptedOverMasking, and a local part the pipeline
+		//    collapsed WHOLE — <HEX>@corp.example.com from a hashed address — which '<' being a
+		//    non-word character made unmatchable, sending the entire address including its
+		//    domain. That last one is a leak, not a cost, and it is why the assertion goes.
+		{tagEmail, mustLongest(
+			tolerant(`[A-Za-z0-9._%+-]`) + `@` + tolerant(`[A-Za-z0-9.-]`) + `\.[A-Za-z]{2,}\b`), 0, true},
 		// 6. UUID — before IP/host; a fixed 8-4-4-4-12 shape.
 		{tagUUID, mustLongest(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), 0, true},
 		// 7. IPv6 — before host and IPv4. The alternatives cover the :: elisions; forms
@@ -263,12 +294,29 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		{tagIP, mustLongest(`\b(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\b`), 0, true},
 		// 9a. Host inside a URL/URI authority — masked regardless of TLD. The optional
 		//     userinfo run skips a (possibly already-masked) credential to reach the host.
-		{tagHost, mustLongest(`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/@\s]*@)?([a-z0-9.-]+)`), 1, false},
+		//     Placeholder-tolerant: without it the host stopped at its first <NUM> and
+		//     api-gw7.prod.acme.com sent ".prod.acme.com" in the clear, with no second detector
+		//     behind it — a public suffix is not on the bare-host allowlist (#43).
+		{tagHost, mustLongest(
+			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/@\s]*@)?(` + tolerant(`[a-z0-9.-]`) + `)`), 1, false},
 		// 9b. Bare hostname — only the private/infra suffixes above (fuzzy: verify off).
+		//     Tolerant for the same reason: db01.corp.internal masked only "corp.internal" and
+		//     sent "db", and a digit in a middle label costs every label before it.
+		//
+		//     BOTH host detectors stay verify:false, and #43 does not change that. Flipping
+		//     them would not have caught this class anyway — the leftover of a partial match,
+		//     db<NUM>.<HOST_1>, is not a shape (?:label\.)+suffix matches, which is #41's
+		//     structural blindness. And for 9b, missing a value ENTIRELY is the designed
+		//     behaviour: bare public hostnames are deliberately left alone, so verify-eligible
+		//     would fail closed on every escalation carrying api.example.com and mute exactly
+		//     the stack traces this feature protects.
 		{tagHost, bareHost, 0, false},
 		// 10. Home directory — mask only the username segment, keeping the rest of the path
-		//     so /home/<USER_1>/go/pkg/mod/... stays useful in a stack trace.
-		{tagUser, mustLongest(`(?:/home/|/Users/)([^/<>\s:]+)`), 1, true},
+		//     so /home/<USER_1>/go/pkg/mod/... stays useful in a stack trace. Tolerant, and the
+		//     awkward position is the one worth naming: a TRAILING digit was always harmless
+		//     (/home/maxie7 → /home/<USER_1><NUM> loses nothing), while a digit in the MIDDLE
+		//     split the value and sent the tail — /home/deploy2prod leaked "prod" (#43).
+		{tagUser, mustLongest(`(?:/home/|/Users/)(` + tolerant(`[^/<>\s:]`) + `)`), 1, true},
 	}
 }
 
@@ -279,16 +327,32 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 // us shape-broken: sk-livekeyabcdefghij0123456789XYZ arrives as sk-livekeyabcdefghij<NUM>XYZ,
 // AKIAIOSFODNN7EXAMPLE as AKIAIOSFODNN<NUM>EXAMPLE, and a JWT as a dot-separated run riddled
 // with <NUM>. A detector anchored on an unbroken run of [A-Za-z0-9] misses all three and the
-// surviving characters go over the wire in the clear. So the prefix-anchored secret detectors
-// treat a pipeline placeholder as just another character of the token run.
+// surviving characters go over the wire in the clear.
 //
-// This does not weaken the inertness invariant. The alternation names the pipeline's six
-// UNTAGGED placeholders and requires '>' immediately after the name, so it can never match
-// this package's own numbered output — <IP_1> and <UUID_1> have '_' where it demands '>'.
-// Every widened detector also stays anchored on a distinctive secret prefix (eyJ, AKIA/ASIA,
-// sk-, Bearer) that no placeholder of either kind carries, so neither sequential masking nor
-// the fail-closed re-scan can trip on a value already masked. TestPlaceholdersAreInert holds
-// both halves of that to the fire.
+// WHICH detectors need this is not a matter of taste, and it is the one durable statement to
+// take away from #43: THE GAPS ARE EXACTLY THE DETECTORS WHOSE VALUES THE PIPELINE DOES NOT
+// ALREADY COLLAPSE. UUIDs and IP addresses arrive as <UUID> and <IP> — one placeholder,
+// nothing left to recognize, no gap possible. Every one of the other nine receives a damaged
+// but not collapsed value and reads a pipeline placeholder as just another character of the
+// run. Four were widened here at 2da31be; the remaining five (URL credentials, email, both
+// host detectors, home directory) were left out and leaked until #43. That is a fact about
+// today's templatizer rather than a property of anything, so it is enforced by tests running
+// the REAL Templatize → Mask composition — see TestEveryUncollapsedDetectorHasATemplatizedRow,
+// which re-derives the exemptions from the templatizer itself every run.
+//
+// This does not weaken the inertness invariant, but the argument for it is now in two parts
+// rather than one, because five of the nine carry no distinctive prefix to lean on:
+//
+//   - Every widened class still excludes '<' and '>', so a run cannot ENTER a placeholder.
+//   - The alternation names the pipeline's six UNTAGGED placeholders and requires '>'
+//     immediately after the name, so it can never match this package's own numbered output —
+//     <IP_1> and <TOKEN_1> have '_' where it demands '>' — and so cannot be stepped over as a
+//     unit either.
+//
+// Neither sequential masking nor the fail-closed re-scan can therefore trip on a value already
+// masked. TestPlaceholdersAreInert holds both halves of that to the fire, and the email
+// detector is the case that needs both: '_' and '.' ARE in its local-part class, so a run
+// could start inside "TOKEN_1" and only the '>' before the '@' stops it.
 const pipelinePH = `<(?:TS|UUID|IP|HEX|NUM|STR)>`
 
 // jwtChar is the base64url alphabet of a JWT segment.

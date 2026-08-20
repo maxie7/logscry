@@ -274,6 +274,19 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		// placeholders must not let them chew on ours — <TOKEN_1> has '_' where the pipeline
 		// alternation demands '>', so none of these may match.
 		"Bearer <TOKEN_1> AKIA<TOKEN_2> sk-<TOKEN_3> eyJ<TOKEN_4>.eyJ<TOKEN_5>.<TOKEN_6>",
+		// Adversarial for the five detectors widened in #43, which — unlike the four above —
+		// are NOT anchored on a distinctive secret prefix. Two independent things have to hold
+		// for these: every widened class still excludes '<' and '>', so a run cannot enter a
+		// placeholder; and pipelinePH demands '>' immediately after one of six untagged names,
+		// so our own <TOKEN_1> cannot be consumed as a unit either.
+		//
+		// The email detector is the one that needs both. Its local-part class contains '_' and
+		// '.', so a run could start inside "TOKEN_1" — the only thing stopping it reaching the
+		// '@' is the '>' that is in neither alternative.
+		"dsn=postgres://<TOKEN_1>@<HOST_2>/prod",
+		"mail <EMAIL_1> then <TOKEN_1>@<HOST_2> refused",
+		"loaded from /home/<USER_1>/go/pkg/mod",
+		"call https://<HOST_1>/v1 and <UUID_1>",
 	}
 	for _, s := range inert {
 		for _, d := range baseDetectors {
@@ -436,26 +449,29 @@ func TestMaskingIsComplete(t *testing.T) {
 // of the path — for a later detector or for the reader.
 func TestEveryDetectorHasACompletenessRow(t *testing.T) {
 	for i, d := range baseDetectors {
-		covered := false
-		for _, r := range completenessRows {
-			prefix := payloadOf(r.prefix)
-			payload := prefix + r.secret + payloadOf(r.suffix)
-			start, end := len(prefix), len(prefix)+len(r.secret)
-			for _, loc := range d.re.FindAllStringSubmatchIndex(payload, -1) {
-				if loc[2*d.group] == start && loc[2*d.group+1] == end {
-					covered = true
-					break
-				}
-			}
-			if covered {
-				break
-			}
-		}
-		if !covered {
+		if _, ok := completenessSecretFor(d); !ok {
 			t.Errorf("detector %d (%s, group %d) has no completeness row; add one to completenessRows.\n pattern: %s",
 				i, d.tag, d.group, d.re.String())
 		}
 	}
+}
+
+// completenessSecretFor returns the secret from d's CANONICAL completeness row: the first row
+// whose target group lands exactly on the declared secret. That row is the one that speaks for
+// the detector, and TestEveryUncollapsedDetectorHasATemplatizedRow asks it what this detector's
+// value looks like before deciding whether the pipeline masker collapses it.
+func completenessSecretFor(d detector) (string, bool) {
+	for _, r := range completenessRows {
+		prefix := payloadOf(r.prefix)
+		payload := prefix + r.secret + payloadOf(r.suffix)
+		start, end := len(prefix), len(prefix)+len(r.secret)
+		for _, loc := range d.re.FindAllStringSubmatchIndex(payload, -1) {
+			if loc[2*d.group] == start && loc[2*d.group+1] == end {
+				return r.secret, true
+			}
+		}
+	}
+	return "", false
 }
 
 // TestAcceptedOverMasking pins the cost of compiling every detector leftmost-longest, in the
@@ -487,6 +503,22 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// boundary and two-group rules would reject it, but porting them here would drop
 		// ::1, fe80::/64 and glued addresses — fragmentation there, a leak here.
 		{"c++ scope operator", "CNSSCertStore::CNSSCertStore", "CNSSCertStor<IP_1>NSSCertStore"},
+		// The email detector carries no leading \b, and these four rows are the ENTIRE cost of
+		// that, enumerated rather than sampled. A match must begin either with a character of
+		// the local-part class or with a pipeline placeholder. If it begins with a WORD
+		// character (a letter, a digit, or '_'), \b could only fail where the preceding
+		// character is also a word character — which is itself in the class, so leftmost
+		// matching would have started there and the span is identical either way. That leaves
+		// exactly the four non-word members of the class as the shapes \b excluded, and a
+		// leading run of them is absorbed the same way. Each costs one character inside a
+		// placeholder that Restore puts back exactly; the shape \b also excluded, a local part
+		// the pipeline collapsed whole, is not over-masking but the leak it was causing, and is
+		// pinned in templatizedRows instead.
+		{"email leading dot absorbed", "mail .alice@corp.example.com", "mail <EMAIL_1>"},
+		{"email leading percent absorbed", "mail %alice@corp.example.com", "mail <EMAIL_1>"},
+		{"email leading plus absorbed", "mail +alice@corp.example.com", "mail <EMAIL_1>"},
+		{"email leading hyphen absorbed", "mail -alice@corp.example.com", "mail <EMAIL_1>"},
+		{"email leading run absorbed", "mail ..-alice@corp.example.com", "mail <EMAIL_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -495,5 +527,238 @@ func TestAcceptedOverMasking(t *testing.T) {
 				t.Errorf("accepted over-masking moved:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------------------
+// The composition: pipeline.Templatize, THEN Mask.
+//
+// Everything above this line feeds the anonymizer raw log text. One field of a real request
+// does not arrive that way: ExplainRequest.Template has already been through the pipeline's
+// template masker (internal/llm/pool.go builds it from score.EscalationRequest.Pattern), so a
+// value reaches these detectors shape-broken — hunter2 as hunter<NUM>, db01 as db<NUM>.
+//
+// The rule, which is the thing worth remembering: THE GAPS ARE EXACTLY THE DETECTORS WHOSE
+// VALUES THE PIPELINE DOES NOT ALREADY COLLAPSE. UUIDs and IP addresses arrive as <UUID> and
+// <IP> — one placeholder, nothing left to recognize, no gap possible. Every other detector
+// receives a damaged but not collapsed value and has to read the pipeline's handwriting.
+//
+// That is a fact about today's templatizer, not a property of anything, which is why it is
+// pinned by tests that run the REAL Templatize rather than by hand-written mangled strings. A
+// test that hand-writes what it thinks the templatizer produces can agree with itself forever
+// while the two components drift apart — which is how detectors 4, 5, 9a, 9b and 10 were left
+// out when the other four were widened at 2da31be.
+// ---------------------------------------------------------------------------------------
+
+// templatizedRow is one raw log line, exactly as a log would carry it, with phMark delimiting
+// each span that must come back as a single placeholder. The row declares INPUT only: what the
+// templatizer does to it, and therefore what Mask must cope with, is derived at run time.
+type templatizedRow struct {
+	name string
+	text string
+}
+
+// templatizedRows covers every detector the pipeline does not collapse — enforced by
+// TestEveryUncollapsedDetectorHasATemplatizedRow.
+//
+// Every row carries a MIDDLE digit, because that is the awkward position and the one an
+// example chosen to pass would avoid: a digit at the END of a value is harmless (/home/maxie7
+// masks to /home/<USER_1><NUM> and loses nothing), while a digit in the MIDDLE splits the value
+// and everything past the split survives (/home/deploy2prod leaked "prod"). Suffixes are kept
+// flush against the value — a port, a path — so the rows also prove the widened detectors did
+// not over-reach, which is the hazard leftmost-longest creates on every detector since #41.
+var templatizedRows = []templatizedRow{
+	// The wire capture that opened #43, both fields of it. The credential detector masks a
+	// submatch; the host that follows is the URL-host detector's, hence two marked spans.
+	{"url-credentials/middle-digit",
+		"FATAL db postgres://\x00svc7user:hun2ter\x00@\x00db01.corp.internal\x00/prod lost"},
+	// The control: no digit in the credential at all, so only the port templatizes.
+	{"url-credentials/no-digit",
+		"dsn=postgres://\x00u:p\x00@\x00db.acme.com\x00:5432/prod"},
+	{"email/digit-in-local", "mail to \x00user01@corp.example.com\x00 bounced"},
+	{"email/digit-in-domain", "mail to \x00bob@db01.example.com\x00 bounced"},
+	{"email/digit-mid-token-both-sides", "mail to \x00us3r@corp7.example.com\x00 bounced"},
+	// The local part collapses ENTIRELY — an opaque or hashed address is an ordinary thing for
+	// an application log to carry, and the pipeline's HEX masker takes the whole of it. This is
+	// the row that decides the email detector's leading \b: with it, '<' is not a word
+	// character, the assertion cannot hold at the start of <HEX>, and the WHOLE address
+	// including its domain goes out unmatched.
+	{"email/local-part-collapsed", "mail to \x00deadbeefcafe1234@corp.example.com\x00 bounced"},
+	{"url-host/middle-digit", "call https://\x00api-gw7x.prod.acme.com\x00/v1"},
+	{"bare-host/middle-digit", "host \x00db01x.corp.internal\x00 failed"},
+	{"bare-host/digit-in-middle-label", "host \x00db.eu1a.corp.internal\x00 failed"},
+	{"home-dir/middle-digit", "loaded from /home/\x00deploy2prod\x00/go/pkg/mod"},
+	{"home-dir/middle-digit-users", "path /Users/\x00jane7doe\x00/app.log missing"},
+	// The four widened at 2da31be, now held to completeness rather than to "a token appeared".
+	{"jwt", "auth \x00eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u\x00 rejected"},
+	{"aws-key", "creds \x00AKIAIOSFODNN7EXAMPLE\x00 denied"},
+	{"bearer-jwt", "hdr Bearer \x00eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u\x00 expired"},
+	{"sk-key", "key \x00sk-abcdefghij0123456789XYZ\x00 rejected"},
+}
+
+// TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
+// row is templatized first, and the value must STILL come back as exactly one placeholder with
+// the text around it untouched.
+//
+// The expectation is derived, never hand-written. The marks ride through Templatize with the
+// text, so wherever the templatized secret ends up, the marks still delimit it — and two premise
+// checks refuse to proceed if that is not true, rather than quietly asserting the wrong span.
+func TestTemplatizedMaskingIsComplete(t *testing.T) {
+	for _, r := range templatizedRows {
+		t.Run(r.name, func(t *testing.T) {
+			payload := payloadOf(r.text)
+			tMarked, _ := pipeline.Templatize(r.text)
+			tPayload, _ := pipeline.Templatize(payload)
+
+			if got, want := strings.Count(tMarked, phMark), strings.Count(r.text, phMark); got != want {
+				t.Fatalf("premise broken: templating changed the mark count, %d → %d:\n in:  %q\n out: %q",
+					want, got, r.text, tMarked)
+			}
+			if payloadOf(tMarked) != tPayload {
+				t.Fatalf("premise broken: the marks perturbed templating:\n marked:   %q\n unmarked: %q",
+					payloadOf(tMarked), tPayload)
+			}
+			if tPayload == payload {
+				t.Fatalf("premise broken: %q was not mangled by the pipeline masker", payload)
+			}
+
+			m := New()
+			masked := mustMask(t, m, tPayload)
+
+			want := regexp.MustCompile(`^` + expand(tMarked) + `$`)
+			if !want.MatchString(masked) {
+				t.Errorf("templatized value not masked whole, or surrounding text disturbed:\n raw:  %q\n in:   %q\n got:  %q\n want: %v",
+					payload, tPayload, masked, want)
+			}
+			if got := m.Restore(masked); got != tPayload {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", tPayload, got)
+			}
+		})
+	}
+}
+
+// lonePipelinePlaceholder matches a value the pipeline masker collapsed ENTIRELY — the whole
+// string is one of its six placeholders and nothing of the original survives.
+var lonePipelinePlaceholder = regexp.MustCompile(`^` + pipelinePH + `$`)
+
+// TestEveryUncollapsedDetectorHasATemplatizedRow is the rule, mechanized. It is deliberately
+// not a comment: #36 is open and will change what the templatizer collapses, and when it does,
+// a detector that is safe today becomes vulnerable without anyone touching this package.
+//
+// For each detector it asks the REAL templatizer what that detector's canonical secret looks
+// like by the time the anonymizer sees it:
+//
+//   - collapsed to a single pipeline placeholder → the anonymizer never sees a value at all,
+//     and no templatized row is required (UUID, IPv4, IPv6 today);
+//   - anything else → some templatized row must exist whose target group lands exactly on the
+//     templatized secret, or this fails naming the detector.
+//
+// The partition is DERIVED from the two real components rather than kept in a list here, so it
+// cannot rot: change the templatizer and the exemptions change with it, red, in this test.
+//
+// One honesty note about that exemption. It is per canonical row, and the IPv6 shapes the
+// pipeline deliberately does NOT collapse (fe80::1 templates as fe<NUM>::<NUM>, README "Known
+// limitations", #40) are not covered by the IPv6 row's exemption. They lose their digits to
+// <NUM> before this package ever sees them, so what survives is structure rather than value.
+// Whether the two IPv6 patterns should be one is #42's question.
+func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
+	// The templatized marked spans of every row, as (payload, start, end) triples.
+	//
+	// Only spans the templatizer actually DAMAGED are collected. A row whose value contains no
+	// digit passes through Templatize unchanged, and a detector matching that span would prove
+	// nothing about reading the pipeline's handwriting — which is the entire question here. The
+	// no-digit rows stay in templatizedRows as controls; they just do not count as coverage.
+	type span struct {
+		text       string
+		start, end int
+	}
+	var spans []span
+	for _, r := range templatizedRows {
+		tMarked, _ := pipeline.Templatize(r.text)
+		raw, templated := strings.Split(r.text, phMark), strings.Split(tMarked, phMark)
+		if len(raw) != len(templated) {
+			continue // TestTemplatizedMaskingIsComplete reports the broken premise
+		}
+		payload, off := payloadOf(tMarked), 0
+		for i, p := range templated {
+			if i%2 == 1 && p != raw[i] {
+				spans = append(spans, span{payload, off, off + len(p)})
+			}
+			off += len(p)
+		}
+	}
+
+	for i, d := range baseDetectors {
+		secret, ok := completenessSecretFor(d)
+		if !ok {
+			continue // TestEveryDetectorHasACompletenessRow already reports this
+		}
+		templated, _ := pipeline.Templatize(secret)
+		if lonePipelinePlaceholder.MatchString(templated) {
+			continue // the pipeline collapses this class; the anonymizer never sees the value
+		}
+		covered := false
+		for _, s := range spans {
+			for _, loc := range d.re.FindAllStringSubmatchIndex(s.text, -1) {
+				if loc[2*d.group] == s.start && loc[2*d.group+1] == s.end {
+					covered = true
+					break
+				}
+			}
+			if covered {
+				break
+			}
+		}
+		if !covered {
+			t.Errorf("detector %d (%s, group %d) reads a value the pipeline does NOT collapse (%q → %q),\n"+
+				"so it must recognize the templatized form and have a row in templatizedRows.\n pattern: %s",
+				i, d.tag, d.group, secret, templated, d.re.String())
+		}
+	}
+}
+
+// TestNoSpuriousFailCloseAfterTemplating is TestHomePathNoSpuriousFailClose run through the
+// composition. Detectors 4, 5 and 10 are verify-eligible, so a widened pattern that matched its
+// own output would not leak — it would MUTE the escalation, which is the opposite failure and
+// just as bad for a stack trace that is the whole product.
+func TestNoSpuriousFailCloseAfterTemplating(t *testing.T) {
+	in, _ := pipeline.Templatize("panic at /home/maxie7/go/pkg/mod/github.com/x/y@v1.0.0/z.go:10")
+	m := New()
+	out, err := m.Mask(in)
+	if err != nil {
+		t.Fatalf("templatized home path spuriously failed closed: %v\n in: %q", err, in)
+	}
+	if !strings.Contains(out, "<USER_1>") {
+		t.Errorf("username not masked: %q", out)
+	}
+	if strings.Contains(out, "maxie") {
+		t.Errorf("username leaked: %q", out)
+	}
+	if got := m.Restore(out); got != in {
+		t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", in, got)
+	}
+}
+
+// TestNoOverMaskingAfterTemplating is TestNoOverMasking's counter-weight for the composition:
+// ordinary log prose that has been through the template masker must survive Mask untouched too.
+// Widening a detector to step over <NUM> is exactly the change that could start eating it.
+func TestNoOverMaskingAfterTemplating(t *testing.T) {
+	survive := []string{
+		"java.lang.NullPointerException",
+		"at com.foo.Bar(Bar.java:42)",
+		"github.com/docker/docker/client.(*Client).ContainerList",
+		"golang.org/x/sync/errgroup",
+		"go.uber.org/zap",
+		"app version v1.2.3 started",
+		"processed 4200 records in 12.5s",
+		"GET /orders 200 in 42ms",
+		"could not reach api.example.com", // bare PUBLIC host: accepted residual gap
+	}
+	for _, s := range survive {
+		in, _ := pipeline.Templatize(s)
+		m := New()
+		if got := mustMask(t, m, in); got != in {
+			t.Errorf("over-masked templatized prose:\n raw: %q\n in:  %q\n out: %q", s, in, got)
+		}
 	}
 }

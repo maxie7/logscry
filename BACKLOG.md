@@ -771,3 +771,103 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       sentence was true; this change is what makes it false.
       No template hashes move: this package runs at the LLM boundary and does not feed
       `hashTemplate`. Released as v0.8.6 (the README note was written against a pending tag).
+
+- [x] **A templatized secret is still a secret** — #43, the second disclosure defect in the
+      package whose job is preventing disclosure, found while wire-testing the #41 fix. One
+      request, two adjacent fields, the same `Mapper`:
+      `Trigger line: FATAL db postgres://<TOKEN_1>@<HOST_1>/prod lost` beside
+      `Masked template: FATAL db postgres://svcuser:hunter<NUM>@<HOST_2><NUM>.<HOST_3>/prod lost`.
+      It classified `svcuser:hunter2` as a credential and then sent it in the field next to the
+      one it masked it out of.
+      The cause is a coupling, not a pattern. `ExplainRequest.Template` is the one field that
+      does not arrive as raw log text: `internal/llm/pool.go` builds it from the pipeline's
+      template, so a value reaches the detectors shape-broken — `hunter2` as `hunter<NUM>`,
+      `db01` as `db<NUM>`. Every detector class excludes `<` and `>` so placeholders stay inert,
+      which also means a value the templatizer has already rewritten no longer matches. Four
+      detectors were given a placeholder-tolerant form at `2da31be`; five were left out of the
+      same decision and have leaked since. Dates from v0.4.0, twelve tagged releases.
+      **The durable finding is the rule, not the two detectors the issue opened with: THE GAPS
+      ARE EXACTLY THE DETECTORS WHOSE VALUES THE PIPELINE DOES NOT ALREADY COLLAPSE.** UUID,
+      IPv4 and IPv6 are safe by construction — they arrive as `<UUID>` and `<IP>`, one
+      placeholder, nothing left to recognize. All nine others receive a damaged but not
+      collapsed value. The audit that produced the issue named two of the five; running the real
+      patterns named five, which is what the rule predicts and is why the fix is all five.
+      **Two kinds of disclosure, deliberately not reported as one number.** Detectors 4 and 5
+      leak credentials and personal addresses — 5 is the likelier to fire, since a digit
+      anywhere on either side of the `@` is enough and corporate addresses have digits. 9a, 9b
+      and 10 leak internal topology: a domain (`.prod.acme.com`, and in a URL there is no second
+      detector behind it — a public suffix is not on the bare-host allowlist), a host label
+      (`db`), an environment name out of a path (`prod`). No credential material in the second
+      group.
+      **Two claims in the issue were wrong and are corrected rather than quietly contradicted.**
+      Bare host does not "leak its first label": it leaks everything up to and including the
+      label carrying the placeholder, so `db.eu1.corp.internal` leaks `db.eu`. And the home
+      directory does leak plaintext — "no plaintext leak, only a fragmented placeholder" holds
+      only for a TRAILING digit (`/home/maxie7` loses nothing), while a digit in the MIDDLE
+      splits the value and sends the tail (`/home/deploy2prod` → `prod`). That asymmetry is the
+      shape of the whole bug, so every test row carries a middle-digit case; a table written
+      from convenient examples passes on examples chosen to pass.
+      **The rule is enforced by a test, not by a comment, because #36 will change masking.**
+      `TestEveryUncollapsedDetectorHasATemplatizedRow` asks the REAL templatizer what each
+      detector's canonical secret looks like on arrival: collapsed to a lone pipeline
+      placeholder means the anonymizer never sees a value and no row is required; anything else
+      must have a row whose span the templatizer actually damaged. The exemptions are re-derived
+      from the two real components every run, so when #36 moves what the templatizer collapses,
+      a detector that is safe today goes red here without anyone touching this package.
+      `TestTemplatizedMaskingIsComplete` runs the same composition and derives its expectation
+      instead of hand-writing it — marks ride through `Templatize` with the text, and two
+      premise checks refuse to proceed if templating perturbed them. A test that hand-writes
+      what it thinks the templatizer produces can agree with itself forever while the two
+      components drift apart, which is how these five were left out at birth.
+      **The email detector's leading `\b` goes, and what that costs is enumerated rather than
+      sampled.** A match begins either with a local-part-class character or with a pipeline
+      placeholder. Beginning with a WORD character (letter, digit, `_`), `\b` could only fail
+      where the character before it is also a word character — itself in the class, so leftmost
+      matching would have started there and the span is identical either way. The excluded set
+      is therefore exactly the four NON-word members of the class in leading position (`.`,
+      `%`, `+`, `-`), each now absorbed into the placeholder and each pinned as its own row in
+      `TestAcceptedOverMasking`, plus a local part the pipeline collapsed WHOLE
+      (`<HEX>@corp.example.com` from a hashed address), which `'<'` being a non-word character
+      made unmatchable — sending the entire address, domain included. That last one is a leak
+      rather than a cost and is what decides the change; it is a row in `templatizedRows`, red
+      with the assertion and green without.
+      A CAPTURE WOULD HAVE ADDED NOTHING TO THAT CLAIM, and the 612-record journald capture was
+      run and could not have: it contains zero lines with an `@` in them, so both forms match
+      nothing and the delta is empty for want of data. The claim is about which first characters
+      the pattern admits — finite, exhaustive over the class, checked against the real engine in
+      leftmost-longest mode — not about real-world frequency. What stays UNMEASURED is only the
+      frequency question: how often a real log line carries an address whose local part begins
+      with `.`, `%`, `+` or `-`, and therefore how often the absorbed character is paid for. No
+      capture we hold can answer it; measuring it needs a capture from a mail-adjacent source
+      (an SMTP relay, a notification or paging service) where addresses appear at all, counting
+      what share of address matches begin with one of the four. Same treatment as #33's
+      colon-glued IPv6 gap: a cost no run has yet shown us paying, rather than one measured and
+      accepted.
+      **The two failure modes widening creates are guarded, both as tests.**
+      `TestPlaceholdersAreInert` gains the adversarial strings for the five, which — unlike the
+      four widened at `2da31be` — carry no distinctive secret prefix to lean on; the inertness
+      argument is now in two parts (a class cannot ENTER a placeholder, and `pipelinePH` demands
+      `>` where our own tags have `_`, so one cannot be stepped over either). The email detector
+      needs both: `_` and `.` are in its local-part class, so a run can start inside `TOKEN_1`
+      and only the `>` before the `@` stops it. Over-matching is guarded by keeping a port or a
+      path flush against every value, the hazard `Longest()` created on every detector in #41.
+      **`residue` starts catching this class, which narrows the note #41 just widened.** The
+      re-scan could not have caught it before, for #41's reason: the detector that produced the
+      leftover did not match the leftover. Now that the verify-eligible detectors read the
+      templatized form, a value that survives in that form IS caught and the escalation is
+      skipped. Both host detectors stay `verify: false` — flipping them would not have caught
+      this class either (`db<NUM>.<HOST_1>` is not a shape the pattern matches), and for the
+      bare-host detector missing a value entirely is the DESIGNED behaviour, so verify-eligible
+      would fail closed on every escalation carrying `api.example.com`.
+      **The Template field is kept rather than dropped.** Dropping it would delete the whole
+      leak surface — it is the only pre-templatized field — but it is the only thing that tells
+      the model WHICH tokens vary, it is the referent of `Occurrences: N`, it is a key-structure
+      signature rather than a masked message for JSON lines, and RDI §7 pins it. A disclosure
+      fix is not the place to change the request shape, and dropping it would leave the
+      composition of the two maskers untested, which is the condition that produced the bug.
+      `internal/pipeline` does not appear in the diff and no template hashes move: this package
+      runs at the LLM boundary and never feeds `hashTemplate`. README was corrected at two
+      sites — one of them asserted that secrets were recognized in both forms and called the
+      cost "cosmetic, not a leak", which was wrong on the day it was written rather than made
+      wrong by this change. Filed separately while auditing: a URL whose USERNAME is itself a
+      recognised secret leaves its password unmasked, independent of templating.

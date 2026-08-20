@@ -395,9 +395,10 @@ domain), bare hostnames on **private/infra suffixes** (`.internal`, `.local`, `.
 (JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, `user:pass@` credentials), and the username in
 `/home/<user>` and `/Users/<user>` paths. If masking a payload fails, that escalation is
 **skipped** (the card says so) rather than sent in the clear. That check re-scans the masked
-text and so catches a value a detector missed entirely; it cannot catch a value a detector
-masked only in part, because the leftover no longer has the shape the detector looks for.
-Completeness is enforced by the detectors' own tests, not at runtime.
+text and so catches a value a detector missed entirely — including one the pipeline's template
+mask has already rewritten, which every detector now recognizes in both forms — but it cannot
+catch a value a detector masked only in part, because the leftover no longer has the shape the
+detector looks for. Completeness is enforced by the detectors' own tests, not at runtime.
 
 **Compressed IPv6 was masked only in part before v0.8.6.** From v0.4.0 — the release
 that introduced `--llm-anonymize` — through v0.8.5, an address written with `::` was masked
@@ -407,11 +408,28 @@ affected, and nothing left the machine if the endpoint was local. If you pointed
 `--llm-anonymize` at a remote provider on any of those releases, that provider received the
 tail of every compressed IPv6 address in the escalated lines.
 
-An escalation carries both the raw line and the pipeline's template for it, and that
-template has already had numbers and IDs masked (`<NUM>`, `<IP>`). Secrets are recognized in
-both forms, but one value can end up with two placeholders — `<HOST_1>` from the raw line and
-`<HOST_2>` from the pre-masked template — which slightly weakens the "the model sees one host
-recur" signal. Cosmetic, not a leak.
+**The pipeline's template was sent in the clear before v0.8.7.** An escalation carries
+both the raw line and the pipeline's template for it, and that template has already had numbers
+and IDs masked (`<NUM>`, `<IP>`, `<HEX>`). Nine of the twelve detectors therefore have to
+recognize a value in that damaged form, and from v0.4.0 — the release that introduced
+`--llm-anonymize` — through v0.8.6, only four of them did. The other five matched up to the
+first placeholder and sent the rest. In one request,
+`postgres://svcuser:hunter2@db01.corp.internal/prod` went out as
+`postgres://<TOKEN_1>@<HOST_1>/prod` in the trigger line and as
+`postgres://svcuser:hunter<NUM>@<HOST_2><NUM>.<HOST_3>/prod` in the field beside it — the same
+mapper, classifying the credential and then sending it. Twelve tagged releases carry that
+behaviour. Two kinds of value were affected, and they are worth keeping apart: **credentials
+and email addresses** (a `user:pass@` pair; any address with a digit anywhere in it, so
+`user01@corp.example.com` and `bob@db01.example.com` went out whole while a digitless address
+masked correctly), and **internal topology** (a domain — `api-gw7.prod.acme.com` sent
+`.prod.acme.com`; a host label — `db01.corp.internal` sent `db`; an environment name out of a
+path — `/home/deploy2prod` sent `prod`). Nothing left the machine on a local Ollama; if you
+pointed `--llm-anonymize` at a remote provider, that provider received those values for every
+escalated line whose template contained one.
+
+One value can still end up with two placeholders — `<HOST_1>` from the raw line and `<HOST_2>`
+from the pre-masked template — which slightly weakens the "the model sees one host recur"
+signal. Cosmetic, and now the only cost.
 
 **This is best-effort risk reduction, not a guarantee.** Free-text log messages can
 contain anything, and logscry only masks what it recognizes. Bare **public** hostnames in
