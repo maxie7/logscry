@@ -503,6 +503,22 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// boundary and two-group rules would reject it, but porting them here would drop
 		// ::1, fe80::/64 and glued addresses — fragmentation there, a leak here.
 		{"c++ scope operator", "CNSSCertStore::CNSSCertStore", "CNSSCertStor<IP_1>NSSCertStore"},
+		// The email detector carries no leading \b, and these four rows are the ENTIRE cost of
+		// that, enumerated rather than sampled. A match must begin either with a character of
+		// the local-part class or with a pipeline placeholder. If it begins with a WORD
+		// character (a letter, a digit, or '_'), \b could only fail where the preceding
+		// character is also a word character — which is itself in the class, so leftmost
+		// matching would have started there and the span is identical either way. That leaves
+		// exactly the four non-word members of the class as the shapes \b excluded, and a
+		// leading run of them is absorbed the same way. Each costs one character inside a
+		// placeholder that Restore puts back exactly; the shape \b also excluded, a local part
+		// the pipeline collapsed whole, is not over-masking but the leak it was causing, and is
+		// pinned in templatizedRows instead.
+		{"email leading dot absorbed", "mail .alice@corp.example.com", "mail <EMAIL_1>"},
+		{"email leading percent absorbed", "mail %alice@corp.example.com", "mail <EMAIL_1>"},
+		{"email leading plus absorbed", "mail +alice@corp.example.com", "mail <EMAIL_1>"},
+		{"email leading hyphen absorbed", "mail -alice@corp.example.com", "mail <EMAIL_1>"},
+		{"email leading run absorbed", "mail ..-alice@corp.example.com", "mail <EMAIL_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -562,6 +578,12 @@ var templatizedRows = []templatizedRow{
 	{"email/digit-in-local", "mail to \x00user01@corp.example.com\x00 bounced"},
 	{"email/digit-in-domain", "mail to \x00bob@db01.example.com\x00 bounced"},
 	{"email/digit-mid-token-both-sides", "mail to \x00us3r@corp7.example.com\x00 bounced"},
+	// The local part collapses ENTIRELY — an opaque or hashed address is an ordinary thing for
+	// an application log to carry, and the pipeline's HEX masker takes the whole of it. This is
+	// the row that decides the email detector's leading \b: with it, '<' is not a word
+	// character, the assertion cannot hold at the start of <HEX>, and the WHOLE address
+	// including its domain goes out unmatched.
+	{"email/local-part-collapsed", "mail to \x00deadbeefcafe1234@corp.example.com\x00 bounced"},
 	{"url-host/middle-digit", "call https://\x00api-gw7x.prod.acme.com\x00/v1"},
 	{"bare-host/middle-digit", "host \x00db01x.corp.internal\x00 failed"},
 	{"bare-host/digit-in-middle-label", "host \x00db.eu1a.corp.internal\x00 failed"},
