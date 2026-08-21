@@ -380,8 +380,10 @@ func TestIssue46PreMaskedCredentialHalf(t *testing.T) {
 		{"JWT username, bare host", "postgres://eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u:hunter2@redis",
 			[]string{"hunter2"}},
 		// The mirror: the secret is the PASSWORD, so the USERNAME is what detector 4 can no
-		// longer reach. Unconditional — no host shape rescues this one, because the email
-		// detector would need the username as a local part and it sits before the colon.
+		// longer reach. The email detector cannot rescue this side — it would need the username
+		// as a local part and the username sits BEFORE the colon — so the shapes that rescued
+		// the password leak here instead. A different detector rescues it for a different shape;
+		// see the address-host row below.
 		{"sk- password", "postgres://appuser:sk-livekeyabcdefghij0123456789XYZ@db",
 			[]string{"appuser"}},
 		{"AKIA password", "s3://myaccount:AKIAIOSFODNN7EXAMPLE@bucket",
@@ -504,6 +506,76 @@ func TestNoDetectorGroupLandsOnOurOwnOutput(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestRestoreHasNoNestedMapping enforces the PRECONDITION that makes Restore correct, which is
+// not the same thing as making Restore correct — that is #50's job and it is not done here.
+//
+// Restore iterates m.byToken (a Go map, randomised order) and substitutes each token ONCE, with
+// no fixpoint. That is only sound while no mapping's VALUE contains another mapping's TOKEN. If
+// one ever does, the answer depends on which order the runtime happened to walk the map:
+// measured with a directly constructed nested pair, wrong in 175 of 200 restores in one process,
+// at a rate set by the keys' hashes rather than a coin flip. A test written against that is
+// green four runs in five.
+//
+// The property holds today because every detector's target group excludes '<' and '>', so no
+// captured value can contain one of our tags. It is also the second and stronger half of why #46
+// was NOT fixed by letting the credential detector span our own tags — that fix would have
+// produced TOKEN_2 -> "<TOKEN_1>:password" directly. A rejection resting on a property nothing
+// enforces is not a rejection, which is why this lands with the fix rather than with #50.
+//
+// So this asserts the precondition over the real mappings Mask produces, and goes red the moment
+// a detector starts capturing one of our tags — before anyone has to debug an intermittently
+// wrong card.
+func TestRestoreHasNoNestedMapping(t *testing.T) {
+	tag := regexp.MustCompile(phPat)
+
+	check := func(t *testing.T, name string, m *Mapper) {
+		t.Helper()
+		for token, original := range m.byToken {
+			for _, nested := range tag.FindAllString(original, -1) {
+				if _, ok := m.byToken[nested]; ok {
+					t.Errorf("%s: mapping %s -> %q contains another mapping's token %s.\n"+
+						"Restore substitutes once, in map order, so this resolves by chance (see #50).",
+						name, token, original, nested)
+				}
+			}
+		}
+	}
+
+	// Every completeness row, which is the corpus that covers every detector by construction.
+	for _, r := range completenessRows {
+		m := New()
+		if _, err := m.Mask(payloadOf(r.prefix) + r.secret + payloadOf(r.suffix)); err != nil {
+			continue // TestMaskingIsComplete reports this
+		}
+		check(t, r.name, m)
+	}
+	// And the templatized composition, where a detector reads a value the pipeline already
+	// rewrote — the case where a class is likeliest to have been widened one character too far.
+	for _, r := range templatizedRows {
+		in, _ := pipeline.Templatize(payloadOf(r.text))
+		m := New()
+		if _, err := m.Mask(in); err != nil {
+			continue // TestTemplatizedMaskingIsComplete reports this
+		}
+		check(t, r.name, m)
+	}
+	// One mapper reused across several lines, as a real request does: Explain masks the trigger,
+	// the template and every context line through the SAME Mapper, so the map that Restore walks
+	// is the union of all of them and nesting could straddle two fields.
+	shared := New()
+	for _, line := range []string{
+		"FATAL pg connect failed dsn=postgres://sk-livekeyabcdefghij0123456789XYZ:hunter2@localhost:5432/app",
+		"FATAL redis auth rejected dsn=redis://:s3cr3tpw@cache.acme.internal:6379/0",
+		"FATAL peer 2001:db8::dead:beef unreachable from /home/deploy2prod",
+		"FATAL mail to user01@corp.example.com bounced via api-gw7.prod.acme.com",
+	} {
+		if _, err := shared.Mask(line); err != nil {
+			t.Fatalf("Mask(%q) errored: %v", line, err)
+		}
+	}
+	check(t, "shared mapper", shared)
 }
 
 // phMark DELIMITS, inside a completeness row's prefix or suffix, a span that is ordinary
