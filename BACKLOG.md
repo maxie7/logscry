@@ -871,3 +871,120 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       cost "cosmetic, not a leak", which was wrong on the day it was written rather than made
       wrong by this change. Filed separately while auditing: a URL whose USERNAME is itself a
       recognised secret leaves its password unmasked, independent of templating.
+
+- [x] **A credential's other half is still a credential** — #46, and the audit that came with
+      it. `--llm-anonymize` sent half of every URL credential to the configured model endpoint
+      in the clear whenever the other half was itself a recognised secret.
+      The cause is the ordering working exactly as designed. Detector 4's target group spans
+      `user:pass` as ONE value, which is what makes it readable as a credential rather than as
+      two opaque runs. Detectors 1–3b — JWT, `AKIA…`, `sk-…` — are the more specific rules and
+      run first, so a secret on EITHER side of the colon mints a `<TOKEN_n>` inside detector 4's
+      span. Its classes exclude `<` and `>` by design (that exclusion is the inertness
+      invariant), and with no second `://` to restart at the detector does not match AT ALL. The
+      surviving half ships as literal text. `Mask` returned a nil error, `residue()` returned
+      `""`, no escalation was skipped, and the card looked normal.
+      **Symmetric, and the issue as filed was not.** It was filed as "a secret username leaves
+      the password unmasked". Running the patterns showed the mirror: a secret PASSWORD leaves
+      the USERNAME unmasked, `postgres://appuser:sk-live…@db` sending `appuser`. Whichever half
+      was not recognisable is the half that goes. Fixing only the reported direction would have
+      closed half the defect and looked complete.
+      **Conditional on the authority shape, and every "rescue" is a different detector taking
+      the value under the wrong tag.** With a dotted alphabetic host the EMAIL detector swallows
+      `hunter2@db.acme.com` as one `<EMAIL_n>`; with an address host, detectors 7/8 mask the host
+      before 9a runs, which destroys 9a's long parse and leaves it falling back onto the userinfo
+      and masking the username as `<HOST_n>`. So:
+      `@db.acme.com` password rescued / username sent; `@localhost` neither rescued;
+      `@10.0.0.5` password sent / username rescued. **No shape is safe on both sides**, which is
+      why the conditional narrows the description and not the severity — and why a reproduction
+      against a fully-qualified host shows nothing wrong. That is how this survived #41 and #43,
+      both of which read this detector closely.
+      Dates from `2da31be` (v0.4.0), thirteen tagged releases (v0.4.0 → v0.8.7). Established
+      from the FULL line history, `git log -p --follow` narrowed to the detector-4 hunk, after
+      `git log -S'://('` returned one commit and was wrong: `-S` counts OCCURRENCES of a string,
+      so the two later edits that rewrote the line without changing that count (#41 wrapping it
+      in `mustLongest`, #43 widening both classes) were invisible to it. The properties that
+      carry the defect — `<>` excluded, `+` on each half — are present in all three states, so
+      the span holds; but the method that could not have shown otherwise is not evidence.
+      **Two defects, one patch, kept apart in the writing.** The `*` quantifiers also close a
+      gap that is not interference at all: detector 4 required at least one character on each
+      side of the colon, so `redis://:password@host` — the ordinary Redis DSN, Redis having had
+      no username before 6.0 — matched no credential detector on any host shape. Same v0.4.0
+      span, different cause, its own tests and its own README paragraph.
+      **The fix adds two rules rather than loosening one.** 4b masks the password when the
+      username was pre-masked, 4c the username when the password was; a single rule cannot mask
+      two spans. Neither fires after detector 4 succeeded (no `:` left in the userinfo) nor after
+      the other (the masked half begins with `<`). Both groups exclude `<>` exactly as detector
+      4's do; only the opposite half, which is CONTEXT, admits one of our tags.
+      **Widening detector 4 was rejected twice over, and the second reason is the durable one.**
+      It attacks the inertness invariant, which is arguable. It also NESTS, which is not:
+      `Restore` iterates `m.byToken` — a Go map — and substitutes ONCE, with no fixpoint, so a
+      mapping whose value contains another mapping's token resolves correctly or does not
+      depending on iteration order. Measured with a directly constructed nested pair: wrong in
+      **175 of 200** restores in one process, and the rate is a function of the keys' hashes
+      rather than a coin flip (Go randomises the starting cell offset; two keys in adjacent cells
+      of one bucket give 7/8), so it varies per process — a test that is green four runs in five.
+      Latent today because nothing nests; nothing prevents it either. Filed.
+      **Reordering fixes nothing here and the reason is worth writing down.** The blockers are
+      the more specific detectors and must precede detector 4: running 4 first would mask
+      `sk-live…:password` as one opaque credential and lose that the username is a live API key.
+      Order is the wrong tool for this pair. It remains a candidate for the UUID-vs-host pair
+      below, which is one reason that one is filed rather than folded in.
+      **The invariant is sharpened, not weakened.** The package comment claimed no detector may
+      MATCH a placeholder we minted. What `apply` and `residue` depend on is that no detector's
+      TARGET GROUP may land on one — `apply` writes only the group, `residue` tests only whether
+      the group captured. The fallbacks read a tag as context and are safe under the narrow
+      claim, which is now the stated one and is mechanised by
+      `TestNoDetectorGroupLandsOnOurOwnOutput` against the real masked output of every
+      completeness row, checking group/placeholder OVERLAP rather than "matched somewhere in a
+      string containing a placeholder" — the loose form reports residual plaintext beside a tag,
+      which is a coverage question and a different test's.
+      **`Mask`'s honest-scope note was WRONG, not incomplete.** It said the re-scan catches a
+      value a detector missed ENTIRELY. #46 is exactly that and it did not catch it. The note now
+      carries the precondition it always needed — provided no earlier detector rewrote part of
+      that value's span — and `residue` starts catching this class, since the fallbacks are
+      verify-eligible and their context admits our tags. Same narrowing move #43 made, one class
+      further.
+
+- [ ] **The detector-on-detector interference audit** — the deliverable #46 came with, recorded
+      here because the negative results are the part that will not survive in anyone's head.
+      #41 (a detector matched a value INCOMPLETELY), #43 (another COMPONENT rewrote it first) and
+      #46 (another DETECTOR rewrote it first) are one blindness with three causes, each found by
+      accident while verifying the previous one. The bounded question: for every detector whose
+      pattern spans a COMPOSITE value, which earlier detectors can mint a placeholder inside that
+      span, and what happens? Finite — thirteen detectors in fixed order — and decidable
+      mechanically, because every target group excludes `<` and `>`, so a placeholder inside a
+      later detector's span truncates or blocks it. The one designed exception is detector 9a's
+      userinfo run `[^/@\s]*@`, which admits `<>` on purpose to step over a masked credential.
+      | interferer → blocked | example | sent | verdict |
+      |---|---|---|---|
+      | 1/2/3b → 4 (either half) | `postgres://sk-live…:hunter2@localhost` | the other half | **DEFECT, fixed** (#46) |
+      | 3a → 4 | — | — | **impossible**: 3a needs `bearer` + `\s+`, and the userinfo class excludes whitespace |
+      | 4 → 5, 4 → 9a | `postgres://u:p@db.acme.com` | nothing | **harmless — designed**; this is why 4 precedes both |
+      | 5 → 9a, 5 → 10 | `/Users/bob@corp.com/…` | nothing | **harmless**; the value is masked whole, as EMAIL |
+      | 7/8 → 9a | `https://10.0.0.5:8080/x` | nothing | **harmless**; 9a is blocked but the whole authority WAS the address |
+      | 6 → 10, 1/2/3b → 10 | `/home/550e8400-…/app.log` | nothing | **harmless**; blocking detector 10 costs a tag, never a value |
+      | 1/2/3b → 3a | `Bearer AKIAIOSFODNN7EXAMPLE` | nothing | **harmless**; already pinned by `TestPlaceholdersAreInert` |
+      | 1/2/3b → 5 | `eyJ….eyJ….sig@example.com` | the domain | **theoretical**; nothing puts a JWT in an email local part |
+      | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, filed** |
+      | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT, filed** (same issue) |
+      | 6 → 9b | `worker-550e8400-….corp.internal` | `worker-` | **DEFECT, filed** (same issue) |
+      | 7 → 8 | `::ffff:192.168.1.1` | `.168.1.1` | **DEFECT, filed** |
+      **Detector 10 has no defects at all**, and that is a computed result rather than an
+      untested area: every interferer that can reach a `/home/` username masks it entirely.
+      **Detector 5's blockers are all theoretical** — it is the composite with the most paths
+      into its span and none corresponds to a log line anyone will write. **3a → 4 is
+      structurally impossible**, not merely unobserved.
+      Three gaps the same sweep surfaced that are NOT detector-on-detector, recorded so the next
+      person does not re-derive them: `redis://:password@host` (empty half — fixed here, above);
+      `sk-proj-…`, the current OpenAI key format, which detector 3b does not match at all and
+      which is anti-correlated with #46 — a key 3b cannot see cannot block detector 4, so fixing
+      3b alone would INTRODUCE the leak for those keys; and detector 9a's scheme anchor, which
+      #43 left non-tolerant while widening the host group beside it, so `s3://` templatizes to
+      `s<NUM>://` and the host goes unmasked on the `Template` field. That last one was found in
+      the #46 wire capture rather than by a test, and the lesson generalises: **a detector's
+      tolerance has to cover its ANCHORS, not only its capture.**
+      `internal/pipeline` does not appear in the diff and no template hashes move: this package
+      runs at the LLM boundary and never feeds `hashTemplate`. README corrected at three sites,
+      one of which asserted that the fail-closed re-scan catches a value a detector missed
+      entirely — wrong on the day it was written, and the sentence this defect walked straight
+      through. Released as TODO-VERSION.
