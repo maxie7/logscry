@@ -987,4 +987,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       runs at the LLM boundary and never feeds `hashTemplate`. README corrected at three sites,
       one of which asserted that the fail-closed re-scan catches a value a detector missed
       entirely — wrong on the day it was written, and the sentence this defect walked straight
-      through. Released as TODO-VERSION.
+      through. Released as **v0.9.0** — a MINOR bump, and the reason is the audit rather than the
+      defect count: the package was swept systematically for the first time, the full
+      interference table published, one defect closed and four filed. A patch release would have
+      described this as one more fix in a series, which is the framing the series is trying to
+      escape.

@@ -431,7 +431,7 @@ path — `/home/deploy2prod` sent `prod`). Nothing left the machine on a local O
 pointed `--llm-anonymize` at a remote provider, that provider received those values for every
 escalated line whose template contained one.
 
-**Half of every URL credential was sent in the clear before TODO-VERSION.** The credential
+**Half of every URL credential was sent in the clear before v0.9.0.** The credential
 detector masks `user:pass` as one value, and the secret detectors that run before it — JWT,
 `AKIA…`, `sk-…` — mask theirs first. So a URL whose username *or* password is itself a recognised
 secret got a placeholder minted inside the credential detector's span, and since that detector's
@@ -455,14 +455,14 @@ took three attempts to find. `postgres://sk-live…:hunter2@localhost:5432/app` 
 `postgres://appuser:sk-live…@db.acme.com` sent `appuser`; `s3://AKIA…:secret@bucket` sent the
 secret access key.
 
-**A credential with an empty half was sent in the clear before TODO-VERSION.** A separate defect
+**A credential with an empty half was sent in the clear before v0.9.0.** A separate defect
 with the same fix, kept separate because the cause is different: the credential detector required
 at least one character on each side of the colon. `redis://:password@host` has no username — Redis
 had none before 6.0 — so the ordinary Redis DSN matched no credential detector at all. Same span,
 v0.4.0 → v0.8.7, and the same accidental rescue on a host with a dotted alphabetic suffix.
 
-**What the audit found and did not close.** TODO-VERSION is a minor release because the package
-was audited systematically for the first time rather than because of the count above: every
+**What the audit found and did not close.** v0.9.0 is a minor release because the package was
+audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
 can mint a placeholder inside that span. The credential cases are fixed. Four are filed and still
 present — a UUID inside a hostname silences the URL-host detector
