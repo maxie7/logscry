@@ -14,10 +14,23 @@
 //
 // Ordering matters for the same reason it does in the pipeline masker: an email contains a
 // host, a URL contains a host and maybe credentials, an IP is digits-and-dots a host regex
-// would grab. The more specific detector runs first (see buildDetectors). No detector can
-// match a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is safe to run
-// sequentially and the fail-closed re-scan cannot fire on its own output; that inertness is
-// what keeps a home path in a Go stack trace from tripping the verifier (see Mask).
+// would grab. The more specific detector runs first (see buildDetectors). No detector's TARGET
+// GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
+// safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and Restore's
+// single non-fixpoint pass is correct; that inertness is what keeps a home path in a Go stack
+// trace from tripping the verifier (see Mask).
+//
+// It is stated on the GROUP rather than on the whole match because that is what the code
+// depends on and because the looser form would forbid a detector that is fine. apply writes
+// only the group; residue tests only whether the group captured. Two detectors — the credential
+// fallbacks 4b and 4c — read one of our tags on purpose, as context, and are safe (see ourPH).
+//
+// That same inertness is what MAKES the failure below possible, and the two are one fact seen
+// from two sides. A detector whose span contains a value another detector already masked cannot
+// step over the placeholder, so it does not match at all, and the rest of its span goes out in
+// the clear. That is #46. Ordering does not fix it — the blocking detectors are the more
+// specific ones and must run first — so the answer is a narrow fallback per blocked half rather
+// than a looser class.
 //
 // The one deliberate exception is the pipeline's own placeholders: see pipelinePH.
 package anonymize
@@ -63,9 +76,21 @@ func New(extraHostSuffixes ...string) *Mapper {
 // "do not send this payload" (see internal/llm/anonymizing.go) — a privacy feature that
 // silently degrades to plaintext is worse than none.
 //
-// Honest scope, and it is narrower than it looks. This re-scan catches a detector that
-// missed a value ENTIRELY — a raw 10.0.0.5 the ordering skipped. It CANNOT catch a detector
-// that matched a value INCOMPLETELY, because the leftover of a partial match is by
+// Honest scope, and it is narrower than it looks — narrower than this note itself claimed
+// until #46, which is worth saying plainly rather than quietly correcting. The note used to
+// read "catches a detector that missed a value ENTIRELY". #46 was exactly that: detector 4
+// missed a URL credential entirely, and the re-scan reported clean. The claim was wrong as
+// written, not merely incomplete.
+//
+// The correct claim has a precondition. This re-scan catches a detector that missed a value
+// entirely — a raw 10.0.0.5 the ordering skipped — PROVIDED no earlier detector has already
+// rewritten part of that value's span. If one has, the leftover is a shape the blocked detector
+// does not match, and the re-scan reads it as clean for the same structural reason a partial
+// match does. Interference between detectors and partial matching are one blindness with two
+// causes, and the audit in BACKLOG.md enumerates which detector pairs can produce it.
+//
+// It equally CANNOT catch a detector that matched a value INCOMPLETELY, because the leftover
+// of a partial match is by
 // construction a shape the detector no longer matches: mask 2001:db8::dead:beef down to
 // 2001:db8:: and the surviving "dead:beef" carries no "::" and fewer than eight groups, so
 // the very detector that produced it reads it as clean. That was #41, live in every release
@@ -79,6 +104,15 @@ func New(extraHostSuffixes ...string) *Mapper {
 // now recognizes its value in that form too, so for the verify-eligible ones a templatized
 // credential, address or home path that survived masking IS caught on the re-scan. The
 // blindness that remains is specifically "matched incompletely", not "arrived reshaped".
+//
+// #46 NARROWS it again by one more class, on the same terms. The credential fallbacks 4b and 4c
+// are verify-eligible and their userinfo context admits our own tags, so a credential half left
+// behind by a blocked detector 4 — the one shape this class actually produced — now trips the
+// re-scan and the escalation is skipped rather than sent. What is NOT fixed in general is the
+// class: any composite detector can still be blocked by a placeholder inside its span, and the
+// cases the audit found and left open are filed rather than closed — a UUID inside a hostname
+// (#48) and an IPv4-mapped IPv6 address (#49). Fallbacks were added where the leak was credential
+// material; the audit table in BACKLOG.md, not this comment, is the record of what remains.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -162,9 +196,12 @@ func (m *Mapper) placeholder(tag, original string) string {
 // their job is best-effort coverage of bare hostnames, and a missed bare host must not mute
 // an otherwise-safe escalation.
 //
-// It sees whole values, not fragments. A partially masked value leaves a remainder that no
-// longer has the shape the detector looks for, so residue reports "clean" on precisely the
-// failure a verifier is wanted for. TestMaskingIsComplete is the check that does see it.
+// It sees whole values, not fragments, and the fragment can be produced two ways. A partially
+// masked value leaves a remainder that no longer has the shape the detector looks for; so does a
+// value whose span another detector already rewrote, which is #46 and is why "missed entirely"
+// was never the safe half of the claim. Either way residue reports "clean" on precisely the
+// failure a verifier is wanted for. TestMaskingIsComplete is the check that does see it, and
+// TestNoDetectorGroupLandsOnOurOwnOutput guards the property both arguments rest on.
 func (m *Mapper) residue(s string) string {
 	for _, d := range m.dets {
 		if !d.verify {
@@ -221,7 +258,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all twelve rather than to the one detector known to need it, because
+// It is applied to all thirteen rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -266,6 +303,43 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    reach the '@' that ends the credential, so the whole detector went quiet (#43).
 		{tagToken, mustLongest(
 			`://(` + tolerant(`[^:/@\s<>]`) + `:` + tolerant(`[^@/\s<>]`) + `)@`), 1, true},
+		// 4b/4c. The half of a credential detector 4 can no longer reach.
+		//
+		//     Detector 4 masks "user:pass" as ONE value, which is what makes it readable as a
+		//     credential rather than as two opaque runs -- and is also what breaks it. Detectors
+		//     1-3b run first, so a JWT, an AKIA key or an sk- key on EITHER side of the colon
+		//     mints a <TOKEN_n> inside detector 4's span; its classes exclude '<' by design, and
+		//     with no second "://" to restart at the detector does not match AT ALL. The other
+		//     half then goes out as literal text and residue() reports clean, because the
+		//     detector that should have caught it is the one that was blocked (#46).
+		//
+		//     Two rules rather than one, because a single rule cannot mask two spans: 4b takes
+		//     the password when the username was pre-masked, 4c takes the username when the
+		//     password was. Neither can fire after detector 4 succeeded -- that leaves no ':'
+		//     inside the userinfo -- and neither can fire after the other, because the half
+		//     already masked begins with '<'.
+		//
+		//     THEY MASK ONLY THEIR OWN HALF, and that is not tidiness. Letting a group span our
+		//     own tag would make the mapping nest (TOKEN_2 -> "<TOKEN_1>:password"), and nesting
+		//     is not representable here: Restore iterates a Go map and substitutes ONCE, with no
+		//     fixpoint, so a nested mapping resolves correctly or does not depending on map
+		//     iteration order. Measured at 175 wrong out of 200 restores in one process. Both
+		//     groups therefore exclude '<' and '>' exactly as detector 4's do; only the opposite
+		//     half, which is context, admits a tag.
+		//
+		//     The runs are '*' rather than '+', which closes a SECOND and unrelated gap: detector
+		//     4 required at least one character on each side of the colon, so
+		//     "redis://:password@host" -- the ordinary Redis DSN, Redis having had no username
+		//     before 6.0 -- matched no credential detector at all. That much held on every host
+		//     shape; whether anything actually LEFT the process did not, because the email
+		//     detector took "password@cache.acme.internal" whole whenever the authority ended in
+		//     a dotted alphabetic suffix. Bare host, loopback or address literal and it shipped.
+		//     Same patch, different cause; see the empty-half rows in completenessRows.
+		{tagToken, mustLongest(
+			`://(?:[^:/@\s<>]|` + pipelinePH + `|` + ourPH + `)*:(` +
+				tolerant(`[^@/\s<>]`) + `)@`), 1, true},
+		{tagToken, mustLongest(
+			`://(` + tolerant(`[^:/@\s<>]`) + `):(?:[^@/\s<>]|` + pipelinePH + `|` + ourPH + `)*@`), 1, true},
 		// 5. Email — before host, since an address contains a domain. Both halves are
 		//    placeholder-tolerant: a digit ANYWHERE on either side of the '@' is enough for the
 		//    pipeline to split the address, and ordinary corporate addresses have digits, so
@@ -354,6 +428,23 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 // detector is the case that needs both: '_' and '.' ARE in its local-part class, so a run
 // could start inside "TOKEN_1" and only the '>' before the '@' stops it.
 const pipelinePH = `<(?:TS|UUID|IP|HEX|NUM|STR)>`
+
+// ourPH matches a placeholder THIS package minted -- <TOKEN_1>, <HOST_2>. It is disjoint from
+// pipelinePH by construction, on the same '_'-vs-'>' distinction the inertness argument above
+// already rests on: the pipeline's six names are untagged and carry no "_<n>".
+//
+// It appears in exactly one place -- the two one-sided credential fallbacks, 4b and 4c -- and
+// there only as CONTEXT, never inside a target group. That distinction is the whole of the
+// safety argument and it is worth stating precisely, because the invariant in the package
+// comment is loose where it says no detector may MATCH a placeholder.
+//
+// What apply() and residue() actually depend on is narrower: apply writes only the target group,
+// and residue tests only whether the target group captured. A detector whose GROUP can land on
+// our own output breaks tag numbering, breaks Restore, and lets the fail-closed re-scan fire on
+// its own output. A detector that READS one of our tags to find its bearings does none of that.
+// TestNoDetectorGroupLandsOnOurOwnOutput holds the narrow claim against the real masked output
+// of every completeness row.
+const ourPH = `<[A-Z]+_\d+>`
 
 // jwtChar is the base64url alphabet of a JWT segment.
 const jwtChar = `[A-Za-z0-9_-]`

@@ -394,11 +394,15 @@ domain), bare hostnames on **private/infra suffixes** (`.internal`, `.local`, `.
 `.lan`, `.corp`, …; extend with `--llm-anonymize-suffix`), UUIDs, known-shape secrets
 (JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, `user:pass@` credentials), and the username in
 `/home/<user>` and `/Users/<user>` paths. If masking a payload fails, that escalation is
-**skipped** (the card says so) rather than sent in the clear. That check re-scans the masked
-text and so catches a value a detector missed entirely — including one the pipeline's template
-mask has already rewritten, which every detector now recognizes in both forms — but it cannot
-catch a value a detector masked only in part, because the leftover no longer has the shape the
-detector looks for. Completeness is enforced by the detectors' own tests, not at runtime.
+**skipped** (the card says so) rather than sent in the clear. What that check can and cannot see
+is worth stating exactly, because the previous wording here was wrong rather than merely vague.
+It re-scans the masked text, so it catches a value a detector missed entirely — including one the
+pipeline's template mask has already rewritten, which every detector now recognizes in both forms
+— **provided no other detector has already rewritten part of that value's span.** It cannot catch
+a value masked only in part, because the leftover no longer has the shape the detector looks for;
+and for the same structural reason it cannot catch a value whose detector was blocked by a
+placeholder minted inside its span. Completeness is enforced by the detectors' own tests, not at
+runtime.
 
 **Compressed IPv6 was masked only in part before v0.8.6.** From v0.4.0 — the release
 that introduced `--llm-anonymize` — through v0.8.5, an address written with `::` was masked
@@ -426,6 +430,55 @@ masked correctly), and **internal topology** (a domain — `api-gw7.prod.acme.co
 path — `/home/deploy2prod` sent `prod`). Nothing left the machine on a local Ollama; if you
 pointed `--llm-anonymize` at a remote provider, that provider received those values for every
 escalated line whose template contained one.
+
+**Half of every URL credential was sent in the clear before v0.9.0.** The credential
+detector masks `user:pass` as one value, and the secret detectors that run before it — JWT,
+`AKIA…`, `sk-…` — mask theirs first. So a URL whose username *or* password is itself a recognised
+secret got a placeholder minted inside the credential detector's span, and since that detector's
+pattern excludes `<` by design, it stopped matching entirely and the **other half** went to the
+configured model endpoint as literal text. From v0.4.0 — the release that introduced
+`--llm-anonymize` — through v0.8.7. Thirteen tagged releases carry it.
+
+Which half leaked depended on which half was recognisable, and whether anything leaked at all
+depended on what followed the `@` — because in each case a *different* detector happened to grab
+the value under the wrong tag:
+
+| after the `@` | secret username | secret password |
+|---|---|---|
+| `@db.acme.com` | password masked by accident, as `<EMAIL_n>` | **username sent** |
+| `@localhost`, `@redis`, `@db` | **password sent** | **username sent** |
+| `@10.0.0.5`, `@[2001:db8::1]` | **password sent** | username masked by accident, as `<HOST_n>` |
+
+No authority shape was safe on both sides, so "conditional" here narrows the description and not
+the severity — and a check against a fully-qualified host shows nothing wrong, which is why this
+took three attempts to find. `postgres://sk-live…:hunter2@localhost:5432/app` sent `hunter2`;
+`postgres://appuser:sk-live…@db.acme.com` sent `appuser`; `s3://AKIA…:secret@bucket` sent the
+secret access key.
+
+**A credential with an empty half was sent in the clear before v0.9.0.** A separate defect
+with the same fix, kept separate because the cause is different: the credential detector required
+at least one character on each side of the colon. `redis://:password@host` has no username — Redis
+had none before 6.0 — so the ordinary Redis DSN matched no credential detector at all. Same span,
+v0.4.0 → v0.8.7, and the same accidental rescue on a host with a dotted alphabetic suffix.
+
+**What the audit found and did not close.** v0.9.0 is a minor release because the package was
+audited systematically for the first time rather than because of the count above: every
+detector whose pattern spans a composite value was checked against every earlier detector that
+can mint a placeholder inside that span. The credential cases are fixed. **Four are open at
+release time**, none involving credential material:
+
+- **#48** — a UUID inside a hostname silences both host detectors:
+  `https://<uuid>.blob.core.windows.net` sends the whole domain, and
+  `worker-<uuid>.corp.internal` sends `worker-`.
+- **#49** — an IPv4-mapped IPv6 address masks only as far as its first octet:
+  `::ffff:192.168.1.1` sends `.168.1.1`.
+- **#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
+  pre-masked template: `s3://…@bucket` sends `bucket`. Not an interference defect — a tolerance
+  gap left over from #43 — but it is open and it leaks a host, so it belongs in the same list.
+- **#51** — `sk-proj-…`, the current OpenAI key format, is not recognised as a secret at all.
+
+The full interference table, including the pairs that turned out to be harmless and why, is in
+`BACKLOG.md`.
 
 One value can still end up with two placeholders — `<HOST_1>` from the raw line and `<HOST_2>`
 from the pre-masked template — which slightly weakens the "the model sees one host recur"
@@ -538,8 +591,11 @@ logscry says so on stderr on the way out.
   bracketed `[addr]:port`, CIDR suffixes, and all IPv4 are unaffected. **This is the template
   mask only.** The `--llm-anonymize` anonymizer is a separate detector set and masks all three
   shapes in full — it must, because there under-masking is disclosure rather than
-  fragmentation. The two IPv6 patterns diverged in #40 and #41; #42 decides whether they stay
-  two.
+  fragmentation. It does **not** mask an IPv4-mapped address in full: `::ffff:192.168.1.1` masks
+  as far as `::ffff:192`, which is a legal hex group, and the remaining three octets are sent.
+  That is a gap in the anonymizer's own pattern (#49), filed rather than fixed here because the
+  fix belongs to the same constant #42 is about. The two IPv6 patterns diverged in #40 and #41; #42
+  decides whether they stay two.
 - **`--docker-tail` defaults to 100 lines** of history per container on attach. An event
   further back than that won't appear until it recurs — use `--docker-tail all` for the
   full backlog.

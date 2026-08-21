@@ -69,6 +69,11 @@ func TestTypeTags(t *testing.T) {
 		{"id 550e8400-e29b-41d4-a716-446655440000 seen", "<UUID_1>"},
 		{"host worker.svc failed", "<HOST_1>"},
 		{"path /Users/jane/app.log missing", "<USER_1>"},
+		// The half of a credential detector 4 can no longer reach is a TOKEN, not an EMAIL. Before
+		// #46 this input masked to "<TOKEN_1>:<EMAIL_1>": the email detector swallowing
+		// "hunter2@db.acme.com" was the only thing keeping the password off the wire, and it did so
+		// under the wrong tag and glued to the host.
+		{"dsn=postgres://sk-livekeyabcdefghij0123456789XYZ:hunter2@db.acme.com/prod", "<TOKEN_2>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -284,6 +289,15 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		// '.', so a run could start inside "TOKEN_1" — the only thing stopping it reaching the
 		// '@' is the '>' that is in neither alternative.
 		"dsn=postgres://<TOKEN_1>@<HOST_2>/prod",
+		// Adversarial for the one-sided credential fallbacks (4b/4c) added for #46. Those are the
+		// only detectors that read one of our own tags ON PURPOSE, so they are where "the pattern
+		// must not match placeholder syntax" stops being the right claim. What has to hold is
+		// narrower, and is what apply() and residue() actually rely on: the TARGET GROUP must never
+		// land on text this package minted. Each string below is a fallback's own output fed back to
+		// it, and in every one it is the group class — '<' and '>' excluded — that refuses.
+		"dsn=postgres://<TOKEN_1>:<TOKEN_2>@<HOST_3>/prod",
+		"dsn=redis://:<TOKEN_1>@<HOST_2>:6379/0",
+		"dsn=postgres://<TOKEN_1>:@<HOST_2>/prod",
 		"mail <EMAIL_1> then <TOKEN_1>@<HOST_2> refused",
 		"loaded from /home/<USER_1>/go/pkg/mod",
 		"call https://<HOST_1>/v1 and <UUID_1>",
@@ -332,6 +346,236 @@ func TestIssue41CompressedIPv6(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIssue46PreMaskedCredentialHalf is the named regression guard for #46, and the reason it
+// is not called "the password leaks" is the finding: the defect is SYMMETRIC.
+//
+// Detector 4's target group spans "user:pass" as ONE value. Detectors 1-3b run first and mint a
+// <TOKEN_n> wherever they recognise a secret, and detector 4's classes exclude '<' and '>' by
+// design — that exclusion is the inertness invariant, not an oversight. So a placeholder minted
+// anywhere inside that span blocks the whole detector, and whichever half was NOT recognisable
+// goes to the configured model endpoint as literal text. Mask returned a nil error the whole
+// time, residue() returned "", no escalation was skipped, and the card looked normal.
+//
+// The dotted-host row is the one worth keeping. Before the fix it did NOT leak — the email
+// detector matched "hunter2@db.acme.com" and swallowed the password under an <EMAIL_n> tag,
+// glued to the host. That accident is why a reproduction against a fully-qualified host shows
+// nothing wrong, and why the shapes that do leak are the ones with a service name, a loopback or
+// an address after the '@': the ordinary DSN forms in container logs.
+func TestIssue46PreMaskedCredentialHalf(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		leaked []string // must not survive anywhere in the masked output
+	}{
+		{"sk- username, bare host", "postgres://sk-livekeyabcdefghij0123456789XYZ:hunter2@redis:6379/0",
+			[]string{"hunter2"}},
+		{"sk- username, loopback", "postgres://sk-livekeyabcdefghij0123456789XYZ:hunter2@localhost:5432/app",
+			[]string{"hunter2"}},
+		{"sk- username, address host", "postgres://sk-livekeyabcdefghij0123456789XYZ:hunter2@10.0.0.5:5432/app",
+			[]string{"hunter2"}},
+		{"AKIA username, bare host", "s3://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMIKauth@bucket",
+			[]string{"wJalrXUtnFEMIKauth"}},
+		{"JWT username, bare host", "postgres://eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u:hunter2@redis",
+			[]string{"hunter2"}},
+		// The mirror: the secret is the PASSWORD, so the USERNAME is what detector 4 can no
+		// longer reach. The email detector cannot rescue this side — it would need the username
+		// as a local part and the username sits BEFORE the colon — so the shapes that rescued
+		// the password leak here instead. A different detector rescues it for a different shape;
+		// see the address-host row below.
+		{"sk- password", "postgres://appuser:sk-livekeyabcdefghij0123456789XYZ@db",
+			[]string{"appuser"}},
+		{"AKIA password", "s3://myaccount:AKIAIOSFODNN7EXAMPLE@bucket",
+			[]string{"myaccount"}},
+		{"JWT password", "amqp://svcbroker:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u@rabbit",
+			[]string{"svcbroker"}},
+		{"sk- password, dotted host", "postgres://appuser:sk-livekeyabcdefghij0123456789XYZ@db.acme.com/prod",
+			[]string{"appuser"}},
+		// The third accidental rescue, and the one that makes "conditional" mean "leaks
+		// somewhere else" rather than "safe". With an ADDRESS after the '@', detector 8 masks
+		// the host before the URL-host detector runs, which destroys that detector's long parse
+		// and leaves it falling back onto the userinfo — so "appuser" was masked, as <HOST_n>.
+		// Correct outcome by the wrong route, under the wrong tag, and only for this shape.
+		{"sk- password, address host", "postgres://appuser:sk-livekeyabcdefghij0123456789XYZ@10.0.0.5:5432/db",
+			[]string{"appuser"}},
+		// Both halves recognisable: nothing was ever wrong here, kept as the control.
+		{"both halves secret", "postgres://sk-livekeyabcdefghij0123456789XYZ:sk-otherkeyabcdefghij9876543210AB@db",
+			[]string{"livekey", "otherkey"}},
+		// The accidental rescue, now done by the right detector under the right tag.
+		{"sk- username, dotted host", "postgres://sk-livekeyabcdefghij0123456789XYZ:hunter2@db.acme.com/prod",
+			[]string{"hunter2", "db.acme.com"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			masked := mustMask(t, m, c.in)
+			for _, leak := range c.leaked {
+				if strings.Contains(masked, leak) {
+					t.Errorf("credential half survived masking: %q still in %q\n in: %q", leak, masked, c.in)
+				}
+			}
+			if got := m.Restore(masked); got != c.in {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", c.in, got)
+			}
+		})
+	}
+}
+
+// TestEmptyCredentialHalf is the SECOND defect the same patch closes, kept as its own test
+// because the cause is different and folding it into #46's description would misreport it.
+//
+// Nothing is pre-masked here and no detector interferes with any other. Detector 4 simply
+// required at least one character on each side of the colon, and a Redis DSN has no username —
+// Redis had none before 6.0, so "redis://:password@host" is the ordinary shape rather than an
+// edge case. It matched no credential detector at all, from v0.4.0 onward.
+//
+// Like #46 it was masked by accident on a host with a dotted alphabetic suffix (the email
+// detector again), so the rows that matter are the ones without one.
+func TestEmptyCredentialHalf(t *testing.T) {
+	cases := []struct{ name, in, leaked string }{
+		{"no username, bare host", "redis://:s3cr3tpw@redis:6379/0", "s3cr3tpw"},
+		{"no username, loopback", "redis://:s3cr3tpw@localhost:6379/0", "s3cr3tpw"},
+		{"no username, address host", "redis://:s3cr3tpw@10.0.0.5:6379/0", "s3cr3tpw"},
+		{"no username, dotted host", "redis://:s3cr3tpw@cache.acme.internal:6379/0", "s3cr3tpw"},
+		{"no password", "postgres://svcacct:@db", "svcacct"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			masked := mustMask(t, m, c.in)
+			if strings.Contains(masked, c.leaked) {
+				t.Errorf("credential survived masking: %q still in %q\n in: %q", c.leaked, masked, c.in)
+			}
+			if got := m.Restore(masked); got != c.in {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", c.in, got)
+			}
+		})
+	}
+}
+
+// TestNoDetectorGroupLandsOnOurOwnOutput is the durable output of the #46 interference audit,
+// mechanized so it does not have to be re-derived by hand.
+//
+// The audit's question was: for every detector spanning a COMPOSITE value, which earlier
+// detectors can mint a placeholder inside that span, and what happens? The answer turns entirely
+// on one property — every detector's TARGET GROUP excludes '<' and '>', so a placeholder inside
+// a later detector's span truncates or blocks that detector. That property is what makes
+// sequential masking safe, what makes the fail-closed re-scan sound, and what makes Restore's
+// single non-fixpoint pass correct; it is also the reason #46 existed at all.
+//
+// TestPlaceholdersAreInert asserts it against hand-written strings. This asserts it against the
+// real thing: the actual masked output of every completeness row, which is the only corpus
+// guaranteed to contain whatever placeholders today's detectors actually mint. A detector added
+// later whose group can chew on our own tags goes red here without anyone thinking of the shape.
+//
+// It is deliberately stated on the GROUP rather than on the whole match. Both credential
+// fallbacks read one of our tags on purpose, as context, to find the half detector 4 could not
+// reach — that is safe, and a test phrased as "no detector may match placeholder syntax" would
+// forbid the fix rather than guard it.
+func TestNoDetectorGroupLandsOnOurOwnOutput(t *testing.T) {
+	for _, r := range completenessRows {
+		payload := payloadOf(r.prefix) + r.secret + payloadOf(r.suffix)
+		masked, err := New().Mask(payload)
+		if err != nil {
+			t.Errorf("%s: Mask(%q) errored: %v", r.name, payload, err)
+			continue
+		}
+		if !regexp.MustCompile(phPat).MatchString(masked) {
+			t.Errorf("%s: masking %q produced no placeholder at all: %q", r.name, payload, masked)
+			continue
+		}
+		// The placeholders actually present, as spans. The claim is about OVERLAP with these,
+		// not about matching somewhere in a string that happens to contain them: residual
+		// plaintext beside a placeholder is a coverage question, and a different test's.
+		tags := regexp.MustCompile(phPat).FindAllStringIndex(masked, -1)
+		for i, d := range baseDetectors {
+			for _, loc := range d.re.FindAllStringSubmatchIndex(masked, -1) {
+				gs, ge := loc[2*d.group], loc[2*d.group+1]
+				if gs < 0 {
+					continue
+				}
+				for _, tag := range tags {
+					if gs < tag[1] && tag[0] < ge {
+						t.Errorf("%s: detector %d (%s, group %d) landed on a placeholder this package minted:\n"+
+							" masked: %q\n group:  %q\n tag:    %q\n pattern: %s",
+							r.name, i, d.tag, d.group, masked,
+							masked[gs:ge], masked[tag[0]:tag[1]], d.re.String())
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestRestoreHasNoNestedMapping enforces the PRECONDITION that makes Restore correct, which is
+// not the same thing as making Restore correct — that is #50's job and it is not done here.
+//
+// Restore iterates m.byToken (a Go map, randomised order) and substitutes each token ONCE, with
+// no fixpoint. That is only sound while no mapping's VALUE contains another mapping's TOKEN. If
+// one ever does, the answer depends on which order the runtime happened to walk the map:
+// measured with a directly constructed nested pair, wrong in 175 of 200 restores in one process,
+// at a rate set by the keys' hashes rather than a coin flip. A test written against that is
+// green four runs in five.
+//
+// The property holds today because every detector's target group excludes '<' and '>', so no
+// captured value can contain one of our tags. It is also the second and stronger half of why #46
+// was NOT fixed by letting the credential detector span our own tags — that fix would have
+// produced TOKEN_2 -> "<TOKEN_1>:password" directly. A rejection resting on a property nothing
+// enforces is not a rejection, which is why this lands with the fix rather than with #50.
+//
+// So this asserts the precondition over the real mappings Mask produces, and goes red the moment
+// a detector starts capturing one of our tags — before anyone has to debug an intermittently
+// wrong card.
+func TestRestoreHasNoNestedMapping(t *testing.T) {
+	tag := regexp.MustCompile(phPat)
+
+	check := func(t *testing.T, name string, m *Mapper) {
+		t.Helper()
+		for token, original := range m.byToken {
+			for _, nested := range tag.FindAllString(original, -1) {
+				if _, ok := m.byToken[nested]; ok {
+					t.Errorf("%s: mapping %s -> %q contains another mapping's token %s.\n"+
+						"Restore substitutes once, in map order, so this resolves by chance (see #50).",
+						name, token, original, nested)
+				}
+			}
+		}
+	}
+
+	// Every completeness row, which is the corpus that covers every detector by construction.
+	for _, r := range completenessRows {
+		m := New()
+		if _, err := m.Mask(payloadOf(r.prefix) + r.secret + payloadOf(r.suffix)); err != nil {
+			continue // TestMaskingIsComplete reports this
+		}
+		check(t, r.name, m)
+	}
+	// And the templatized composition, where a detector reads a value the pipeline already
+	// rewrote — the case where a class is likeliest to have been widened one character too far.
+	for _, r := range templatizedRows {
+		in, _ := pipeline.Templatize(payloadOf(r.text))
+		m := New()
+		if _, err := m.Mask(in); err != nil {
+			continue // TestTemplatizedMaskingIsComplete reports this
+		}
+		check(t, r.name, m)
+	}
+	// One mapper reused across several lines, as a real request does: Explain masks the trigger,
+	// the template and every context line through the SAME Mapper, so the map that Restore walks
+	// is the union of all of them and nesting could straddle two fields.
+	shared := New()
+	for _, line := range []string{
+		"FATAL pg connect failed dsn=postgres://sk-livekeyabcdefghij0123456789XYZ:hunter2@localhost:5432/app",
+		"FATAL redis auth rejected dsn=redis://:s3cr3tpw@cache.acme.internal:6379/0",
+		"FATAL peer 2001:db8::dead:beef unreachable from /home/deploy2prod",
+		"FATAL mail to user01@corp.example.com bounced via api-gw7.prod.acme.com",
+	} {
+		if _, err := shared.Mask(line); err != nil {
+			t.Fatalf("Mask(%q) errored: %v", line, err)
+		}
+	}
+	check(t, "shared mapper", shared)
 }
 
 // phMark DELIMITS, inside a completeness row's prefix or suffix, a span that is ordinary
@@ -404,6 +648,27 @@ var completenessRows = []completenessRow{
 	// but its target group is exactly the credentials, which is what the row declares. The
 	// phMark is the <HOST_n> the URL-host detector mints for the host that follows.
 	{"url-credentials", "dsn=postgres://", "svcuser:hunter2", "@" + phMark + "db.acme.com" + phMark + "/prod"},
+	// #46, both halves. Detector 4's group spans user:pass as ONE value, so a placeholder
+	// minted anywhere inside that span blocks the whole detector and the OTHER half ships in
+	// the clear. Which half survives depends only on which half was recognisable, so the defect
+	// is symmetric and so are the rows: the declared secret is the half detector 4 can no longer
+	// reach, and the phMark is the placeholder that blocked it.
+	{"url-credentials/premasked-username",
+		"dsn=postgres://" + phMark + "sk-abcdefghij0123456789XYZ" + phMark + ":", "hun2ter",
+		"@" + phMark + "db.acme.com" + phMark + "/prod"},
+	{"url-credentials/premasked-password",
+		"dsn=postgres://", "app7user",
+		":" + phMark + "sk-abcdefghij0123456789XYZ" + phMark + "@" + phMark + "db.acme.com" + phMark + "/prod"},
+	// The empty halves, a DIFFERENT defect closed by the same patch: detector 4 requires at
+	// least one character on each side of the colon, and a Redis DSN has no username (Redis had
+	// none before 6.0). Nothing is pre-masked in these two — the credential detector simply
+	// never covered the shape. Both put text flush against the value with no separator at all
+	// (":" on the left, ":@" on the right), so they double as the greed guard for the '*'
+	// quantifier that admits them.
+	{"url-credentials/empty-username",
+		"dsn=redis://:", "s3cr3tpw", "@" + phMark + "cache.acme.internal" + phMark + ":6379/0"},
+	{"url-credentials/empty-password",
+		"dsn=postgres://", "svc7acct", ":@" + phMark + "db.acme.com" + phMark + "/prod"},
 	// Greed guard: the host must stop at "/", not eat the path.
 	{"url-host", "call https://", "internal.acme.com", "/v1"},
 	{"bare-host", "host ", "worker.svc", " failed"},
@@ -519,6 +784,12 @@ func TestAcceptedOverMasking(t *testing.T) {
 		{"email leading plus absorbed", "mail +alice@corp.example.com", "mail <EMAIL_1>"},
 		{"email leading hyphen absorbed", "mail -alice@corp.example.com", "mail <EMAIL_1>"},
 		{"email leading run absorbed", "mail ..-alice@corp.example.com", "mail <EMAIL_1>"},
+		// INHERITED, not introduced. A URL with a query and no path separator reads as credentials,
+		// because the userinfo class admits '?' and '=' and only '/' would have stopped it. Detector
+		// 4 has done this since v0.4.0; the one-sided fallbacks added for #46 reuse the same class
+		// and inherit it unchanged. Pinned here so that if they ever widen it, the diff shows up as a
+		// behaviour change rather than passing as "detector 4 always did that".
+		{"url query absorbed as credentials", "https://api.acme.com?q=a:b@c", "https://<TOKEN_1>@<HOST_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -575,6 +846,17 @@ var templatizedRows = []templatizedRow{
 	// The control: no digit in the credential at all, so only the port templatizes.
 	{"url-credentials/no-digit",
 		"dsn=postgres://\x00u:p\x00@\x00db.acme.com\x00:5432/prod"},
+	// #46 through the composition. Three marked spans each: the secret that blocks detector 4,
+	// the half it can no longer reach, and the host behind it. The blocking secret must still be
+	// recognised in its TEMPLATIZED form for the row to reproduce the bug at all — if detector 3b
+	// missed the mangled key there would be nothing in detector 4's way and the row would pass for
+	// the wrong reason.
+	{"url-credentials/premasked-username",
+		"dsn=postgres://\x00sk-livekeyabcdefghij0123456789XYZ\x00:\x00hun2ter\x00@\x00db01.corp.internal\x00/prod"},
+	{"url-credentials/premasked-password",
+		"dsn=postgres://\x00app7user\x00:\x00sk-livekeyabcdefghij0123456789XYZ\x00@\x00db01.corp.internal\x00/prod"},
+	{"url-credentials/empty-username",
+		"dsn=redis://:\x00s3cr3tpw\x00@\x00cache01.corp.internal\x00:6379/0"},
 	{"email/digit-in-local", "mail to \x00user01@corp.example.com\x00 bounced"},
 	{"email/digit-in-domain", "mail to \x00bob@db01.example.com\x00 bounced"},
 	{"email/digit-mid-token-both-sides", "mail to \x00us3r@corp7.example.com\x00 bounced"},
