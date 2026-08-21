@@ -110,9 +110,9 @@ func New(extraHostSuffixes ...string) *Mapper {
 // behind by a blocked detector 4 — the one shape this class actually produced — now trips the
 // re-scan and the escalation is skipped rather than sent. What is NOT fixed in general is the
 // class: any composite detector can still be blocked by a placeholder inside its span, and the
-// three cases the audit found and left open (a UUID inside a hostname, an IPv4-mapped IPv6
-// address) are filed rather than closed. Fallbacks were added where the leak was credential
-// material; the audit table, not this comment, is the record of what remains.
+// cases the audit found and left open are filed rather than closed — a UUID inside a hostname
+// (#48) and an IPv4-mapped IPv6 address (#49). Fallbacks were added where the leak was credential
+// material; the audit table in BACKLOG.md, not this comment, is the record of what remains.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -330,8 +330,11 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     The runs are '*' rather than '+', which closes a SECOND and unrelated gap: detector
 		//     4 required at least one character on each side of the colon, so
 		//     "redis://:password@host" -- the ordinary Redis DSN, Redis having had no username
-		//     before 6.0 -- matched no credential detector at all, on any host shape. Same patch,
-		//     different cause; see the empty-half rows in completenessRows.
+		//     before 6.0 -- matched no credential detector at all. That much held on every host
+		//     shape; whether anything actually LEFT the process did not, because the email
+		//     detector took "password@cache.acme.internal" whole whenever the authority ended in
+		//     a dotted alphabetic suffix. Bare host, loopback or address literal and it shipped.
+		//     Same patch, different cause; see the empty-half rows in completenessRows.
 		{tagToken, mustLongest(
 			`://(?:[^:/@\s<>]|` + pipelinePH + `|` + ourPH + `)*:(` +
 				tolerant(`[^@/\s<>]`) + `)@`), 1, true},

@@ -464,14 +464,21 @@ v0.4.0 → v0.8.7, and the same accidental rescue on a host with a dotted alphab
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
-can mint a placeholder inside that span. The credential cases are fixed. Four are filed and still
-present — a UUID inside a hostname silences the URL-host detector
-(`https://<uuid>.blob.core.windows.net` sends the domain) and the bare-host detector
-(`worker-<uuid>.corp.internal` sends `worker-`); an IPv4-mapped IPv6 address masks only as far as
-its first octet (`::ffff:192.168.1.1` sends `.168.1.1`); and a URL scheme containing a digit hides
-the host from the URL-host detector in the pre-masked template (`s3://…@bucket` sends `bucket`).
-None involves credential material. The full interference table, including the pairs that turned
-out to be harmless and why, is in `BACKLOG.md`.
+can mint a placeholder inside that span. The credential cases are fixed. **Four are open at
+release time**, none involving credential material:
+
+- **#48** — a UUID inside a hostname silences both host detectors:
+  `https://<uuid>.blob.core.windows.net` sends the whole domain, and
+  `worker-<uuid>.corp.internal` sends `worker-`.
+- **#49** — an IPv4-mapped IPv6 address masks only as far as its first octet:
+  `::ffff:192.168.1.1` sends `.168.1.1`.
+- **#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
+  pre-masked template: `s3://…@bucket` sends `bucket`. Not an interference defect — a tolerance
+  gap left over from #43 — but it is open and it leaks a host, so it belongs in the same list.
+- **#51** — `sk-proj-…`, the current OpenAI key format, is not recognised as a secret at all.
+
+The full interference table, including the pairs that turned out to be harmless and why, is in
+`BACKLOG.md`.
 
 One value can still end up with two placeholders — `<HOST_1>` from the raw line and `<HOST_2>`
 from the pre-masked template — which slightly weakens the "the model sees one host recur"
@@ -586,8 +593,8 @@ logscry says so on stderr on the way out.
   shapes in full — it must, because there under-masking is disclosure rather than
   fragmentation. It does **not** mask an IPv4-mapped address in full: `::ffff:192.168.1.1` masks
   as far as `::ffff:192`, which is a legal hex group, and the remaining three octets are sent.
-  That is a gap in the anonymizer's own pattern, filed rather than fixed here because the fix
-  belongs to the same constant #42 is about. The two IPv6 patterns diverged in #40 and #41; #42
+  That is a gap in the anonymizer's own pattern (#49), filed rather than fixed here because the
+  fix belongs to the same constant #42 is about. The two IPv6 patterns diverged in #40 and #41; #42
   decides whether they stay two.
 - **`--docker-tail` defaults to 100 lines** of history per container on attach. An event
   further back than that won't appear until it recurs — use `--docker-tail all` for the

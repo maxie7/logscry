@@ -701,7 +701,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       sequences, so there is nothing to validate it against), #36's `<NUM>`-inside-tokens
       problem, and `internal/anonymize`, which carries a near-verbatim copy of the same IPv6
       alternation. That copy is now the durable finding: this change makes the two DIVERGE.
-      Filed separately.
+      Filed separately as #42.
 
 - [x] **A partial match is a leak, not a near miss** — #41, the disclosure defect in the one
       package whose job is preventing disclosure. `--llm-anonymize` sent part of every
@@ -870,7 +870,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       sites — one of them asserted that secrets were recognized in both forms and called the
       cost "cosmetic, not a leak", which was wrong on the day it was written rather than made
       wrong by this change. Filed separately while auditing: a URL whose USERNAME is itself a
-      recognised secret leaves its password unmasked, independent of templating.
+      recognised secret leaves its password unmasked, independent of templating — #46, and it turned
+      out to be the reported half of a symmetric defect. Closed below.
 
 - [x] **A credential's other half is still a credential** — #46, and the audit that came with
       it. `--llm-anonymize` sent half of every URL credential to the configured model endpoint
@@ -908,8 +909,13 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Two defects, one patch, kept apart in the writing.** The `*` quantifiers also close a
       gap that is not interference at all: detector 4 required at least one character on each
       side of the colon, so `redis://:password@host` — the ordinary Redis DSN, Redis having had
-      no username before 6.0 — matched no credential detector on any host shape. Same v0.4.0
-      span, different cause, its own tests and its own README paragraph.
+      no username before 6.0 — matched no credential detector at all. That much held on every
+      host shape, but the DISCLOSURE did not, and the distinction is the same one #46 turned on:
+      the email detector took `password@cache.acme.internal` whole whenever the authority ended
+      in a dotted alphabetic suffix, `.internal` included, so only a bare host, a loopback or an
+      address literal actually shipped the password. This entry said "on any host shape" in
+      draft, which was the plan's claim and was wrong. Same v0.4.0 span, different cause, its own
+      tests and its own README paragraph.
       **The fix adds two rules rather than loosening one.** 4b masks the password when the
       username was pre-masked, 4c the username when the password was; a single rule cannot mask
       two spans. Neither fires after detector 4 succeeded (no `:` left in the userinfo) nor after
@@ -923,12 +929,14 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **175 of 200** restores in one process, and the rate is a function of the keys' hashes
       rather than a coin flip (Go randomises the starting cell offset; two keys in adjacent cells
       of one bucket give 7/8), so it varies per process — a test that is green four runs in five.
-      Latent today because nothing nests; nothing prevents it either. Filed.
+      Latent today because nothing nests; nothing prevents it either — filed as **#50**, with
+      `TestRestoreHasNoNestedMapping` landing here to enforce the precondition this argument
+      rests on, since a rejection resting on an unenforced property is not a rejection.
       **Reordering fixes nothing here and the reason is worth writing down.** The blockers are
       the more specific detectors and must precede detector 4: running 4 first would mask
       `sk-live…:password` as one opaque credential and lose that the username is a live API key.
       Order is the wrong tool for this pair. It remains a candidate for the UUID-vs-host pair
-      below, which is one reason that one is filed rather than folded in.
+      below (**#48**), which is one reason that one is filed rather than folded in.
       **The invariant is sharpened, not weakened.** The package comment claimed no detector may
       MATCH a placeholder we minted. What `apply` and `residue` depend on is that no detector's
       TARGET GROUP may land on one — `apply` writes only the group, `residue` tests only whether
@@ -965,10 +973,10 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 6 → 10, 1/2/3b → 10 | `/home/550e8400-…/app.log` | nothing | **harmless**; blocking detector 10 costs a tag, never a value |
       | 1/2/3b → 3a | `Bearer AKIAIOSFODNN7EXAMPLE` | nothing | **harmless**; already pinned by `TestPlaceholdersAreInert` |
       | 1/2/3b → 5 | `eyJ….eyJ….sig@example.com` | the domain | **theoretical**; nothing puts a JWT in an email local part |
-      | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, filed** |
-      | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT, filed** (same issue) |
-      | 6 → 9b | `worker-550e8400-….corp.internal` | `worker-` | **DEFECT, filed** (same issue) |
-      | 7 → 8 | `::ffff:192.168.1.1` | `.168.1.1` | **DEFECT, filed** |
+      | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, filed #48** |
+      | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT, filed #48** (same cause) |
+      | 6 → 9b | `worker-550e8400-….corp.internal` | `worker-` | **DEFECT, filed #48** (same cause) |
+      | 7 → 8 | `::ffff:192.168.1.1` | `.168.1.1` | **DEFECT, filed #49** |
       **Detector 10 has no defects at all**, and that is a computed result rather than an
       untested area: every interferer that can reach a `/home/` username masks it entirely.
       **Detector 5's blockers are all theoretical** — it is the composite with the most paths
@@ -976,19 +984,23 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       structurally impossible**, not merely unobserved.
       Three gaps the same sweep surfaced that are NOT detector-on-detector, recorded so the next
       person does not re-derive them: `redis://:password@host` (empty half — fixed here, above);
-      `sk-proj-…`, the current OpenAI key format, which detector 3b does not match at all and
-      which is anti-correlated with #46 — a key 3b cannot see cannot block detector 4, so fixing
-      3b alone would INTRODUCE the leak for those keys; and detector 9a's scheme anchor, which
-      #43 left non-tolerant while widening the host group beside it, so `s3://` templatizes to
+      `sk-proj-…`, the current OpenAI key format, which detector 3b does not match at all
+      (**#51**) and which is anti-correlated with #46 — a key 3b cannot see cannot block
+      detector 4, so fixing 3b alone would INTRODUCE this leak for those keys, and #51 must not
+      land before this does; and detector 9a's scheme anchor (**#52**), which #43 left
+      non-tolerant while widening the host group beside it, so `s3://` templatizes to
       `s<NUM>://` and the host goes unmasked on the `Template` field. That last one was found in
       the #46 wire capture rather than by a test, and the lesson generalises: **a detector's
-      tolerance has to cover its ANCHORS, not only its capture.**
+      tolerance has to cover its ANCHORS, not only its capture** — which is also why the
+      coverage test that should have caught it did not, since it checks a detector's GROUP and
+      the scheme is context.
       `internal/pipeline` does not appear in the diff and no template hashes move: this package
       runs at the LLM boundary and never feeds `hashTemplate`. README corrected at three sites,
       one of which asserted that the fail-closed re-scan catches a value a detector missed
       entirely — wrong on the day it was written, and the sentence this defect walked straight
       through. Released as **v0.9.0** — a MINOR bump, and the reason is the audit rather than the
       defect count: the package was swept systematically for the first time, the full
-      interference table published, one defect closed and four filed. A patch release would have
+      interference table published, one defect closed and four filed (#48, #49, #51, #52, plus
+      #50 from the rejected fix). A patch release would have
       described this as one more fix in a series, which is the framing the series is trying to
       escape.
