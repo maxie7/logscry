@@ -14,8 +14,31 @@
 //
 // Ordering matters for the same reason it does in the pipeline masker: an email contains a
 // host, a URL contains a host and maybe credentials, an IP is digits-and-dots a host regex
-// would grab. The more specific detector runs first (see buildDetectors). No detector's TARGET
-// GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
+// would grab. The more specific detector runs first (see buildDetectors).
+//
+// That rule governs detectors which COMPETE FOR THE SAME SPAN, and the distinction is
+// load-bearing rather than pedantic, because detector 6 runs out of sequence and #48 is the
+// reason. In each pair above, both detectors can match the SAME text and the more specific one is
+// the right answer. Detector 6 is in no such relation with either host detector: a UUID standing
+// alone is unreachable by both — 9a requires a "://" and 9b requires a dotted name ending in a
+// private suffix, and a UUID has neither a scheme nor a dot. The only text they contend for is a
+// UUID that is a LABEL INSIDE a hostname, and there the host is the right answer, because the
+// value being protected is the domain and not the identifier. So 6 runs AFTER 9b, and that is the
+// specificity rule applied rather than broken: containment, not competition, and the container
+// wins. The cost is that such a UUID comes back <HOST_n> rather than <UUID_n>, which is the cheap
+// half of the trade — before the move the model got <UUID_n> AND the real domain in the clear, so
+// the tag was never the thing being preserved.
+//
+// AN IP IS THE OPPOSITE CASE, and that is why the move does not generalise. https://10.0.0.5/x is
+// a URL whose authority IS the address, so detectors 8 and 9a genuinely compete for that span and
+// 8 must win or the tag says HOST when the value is an IP. But https://10.0.0.5.nip.io/x needs 9a
+// to win, because there the address is a label inside the authority. No ordering of a linear chain
+// satisfies both, since the right answer depends on what the matched span is PART OF and a chain
+// has no notion of that. That half is NOT fixed here and is filed as #54; the candidate is a
+// pre-pass identifying the authority span before the inner detectors run, so containment becomes
+// representable instead of inferred from order.
+//
+// No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and Restore's
 // single non-fixpoint pass is correct; that inertness is what keeps a home path in a Go stack
 // trace from tripping the verifier (see Mask).
@@ -109,10 +132,17 @@ func New(extraHostSuffixes ...string) *Mapper {
 // are verify-eligible and their userinfo context admits our own tags, so a credential half left
 // behind by a blocked detector 4 — the one shape this class actually produced — now trips the
 // re-scan and the escalation is skipped rather than sent. What is NOT fixed in general is the
-// class: any composite detector can still be blocked by a placeholder inside its span, and the
-// cases the audit found and left open are filed rather than closed — a UUID inside a hostname
-// (#48) and an IPv4-mapped IPv6 address (#49). Fallbacks were added where the leak was credential
-// material; the audit table in BACKLOG.md, not this comment, is the record of what remains.
+// class: any composite detector can still be blocked by a placeholder inside its span.
+//
+// #48 CLOSES ONE MORE, and it is the one ordering could reach. A UUID inside a hostname is masked
+// as part of the host now, because detector 6 moved behind both host detectors — see the ordering
+// note above for why that is the specificity rule applied rather than broken. What remains of that
+// pair is the case ordering CANNOT reach: an IPv4 literal in a host label, where
+// https://10.0.0.5.nip.io/x sends ".nip.io" and worker-10.0.0.5.corp.internal sends "worker-",
+// because the two IPv4 cases want opposite orders and no linear chain gives both. Filed as
+// #54, alongside an IPv4-mapped IPv6 address (#49). Fallbacks were added where the leak was
+// credential material; the audit table in BACKLOG.md, not this comment, is the record of what
+// remains.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -359,8 +389,8 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    domain. That last one is a leak, not a cost, and it is why the assertion goes.
 		{tagEmail, mustLongest(
 			tolerant(`[A-Za-z0-9._%+-]`) + `@` + tolerant(`[A-Za-z0-9.-]`) + `\.[A-Za-z]{2,}\b`), 0, true},
-		// 6. UUID — before IP/host; a fixed 8-4-4-4-12 shape.
-		{tagUUID, mustLongest(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), 0, true},
+		// 6 ran HERE until #48 and now runs after 9b — see the block below and the package
+		//    comment. The numbering is the audit table's, not the chain's.
 		// 7. IPv6 — before host and IPv4. The alternatives cover the :: elisions; forms
 		//    without "::" and fewer than eight groups (times, MACs) do not match.
 		{tagIP, mustLongest(ipv6Pattern), 0, true},
@@ -385,6 +415,30 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     would fail closed on every escalation carrying api.example.com and mute exactly
 		//     the stack traces this feature protects.
 		{tagHost, bareHost, 0, false},
+		// 6. UUID — a fixed 8-4-4-4-12 shape. It runs HERE, after both host detectors, and the
+		//    out-of-sequence number is deliberate: the audit table, the README and the issues all
+		//    say "detector 6", "9a", "9b", so renumbering the chain to match position would
+		//    invalidate every one of them.
+		//
+		//    It ran before them until #48, and that was a leak. A UUID used as a hostname LABEL
+		//    minted a <UUID_n> inside the host detectors' span; every host class excludes '<' and
+		//    '>', so the host was masked in part or not at all —
+		//    https://<uuid>.blob.core.windows.net sent the whole domain with nothing behind it,
+		//    api.<uuid>.acme.com sent ".acme.com", worker-<uuid>.corp.internal sent "worker-".
+		//    Both host detectors are verify:false, so residue() reported clean and the escalation
+		//    was sent.
+		//
+		//    WHY MOVING THIS ONE DOES NOT BREAK MOST-SPECIFIC-FIRST is argued in full in the
+		//    package comment, and the short form is that 6 and the host detectors are not in a
+		//    specificity relation at all: a UUID standing alone is unreachable by both, so they
+		//    never compete, and the only text they contend for is a UUID INSIDE a host — where
+		//    the host is the right answer. Containment, not competition.
+		//
+		//    An IP is the opposite case and stays where it is. See the package comment.
+		//
+		//    Placement is between 9b and 10 rather than at the end: keeping it ahead of the
+		//    home-dir detector preserves /home/<uuid>/app.log as <UUID_1> rather than <USER_1>.
+		{tagUUID, mustLongest(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), 0, true},
 		// 10. Home directory — mask only the username segment, keeping the rest of the path
 		//     so /home/<USER_1>/go/pkg/mod/... stays useful in a stack trace. Tolerant, and the
 		//     awkward position is the one worth naming: a TRAILING digit was always harmless

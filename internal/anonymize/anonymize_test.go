@@ -69,6 +69,15 @@ func TestTypeTags(t *testing.T) {
 		{"id 550e8400-e29b-41d4-a716-446655440000 seen", "<UUID_1>"},
 		{"host worker.svc failed", "<HOST_1>"},
 		{"path /Users/jane/app.log missing", "<USER_1>"},
+		// A UUID used as a hostname LABEL is part of the host, so it comes back <HOST_n> rather
+		// than <UUID_n>. That is a deliberate change of what the model is told it is reasoning
+		// about, and it is the cheap half of the trade: before #48 this input produced <UUID_1>
+		// AND ".blob.core.windows.net" in the clear, so the tag was never the thing being
+		// preserved -- the choice is "<UUID_n> plus a leaked domain" against "<HOST_n> and
+		// nothing leaked". The converse, that a UUID which is NOT part of a host keeps its own
+		// tag, is TestUUIDOutsideAHostKeepsItsOwnTag and is not optional: detector 6 now runs
+		// after both host detectors, so every other detector gets first refusal on a UUID.
+		{"call https://550e8400-e29b-41d4-a716-446655440000.blob.core.windows.net/x", "<HOST_1>"},
 		// The half of a credential detector 4 can no longer reach is a TOKEN, not an EMAIL. Before
 		// #46 this input masked to "<TOKEN_1>:<EMAIL_1>": the email detector swallowing
 		// "hunter2@db.acme.com" was the only thing keeping the password off the wire, and it did so
@@ -466,6 +475,119 @@ func TestEmptyCredentialHalf(t *testing.T) {
 //
 // TestPlaceholdersAreInert asserts it against hand-written strings. This asserts it against the
 // real thing: the actual masked output of every completeness row, which is the only corpus
+// TestIssue48UUIDInHostname is the named regression for #48, carrying the three shapes from the
+// issue verbatim.
+//
+// Detector 6 ran before both host detectors, so a UUID used as a hostname LABEL minted a
+// <UUID_n> inside their span. Every host class excludes '<' and '>' — that inertness is what
+// makes sequential masking safe — so the host detector could not step over the tag and the domain
+// around it went out in the clear. Both host detectors are verify:false, so residue() reported
+// clean and the escalation was SENT rather than skipped.
+//
+// It is live on the RAW path specifically. On the Template field the pipeline has already
+// collapsed the UUID to <UUID>, which pipelinePH names, so the tolerant host group steps over it;
+// but Trigger.Raw, Trigger.Source and every context line reach Mask as raw text
+// (internal/llm/anonymizing.go), and that is most of a payload.
+//
+// The last case is the one that does NOT close, and it is here on purpose: one run shows both
+// what the fix reaches and what it does not. An IPv4 literal in a host label does exactly the
+// same thing, and it CANNOT be fixed the same way, because the two IPv4 cases want opposite
+// orders — https://10.0.0.5/x needs detector 8 to win (the address IS the authority, and the IP
+// tag is the product) while https://10.0.0.5.nip.io/x needs 9a to win (the address is a label
+// INSIDE the authority). No ordering of a linear chain satisfies both, because the right answer
+// depends on what the matched span is PART OF and the chain has no notion of that. Filed as
+// #54, with the impossibility carried as a result rather than left to be rediscovered.
+func TestIssue48UUIDInHostname(t *testing.T) {
+	const uuid = "550e8400-e29b-41d4-a716-446655440000"
+
+	closed := []struct {
+		name string
+		in   string
+		// every fragment that must NOT survive, including the one the old behaviour sent
+		leaks []string
+	}{
+		// 9a's group is required immediately after "://", so a tag in the FIRST label kills the
+		// whole match. Nothing was behind it either: a public suffix is not on the bare-host
+		// allowlist, so 9b never looks at it.
+		{"leading label, public suffix",
+			"upload failed to https://" + uuid + ".blob.core.windows.net/x",
+			[]string{"blob.core.windows.net", ".blob", "windows", uuid}},
+		// 9a's group takes the labels before the tag and stops, sending the tail.
+		{"middle label, public suffix",
+			"gateway 502 from https://api." + uuid + ".acme.com/",
+			[]string{"acme.com", ".acme", "api.", uuid}},
+		// 9b's \b re-anchors after the '>' and takes only the private suffix, sending every
+		// label before the UUID.
+		{"bare host, private suffix",
+			"peer worker-" + uuid + ".corp.internal unreachable",
+			[]string{"worker-", "corp.internal", uuid}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			masked := mustMask(t, m, c.in)
+			for _, leak := range c.leaks {
+				if strings.Contains(masked, leak) {
+					t.Errorf("%q leaked:\n in:  %q\n out: %q", leak, c.in, masked)
+				}
+			}
+			if got := m.Restore(masked); got != c.in {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", c.in, got)
+			}
+		})
+	}
+
+	// The negative half. This is an ASSERTION that the gap is still open, not a tolerated
+	// failure: when #54 is fixed this test goes red and is the reminder to update it.
+	t.Run("ipv4 label still open (#54)", func(t *testing.T) {
+		const in = "resolver miss for https://10.0.0.5.nip.io/x"
+		masked := mustMask(t, New(), in)
+		if !strings.Contains(masked, ".nip.io") {
+			t.Errorf("#54 appears to be fixed — update this test and the docs that call it open:\n"+
+				" in:  %q\n out: %q", in, masked)
+		}
+	})
+}
+
+// TestUUIDOutsideAHostKeepsItsOwnTag is the other half of #48's tag change, and it is not
+// optional.
+//
+// Moving detector 6 behind both host detectors means every other detector now gets first refusal
+// on a UUID, and 9a's group class admits every character a UUID contains. Reasoning that
+// (label\.)+suffix cannot reach a dotless value is not enough: without this test, "a UUID in a
+// hostname became HOST" could quietly become "a UUID became HOST", and TestTypeTags — which
+// checks Contains — would not notice.
+//
+// So these are exact outputs, one per position a UUID can occupy without being part of a host.
+func TestUUIDOutsideAHostKeepsItsOwnTag(t *testing.T) {
+	const uuid = "550e8400-e29b-41d4-a716-446655440000"
+	cases := []struct {
+		name, in, want string
+	}{
+		// Standing alone: no scheme for 9a, no dot or private suffix for 9b.
+		{"bare", "request " + uuid + " timed out", "request <UUID_1> timed out"},
+		// In a URL PATH: 9a's group class excludes '/', so it stops at the authority.
+		{"url path", "GET https://api.acme.com/orders/" + uuid + " 404",
+			"GET https://<HOST_1>/orders/<UUID_1> 404"},
+		// In a home path: detector 6 still precedes detector 10, which is why it is placed
+		// between 9b and 10 rather than at the end of the chain — at the end this would come
+		// back <USER_1>.
+		{"home path", "loaded from /home/" + uuid + "/app.log",
+			"loaded from /home/<UUID_1>/app.log"},
+		// Beside a real bare host, which now numbers first. Both keep their own tag.
+		{"beside a host", "id " + uuid + " on worker.svc", "id <UUID_1> on <HOST_1>"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			if got := mustMask(t, m, c.in); got != c.want {
+				t.Errorf("a UUID outside a host changed tag:\n in:   %q\n got:  %q\n want: %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}
+
 // guaranteed to contain whatever placeholders today's detectors actually mint. A detector added
 // later whose group can chew on our own tags goes red here without anyone thinking of the shape.
 //
@@ -672,6 +794,26 @@ var completenessRows = []completenessRow{
 	// Greed guard: the host must stop at "/", not eat the path.
 	{"url-host", "call https://", "internal.acme.com", "/v1"},
 	{"bare-host", "host ", "worker.svc", " failed"},
+	// #48. A UUID used as a hostname LABEL. Detector 6 minted a <UUID_n> inside the host
+	// detectors' span, and every host class excludes '<' and '>', so the host was masked in part
+	// or not at all. One row per shape, because the three fail in three different ways:
+	//
+	//   leading label  -- 9a's group is required immediately after "://", so a tag in the FIRST
+	//                     label kills the whole match and the entire domain shipped with nothing
+	//                     behind it (a public suffix is not on the bare-host allowlist).
+	//   middle label   -- 9a's group takes the labels before the tag and stops, sending the tail.
+	//   bare host      -- 9b's \b re-anchors after the '>' and takes only the private suffix,
+	//                     sending every label before the UUID.
+	//
+	// These rows are placed AFTER the canonical url-host and bare-host rows on purpose:
+	// completenessSecretFor returns the FIRST row whose group lands exactly on the secret, and
+	// TestEveryUncollapsedDetectorHasATemplatizedRow reads that choice.
+	{"url-host/uuid-label-leading", "call https://",
+		"550e8400-e29b-41d4-a716-446655440000.blob.core.windows.net", "/x"},
+	{"url-host/uuid-label-mid", "call https://",
+		"api.550e8400-e29b-41d4-a716-446655440000.acme.com", "/x"},
+	{"bare-host/uuid-label", "host ",
+		"worker-550e8400-e29b-41d4-a716-446655440000.corp.internal", " failed"},
 	{"home-dir", "loaded from /home/", "maxie", "/go/pkg/mod"},
 }
 
@@ -869,6 +1011,12 @@ var templatizedRows = []templatizedRow{
 	{"url-host/middle-digit", "call https://\x00api-gw7x.prod.acme.com\x00/v1"},
 	{"bare-host/middle-digit", "host \x00db01x.corp.internal\x00 failed"},
 	{"bare-host/digit-in-middle-label", "host \x00db.eu1a.corp.internal\x00 failed"},
+	// #48 through the composition, and this row is green BOTH BEFORE AND AFTER the fix -- which
+	// is the point of it. The pipeline collapses a UUID to <UUID>, one of the six UNTAGGED
+	// placeholders pipelinePH names, so 9a's tolerant group steps over it and has always masked
+	// this host whole. The defect lived only on the RAW path -- Trigger.Raw and every context
+	// line -- and this row pins that the reorder does not break the path that was already right.
+	{"url-host/uuid-label", "call https://\x00550e8400-e29b-41d4-a716-446655440000.blob.core.windows.net\x00/x"},
 	{"home-dir/middle-digit", "loaded from /home/\x00deploy2prod\x00/go/pkg/mod"},
 	{"home-dir/middle-digit-users", "path /Users/\x00jane7doe\x00/app.log missing"},
 	// The four widened at 2da31be, now held to completeness rather than to "a token appeared".
