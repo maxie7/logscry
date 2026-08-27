@@ -474,11 +474,11 @@ were open at release time**, none of them involving credential material — and 
 while closing the first of them, found one that does; it is listed last:
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
-  `TODO-VERSION`.** A UUID used as a hostname label is now masked as part of the host. The audit
+  `v0.9.1`.** A UUID used as a hostname label is now masked as part of the host. The audit
   filed this and the IPv4 row below as one defect because they share a cause; fixing it showed
   they do not share a *remedy*, so the count above is right about how many were open and wrong
   about how many issues they were.
-- **ISSUE-TBD** — the half of #48 that ordering cannot reach, refiled as its own class: an inner
+- **#54** — the half of #48 that ordering cannot reach, refiled as its own class: an inner
   detector mints a placeholder inside a host detector's span and **no ordering resolves it**,
   because the right answer depends on what the matched span is part of.
   `https://10.0.0.5.nip.io/x` sends `.nip.io` and `worker-10.0.0.5.corp.internal` sends
@@ -490,7 +490,7 @@ while closing the first of them, found one that does; it is listed last:
   pre-masked template: `s3://…@bucket` sends `bucket`. Not an interference defect — a tolerance
   gap left over from #43 — but it is open and it leaks a host, so it belongs in the same list.
 - **#51** — `sk-proj-…`, the current OpenAI key format, is not recognised as a secret at all.
-- **ISSUE-TBD** — **a username with no password is not a credential to any detector.**
+- **#55** — **a username with no password is not a credential to any detector.**
   `postgres://appuser@db:5432/app` sends `appuser`. Detectors 4, 4b and 4c are all anchored on the
   `:` inside the userinfo, and the URL-host detector's userinfo run is *context* that steps over
   the value rather than a group that captures it — so a password-less userinfo falls through the

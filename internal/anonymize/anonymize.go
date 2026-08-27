@@ -34,7 +34,7 @@
 // 8 must win or the tag says HOST when the value is an IP. But https://10.0.0.5.nip.io/x needs 9a
 // to win, because there the address is a label inside the authority. No ordering of a linear chain
 // satisfies both, since the right answer depends on what the matched span is PART OF and a chain
-// has no notion of that. That half is NOT fixed here and is filed as ISSUE-TBD; the candidate is a
+// has no notion of that. That half is NOT fixed here and is filed as #54; the candidate is a
 // pre-pass identifying the authority span before the inner detectors run, so containment becomes
 // representable instead of inferred from order.
 //
@@ -140,7 +140,7 @@ func New(extraHostSuffixes ...string) *Mapper {
 // pair is the case ordering CANNOT reach: an IPv4 literal in a host label, where
 // https://10.0.0.5.nip.io/x sends ".nip.io" and worker-10.0.0.5.corp.internal sends "worker-",
 // because the two IPv4 cases want opposite orders and no linear chain gives both. Filed as
-// ISSUE-TBD, alongside an IPv4-mapped IPv6 address (#49). Fallbacks were added where the leak was
+// #54, alongside an IPv4-mapped IPv6 address (#49). Fallbacks were added where the leak was
 // credential material; the audit table in BACKLOG.md, not this comment, is the record of what
 // remains.
 func (m *Mapper) Mask(s string) (string, error) {

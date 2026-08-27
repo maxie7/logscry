@@ -921,7 +921,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       and no linear chain gives both, since the right answer depends on what the matched span is
       PART OF. That is a result, and it is what rules out another reordering and points at the
       structural candidate: a pre-pass identifying the authority span before the inner detectors
-      run. Refiled as its own class under **ISSUE-TBD**, together with a shape the sweep added to
+      run. Refiled as its own class under **#54**, together with a shape the sweep added to
       the table: `worker-10.0.0.5.corp.internal` sends `worker-` and has **no `://` to anchor on**,
       so the companion-detector approach that reads our own tags as context — the 4b/4c shape —
       closes only one of the two and was rejected for that reason rather than on cost.
@@ -940,7 +940,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       userinfo run is context that steps over the value rather than a group that captures it. So
       `postgres://appuser@db:5432/app` sends `appuser`. Same family as #46 and the empty-half gap
       — the credential grammar not covering a userinfo shape that exists in the wild — and
-      different from both in which half is missing. v0.4.0 → v0.9.0. `ISSUE-TBD`.
+      different from both in which half is missing. v0.4.0 → v0.9.0. **#55**.
       `internal/pipeline` does not appear in the diff: this package runs at the LLM boundary and
       never feeds `hashTemplate`, so no template hashes move. README corrected at three sites, two
       of which this find contradicted — "the credential cases are fixed" and "none involving
@@ -1050,8 +1050,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, FIXED** (#48) |
       | 6 → 9a | `https://api.550e8400-….acme.com/` | `.acme.com` | **DEFECT, FIXED** (#48) |
       | 6 → 9b | `worker-550e8400-….corp.internal` | `worker-` | **DEFECT, FIXED** (#48) |
-      | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT, open — ISSUE-TBD.** Same cause, DIFFERENT remedy; see below |
-      | 8 → 9b | `worker-10.0.0.5.corp.internal` | `worker-` | **DEFECT, open — ISSUE-TBD.** New in the #48 sweep; not in the original table |
+      | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT, open — #54.** Same cause, DIFFERENT remedy; see below |
+      | 8 → 9b | `worker-10.0.0.5.corp.internal` | `worker-` | **DEFECT, open — #54.** New in the #48 sweep; not in the original table |
       | 7 → 8 | `::ffff:192.168.1.1` | `.168.1.1` | **DEFECT, filed #49** |
       **Detector 10 has no defects at all**, and that is a computed result rather than an
       untested area: every interferer that can reach a `/home/` username masks it entirely.

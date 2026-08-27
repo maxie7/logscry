@@ -496,7 +496,7 @@ func TestEmptyCredentialHalf(t *testing.T) {
 // tag is the product) while https://10.0.0.5.nip.io/x needs 9a to win (the address is a label
 // INSIDE the authority). No ordering of a linear chain satisfies both, because the right answer
 // depends on what the matched span is PART OF and the chain has no notion of that. Filed as
-// ISSUE-TBD, with the impossibility carried as a result rather than left to be rediscovered.
+// #54, with the impossibility carried as a result rather than left to be rediscovered.
 func TestIssue48UUIDInHostname(t *testing.T) {
 	const uuid = "550e8400-e29b-41d4-a716-446655440000"
 
@@ -538,12 +538,12 @@ func TestIssue48UUIDInHostname(t *testing.T) {
 	}
 
 	// The negative half. This is an ASSERTION that the gap is still open, not a tolerated
-	// failure: when ISSUE-TBD is fixed this test goes red and is the reminder to update it.
-	t.Run("ipv4 label still open (ISSUE-TBD)", func(t *testing.T) {
+	// failure: when #54 is fixed this test goes red and is the reminder to update it.
+	t.Run("ipv4 label still open (#54)", func(t *testing.T) {
 		const in = "resolver miss for https://10.0.0.5.nip.io/x"
 		masked := mustMask(t, New(), in)
 		if !strings.Contains(masked, ".nip.io") {
-			t.Errorf("ISSUE-TBD appears to be fixed — update this test and the docs that call it open:\n"+
+			t.Errorf("#54 appears to be fixed — update this test and the docs that call it open:\n"+
 				" in:  %q\n out: %q", in, masked)
 		}
 	})
