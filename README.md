@@ -393,7 +393,12 @@ What it masks: IPv4/IPv6, email addresses, hosts inside URLs and connection stri
 domain), bare hostnames on **private/infra suffixes** (`.internal`, `.local`, `.svc`,
 `.lan`, `.corp`, …; extend with `--llm-anonymize-suffix`), UUIDs, known-shape secrets
 (JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, `user:pass@` credentials), and the username in
-`/home/<user>` and `/Users/<user>` paths. If masking a payload fails, that escalation is
+`/home/<user>` and `/Users/<user>` paths.
+
+A value that is *part of* a hostname is masked as part of that host, under `<HOST_n>`, rather than
+under its own tag: `https://550e8400-….blob.core.windows.net` comes back as one `<HOST_n>` and not
+as `<UUID_n>` followed by a domain. The whole authority is one value, and that is what the model
+should see recur. If masking a payload fails, that escalation is
 **skipped** (the card says so) rather than sent in the clear. What that check can and cannot see
 is worth stating exactly, because the previous wording here was wrong rather than merely vague.
 It re-scans the masked text, so it catches a value a detector missed entirely — including one the
@@ -464,18 +469,37 @@ v0.4.0 → v0.8.7, and the same accidental rescue on a host with a dotted alphab
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
-can mint a placeholder inside that span. The credential cases are fixed. **Four are open at
-release time**, none involving credential material:
+can mint a placeholder inside that span. The *interference* credential cases are fixed. **Four
+were open at release time**, none of them involving credential material — and a later sweep, run
+while closing the first of them, found one that does; it is listed last:
 
-- **#48** — a UUID inside a hostname silences both host detectors:
-  `https://<uuid>.blob.core.windows.net` sends the whole domain, and
-  `worker-<uuid>.corp.internal` sends `worker-`.
+- ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
+  `TODO-VERSION`.** A UUID used as a hostname label is now masked as part of the host. The audit
+  filed this and the IPv4 row below as one defect because they share a cause; fixing it showed
+  they do not share a *remedy*, so the count above is right about how many were open and wrong
+  about how many issues they were.
+- **ISSUE-TBD** — the half of #48 that ordering cannot reach, refiled as its own class: an inner
+  detector mints a placeholder inside a host detector's span and **no ordering resolves it**,
+  because the right answer depends on what the matched span is part of.
+  `https://10.0.0.5.nip.io/x` sends `.nip.io` and `worker-10.0.0.5.corp.internal` sends
+  `worker-`, while `https://10.0.0.5/x` must keep masking as `<IP_n>` — and no linear chain gives
+  both. The candidate is structural: identify the authority span before the inner detectors run.
 - **#49** — an IPv4-mapped IPv6 address masks only as far as its first octet:
   `::ffff:192.168.1.1` sends `.168.1.1`.
 - **#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
   pre-masked template: `s3://…@bucket` sends `bucket`. Not an interference defect — a tolerance
   gap left over from #43 — but it is open and it leaks a host, so it belongs in the same list.
 - **#51** — `sk-proj-…`, the current OpenAI key format, is not recognised as a secret at all.
+- **ISSUE-TBD** — **a username with no password is not a credential to any detector.**
+  `postgres://appuser@db:5432/app` sends `appuser`. Detectors 4, 4b and 4c are all anchored on the
+  `:` inside the userinfo, and the URL-host detector's userinfo run is *context* that steps over
+  the value rather than a group that captures it — so a password-less userinfo falls through the
+  whole chain. Found by the sweep that came with #48, and **not** an interference defect: it is a
+  coverage gap in the credential grammar, the same family as the `redis://:password@host` case
+  above and differing in which half is missing. v0.4.0 → v0.9.0. Whether the username actually
+  leaves the process depends on what follows the `@`, which is #46's table inverted: a dotted host
+  masks it by accident as `<EMAIL_n>`, an address literal masks it by accident as `<HOST_n>`, and
+  a **single-label host — `@db`, `@redis`, `@rabbit`, the ordinary container DSN — sends it**.
 
 The full interference table, including the pairs that turned out to be harmless and why, is in
 `BACKLOG.md`.

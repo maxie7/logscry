@@ -873,6 +873,80 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
 
+- [x] **A UUID in a hostname is part of the host, not a value beside it** — #48, the first of the
+      four the audit left open. `--llm-anonymize` sent a hostname in part or in full whenever one
+      of its labels was a UUID: `https://<uuid>.blob.core.windows.net/x` sent the whole domain
+      with nothing behind it, `https://api.<uuid>.acme.com/` sent `.acme.com`, and
+      `worker-<uuid>.corp.internal` sent `worker-`. v0.4.0 → v0.9.0.
+      **The cause is the interference class, and the fix is ordering — the tool that did NOT work
+      for #46.** Detector 6 ran before both host detectors, so a UUID label minted a `<UUID_n>`
+      inside their span; every host class excludes `<` and `>`, so 9a (whose group is required
+      immediately after `://`) failed to match AT ALL on a leading label, truncated on a middle
+      one, and 9b's `\b` re-anchored past the tag and took only the private suffix. Both host
+      detectors are `verify: false`, so `residue` reported clean and the escalation was SENT.
+      **Live on the RAW path only, which is most of a payload.** `Trigger.Raw`, `Trigger.Source`
+      and every context line reach `Mask` as raw text; the `Template` field does not, because the
+      pipeline collapses a UUID to `<UUID>` — one of the six untagged names `pipelinePH` matches —
+      so the tolerant host group has always stepped over it there. A wire capture shows both in
+      one payload: the trigger line leaking and the same line's masked template clean.
+      `templatizedRows` carries a row that is green BEFORE and AFTER for exactly this reason.
+      **Why reordering is legitimate here and was rejected for #46**, which is the part that will
+      not survive in anyone's head. Most-specific-first governs detectors that COMPETE FOR THE
+      SAME SPAN — an email contains a host, an IP is digits-and-dots a host regex would grab —
+      and in each such pair the more specific detector must run first. Detector 6 is in no such
+      relation with the host detectors: a UUID standing alone is unreachable by both, since 9a
+      needs a `://` and 9b needs a dotted name on a private suffix, and a UUID has neither a
+      scheme nor a dot. The only text they contend for is a UUID INSIDE a host, and there the host
+      is the right answer. **Containment, not competition, and the container wins** — so the move
+      APPLIES the stated principle rather than breaking it, and the package comment now says so.
+      For #46 the blockers were genuinely more specific and had to precede detector 4; order was
+      the wrong tool. The prediction recorded in that entry — "it remains a candidate for the
+      UUID-vs-host pair below" — was right, and this is why.
+      **The tag changes and that was argued, not noted.** Such a UUID now comes back `<HOST_n>`
+      instead of `<UUID_n>`. The choice was never `<UUID_n>` against `<HOST_n>`; it was "`<UUID_n>`
+      plus a leaked domain" against "`<HOST_n>` and nothing leaked". `HOST` is also the truer
+      thing to tell the model — it is a host that recurs, not an identifier that recurs. Pinned on
+      BOTH sides, because with detector 6 at the back of the chain every other detector now gets
+      first refusal on a UUID and 9a's group class admits every character a UUID contains:
+      `TestTypeTags` pins the change, and `TestUUIDOutsideAHostKeepsItsOwnTag` pins with exact
+      outputs that a bare UUID, a UUID in a URL path and a UUID in a `/home/` path all still come
+      back `<UUID_n>`. Detector 6 sits between 9b and 10 rather than at the end for the last of
+      those: ahead of the home-dir detector, `/home/<uuid>/` stays `<UUID_n>` and not `<USER_n>`.
+      **Stated plainly: this is a PARTIAL fix and the rest is refiled, not left in a comment.**
+      The audit filed three rows as one defect because they share a cause. They do not share a
+      remedy. An IPv4 literal in a host label does exactly the same thing and ordering CANNOT
+      resolve it, because the two IPv4 cases want opposite orders — `https://10.0.0.5/x` needs
+      detector 8 to win (the address IS the authority and the `IP` tag is the product) while
+      `https://10.0.0.5.nip.io/x` needs 9a to win (the address is a label INSIDE the authority) —
+      and no linear chain gives both, since the right answer depends on what the matched span is
+      PART OF. That is a result, and it is what rules out another reordering and points at the
+      structural candidate: a pre-pass identifying the authority span before the inner detectors
+      run. Refiled as its own class under **ISSUE-TBD**, together with a shape the sweep added to
+      the table: `worker-10.0.0.5.corp.internal` sends `worker-` and has **no `://` to anchor on**,
+      so the companion-detector approach that reads our own tags as context — the 4b/4c shape —
+      closes only one of the two and was rejected for that reason rather than on cost.
+      **The sweep, as computed results.** Which detectors can mint a tag inside a host detector's
+      GROUP span? Beyond 6 (fixed) and 8 (refiled): detectors 1, 2 and 3b are structurally
+      identical — their alphabets are subsets of the host classes — but require a hostname label
+      that literally IS a JWT, an `AKIA…` key or an `sk-` key, so they stand where `1/2/3b → 5`
+      does, theoretical. Detector 5 masks the value WHOLE under the wrong tag, harmless. Detector
+      3a reaches 9a's ANCHOR rather than its group, by masking a scheme when an empty `Bearer`
+      precedes a URL — that is **#52's** cause, a tolerance gap on an anchor, not this class.
+      **Detectors 7 and 10 are impossible, and that is computed rather than unswept**: 7 needs a
+      `:` and 10 needs a `/`, and each of those characters is one that TERMINATES a host.
+      **One find was NOT in this class and is filed separately** rather than buried in an
+      interference issue where nobody would look for it: a userinfo with no password is invisible
+      to every credential detector, because 4, 4b and 4c are all anchored on the `:` and 9a's
+      userinfo run is context that steps over the value rather than a group that captures it. So
+      `postgres://appuser@db:5432/app` sends `appuser`. Same family as #46 and the empty-half gap
+      — the credential grammar not covering a userinfo shape that exists in the wild — and
+      different from both in which half is missing. v0.4.0 → v0.9.0. `ISSUE-TBD`.
+      `internal/pipeline` does not appear in the diff: this package runs at the LLM boundary and
+      never feeds `hashTemplate`, so no template hashes move. README corrected at three sites, two
+      of which this find contradicted — "the credential cases are fixed" and "none involving
+      credential material" were both true of the interference audit and both false once the
+      password-less userinfo turned up.
+
 - [x] **A credential's other half is still a credential** — #46, and the audit that came with
       it. `--llm-anonymize` sent half of every URL credential to the configured model endpoint
       in the clear whenever the other half was itself a recognised secret.
@@ -973,9 +1047,11 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 6 → 10, 1/2/3b → 10 | `/home/550e8400-…/app.log` | nothing | **harmless**; blocking detector 10 costs a tag, never a value |
       | 1/2/3b → 3a | `Bearer AKIAIOSFODNN7EXAMPLE` | nothing | **harmless**; already pinned by `TestPlaceholdersAreInert` |
       | 1/2/3b → 5 | `eyJ….eyJ….sig@example.com` | the domain | **theoretical**; nothing puts a JWT in an email local part |
-      | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, filed #48** |
-      | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT, filed #48** (same cause) |
-      | 6 → 9b | `worker-550e8400-….corp.internal` | `worker-` | **DEFECT, filed #48** (same cause) |
+      | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, FIXED** (#48) |
+      | 6 → 9a | `https://api.550e8400-….acme.com/` | `.acme.com` | **DEFECT, FIXED** (#48) |
+      | 6 → 9b | `worker-550e8400-….corp.internal` | `worker-` | **DEFECT, FIXED** (#48) |
+      | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT, open — ISSUE-TBD.** Same cause, DIFFERENT remedy; see below |
+      | 8 → 9b | `worker-10.0.0.5.corp.internal` | `worker-` | **DEFECT, open — ISSUE-TBD.** New in the #48 sweep; not in the original table |
       | 7 → 8 | `::ffff:192.168.1.1` | `.168.1.1` | **DEFECT, filed #49** |
       **Detector 10 has no defects at all**, and that is a computed result rather than an
       untested area: every interferer that can reach a `/home/` username masks it entirely.
