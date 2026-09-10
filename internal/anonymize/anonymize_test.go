@@ -83,6 +83,12 @@ func TestTypeTags(t *testing.T) {
 		// "hunter2@db.acme.com" was the only thing keeping the password off the wire, and it did so
 		// under the wrong tag and glued to the host.
 		{"dsn=postgres://sk-livekeyabcdefghij0123456789XYZ:hunter2@db.acme.com/prod", "<TOKEN_2>"},
+		// #55: a userinfo with no password is a credential, and the tag is the point. Before the
+		// fix this input came back with "appuser" in the clear beside <HOST_1>; against a dotted
+		// host it came back <EMAIL_1>, which is the wrong tag for a username and glued it to the
+		// host besides. Contains cannot see a tag that is right for the wrong span, so the exact
+		// output is pinned in TestIssue55PasswordlessUserinfo and this row states the type claim.
+		{"dsn=postgres://appuser@db:5432/app", "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -463,6 +469,122 @@ func TestEmptyCredentialHalf(t *testing.T) {
 	}
 }
 
+// TestIssue55PasswordlessUserinfo is the named regression for #55, and it carries exact outputs
+// because TestTypeTags checks Contains and so cannot see a tag that is right for the wrong span.
+//
+// A userinfo with no password matched NO credential detector from v0.4.0 onward. Detectors 4, 4b
+// and 4c were all anchored on the ':' inside it, and 9a's userinfo run is CONTEXT that steps over
+// the value to reach the host rather than a group that captures it — apply() writes only the
+// target group and residue() tests only the target group, so a run that is neither masks nothing.
+// "postgres://appuser@db" therefore sent "appuser", Mask returned nil, residue() returned "" and
+// the escalation was SENT.
+//
+// Whether the username actually left the process depended on the authority, and that is where the
+// issue AS FILED was wrong in the DANGEROUS direction. It said a dotted host rescues the username
+// as an email and an address literal rescues it as a host. Both rescues are PARTIAL: each holds
+// only while the username lies inside the RESCUING detector's alphabet, and both alphabets are
+// narrower than RFC 3986's userinfo production. The rows below carry one character that defeats
+// each, and they are the rows that would have been left out by an example chosen to pass.
+func TestIssue55PasswordlessUserinfo(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		// The shapes that leaked outright: an ordinary container or compose service name after the
+		// '@', which is how a DSN is written in every docker-compose file in existence.
+		{"bare host", "dsn=postgres://appuser@db:5432/app",
+			"dsn=postgres://<TOKEN_1>@<HOST_1>:5432/app"},
+		{"loopback", "dsn=postgres://appuser@localhost:5432/app",
+			"dsn=postgres://<TOKEN_1>@<HOST_1>:5432/app"},
+		{"service name", "dsn=amqp://svcbroker@rabbit:5672/vhost",
+			"dsn=amqp://<TOKEN_1>@<HOST_1>:5672/vhost"},
+		// The accidental rescues, now done by the right detector under the right tag. Before the
+		// fix the first came back <EMAIL_1> covering the username AND the host as one value, and
+		// the second came back <HOST_1> for the username with the address separately <IP_1>.
+		{"dotted host", "dsn=postgres://appuser@db.acme.com/prod",
+			"dsn=postgres://<TOKEN_1>@<HOST_1>/prod"},
+		{"address host", "dsn=postgres://appuser@10.0.0.5:5432/db",
+			"dsn=postgres://<TOKEN_1>@<IP_1>:5432/db"},
+		// Each rescue defeated by ONE character. '!' is a sub-delim, legal in a userinfo and absent
+		// from the email detector's local-part class, so before the fix this masked to
+		// "dsn=postgres://<HOST_1>!<EMAIL_1>/prod" and the '!' went out between two placeholders.
+		{"dotted host, sub-delim in username", "dsn=postgres://us!er@db.acme.com/prod",
+			"dsn=postgres://<TOKEN_1>@<HOST_1>/prod"},
+		// '_' is legal in a userinfo and absent from 9a's group class, so the host-tag rescue took
+		// "svc" and sent the rest: "dsn=postgres://<HOST_1>_user@<IP_1>:5432/db".
+		{"address host, underscore in username", "dsn=postgres://svc_user@10.0.0.5:5432/db",
+			"dsn=postgres://<TOKEN_1>@<IP_1>:5432/db"},
+		// Percent-encoding, which is what makes a password containing '@' or ':' legal at all. It
+		// works because the classes are NEGATED — "%40" is three characters, none of which is '@' —
+		// and until these rows nothing in this package tested that it does.
+		{"pct-encoded username, no password", "dsn=postgres://u%40ser@db:5432/app",
+			"dsn=postgres://<TOKEN_1>@<HOST_1>:5432/app"},
+		{"pct-encoded password", "dsn=postgres://appuser:p%40ss@db:5432/app",
+			"dsn=postgres://<TOKEN_1>@<HOST_1>:5432/app"},
+		// A userinfo may contain more than one ':' (RFC 3986 §3.2.1). The merged rule spans it
+		// exactly as detector 4 did, because detector 4's PASSWORD class already admitted ':' —
+		// only the FIRST colon was ever structural, and only as a required delimiter.
+		{"multi-colon userinfo", "dsn=postgres://appuser:hun:ter2@db:5432/app",
+			"dsn=postgres://<TOKEN_1>@<HOST_1>:5432/app"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			got := mustMask(t, m, c.in)
+			if got != c.want {
+				t.Errorf("password-less userinfo not masked as expected:\n in:   %q\n got:  %q\n want: %q",
+					c.in, got, c.want)
+			}
+			if r := m.Restore(got); r != c.in {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", c.in, r)
+			}
+		})
+	}
+
+	// The class is verify-eligible now, and it could not have been before: no detector matched the
+	// shape at all, so residue() could not have caught it however hard it looked. If some future
+	// detector ever blocks this rule the way 1-3b block detector 4, the escalation is MUTED rather
+	// than sent — which is the outcome #46 taught us to want.
+	if tag := New().residue("postgres://appuser@db:5432/app"); tag != tagToken {
+		t.Errorf("a password-less userinfo is not verify-eligible: residue = %q, want %q", tag, tagToken)
+	}
+
+	// The negative half, in TestIssue48UUIDInHostname's style. These are ASSERTIONS that the gaps
+	// are open, not tolerated failures: each goes red when its issue is fixed and is the reminder
+	// to update the docs that call it open. One run therefore shows both what this fix reaches and
+	// what it does not.
+	open := []struct{ name, in, leak string }{
+		// A detector recognised only PART of the half, so a tag sits mid-value and every credential
+		// group — all of which must exclude '<' — is blocked. The remainder can lie on EITHER side
+		// of the tag, so unlike #46 this is not covered by adding two rules: no single pattern
+		// reaches it. ISSUE-TBD.
+		{"partly-recognised half (ISSUE-TBD)", "s3://AKIAIOSFODNN7EXAMPLE.prod@bucket", ".prod"},
+		// The same shape WITH a colon, which is the half that matters: #46's own fix does not cover
+		// it either, so this is an uncovered remainder of #46 rather than a leftover of #55.
+		{"partly-recognised half, with colon (ISSUE-TBD)",
+			"s3://AKIAIOSFODNN7EXAMPLE.prod:secret@bucket", ".prod"},
+		// A raw '@' in the password. net/url parses this correctly by taking the LAST '@', so it is
+		// NOT an unparseable URI — but every credential group excludes '@' because that is the
+		// delimiter they anchor on, so the mask stops at the FIRST one and the TRUE HOST goes out
+		// behind it. ISSUE-TBD.
+		{"raw '@' in the password (ISSUE-TBD)", "postgres://user:p@ss@db", "@db"},
+		// A raw '/' in the password. net/url ERRORS on this one, so unlike the '@' case there is no
+		// reliable parse to widen towards and the honest candidate is to fail closed rather than
+		// mask in part. Today the username is masked as a HOST and both the password remainder and
+		// the real host are sent. ISSUE-TBD.
+		{"raw '/' in the password (ISSUE-TBD)", "postgres://user:p/ss@db", "p/ss"},
+		// No scheme, so no "://" for any credential rule to anchor on. By design rather than by
+		// defect, and here so one run also shows the boundary of what the anchor reaches.
+		{"no scheme, by design", "user@db:5432/app", "user@db"},
+	}
+	for _, c := range open {
+		t.Run(c.name, func(t *testing.T) {
+			masked := mustMask(t, New(), c.in)
+			if !strings.Contains(masked, c.leak) {
+				t.Errorf("this gap appears to be closed — update this test and the docs that call it open:\n"+
+					" in:  %q\n out: %q\n looking for: %q", c.in, masked, c.leak)
+			}
+		})
+	}
+}
+
 // TestNoDetectorGroupLandsOnOurOwnOutput is the durable output of the #46 interference audit,
 // mechanized so it does not have to be re-derived by hand.
 //
@@ -781,16 +903,59 @@ var completenessRows = []completenessRow{
 	{"url-credentials/premasked-password",
 		"dsn=postgres://", "app7user",
 		":" + phMark + "sk-abcdefghij0123456789XYZ" + phMark + "@" + phMark + "db.acme.com" + phMark + "/prod"},
-	// The empty halves, a DIFFERENT defect closed by the same patch: detector 4 requires at
-	// least one character on each side of the colon, and a Redis DSN has no username (Redis had
-	// none before 6.0). Nothing is pre-masked in these two — the credential detector simply
-	// never covered the shape. Both put text flush against the value with no separator at all
-	// (":" on the left, ":@" on the right), so they double as the greed guard for the '*'
-	// quantifier that admits them.
+	// The empty halves, a DIFFERENT defect from #46 and closed alongside it: the credential
+	// detector required at least one character on each side of the colon, and a Redis DSN has no
+	// username (Redis had none before 6.0). Nothing is pre-masked in these two — the detector
+	// simply never covered the shape.
+	//
+	// #55's merge moved the SPAN here rather than whether the value is masked. With the colon an
+	// ordinary userinfo character, the rule captures it along with the half beside it, so the
+	// declared secret carries the colon and the prefix/suffix no longer do. That is a traded
+	// signal, not a tidy-up, and it is pinned as one in TestAcceptedOverMasking rather than left
+	// to be inferred from these two rows.
 	{"url-credentials/empty-username",
-		"dsn=redis://:", "s3cr3tpw", "@" + phMark + "cache.acme.internal" + phMark + ":6379/0"},
+		"dsn=redis://", ":s3cr3tpw", "@" + phMark + "cache.acme.internal" + phMark + ":6379/0"},
 	{"url-credentials/empty-password",
-		"dsn=postgres://", "svc7acct", ":@" + phMark + "db.acme.com" + phMark + "/prod"},
+		"dsn=postgres://", "svc7acct:", "@" + phMark + "db.acme.com" + phMark + "/prod"},
+	// #55. A userinfo with NO password, and therefore no colon for any credential detector to
+	// anchor on. One row per authority shape, because whether the username actually left the
+	// process depended entirely on what followed the '@' — #46's table inverted. The bare-host
+	// and loopback rows are the shapes that leaked outright; the dotted and address rows were
+	// rescued by the email and host detectors, under the wrong tag and only PARTLY (see
+	// TestIssue55PasswordlessUserinfo for the one character that defeats each rescue).
+	//
+	// Text is flush against the value at both ends by construction: the prefix ends with "//"
+	// and the suffix opens with the '@' the rule anchors on, so neither end has a separator to
+	// hide an over-reach behind.
+	{"url-credentials/no-password/bare-host",
+		"dsn=postgres://", "appuser", "@" + phMark + "db" + phMark + ":5432/app"},
+	{"url-credentials/no-password/loopback",
+		"dsn=postgres://", "appuser", "@" + phMark + "localhost" + phMark + ":5432/app"},
+	{"url-credentials/no-password/dotted-host",
+		"dsn=postgres://", "appuser", "@" + phMark + "db.acme.com" + phMark + "/prod"},
+	{"url-credentials/no-password/private-host",
+		"dsn=postgres://", "appuser", "@" + phMark + "cache.acme.internal" + phMark + ":6379/0"},
+	{"url-credentials/no-password/address-host",
+		"dsn=postgres://", "appuser", "@" + phMark + "10.0.0.5" + phMark + ":5432/app"},
+	// Green BEFORE and AFTER #55, which is the whole point of them. The merge makes the colon an
+	// ordinary userinfo character, so the two shapes whose reading depends on a colon had to be
+	// CHECKED rather than assumed to be unaffected.
+	//
+	// A multi-colon userinfo is legal — RFC 3986 §3.2.1 puts ':' in the production — and its span
+	// is byte-identical before and after, because detector 4's PASSWORD class already admitted
+	// ':'. Only the first colon was ever structural, and only as a required delimiter; the rest
+	// were already just characters, which is why removing the first one's special status changes
+	// nothing here.
+	//
+	// A percent-encoded '@' is what makes a password containing '@' legal at all, so
+	// "postgres://user:p%40ss@host" is an ordinary DSN rather than an edge case. It works, and it
+	// works by construction rather than by luck of example: the classes are NEGATED, so '%', '4'
+	// and '0' are three ordinary characters and nothing anywhere in this package special-cases
+	// pct-encoding. Nothing relied on that until this row — there was no test for it.
+	{"url-credentials/multi-colon",
+		"dsn=postgres://", "appuser:hun:ter2", "@" + phMark + "db.acme.com" + phMark + "/prod"},
+	{"url-credentials/pct-encoded-at",
+		"dsn=postgres://", "appuser:p%40ss", "@" + phMark + "db.acme.com" + phMark + "/prod"},
 	// Greed guard: the host must stop at "/", not eat the path.
 	{"url-host", "call https://", "internal.acme.com", "/v1"},
 	{"bare-host", "host ", "worker.svc", " failed"},
@@ -932,6 +1097,45 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// and inherit it unchanged. Pinned here so that if they ever widen it, the diff shows up as a
 		// behaviour change rather than passing as "detector 4 always did that".
 		{"url query absorbed as credentials", "https://api.acme.com?q=a:b@c", "https://<TOKEN_1>@<HOST_1>"},
+		// #55's widening, and it is the colon-LESS sibling of the row above rather than a change to
+		// it: that input has a colon, so detector 4 has always owned it and its output is
+		// byte-identical before and after the merge.
+		//
+		// This one was absent from the table because it was not over-masked — it was UNDER-masked.
+		// Today the input sends "api.acme.com" in the clear: 9a is compiled leftmost-longest, so it
+		// reads "api.acme.com?q=a@" as userinfo CONTEXT, steps over it, and masks only the "b"
+		// behind it. So the widening CLOSES a host leak as well as costing an over-mask, and that
+		// is what the trade rests on — the package's over-mask-rather-than-under-mask asymmetry is
+		// the second argument here, not the only one.
+		{"url query absorbed as credentials, no colon",
+			"https://api.acme.com?q=a@b", "https://<TOKEN_1>@<HOST_1>"},
+		// THE TRADED SIGNAL, recorded on purpose rather than arriving as a side effect of the
+		// merge. Detector 4 now spans the whole userinfo, so a colon beside an ABSENT half is
+		// captured with the half that is there: "redis://:<TOKEN_1>@" becomes "redis://<TOKEN_1>@".
+		//
+		// Restore is unaffected — it substitutes the exact matched text — so nothing is lost on the
+		// way home. What is lost is a hint on the way OUT: the leading colon used to tell the model
+		// the missing half was the USERNAME, which is what makes a Redis DSN recognisably a Redis
+		// DSN. That is a real cost, judged the cheap half of "one rule instead of two", and written
+		// down here so the judgement is visible rather than implied by two moved completeness rows.
+		{"empty username: the colon is absorbed",
+			"dsn=redis://:s3cr3tpw@cache.acme.internal:6379/0", "dsn=redis://<TOKEN_1>@<HOST_1>:6379/0"},
+		{"empty password: the colon is absorbed",
+			"postgres://svcacct:@db", "postgres://<TOKEN_1>@<HOST_1>"},
+		// The degenerate end of the same widening: a userinfo that is nothing BUT a delimiter now
+		// mints a placeholder for a value that does not exist, and tells the model there is a
+		// credential where there is none. Nothing leaks either way — there is nothing there to
+		// leak — so this is the cheapest cell in the trade, and the most obviously silly, which is
+		// why it is stated rather than left for someone to find on a card.
+		{"bare colon userinfo", "postgres://:@db", "postgres://<TOKEN_1>@<HOST_1>"},
+		// A public git remote, which is ordinary in a clone log and a Go module stack frame. Before
+		// #55 the EMAIL detector took "git@github.com" whole, so this was already masked — under a
+		// tag saying "address" for a value that is a username and a host. Nothing is disclosed
+		// either way and both tags are now right, but the OUTPUT moves, so it is pinned here rather
+		// than left to surprise a reader.
+		{"git remote username absorbed",
+			"git+ssh://git@github.com/org/repo.git cloned",
+			"git+ssh://<TOKEN_1>@<HOST_1>/org/repo.git cloned"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -998,7 +1202,15 @@ var templatizedRows = []templatizedRow{
 	{"url-credentials/premasked-password",
 		"dsn=postgres://\x00app7user\x00:\x00sk-livekeyabcdefghij0123456789XYZ\x00@\x00db01.corp.internal\x00/prod"},
 	{"url-credentials/empty-username",
-		"dsn=redis://:\x00s3cr3tpw\x00@\x00cache01.corp.internal\x00:6379/0"},
+		"dsn=redis://\x00:s3cr3tpw\x00@\x00cache01.corp.internal\x00:6379/0"},
+	// #55 through the composition, and it is red before the fix for a reason worth naming: the
+	// templatized line masks to "dsn=postgres://<EMAIL_1>:<NUM>/app", ONE placeholder swallowing
+	// the username and the host together, so the derived expectation fails on the mark count
+	// rather than on a surviving fragment. A userinfo is a value the pipeline does not collapse
+	// — it breaks it with <NUM> and leaves the rest — so this row is required coverage under
+	// TestEveryUncollapsedDetectorHasATemplatizedRow, not decoration.
+	{"url-credentials/no-password",
+		"dsn=postgres://\x00app7user\x00@\x00db01.corp.internal\x00:5432/app"},
 	{"email/digit-in-local", "mail to \x00user01@corp.example.com\x00 bounced"},
 	{"email/digit-in-domain", "mail to \x00bob@db01.example.com\x00 bounced"},
 	{"email/digit-mid-token-both-sides", "mail to \x00us3r@corp7.example.com\x00 bounced"},
