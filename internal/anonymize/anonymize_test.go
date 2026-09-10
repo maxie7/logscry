@@ -554,22 +554,22 @@ func TestIssue55PasswordlessUserinfo(t *testing.T) {
 		// A detector recognised only PART of the half, so a tag sits mid-value and every credential
 		// group — all of which must exclude '<' — is blocked. The remainder can lie on EITHER side
 		// of the tag, so unlike #46 this is not covered by adding two rules: no single pattern
-		// reaches it. ISSUE-TBD.
-		{"partly-recognised half (ISSUE-TBD)", "s3://AKIAIOSFODNN7EXAMPLE.prod@bucket", ".prod"},
+		// reaches it. #57.
+		{"partly-recognised half (#57)", "s3://AKIAIOSFODNN7EXAMPLE.prod@bucket", ".prod"},
 		// The same shape WITH a colon, which is the half that matters: #46's own fix does not cover
 		// it either, so this is an uncovered remainder of #46 rather than a leftover of #55.
-		{"partly-recognised half, with colon (ISSUE-TBD)",
+		{"partly-recognised half, with colon (#57)",
 			"s3://AKIAIOSFODNN7EXAMPLE.prod:secret@bucket", ".prod"},
 		// A raw '@' in the password. net/url parses this correctly by taking the LAST '@', so it is
 		// NOT an unparseable URI — but every credential group excludes '@' because that is the
 		// delimiter they anchor on, so the mask stops at the FIRST one and the TRUE HOST goes out
-		// behind it. ISSUE-TBD.
-		{"raw '@' in the password (ISSUE-TBD)", "postgres://user:p@ss@db", "@db"},
+		// behind it. #58.
+		{"raw '@' in the password (#58)", "postgres://user:p@ss@db", "@db"},
 		// A raw '/' in the password. net/url ERRORS on this one, so unlike the '@' case there is no
 		// reliable parse to widen towards and the honest candidate is to fail closed rather than
 		// mask in part. Today the username is masked as a HOST and both the password remainder and
-		// the real host are sent. ISSUE-TBD.
-		{"raw '/' in the password (ISSUE-TBD)", "postgres://user:p/ss@db", "p/ss"},
+		// the real host are sent. #59.
+		{"raw '/' in the password (#59)", "postgres://user:p/ss@db", "p/ss"},
 		// No scheme, so no "://" for any credential rule to anchor on. By design rather than by
 		// defect, and here so one run also shows the boundary of what the anchor reaches.
 		{"no scheme, by design", "user@db:5432/app", "user@db"},

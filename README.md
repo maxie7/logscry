@@ -411,7 +411,7 @@ reason it cannot catch a value whose detector was blocked by a placeholder minte
 The first proviso is the one #55 added, and it is the flatter of the two: the re-scan is the
 detectors, run again, so a *shape no detector describes* is invisible to it by construction
 rather than by accident. A password-less userinfo was exactly that, and the re-scan reported
-clean on every one of them for sixteen releases. Completeness is enforced by the detectors' own
+clean on every one of them for fifteen releases. Completeness is enforced by the detectors' own
 tests, not at runtime.
 
 **Compressed IPv6 was masked only in part before v0.8.6.** From v0.4.0 — the release
@@ -471,13 +471,13 @@ at least one character on each side of the colon. `redis://:password@host` has n
 had none before 6.0 — so the ordinary Redis DSN matched no credential detector at all. Same span,
 v0.4.0 → v0.8.7, and the same accidental rescue on a host with a dotted alphabetic suffix.
 
-**A username with no password was sent in the clear before `TODO-VERSION`.** The third gap in
+**A username with no password was sent in the clear before `v0.9.2`.** The third gap in
 the same grammar, and the one with no colon anywhere to anchor on. The credential detectors were
 all written around a literal `:` between two runs, and the URL-host detector's userinfo run is
 *context* that steps over the value to reach the host rather than a group that captures it — so
 `postgres://appuser@db:5432/app` fell through the whole chain and sent `appuser`. Masking
 returned no error and the fail-closed re-scan reported clean, because no pattern described the
-shape to look for it with. v0.4.0 → v0.9.1, sixteen tagged releases.
+shape to look for it with. v0.4.0 → v0.9.1, fifteen tagged releases.
 
 Whether the username actually left the process depended on the authority, and this is #46's
 table inverted — **with both accidental rescues only partial**, which the issue as filed did not
@@ -512,7 +512,7 @@ were open at release time**, none of them involving credential material — a cl
 been corrected twice by later sweeps rather than once, so it should be read as a statement about
 what the interference audit examined and not about what the package leaked. The sweep run while
 closing the first of them found a credential gap the audit had no reason to look at (#55, closed
-in `TODO-VERSION`); the sweep run while closing *that* found three more, listed last below. Each
+in `v0.9.2`); the sweep run while closing *that* found three more, listed last below. Each
 time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -533,24 +533,24 @@ time the audit's own count was right and its scope was narrower than the sentenc
   gap left over from #43 — but it is open and it leaks a host, so it belongs in the same list.
 - **#51** — `sk-proj-…`, the current OpenAI key format, is not recognised as a secret at all.
 - ~~**#55** — a username with no password is not a credential to any detector.~~ **Closed in
-  `TODO-VERSION`.** See the paragraph above. The sweep that closed it enumerated the whole
+  `v0.9.2`.** See the paragraph above. The sweep that closed it enumerated the whole
   userinfo production and found three more gaps in it, which are the three below: they share a
   family with #46 rather than with #55, because in each the grammar describes the value correctly
   and something else stops the rule reaching it.
-- **ISSUE-TBD** — **a userinfo half that a detector recognised only in *part* leaves an
+- **#57** — **a userinfo half that a detector recognised only in *part* leaves an
   unreachable remainder.** `s3://AKIA…EXAMPLE.prod@bucket` sends `.prod`, and so does
   `s3://AKIA…EXAMPLE.prod:secret@bucket` — so **#46's own fix does not cover it**, which makes
   this an uncovered remainder of #46 rather than a leftover of #55. The tag minted mid-value
   blocks every credential rule (all of their groups exclude `<`), and the remainder can lie on
   *either side* of it, so unlike #46 this is not closed by adding two rules: no single pattern
   reaches it. The candidate is structural — a second group or a second tag on the detector type.
-- **ISSUE-TBD** — **a raw `@` in a password truncates the mask and sends the real host.**
+- **#58** — **a raw `@` in a password truncates the mask and sends the real host.**
   `postgres://user:p@ss@db` sends `db`. Every credential group excludes `@` because that is the
   delimiter they anchor on, so the match ends at the *first* `@` and what follows is re-parsed as
   an authority. `@` must be written `%40` to be legal, but this is **not** an unparseable URI:
   RFC 3986 resolves it by taking the last `@`, and Go's `net/url` parses the string correctly.
   The candidate is correspondingly small.
-- **ISSUE-TBD** — **a raw `/` in a password: partial mask, host sent, and no reliable parse.**
+- **#59** — **a raw `/` in a password: partial mask, host sent, and no reliable parse.**
   `postgres://user:p/ss@db` masks the *username* as a host and sends both `p/ss` and `db`.
   Unlike the `@` case there is no correct parse to widen towards — `net/url` errors on it, and
   the RFC says the authority ends at the first `/`, so the string does not mean what its author

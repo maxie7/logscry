@@ -160,8 +160,7 @@ func New(extraHostSuffixes ...string) *Mapper {
 // however hard it looked, there being no pattern to look with. Closing it makes the class
 // verify-eligible for the first time: a password-less userinfo that ever survives masking now
 // mutes the escalation instead of being sent. What stays invisible is the remainder of a half
-// only PARTLY recognised by an earlier detector, for exactly #46's reason and filed as
-// ISSUE-TBD.
+// only PARTLY recognised by an earlier detector, for exactly #46's reason; that is #57.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -391,7 +390,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    '<' and '>' stay excluded. That is the inertness invariant rather than a detail: it
 		//    is what keeps this group off our own output, and it is also the wall that a half only
 		//    PARTLY recognised by an earlier detector runs into, where the remainder may lie on
-		//    either side of the minted tag and no single pattern reaches it. Open; ISSUE-TBD.
+		//    either side of the minted tag and no single pattern reaches it. Open; #57.
 		{tagToken, mustLongest(`://(` + tolerant(`[^/@\s<>]`) + `)@`), 1, true},
 		// 4b/4c. The half of a credential detector 4 can no longer reach.
 		//
@@ -432,7 +431,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     convention, plus matching changes in apply, residue, completenessSecretFor and
 		//     TestNoDetectorGroupLandsOnOurOwnOutput. So three rules is merged as far as the
 		//     struct allows, not nearly merged. The same wall is what makes a PARTLY recognised
-		//     half uncoverable by any pattern at all (ISSUE-TBD): there the remainder can lie on
+		//     half uncoverable by any pattern at all (#57): there the remainder can lie on
 		//     either side of the tag, so it is not two rules, it is none.
 		{tagToken, mustLongest(
 			`://(?:[^:/@\s<>]|` + pipelinePH + `|` + ourPH + `)*:(` +

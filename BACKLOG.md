@@ -875,7 +875,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
 - [x] **A username with no password is still a credential** — #55, the third gap found in one
       grammar and the one that closed it as a class. `--llm-anonymize` sent `appuser` from
-      `postgres://appuser@db:5432/app`, v0.4.0 → v0.9.1, sixteen tagged releases.
+      `postgres://appuser@db:5432/app`, v0.4.0 → v0.9.1, fifteen tagged releases.
       **The cause is a grammar written as delimiters instead of as a production.** RFC 3986
       §3.2.1 gives `userinfo = *( unreserved / pct-encoded / sub-delims / ":" )` — the colon is a
       MEMBER of the production, not a separator between two of them. Detectors 4, 4b and 4c were
@@ -955,12 +955,12 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 7–10 | either or both halves pre-masked | masked by 4b/4c | #46, correct |
       | 11–14 | pct-encoded, sub-delims | masked | works; now tested |
       | 15–16 | multi-colon | masked, span unchanged | only the first colon was ever structural |
-      | 17 | a half recognised only in PART | `.prod` sent, residue clean | **OPEN — ISSUE-TBD** |
-      | 18 | raw `@` in a half | the TRUE HOST sent | **OPEN — ISSUE-TBD** |
-      | 19 | raw `/` in a half | host and remainder sent | **OPEN — ISSUE-TBD** |
+      | 17 | a half recognised only in PART | `.prod` sent, residue clean | **OPEN — #57** |
+      | 18 | raw `@` in a half | the TRUE HOST sent | **OPEN — #58** |
+      | 19 | raw `/` in a half | host and remainder sent | **OPEN — #59** |
       | 20–22 | no scheme; unexpressible shapes | — | computed, not run |
 
-      **Row 17 is not a leftover of #55 and is filed on its own terms.** An earlier detector
+      **Row 17 is not a leftover of #55 and is filed on its own terms, as #57.** An earlier detector
       recognises only part of a half, minting a tag mid-value; every credential group excludes
       `<`, so all three rules are blocked, and the remainder can lie on EITHER side of the tag.
       That is not two rules — it is none, and it is the THIRD encounter with the one-group-one-tag
@@ -968,7 +968,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       `s3://AKIA…EXAMPLE.prod:secret@bucket` leaks too, so **#46's own fix does not cover it** —
       an uncovered remainder of #46 found after #46 was called closed. The candidate named in the
       draft is a second group or a second tag on `detector` rather than another pattern.
-      **Rows 18 and 19 share a cause and NOT a remedy, so they are two issues.** Same distinction
+      **Rows 18 and 19 share a cause and NOT a remedy, so they are two issues, #58 and #59.** Same distinction
       the audit drew when #48 and #54 were split. Both are a delimiter appearing raw inside a half,
       and both are RFC-illegal — but `net/url` PARSES `postgres://user:p@ss@db` correctly, taking
       the last `@` as the RFC requires, so that one is not unparseable and the candidate is to
