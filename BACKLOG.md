@@ -873,6 +873,112 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
 
+- [x] **A username with no password is still a credential** — #55, the third gap found in one
+      grammar and the one that closed it as a class. `--llm-anonymize` sent `appuser` from
+      `postgres://appuser@db:5432/app`, v0.4.0 → v0.9.1, sixteen tagged releases.
+      **The cause is a grammar written as delimiters instead of as a production.** RFC 3986
+      §3.2.1 gives `userinfo = *( unreserved / pct-encoded / sub-delims / ":" )` — the colon is a
+      MEMBER of the production, not a separator between two of them. Detectors 4, 4b and 4c were
+      all written as two runs with a literal `:` between them, which describes the same value in a
+      way that leaves three of its arrangements unreachable, and all three were found separately:
+      the empty username (the Redis DSN, closed alongside #46), the empty password (same patch),
+      and no colon at all — this one, with nothing to anchor on. 9a's userinfo run is CONTEXT that
+      steps over the value to reach the host rather than a group that captures it, because `apply`
+      writes only the target group and `residue` tests only the target group, so the one rule that
+      READS a password-less userinfo masks nothing. `Mask` returned nil, `residue()` returned `""`,
+      the escalation was SENT.
+      **`residue` could not have caught it, and that is a NEW proviso rather than #46's.** The
+      re-scan is the detectors run again, so it is blind to a SHAPE NO DETECTOR DESCRIBES by
+      construction — not, as with #41/#46, because a leftover no longer matches. The README's
+      re-scan paragraph had one proviso and now has two; that sentence has been corrected twice
+      and this is the second time.
+      **The fix MERGES rather than adds, and the number three is argued.** A colon-less fourth
+      rule was the obvious fix. Measured against the whole existing corpus, raw and templatized,
+      it closes EXACTLY the same leaks as widening detector 4's class to admit the colon — so the
+      choice was rule-set shape and not coverage, and when coverage is equal the smaller rule set
+      wins. A grammar covered by four overlapping patterns keyed on which delimiters happen to be
+      present is how the first three gaps happened; a fifth arrangement as a fifth pattern would
+      entrench the shape that has already failed three times. Detector 4 is now one group over the
+      whole userinfo and the colon is an ordinary character in it.
+      **The merge stops at three rules and the wall is `detector{re, group, tag}`.** 4b and 4c
+      mask the half left behind when the other was pre-masked, and that half is on the LEFT for
+      one and the RIGHT for the other; one group and one tag per detector means a single pattern
+      would need two capture positions. Stated in the code as a constraint: merged as far as the
+      struct allows, not nearly merged. This is the second of three encounters with that same
+      constraint against this same grammar — see the third below.
+      **The conditional was measured, and #55 AS FILED understated it.** The issue said a dotted
+      host rescues the username as an `<EMAIL_n>` and an address literal rescues it as a
+      `<HOST_n>`. Both rescues are PARTIAL: each holds only while the username lies inside the
+      RESCUING detector's alphabet, and both alphabets are narrower than the userinfo production.
+      One sub-delim defeats the email rescue — `us!er@db.acme.com` sent the `!`; one underscore
+      defeats the host rescue — `svc_user@10.0.0.5` sent `_user`. So no authority shape was safe,
+      and the correction runs in the dangerous direction rather than the convenient one.
+      **The over-masking trade was decided, not absorbed, and it is not purely a cost.**
+      `https://api.acme.com?q=a@b` now reads as a userinfo. Measured: BEFORE the fix that input
+      sent `api.acme.com` in the clear, because 9a is leftmost-longest and reads the query as
+      userinfo CONTEXT, masking only the `b` behind it. So the widening CLOSES a host leak as well
+      as costing an over-mask, and the package's over-mask-rather-than-under-mask asymmetry is the
+      second argument rather than the only one. The brief predicted the existing
+      `url query absorbed as credentials` row would move; it does not — that input has a colon and
+      detector 4 has always owned it, byte-identical before and after. The colon-LESS sibling is
+      what the widening costs, and it joins the table beside it.
+      **Two shapes checked rather than assumed, because the colon stopped being structural.** A
+      multi-colon userinfo (`user:pass:extra@`) spans byte-identically before and after — detector
+      4's PASSWORD class already admitted `:`, so only the FIRST colon was ever structural, and
+      only as a required delimiter. Percent-encoding needs no handling and never did: the classes
+      are NEGATED, so `%40` is three characters none of which is `@`. Nothing relied on that and
+      nothing tested it; two completeness rows now do.
+      **What it costs is a signal on the way out, pinned in `TestAcceptedOverMasking`.** A colon
+      beside an ABSENT half is captured with the half that is there, so `redis://:<TOKEN_1>@`
+      becomes `redis://<TOKEN_1>@` — `Restore` is exact, but the leading colon used to tell the
+      model the missing half was the USERNAME. `://:@host` is louder: a lone delimiter now mints a
+      placeholder, announcing a credential where there is none. Both moved rows are in that table
+      deliberately rather than arriving as a side effect of the merge.
+      `internal/pipeline` does not appear in the diff: this package runs at the LLM boundary and
+      never feeds `hashTemplate`, so no template hashes move.
+      **The sweep is the deliverable, and it filed three issues rather than three table cells.**
+      The whole userinfo production was enumerated — username present/absent, password
+      present/absent, colon present/absent, either half pre-masked, pct-encoding and sub-delims —
+      and every negative was RUN except three that are impossible to write and were computed from
+      the production: a password with no colon (unexpressible), whitespace/`<`/`>`/`/` inside a
+      half (not in the production), and a userinfo with no scheme (not a URI at all). The full
+      table is below. Three shapes are open and each is filed, because a defect in a table cell is
+      a defect nobody reads — row 17 sat in one and took a different investigation to surface:
+      a half only PARTLY recognised, a raw `@`, and a raw `/`.
+
+      | # | shape | today | verdict |
+      |---|---|---|---|
+      | 1 | `user@` — no colon | `appuser` sent | **FIXED (#55)** |
+      | 2–4 | `user:pass@`, `:pass@`, `user:@` | masked | correct; 3 and 4 move the span |
+      | 5 | `:@` | no match | now masks a lone delimiter |
+      | 6 | `@` — empty userinfo | no match | nothing to leak |
+      | 7–10 | either or both halves pre-masked | masked by 4b/4c | #46, correct |
+      | 11–14 | pct-encoded, sub-delims | masked | works; now tested |
+      | 15–16 | multi-colon | masked, span unchanged | only the first colon was ever structural |
+      | 17 | a half recognised only in PART | `.prod` sent, residue clean | **OPEN — ISSUE-TBD** |
+      | 18 | raw `@` in a half | the TRUE HOST sent | **OPEN — ISSUE-TBD** |
+      | 19 | raw `/` in a half | host and remainder sent | **OPEN — ISSUE-TBD** |
+      | 20–22 | no scheme; unexpressible shapes | — | computed, not run |
+
+      **Row 17 is not a leftover of #55 and is filed on its own terms.** An earlier detector
+      recognises only part of a half, minting a tag mid-value; every credential group excludes
+      `<`, so all three rules are blocked, and the remainder can lie on EITHER side of the tag.
+      That is not two rules — it is none, and it is the THIRD encounter with the one-group-one-tag
+      constraint against this grammar. Decisive measurement:
+      `s3://AKIA…EXAMPLE.prod:secret@bucket` leaks too, so **#46's own fix does not cover it** —
+      an uncovered remainder of #46 found after #46 was called closed. The candidate named in the
+      draft is a second group or a second tag on `detector` rather than another pattern.
+      **Rows 18 and 19 share a cause and NOT a remedy, so they are two issues.** Same distinction
+      the audit drew when #48 and #54 were split. Both are a delimiter appearing raw inside a half,
+      and both are RFC-illegal — but `net/url` PARSES `postgres://user:p@ss@db` correctly, taking
+      the last `@` as the RFC requires, so that one is not unparseable and the candidate is to
+      admit `@` and let leftmost-longest reach the last one. `net/url` ERRORS on
+      `postgres://user:p/ss@db`, because the authority ends at the first `/` and the parse the
+      author meant and the parse the grammar mandates disagree with nothing in the text to
+      separate them. There the honest candidate is to FAIL CLOSED rather than mask in part, which
+      would be the first place in this package where the answer is to mask less and refuse: a
+      partial mask that leaks a host is worse than a skipped escalation.
+
 - [x] **A UUID in a hostname is part of the host, not a value beside it** — #48, the first of the
       four the audit left open. `--llm-anonymize` sent a hostname in part or in full whenever one
       of its labels was a UUID: `https://<uuid>.blob.core.windows.net/x` sent the whole domain
