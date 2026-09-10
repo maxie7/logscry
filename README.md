@@ -392,7 +392,8 @@ disk, never reused.
 What it masks: IPv4/IPv6, email addresses, hosts inside URLs and connection strings (any
 domain), bare hostnames on **private/infra suffixes** (`.internal`, `.local`, `.svc`,
 `.lan`, `.corp`, …; extend with `--llm-anonymize-suffix`), UUIDs, known-shape secrets
-(JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, `user:pass@` credentials), and the username in
+(JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, and a URL userinfo in any of its shapes —
+`user:pass@`, `user@`, `:pass@`), and the username in
 `/home/<user>` and `/Users/<user>` paths.
 
 A value that is *part of* a hostname is masked as part of that host, under `<HOST_n>`, rather than
@@ -403,11 +404,15 @@ should see recur. If masking a payload fails, that escalation is
 is worth stating exactly, because the previous wording here was wrong rather than merely vague.
 It re-scans the masked text, so it catches a value a detector missed entirely — including one the
 pipeline's template mask has already rewritten, which every detector now recognizes in both forms
-— **provided no other detector has already rewritten part of that value's span.** It cannot catch
-a value masked only in part, because the leftover no longer has the shape the detector looks for;
-and for the same structural reason it cannot catch a value whose detector was blocked by a
-placeholder minted inside its span. Completeness is enforced by the detectors' own tests, not at
-runtime.
+— **provided two things: that some detector describes the value's shape at all, and that no other
+detector has already rewritten part of its span.** It cannot catch a value masked only in part,
+because the leftover no longer has the shape the detector looks for; and for the same structural
+reason it cannot catch a value whose detector was blocked by a placeholder minted inside its span.
+The first proviso is the one #55 added, and it is the flatter of the two: the re-scan is the
+detectors, run again, so a *shape no detector describes* is invisible to it by construction
+rather than by accident. A password-less userinfo was exactly that, and the re-scan reported
+clean on every one of them for fifteen releases. Completeness is enforced by the detectors' own
+tests, not at runtime.
 
 **Compressed IPv6 was masked only in part before v0.8.6.** From v0.4.0 — the release
 that introduced `--llm-anonymize` — through v0.8.5, an address written with `::` was masked
@@ -466,12 +471,49 @@ at least one character on each side of the colon. `redis://:password@host` has n
 had none before 6.0 — so the ordinary Redis DSN matched no credential detector at all. Same span,
 v0.4.0 → v0.8.7, and the same accidental rescue on a host with a dotted alphabetic suffix.
 
+**A username with no password was sent in the clear before `v0.9.2`.** The third gap in
+the same grammar, and the one with no colon anywhere to anchor on. The credential detectors were
+all written around a literal `:` between two runs, and the URL-host detector's userinfo run is
+*context* that steps over the value to reach the host rather than a group that captures it — so
+`postgres://appuser@db:5432/app` fell through the whole chain and sent `appuser`. Masking
+returned no error and the fail-closed re-scan reported clean, because no pattern described the
+shape to look for it with. v0.4.0 → v0.9.1, fifteen tagged releases.
+
+Whether the username actually left the process depended on the authority, and this is #46's
+table inverted — **with both accidental rescues only partial**, which the issue as filed did not
+say:
+
+| after the `@` | password-less username |
+|---|---|
+| `@db`, `@redis`, `@rabbit`, `@localhost` | **sent whole** — the ordinary container and compose DSN |
+| `@db.acme.com`, `@cache.acme.internal` | masked by accident as `<EMAIL_n>`, glued to the host — but **only while the username stays inside the email detector's local-part class**. One sub-delim defeats it: `us!er@db.acme.com` sent the `!` |
+| `@10.0.0.5`, `@[2001:db8::1]` | masked by accident as `<HOST_n>` — but **only while the username stays inside the host detector's class**. One underscore defeats it: `svc_user@10.0.0.5` sent `_user` |
+
+So no authority shape was safe, which is again why "conditional" narrows the description and not
+the severity — and a reproduction against a fully-qualified host and a tidy username shows
+nothing wrong.
+
+**The fix merges rather than adds**, and that is worth one line here because it changes what the
+package masks in two places you can see. The credential detector is now a single group over the
+whole userinfo, with the colon an ordinary member of it (RFC 3986 §3.2.1), so a fourth rule for
+the colon-less arrangement was not needed. Two consequences: a colon beside an *absent* half is
+now captured with the half that is there, so `redis://:password@host` masks to
+`redis://<TOKEN_1>@<HOST_1>` rather than `redis://:<TOKEN_1>@<HOST_1>` — the model loses the
+hint that the missing half was the username; and a URL whose query contains an `@` with no
+colon is now read as a credential. The second is not only a cost: before the fix
+`https://api.acme.com?q=a@b` sent **the host** in the clear, so the widening closes a leak as
+well as over-masking.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
 can mint a placeholder inside that span. The *interference* credential cases are fixed. **Four
-were open at release time**, none of them involving credential material — and a later sweep, run
-while closing the first of them, found one that does; it is listed last:
+were open at release time**, none of them involving credential material — a claim that has now
+been corrected twice by later sweeps rather than once, so it should be read as a statement about
+what the interference audit examined and not about what the package leaked. The sweep run while
+closing the first of them found a credential gap the audit had no reason to look at (#55, closed
+in `v0.9.2`); the sweep run while closing *that* found three more, listed last below. Each
+time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
   `v0.9.1`.** A UUID used as a hostname label is now masked as part of the host. The audit
@@ -490,16 +532,30 @@ while closing the first of them, found one that does; it is listed last:
   pre-masked template: `s3://…@bucket` sends `bucket`. Not an interference defect — a tolerance
   gap left over from #43 — but it is open and it leaks a host, so it belongs in the same list.
 - **#51** — `sk-proj-…`, the current OpenAI key format, is not recognised as a secret at all.
-- **#55** — **a username with no password is not a credential to any detector.**
-  `postgres://appuser@db:5432/app` sends `appuser`. Detectors 4, 4b and 4c are all anchored on the
-  `:` inside the userinfo, and the URL-host detector's userinfo run is *context* that steps over
-  the value rather than a group that captures it — so a password-less userinfo falls through the
-  whole chain. Found by the sweep that came with #48, and **not** an interference defect: it is a
-  coverage gap in the credential grammar, the same family as the `redis://:password@host` case
-  above and differing in which half is missing. v0.4.0 → v0.9.0. Whether the username actually
-  leaves the process depends on what follows the `@`, which is #46's table inverted: a dotted host
-  masks it by accident as `<EMAIL_n>`, an address literal masks it by accident as `<HOST_n>`, and
-  a **single-label host — `@db`, `@redis`, `@rabbit`, the ordinary container DSN — sends it**.
+- ~~**#55** — a username with no password is not a credential to any detector.~~ **Closed in
+  `v0.9.2`.** See the paragraph above. The sweep that closed it enumerated the whole
+  userinfo production and found three more gaps in it, which are the three below: they share a
+  family with #46 rather than with #55, because in each the grammar describes the value correctly
+  and something else stops the rule reaching it.
+- **#57** — **a userinfo half that a detector recognised only in *part* leaves an
+  unreachable remainder.** `s3://AKIA…EXAMPLE.prod@bucket` sends `.prod`, and so does
+  `s3://AKIA…EXAMPLE.prod:secret@bucket` — so **#46's own fix does not cover it**, which makes
+  this an uncovered remainder of #46 rather than a leftover of #55. The tag minted mid-value
+  blocks every credential rule (all of their groups exclude `<`), and the remainder can lie on
+  *either side* of it, so unlike #46 this is not closed by adding two rules: no single pattern
+  reaches it. The candidate is structural — a second group or a second tag on the detector type.
+- **#58** — **a raw `@` in a password truncates the mask and sends the real host.**
+  `postgres://user:p@ss@db` sends `db`. Every credential group excludes `@` because that is the
+  delimiter they anchor on, so the match ends at the *first* `@` and what follows is re-parsed as
+  an authority. `@` must be written `%40` to be legal, but this is **not** an unparseable URI:
+  RFC 3986 resolves it by taking the last `@`, and Go's `net/url` parses the string correctly.
+  The candidate is correspondingly small.
+- **#59** — **a raw `/` in a password: partial mask, host sent, and no reliable parse.**
+  `postgres://user:p/ss@db` masks the *username* as a host and sends both `p/ss` and `db`.
+  Unlike the `@` case there is no correct parse to widen towards — `net/url` errors on it, and
+  the RFC says the authority ends at the first `/`, so the string does not mean what its author
+  meant. The honest candidate here is to **fail closed** rather than mask in part: a partial mask
+  that leaks a host is worse than a skipped escalation.
 
 The full interference table, including the pairs that turned out to be harmless and why, is in
 `BACKLOG.md`.
