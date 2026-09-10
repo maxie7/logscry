@@ -55,6 +55,16 @@
 // specific ones and must run first — so the answer is a narrow fallback per blocked half rather
 // than a looser class.
 //
+// THE CREDENTIAL GRAMMAR IS COVERED BY THREE RULES, and the number is argued rather than
+// accumulated, because three gaps were found in that grammar one at a time and each by a
+// different accident (#46; the empty-username case found while fixing it; #55). Since #55
+// detector 4 is one group over the WHOLE userinfo — RFC 3986 §3.2.1 puts ':' inside the
+// production rather than between two of them — so every arrangement of the colon is one rule's
+// business and the delimiter stops being a thing rules are keyed on. What stays split is 4b and
+// 4c, and there the reason is this struct rather than the grammar: the half left behind sits on
+// the left for one and the right for the other, and a detector carries one group and one tag.
+// Three rules is merged as far as the struct allows.
+//
 // The one deliberate exception is the pipeline's own placeholders: see pipelinePH.
 package anonymize
 
@@ -143,6 +153,15 @@ func New(extraHostSuffixes ...string) *Mapper {
 // #54, alongside an IPv4-mapped IPv6 address (#49). Fallbacks were added where the leak was
 // credential material; the audit table in BACKLOG.md, not this comment, is the record of what
 // remains.
+//
+// #55 IS NOT ONE OF THESE NARROWINGS, and separating it from them is the point of saying so. It
+// was not a detector blocked by a placeholder and not one matching in part: it was a SHAPE NO
+// DETECTOR DESCRIBED — a userinfo with no password — so the re-scan could not have caught it
+// however hard it looked, there being no pattern to look with. Closing it makes the class
+// verify-eligible for the first time: a password-less userinfo that ever survives masking now
+// mutes the escalation instead of being sent. What stays invisible is the remainder of a half
+// only PARTLY recognised by an earlier detector, for exactly #46's reason and filed as
+// ISSUE-TBD.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -326,13 +345,54 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		{tagToken, mustLongest(`(?i)\bbearer\s+(` + tolerant(`[A-Za-z0-9._~+/=-]`) + `)`), 1, true},
 		// 3b. sk- style API keys (OpenAI and friends).
 		{tagToken, mustLongest(`\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`), 0, true},
-		// 4. Credentials embedded in a URL / connection string: scheme://user:pass@host.
-		//    Runs before host and email so "@host" survives for the host detector and
-		//    "user:pass@host" is not misread as an email. Both halves are placeholder-tolerant:
-		//    the pipeline turns hunter2 into hunter<NUM>, and a run that stops at '<' can never
-		//    reach the '@' that ends the credential, so the whole detector went quiet (#43).
-		{tagToken, mustLongest(
-			`://(` + tolerant(`[^:/@\s<>]`) + `:` + tolerant(`[^@/\s<>]`) + `)@`), 1, true},
+		// 4. Credentials embedded in a URL / connection string: scheme://userinfo@host.
+		//    Runs before host and email so "@host" survives for the host detector and a userinfo
+		//    is not misread as an email address. Placeholder-tolerant: the pipeline turns hunter2
+		//    into hunter<NUM>, and a run that stops at '<' can never reach the '@' that ends the
+		//    credential, so the whole detector went quiet on the Template field (#43).
+		//
+		//    ONE GROUP OVER THE WHOLE USERINFO, and the colon inside it is not structural. That is
+		//    #55, and it is a MERGE rather than an addition. RFC 3986 §3.2.1 gives
+		//    userinfo = *( unreserved / pct-encoded / sub-delims / ":" ) -- the colon is a MEMBER
+		//    of the production, not a delimiter between two productions -- and this rule now says
+		//    the same thing. Until #55 it was written as two runs with a literal ':' between them,
+		//    which describes the same value in a way that left three of its arrangements
+		//    unreachable, and they were found one at a time by three different accidents:
+		//
+		//      user:pass   both halves, the only shape the old rule was written for
+		//      :pass       no username -- the ordinary Redis DSN, Redis having had none before 6.0
+		//      user:       no password
+		//      user        NO COLON AT ALL, so nothing to anchor on: postgres://appuser@db sent
+		//                  "appuser" from v0.4.0 onward (#55)
+		//
+		//    A FOURTH RULE for the last of those was the obvious fix and was rejected. It closes
+		//    exactly the same leaks as this merge -- measured against the whole existing corpus,
+		//    not assumed -- so the choice was rule-set shape rather than coverage, and a grammar
+		//    covered by four overlapping patterns keyed on which delimiters happen to be present
+		//    is precisely how the first three gaps happened. Adding a fifth arrangement as a fifth
+		//    pattern would entrench the shape that has already failed three times.
+		//
+		//    WHAT THE MERGE COSTS is a signal on the way OUT, and it is pinned in
+		//    TestAcceptedOverMasking rather than left implicit in two moved completeness rows. A
+		//    colon beside an ABSENT half is captured with the half that is there, so
+		//    "redis://:<TOKEN_1>@" becomes "redis://<TOKEN_1>@". Restore is unaffected -- it
+		//    substitutes the exact matched text -- but the leading colon used to tell the model
+		//    that the missing half was the USERNAME, which is what makes a Redis DSN legible as
+		//    one. The degenerate case is louder: "://:@host" now mints a placeholder for a lone
+		//    delimiter, announcing a credential where there is none.
+		//
+		//    THE CLASS STAYS NEGATED rather than becoming RFC 3986's positive one
+		//    ([A-Za-z0-9-._~%!$&'()*+,;=:]). A positive class would be NARROWER than this, and
+		//    narrowing is the disclosure direction in this package; a password carrying an
+		//    unencoded '?' or '#' is illegal and happens. Negation is also why percent-encoding
+		//    needs no special handling and never did -- "%40" is three characters, none of which
+		//    is '@' -- and two completeness rows now say so, because nothing tested it before #55.
+		//
+		//    '<' and '>' stay excluded. That is the inertness invariant rather than a detail: it
+		//    is what keeps this group off our own output, and it is also the wall that a half only
+		//    PARTLY recognised by an earlier detector runs into, where the remainder may lie on
+		//    either side of the minted tag and no single pattern reaches it. Open; ISSUE-TBD.
+		{tagToken, mustLongest(`://(` + tolerant(`[^/@\s<>]`) + `)@`), 1, true},
 		// 4b/4c. The half of a credential detector 4 can no longer reach.
 		//
 		//     Detector 4 masks "user:pass" as ONE value, which is what makes it readable as a
@@ -357,14 +417,23 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     groups therefore exclude '<' and '>' exactly as detector 4's do; only the opposite
 		//     half, which is context, admits a tag.
 		//
-		//     The runs are '*' rather than '+', which closes a SECOND and unrelated gap: detector
-		//     4 required at least one character on each side of the colon, so
-		//     "redis://:password@host" -- the ordinary Redis DSN, Redis having had no username
-		//     before 6.0 -- matched no credential detector at all. That much held on every host
-		//     shape; whether anything actually LEFT the process did not, because the email
-		//     detector took "password@cache.acme.internal" whole whenever the authority ended in
-		//     a dotted alphabetic suffix. Bare host, loopback or address literal and it shipped.
-		//     Same patch, different cause; see the empty-half rows in completenessRows.
+		//     The CONTEXT runs are '*' rather than '+' so a pre-masked half beside an absent one
+		//     still resolves -- "://<TOKEN_1>:@host". The empty-half shapes themselves stopped
+		//     being these rules' business at #55: detector 4 now spans the whole userinfo and
+		//     covers "://:pass@" and "://user:@" directly, so what reaches 4b and 4c is only ever
+		//     a userinfo one of whose halves THIS PACKAGE already masked.
+		//
+		//     THEY ARE ALSO WHY THE #55 MERGE STOPS AT THREE RULES, and the reason is the struct
+		//     rather than effort. Detector 4 could absorb the colon-less case because the two
+		//     differed only in whether ':' was in the class. These two cannot follow: the half to
+		//     mask sits on the LEFT for one and on the RIGHT for the other, and a detector carries
+		//     ONE group and ONE tag. Covering both from a single pattern needs two capture
+		//     positions -- `group int` becoming a group list with a "first that captured"
+		//     convention, plus matching changes in apply, residue, completenessSecretFor and
+		//     TestNoDetectorGroupLandsOnOurOwnOutput. So three rules is merged as far as the
+		//     struct allows, not nearly merged. The same wall is what makes a PARTLY recognised
+		//     half uncoverable by any pattern at all (ISSUE-TBD): there the remainder can lie on
+		//     either side of the tag, so it is not two rules, it is none.
 		{tagToken, mustLongest(
 			`://(?:[^:/@\s<>]|` + pipelinePH + `|` + ourPH + `)*:(` +
 				tolerant(`[^@/\s<>]`) + `)@`), 1, true},
