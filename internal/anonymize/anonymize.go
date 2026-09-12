@@ -65,6 +65,14 @@
 // the left for one and the right for the other, and a detector carries one group and one tag.
 // Three rules is merged as far as the struct allows.
 //
+// THE '@' WENT THE SAME WAY AT #58. Every userinfo class excluded it as "the delimiter", which
+// made the FIRST '@' structural; RFC 3986 §3.2 makes the LAST one structural, and net/url
+// agrees. All four userinfo runs -- 4, 4b, 4c and 9a's context -- now admit '@', and detector 4
+// carries the other half of the RFC's rule as context (authorityTail) so that a tag between a
+// raw '@' and the real delimiter makes it decline rather than take a prefix. What was NOT
+// changed is '?' and '#', which the same RFC paragraph also ends the authority at: bounding
+// there was measured and reopens a leak, and those two belong with the raw '/' in #59's class.
+//
 // The one deliberate exception is the pipeline's own placeholders: see pipelinePH.
 package anonymize
 
@@ -315,7 +323,11 @@ var defaultHostSuffixes = []string{
 //
 // Submatches are unaffected here: leftmost-longest changes which parse wins only when a
 // LONGER whole match exists by another route, and the four detectors that mask a submatch
-// each have a single greedy capture with no such alternative.
+// each have a single greedy capture with no such alternative. Detector 4 is the one to check
+// since #58, because its group is followed by context (authorityTail) and a class that admits
+// '@' could in principle end the group at any of several '@'s. It cannot: the tail admits no
+// '@' and must reach a terminator, so exactly one '@' -- the last before the authority ends --
+// lets the whole pattern match, and the group's end is forced there.
 func mustLongest(pat string) *regexp.Regexp {
 	re := regexp.MustCompile(pat)
 	re.Longest()
@@ -349,6 +361,43 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    is not misread as an email address. Placeholder-tolerant: the pipeline turns hunter2
 		//    into hunter<NUM>, and a run that stops at '<' can never reach the '@' that ends the
 		//    credential, so the whole detector went quiet on the Template field (#43).
+		//
+		//    THE DELIMITER IS THE LAST '@', NOT THE FIRST, and the class admits '@' to say so. That
+		//    is #58. Until then every userinfo class excluded '@' on the reasoning that '@' is the
+		//    delimiter, so "postgres://user:p@ss@db" was masked to the FIRST one, 9a read the "ss"
+		//    behind it as an authority, and the real host went out in the clear; a raw '@' in the
+		//    USERNAME sent the password as well. A raw '@' in a userinfo is illegal -- RFC 3986
+		//    §3.2.1 wants %40 -- and ordinary, because people put '@' in passwords and paste DSNs
+		//    into logs unencoded. It is not, however, ambiguous: §3.2 makes the delimiting '@' the
+		//    last one before the authority ends, and net/url already parses it that way (measured:
+		//    user="user" pass="p@ss" host="db", no error). This rule now reads the same string the
+		//    same way the standard library does.
+		//
+		//    THE RULE IS WRITTEN IN FULL, and the second half is authorityTail. "Last '@'" on its
+		//    own is what leftmost-longest gives a class that admits '@' -- except where a tag sits
+		//    between a raw '@' and the real delimiter. "us@er:<TOKEN_1>@db" is that shape (#46's
+		//    4c cell with a raw '@' in it), and a rule without the tail matched it as "us@" and
+		//    sent "er" in the clear, where it used to be mis-tagged as a host: a host leak traded
+		//    for a username-fragment leak, which is the wrong direction. The tail says what the RFC
+		//    says: after the delimiting '@' comes host[:port] and then the end of the authority,
+		//    with no further '@' in between. On the blocked shape that fails, this rule DECLINES,
+		//    and 4c -- written for exactly a userinfo one of whose halves we already masked --
+		//    takes the whole half. The parse is unique: the tail cannot contain '@', so the group's
+		//    end is forced to the last '@' before a terminator, whatever the group could have
+		//    matched on its own.
+		//
+		//    WHAT IS NOT BOUNDED IS '?' AND '#', and that was measured rather than left to symmetry.
+		//    The same paragraph of the same RFC ends the authority at '/', '?' or '#'; this class
+		//    excludes '/' and admits the other two, and it would have been tidy to stop admitting
+		//    them alongside admitting '@'. It reopens a leak: "postgres://user:p?ss@db" is fully
+		//    masked today and, bounded, sends "p?ss" and "db". The symmetry misleads because
+		//    net/url cuts fragment and query BEFORE resolving the '@', so it errors on a raw '?',
+		//    '#' and '/' in a password identically -- those three are one class, the class with no
+		//    reliable parse, and it is #59's. Bounding at '?' and '#' would be the '/'-exclusion
+		//    extended to its siblings, i.e. part of #59's remedy, whatever that turns out to be.
+		//    What admitting '@' costs instead is two over-masks, both pinned in
+		//    TestAcceptedOverMasking: a query carrying two '@'s is absorbed one parameter further,
+		//    and a credentialed URL whose QUERY carries an '@' absorbs the host into the token.
 		//
 		//    ONE GROUP OVER THE WHOLE USERINFO, and the colon inside it is not structural. That is
 		//    #55, and it is a MERGE rather than an addition. RFC 3986 §3.2.1 gives
@@ -390,8 +439,10 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    '<' and '>' stay excluded. That is the inertness invariant rather than a detail: it
 		//    is what keeps this group off our own output, and it is also the wall that a half only
 		//    PARTLY recognised by an earlier detector runs into, where the remainder may lie on
-		//    either side of the minted tag and no single pattern reaches it. Open; #57.
-		{tagToken, mustLongest(`://(` + tolerant(`[^/@\s<>]`) + `)@`), 1, true},
+		//    either side of the minted tag and no single pattern reaches it. Open; #57. It is also
+		//    what makes the tail's "decline" work: a group that cannot start on or enter a tag has
+		//    nowhere else to go once the tail refuses.
+		{tagToken, mustLongest(`://(` + tolerant(`[^/\s<>]`) + `)@` + authorityTail), 1, true},
 		// 4b/4c. The half of a credential detector 4 can no longer reach.
 		//
 		//     Detector 4 masks "user:pass" as ONE value, which is what makes it readable as a
@@ -422,6 +473,12 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     covers "://:pass@" and "://user:@" directly, so what reaches 4b and 4c is only ever
 		//     a userinfo one of whose halves THIS PACKAGE already masked.
 		//
+		//     Both admit '@' since #58, group and context alike, so the half they take runs to the
+		//     LAST '@' as detector 4's does. They carry no authorityTail, and the reason is what a
+		//     tag after a raw '@' in THEIR half would mean: the other half is already a tag by
+		//     construction, so a second tag inside this one is a half an earlier detector
+		//     recognised only in part -- #57, the shape no pattern reaches, rather than #58.
+		//
 		//     THEY ARE ALSO WHY THE #55 MERGE STOPS AT THREE RULES, and the reason is the struct
 		//     rather than effort. Detector 4 could absorb the colon-less case because the two
 		//     differed only in whether ':' was in the class. These two cannot follow: the half to
@@ -434,10 +491,10 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     half uncoverable by any pattern at all (#57): there the remainder can lie on
 		//     either side of the tag, so it is not two rules, it is none.
 		{tagToken, mustLongest(
-			`://(?:[^:/@\s<>]|` + pipelinePH + `|` + ourPH + `)*:(` +
-				tolerant(`[^@/\s<>]`) + `)@`), 1, true},
+			`://(?:[^:/\s<>]|` + pipelinePH + `|` + ourPH + `)*:(` +
+				tolerant(`[^/\s<>]`) + `)@`), 1, true},
 		{tagToken, mustLongest(
-			`://(` + tolerant(`[^:/@\s<>]`) + `):(?:[^@/\s<>]|` + pipelinePH + `|` + ourPH + `)*@`), 1, true},
+			`://(` + tolerant(`[^:/\s<>]`) + `):(?:[^/\s<>]|` + pipelinePH + `|` + ourPH + `)*@`), 1, true},
 		// 5. Email — before host, since an address contains a domain. Both halves are
 		//    placeholder-tolerant: a digit ANYWHERE on either side of the '@' is enough for the
 		//    pipeline to split the address, and ordinary corporate addresses have digits, so
@@ -469,8 +526,17 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     Placeholder-tolerant: without it the host stopped at its first <NUM> and
 		//     api-gw7.prod.acme.com sent ".prod.acme.com" in the clear, with no second detector
 		//     behind it — a public suffix is not on the bare-host allowlist (#43).
+		//
+		//     The userinfo run admits '@' since #58, for the same reason detector 4's class does:
+		//     this is the fourth rule that reads a userinfo, and if it stopped at the first '@'
+		//     while the credential rules read to the last, the package would parse one string two
+		//     ways. It is the one userinfo run that admits '<' and '>' on purpose -- it steps over
+		//     the tag the credential rules minted -- and that is unchanged. Where it shows is only
+		//     the shapes every credential rule declined, which are #57's: there the HOST tag now
+		//     lands on the real host and what leaks is the partly-recognised half's remainder,
+		//     where before both leaked.
 		{tagHost, mustLongest(
-			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/@\s]*@)?(` + tolerant(`[a-z0-9.-]`) + `)`), 1, false},
+			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/\s]*@)?(` + tolerant(`[a-z0-9.-]`) + `)`), 1, false},
 		// 9b. Bare hostname — only the private/infra suffixes above (fuzzy: verify off).
 		//     Tolerant for the same reason: db01.corp.internal masked only "corp.internal" and
 		//     sent "db", and a digit in a middle label costs every label before it.
@@ -567,6 +633,21 @@ const pipelinePH = `<(?:TS|UUID|IP|HEX|NUM|STR)>`
 // TestNoDetectorGroupLandsOnOurOwnOutput holds the narrow claim against the real masked output
 // of every completeness row.
 const ourPH = `<[A-Z]+_\d+>`
+
+// authorityTail is what follows the DELIMITING '@' of a userinfo: host[:port], then the end of
+// the authority. It is CONTEXT, never group, and it contains no '@' by construction -- which is
+// the whole of RFC 3986 §3.2's disambiguation of a raw '@' inside a userinfo, and the reason
+// detector 4 can admit '@' into its class without matching a prefix (#58).
+//
+// The host run is placeholder-tolerant for the Template field (db<NUM>.corp.internal) and
+// otherwise negated, so a port, a bracketed IPv6 literal, a comma-separated host list and a
+// query with no '@' in it all read as "the rest of the authority" and cost nothing. The
+// terminator is '/', whitespace, '>' or the end of the text. '>' is there for an
+// angle-bracketed URL, "<postgres://u:p@db>". '<' is deliberately NOT a terminator: detector 4
+// runs before every host detector, so a '<' after the host at that point can only be a tag
+// minted by 1-3b -- and 1-3b mint tags inside the USERINFO, which means the '@' just crossed was
+// a raw one and the match must fail so that 4b or 4c can take the half.
+const authorityTail = `(?:[^@/\s<>]|` + pipelinePH + `)*(?:[/\s>]|$)`
 
 // jwtChar is the base64url alphabet of a JWT segment.
 const jwtChar = `[A-Za-z0-9_-]`
