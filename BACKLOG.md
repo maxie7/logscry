@@ -954,7 +954,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       detector matched exactly what it was written for and stopped where its author thought the
       value ended; **its notion of the value is smaller than the value.** Neither `residue` nor
       the completeness tests can see that class, because both ask whether the group landed on
-      the declared secret — and it did. Filed as **ISSUE-TBD** with the replica-set URI as the
+      the declared secret — and it did. Filed as **#61** with the replica-set URI as the
       example; pinned as an open assertion and as a literal `host2` in the multi-host
       completeness row, both red when it is fixed. The candidate is the #54 authority pre-pass,
       which this is the second issue to land on.
@@ -970,7 +970,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       the #58 bullet struck, the "what it masks" sentence, the "three more" audit sentence — now
       "and closing the second of those found one of a kind none of the sweeps had a category
       for" — and the new past-tense paragraph with the conditional table. Released as
-      `TODO-VERSION`.
+      `v0.9.3`.
 
 - [x] **A username with no password is still a credential** — #55, the third gap found in one
       grammar and the one that closed it as a class. `--llm-anonymize` sent `appuser` from

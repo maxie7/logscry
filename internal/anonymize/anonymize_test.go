@@ -642,7 +642,7 @@ func TestIssue58RawAtInUserinfo(t *testing.T) {
 		// The cell that forces authorityTail. See the comment above.
 		{"raw '@' in the username, pre-masked password (4c)",
 			"postgres://us@er:" + sk + "@db", "postgres://<TOKEN_2>:<TOKEN_1>@<HOST_1>"},
-		// A replica-set URI: the credential is closed here; the second host is ISSUE-TBD, below.
+		// A replica-set URI: the credential is closed here; the second host is #61, below.
 		{"multi-host, raw '@' in the password", "mongodb://user:p@ss@host1:27017,host2:27017/db",
 			"mongodb://<TOKEN_1>@<HOST_1>:27017,host2:27017/db"},
 	}
@@ -688,8 +688,8 @@ func TestIssue58RawAtInUserinfo(t *testing.T) {
 		{"partly-recognised half, raw '@' (#57)", "s3://AKIAIOSFODNN7EXAMPLE.prod@x@bucket", ".prod"},
 		// The second host of a replica set. The credential is right, the first host is right, and
 		// 9a's group stops at the port colon and the comma. Not interference and not a grammar
-		// gap: the detector's notion of the value is smaller than the value. ISSUE-TBD.
-		{"second host of a multi-host DSN (ISSUE-TBD)",
+		// gap: the detector's notion of the value is smaller than the value. #61.
+		{"second host of a multi-host DSN (#61)",
 			"mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0", "host2:27017,host3"},
 	}
 	for _, c := range open {
@@ -1097,7 +1097,7 @@ var completenessRows = []completenessRow{
 	// A replica-set URI. This row proves the host list is NOT swallowed into the credential span
 	// -- the '@' that delimits is the one before host1, and the suffix is returned intact. The
 	// second host is LITERAL in that suffix on purpose: it is sent today, before and after #58,
-	// because 9a's group stops at the port colon and the comma (ISSUE-TBD). When that is fixed,
+	// because 9a's group stops at the port colon and the comma (#61). When that is fixed,
 	// host2 moves inside phMarks and this row is the reminder.
 	{"url-credentials/raw-at-multi-host",
 		"dsn=mongodb://", "user:p@ss",
