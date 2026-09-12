@@ -504,7 +504,7 @@ colon is now read as a credential. The second is not only a cost: before the fix
 `https://api.acme.com?q=a@b` sent **the host** in the clear, so the widening closes a leak as
 well as over-masking.
 
-**A raw `@` inside a URL userinfo sent the real host before `TODO-VERSION`.** Every credential
+**A raw `@` inside a URL userinfo sent the real host before `v0.9.3`.** Every credential
 rule excluded `@` on the reasoning that `@` is the delimiter, so `postgres://user:p@ss@db` was
 masked up to the *first* one: the `ss` behind it was re-read as an authority and tagged
 `<HOST_n>`, and the real host `db` went to the configured model endpoint in the clear. A raw `@`
@@ -531,7 +531,7 @@ the authority at `?` and `#`, and bounding the userinfo there — which would ha
 on a raw `?`, `#` and `/` in a password identically, so those two belong to #59's class and not
 this one. And a replica-set URI (`mongodb://user:pass@host1:27017,host2:27017/db`) keeps its
 credential and its first host masked, before and after — but its second host is sent, before and
-after, which is ISSUE-TBD below.
+after, which is #61 below.
 
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
@@ -542,7 +542,7 @@ been corrected twice by later sweeps rather than once, so it should be read as a
 what the interference audit examined and not about what the package leaked. The sweep run while
 closing the first of them found a credential gap the audit had no reason to look at (#55, closed
 in `v0.9.2`); the sweep run while closing *that* found three more, listed last below; and closing
-the second of *those* (#58, closed in `TODO-VERSION`) found one of a kind none of the sweeps had
+the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the sweeps had
 a category for. Each time the audit's own count was right and its scope was narrower than the
 sentence sounded.
 
@@ -576,10 +576,10 @@ sentence sounded.
   *either side* of it, so unlike #46 this is not closed by adding two rules: no single pattern
   reaches it. The candidate is structural — a second group or a second tag on the detector type.
 - ~~**#58** — a raw `@` in a password truncates the mask and sends the real host.~~ **Closed in
-  `TODO-VERSION`.** See the paragraph above. The candidate was not as small as the issue said:
+  `v0.9.3`.** See the paragraph above. The candidate was not as small as the issue said:
   admitting `@` alone traded a host leak for a username-fragment leak on one shape, so the rule
   carries the RFC's full disambiguation rather than half of it.
-- **ISSUE-TBD** — **hosts 2..n of a multi-host connection string are sent in the clear.**
+- **#61** — **hosts 2..n of a multi-host connection string are sent in the clear.**
   `mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0` masks the
   credential and `host1` and sends `host2` and `host3`; `mysql://user:pass@host1,host2/db` sends
   `host2`. Replica-set and failover URIs are ordinary — MongoDB, MySQL, libpq, Sentinel all write
