@@ -393,7 +393,7 @@ What it masks: IPv4/IPv6, email addresses, hosts inside URLs and connection stri
 domain), bare hostnames on **private/infra suffixes** (`.internal`, `.local`, `.svc`,
 `.lan`, `.corp`, …; extend with `--llm-anonymize-suffix`), UUIDs, known-shape secrets
 (JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, and a URL userinfo in any of its shapes —
-`user:pass@`, `user@`, `:pass@`), and the username in
+`user:pass@`, `user@`, `:pass@`, with or without a raw `@` inside it), and the username in
 `/home/<user>` and `/Users/<user>` paths.
 
 A value that is *part of* a hostname is masked as part of that host, under `<HOST_n>`, rather than
@@ -504,6 +504,35 @@ colon is now read as a credential. The second is not only a cost: before the fix
 `https://api.acme.com?q=a@b` sent **the host** in the clear, so the widening closes a leak as
 well as over-masking.
 
+**A raw `@` inside a URL userinfo sent the real host before `TODO-VERSION`.** Every credential
+rule excluded `@` on the reasoning that `@` is the delimiter, so `postgres://user:p@ss@db` was
+masked up to the *first* one: the `ss` behind it was re-read as an authority and tagged
+`<HOST_n>`, and the real host `db` went to the configured model endpoint in the clear. A raw `@`
+in the *username* was worse — `postgres://us@er:pass@db` sent the password and the host. A raw
+`@` in a userinfo is illegal (RFC 3986 wants `%40`) and ordinary, because people put `@` in
+passwords and paste DSNs into logs unencoded; it is not ambiguous, because the RFC makes the
+*last* `@` the delimiter and Go's `net/url` already parses it that way. v0.4.0 → v0.9.2, sixteen
+tagged releases. Whether anything left the process again depended on the authority:
+
+| after the last `@` | raw `@` in the password | raw `@` in the username |
+|---|---|---|
+| `@db`, `@redis`, `@localhost` | **host sent**; the password's tail tagged as the host | **password and host sent** |
+| `@db.acme.com` | masked by accident as `<EMAIL_n>`, glued to the host | masked by accident as `<EMAIL_n>` |
+| `@10.0.0.5` | nothing sent; the password's tail tagged as the host | **password sent** |
+
+The fix writes the RFC's rule down in full — the delimiting `@` is the one after which no further
+`@` appears before the authority ends — rather than only admitting `@` into the class, because
+admitting it alone traded one leak for another: with a secret password (`us@er:sk-live…@db`) the
+credential rule matched the prefix `us@` and the fragment `er` went out where it had been
+mis-tagged before. Two things were checked rather than assumed. The same RFC paragraph also ends
+the authority at `?` and `#`, and bounding the userinfo there — which would have retired the
+`?q=a@b` over-mask above — was measured and **rejected**, because it reopens a leak:
+`postgres://user:p?ss@db` is fully masked today and would send `p?ss` and `db`. `net/url` errors
+on a raw `?`, `#` and `/` in a password identically, so those two belong to #59's class and not
+this one. And a replica-set URI (`mongodb://user:pass@host1:27017,host2:27017/db`) keeps its
+credential and its first host masked, before and after — but its second host is sent, before and
+after, which is ISSUE-TBD below.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -512,8 +541,10 @@ were open at release time**, none of them involving credential material — a cl
 been corrected twice by later sweeps rather than once, so it should be read as a statement about
 what the interference audit examined and not about what the package leaked. The sweep run while
 closing the first of them found a credential gap the audit had no reason to look at (#55, closed
-in `v0.9.2`); the sweep run while closing *that* found three more, listed last below. Each
-time the audit's own count was right and its scope was narrower than the sentence sounded.
+in `v0.9.2`); the sweep run while closing *that* found three more, listed last below; and closing
+the second of *those* (#58, closed in `TODO-VERSION`) found one of a kind none of the sweeps had
+a category for. Each time the audit's own count was right and its scope was narrower than the
+sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
   `v0.9.1`.** A UUID used as a hostname label is now masked as part of the host. The audit
@@ -544,12 +575,23 @@ time the audit's own count was right and its scope was narrower than the sentenc
   blocks every credential rule (all of their groups exclude `<`), and the remainder can lie on
   *either side* of it, so unlike #46 this is not closed by adding two rules: no single pattern
   reaches it. The candidate is structural — a second group or a second tag on the detector type.
-- **#58** — **a raw `@` in a password truncates the mask and sends the real host.**
-  `postgres://user:p@ss@db` sends `db`. Every credential group excludes `@` because that is the
-  delimiter they anchor on, so the match ends at the *first* `@` and what follows is re-parsed as
-  an authority. `@` must be written `%40` to be legal, but this is **not** an unparseable URI:
-  RFC 3986 resolves it by taking the last `@`, and Go's `net/url` parses the string correctly.
-  The candidate is correspondingly small.
+- ~~**#58** — a raw `@` in a password truncates the mask and sends the real host.~~ **Closed in
+  `TODO-VERSION`.** See the paragraph above. The candidate was not as small as the issue said:
+  admitting `@` alone traded a host leak for a username-fragment leak on one shape, so the rule
+  carries the RFC's full disambiguation rather than half of it.
+- **ISSUE-TBD** — **hosts 2..n of a multi-host connection string are sent in the clear.**
+  `mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0` masks the
+  credential and `host1` and sends `host2` and `host3`; `mysql://user:pass@host1,host2/db` sends
+  `host2`. Replica-set and failover URIs are ordinary — MongoDB, MySQL, libpq, Sentinel all write
+  the host list this way. This is a **fourth kind of cause**, and the first instance of it: not an
+  under-matching pattern (#41), not a value another component rewrote (#43), not a detector
+  blocked by another's tag (#46, #48, #54, #57), not a shape no rule described (#55). The
+  credential rule is right, the host rule is right, and the host rule's notion of the value —
+  `host[:port]` — is smaller than the value, `host[:port](,host[:port])*`. It matched exactly
+  what it was written to match and stopped where its author thought the value ended. Neither the
+  fail-closed re-scan nor the completeness tests can see that, because both ask whether the
+  detector's group landed on the declared secret, and it did. A host on a private suffix is
+  rescued by the bare-host detector; a public suffix or a bare service name is not. From v0.4.0.
 - **#59** — **a raw `/` in a password: partial mask, host sent, and no reliable parse.**
   `postgres://user:p/ss@db` masks the *username* as a host and sends both `p/ss` and `db`.
   Unlike the `@` case there is no correct parse to widen towards — `net/url` errors on it, and
