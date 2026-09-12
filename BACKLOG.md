@@ -873,6 +873,105 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
 
+- [x] **A raw `@` inside a userinfo is masked to the last `@`** — #58, row 18 of the #55
+      sweep. `--llm-anonymize` masked `postgres://user:p@ss@db` up to the FIRST `@`, 9a read the
+      `ss` behind it as an authority and tagged it `<HOST_n>`, and the real host went to the
+      configured model endpoint in the clear; a raw `@` in the USERNAME (`us@er:pass@db`) sent
+      the password and the host. v0.4.0 → v0.9.2, **sixteen tagged releases**, counted rather
+      than derived: `git tag --contains 2da31be | wc -l` → 16, the same fifteen as #55 plus
+      v0.9.2. Established from the full line history (`git log -L394,394:` on the detector-4
+      line, four states: `2da31be`, `0ee8e38` #41, `4a6fc68` #43, `96abd93` #55), every one of
+      which excluded `@` from every userinfo class.
+      **The cause is a delimiter chosen by position rather than by rule.** Every userinfo class
+      excluded `@` because "that is the delimiter they anchor on", which makes the FIRST `@`
+      structural. RFC 3986 §3.2 makes the LAST one structural — userinfo may not carry a raw
+      `@`, so a string with two has one legal reading — and `net/url` already implements it:
+      measured again for this fix, `user="user" pass="p@ss" host="db"`, no error, and `p@s@s`
+      likewise. "Last `@` wins" is the standard library's behaviour, not a heuristic.
+      **The fix is not the one-character change the issue proposed, and the cell that forced
+      that is #46's.** Admitting `@` into the classes and nothing else was measured over the
+      whole corpus and closes every plain shape — but on `us@er:sk-live…@db` (raw `@` in the
+      username, secret password) detector 4 matched the PREFIX `us@`, because the `<TOKEN_1>`
+      blocks the longer parse, and 9a reading to the last `@` then sent `er` in the clear where
+      it had been mis-tagged as a host. A host leak traded for a username-fragment leak is the
+      wrong direction, and `residue` reads that output as clean. So detector 4 carries the
+      second half of the RFC's rule as trailing CONTEXT, `authorityTail`: after the delimiting
+      `@` comes `host[:port]` with no further `@`, then `/`, whitespace, `>` or the end. On the
+      blocked shape that fails, detector 4 declines, and 4c — written for exactly a userinfo one
+      of whose halves we already masked — takes the half whole. The parse stays unique, which
+      the `mustLongest` note now argues: the tail admits no `@`, so exactly one `@` lets the
+      whole pattern match. `<` is deliberately not a terminator: at detector 4's position a `<`
+      after the host can only be a tag 1–3b minted inside the userinfo, which means the `@`
+      just crossed was a raw one. 4b, 4c and 9a's context admit `@` too — the fourth rule that
+      reads a userinfo must agree with the three that capture it on which `@` delimits — and
+      carry no tail, since a tag after a raw `@` in THEIR half is a partly-recognised half, #57.
+      **Bounding at `?` and `#` was the working hypothesis and it was rejected on output.** The
+      same RFC paragraph ends the authority at `/`, `?` or `#`; the class excludes `/` and admits
+      the other two, and applying half a rule is how this grammar accumulated its gaps. Measured:
+      bounding retires the `?q=a@b` accepted over-mask row with the host still covered by 9a —
+      and reopens a leak, `postgres://user:p?ss@db` going from fully masked to
+      `<HOST_1>:p?ss@db`, password fragment and host both sent, on a shape the #55 comment
+      already names as "illegal and happens". It is a straight trade in the disclosure
+      direction and does not ship. **Why the symmetry misleads**: `net/url` cuts fragment and
+      query BEFORE resolving the `@`, so it errors on a raw `?`, `#` and `/` identically
+      (`invalid port ":p" after host`, all three). Those are one class — no reliable parse —
+      and it is #59's. Bounding at `?#` is the `/`-exclusion extended to its siblings, i.e. part
+      of #59's remedy whatever that is, and it is named here and stopped at rather than folded
+      in. The `?q=a@b` row is therefore LEFT AS IT IS, byte-identical before and after, with the
+      reason in its comment.
+      **What admitting `@` costs, both pinned in `TestAcceptedOverMasking`.** A query carrying
+      two `@`s (`?q=a@b&r=c@d`) is absorbed one parameter further — `&r=c@d` used to stay in
+      the clear. A credentialed URL whose QUERY carries an `@` (`user:pass@db?x=a@b`) absorbs
+      `db?x=a` into the credential token, with `b` tagged as the host. Nothing that was masked
+      becomes unmasked and `Restore` is exact. Prose is unaffected: `/` and whitespace still
+      bound the run — two DSNs on one line, a URL beside an email, `<postgres://u:p@db>`,
+      `"postgres://u:p@db"`, a Go module path with `@v1.0.0`, all byte-identical.
+      **The conditional, measured on the old code rather than reasoned.** With a raw `@` in the
+      PASSWORD: bare host and loopback sent the host; a dotted host was rescued by the email
+      detector (`ss@db.acme.com` as `<EMAIL_n>`); an address literal sent nothing but tagged the
+      password's tail as a host. With a raw `@` in the USERNAME: bare host and address literal
+      sent the PASSWORD (`<TOKEN_1>@<HOST_1>:pass@<IP_1>`); a dotted host rescued it as
+      `<EMAIL_n>`. The README carries the table.
+      **`residue` — half.** Detector 4 is verify-eligible and now describes the whole raw-`@`
+      userinfo, so one that survives masking WHOLE mutes the escalation; that was true before
+      too, since the old rule matched a prefix of it. What failed was the LEFTOVER
+      (`<HOST_1>@db`), which is #41's blindness, and the fix removes the leftover rather than
+      teaching the re-scan to see it. No new proviso on the README's re-scan paragraph.
+      **The #57 shapes with a raw `@` move, and which fragment leaks is stated.**
+      `s3://AKIA….prod@x@bucket` used to send `.prod` AND `@bucket` with `x` mis-tagged as the
+      host; it now masks the host and sends `.prod@x`. Still #57, pinned as an open assertion
+      on the fragment present in both states.
+      **The multi-host shapes the sweep table did not have, and the finding they produced.**
+      `mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0` and
+      `mysql://user:pass@host1,host2/db` were run before and after: the credential span is
+      right and the host list is NOT swallowed into it — but **hosts 2..n are sent, before and
+      after**, because 9a's group class `[a-z0-9.-]` stops at the port colon and the comma, and
+      9b rescues only a private suffix (`h2.corp.internal` masked; `h2.acme.com` and `host2`
+      sent). Undocumented anywhere — README, this file, the code — and **a fourth category of
+      cause**, worth naming because the other three each took several instances to notice: not
+      an under-matching pattern (#41), not another component rewriting the value (#43), not
+      another detector blocking it (#46/#48/#54/#57), not a shape no rule described (#55). The
+      detector matched exactly what it was written for and stopped where its author thought the
+      value ended; **its notion of the value is smaller than the value.** Neither `residue` nor
+      the completeness tests can see that class, because both ask whether the group landed on
+      the declared secret — and it did. Filed as **ISSUE-TBD** with the replica-set URI as the
+      example; pinned as an open assertion and as a literal `host2` in the multi-host
+      completeness row, both red when it is fixed. The candidate is the #54 authority pre-pass,
+      which this is the second issue to land on.
+      **Tests.** `TestIssue58RawAtInUserinfo` with exact outputs for every position the `@` can
+      occupy, both #46 cells with a raw `@` in the fallback's half, and the replica-set URI;
+      seven completeness rows flush at both ends; two templatized rows through the real
+      `Templatize`; the old truncated output fed back to `TestPlaceholdersAreInert`. Red before
+      the fix: 12 + 7 + 1 + 2 rows. `TestNoDetectorGroupLandsOnOurOwnOutput`,
+      `TestRestoreHasNoNestedMapping` and `TestPlaceholdersAreInert` green throughout; every
+      widened class still excludes `<` and `>`.
+      `internal/pipeline` does not appear in the diff: this package runs at the LLM boundary and
+      never feeds `hashTemplate`, so no template hashes move. README corrected at four sites:
+      the #58 bullet struck, the "what it masks" sentence, the "three more" audit sentence — now
+      "and closing the second of those found one of a kind none of the sweeps had a category
+      for" — and the new past-tense paragraph with the conditional table. Released as
+      `TODO-VERSION`.
+
 - [x] **A username with no password is still a credential** — #55, the third gap found in one
       grammar and the one that closed it as a class. `--llm-anonymize` sent `appuser` from
       `postgres://appuser@db:5432/app`, v0.4.0 → v0.9.1, fifteen tagged releases.
@@ -956,7 +1055,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 11–14 | pct-encoded, sub-delims | masked | works; now tested |
       | 15–16 | multi-colon | masked, span unchanged | only the first colon was ever structural |
       | 17 | a half recognised only in PART | `.prod` sent, residue clean | **OPEN — #57** |
-      | 18 | raw `@` in a half | the TRUE HOST sent | **OPEN — #58** |
+      | 18 | raw `@` in a half | the TRUE HOST sent | **FIXED (#58)** |
       | 19 | raw `/` in a half | host and remainder sent | **OPEN — #59** |
       | 20–22 | no scheme; unexpressible shapes | — | computed, not run |
 
@@ -977,7 +1076,10 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       author meant and the parse the grammar mandates disagree with nothing in the text to
       separate them. There the honest candidate is to FAIL CLOSED rather than mask in part, which
       would be the first place in this package where the answer is to mask less and refuse: a
-      partial mask that leaks a host is worse than a skipped escalation.
+      partial mask that leaks a host is worse than a skipped escalation. **#58's fix added a
+      measurement to this split**: `net/url` errors on a raw `?` and `#` exactly as it does on a
+      raw `/` (it cuts query and fragment before resolving the `@`), so those two are row 19's
+      class and not row 18's — see the #58 entry above.
 
 - [x] **A UUID in a hostname is part of the host, not a value beside it** — #48, the first of the
       four the audit left open. `--llm-anonymize` sent a hostname in part or in full whenever one

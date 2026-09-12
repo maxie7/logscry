@@ -89,6 +89,11 @@ func TestTypeTags(t *testing.T) {
 		// host besides. Contains cannot see a tag that is right for the wrong span, so the exact
 		// output is pinned in TestIssue55PasswordlessUserinfo and this row states the type claim.
 		{"dsn=postgres://appuser@db:5432/app", "<TOKEN_1>"},
+		// #58: a raw '@' inside the password is part of the credential, and the credential is ONE
+		// value up to the LAST '@'. Before the fix this came back <TOKEN_1>@<HOST_1>@db -- the
+		// "ss" behind the first '@' tagged as a host and the real host in the clear. Contains
+		// cannot tell those apart, so the exact output is pinned in TestIssue58RawAtInUserinfo.
+		{"dsn=postgres://user:p@ss@db", "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -314,6 +319,11 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"dsn=redis://:<TOKEN_1>@<HOST_2>:6379/0",
 		"dsn=postgres://<TOKEN_1>:@<HOST_2>/prod",
 		"mail <EMAIL_1> then <TOKEN_1>@<HOST_2> refused",
+		// #58's OLD output fed back: the truncated mask left a stray '@' between two of our tags.
+		// Detector 4 now admits '@' and reads to the last one, so this is the string that would
+		// show a group stepping over a tag to reach it. The group class still excludes '<', so the
+		// run cannot start on <TOKEN_1> and there is nothing before it to start on.
+		"dsn=postgres://<TOKEN_1>@<HOST_2>@<HOST_3>/prod",
 		"loaded from /home/<USER_1>/go/pkg/mod",
 		"call https://<HOST_1>/v1 and <UUID_1>",
 	}
@@ -560,11 +570,8 @@ func TestIssue55PasswordlessUserinfo(t *testing.T) {
 		// it either, so this is an uncovered remainder of #46 rather than a leftover of #55.
 		{"partly-recognised half, with colon (#57)",
 			"s3://AKIAIOSFODNN7EXAMPLE.prod:secret@bucket", ".prod"},
-		// A raw '@' in the password. net/url parses this correctly by taking the LAST '@', so it is
-		// NOT an unparseable URI — but every credential group excludes '@' because that is the
-		// delimiter they anchor on, so the mask stops at the FIRST one and the TRUE HOST goes out
-		// behind it. #58.
-		{"raw '@' in the password (#58)", "postgres://user:p@ss@db", "@db"},
+		// A raw '@' in the password sat here as #58 until it was closed; it is
+		// TestIssue58RawAtInUserinfo now, with the '/' case below kept as its control.
 		// A raw '/' in the password. net/url ERRORS on this one, so unlike the '@' case there is no
 		// reliable parse to widen towards and the honest candidate is to fail closed rather than
 		// mask in part. Today the username is masked as a HOST and both the password remainder and
@@ -573,6 +580,117 @@ func TestIssue55PasswordlessUserinfo(t *testing.T) {
 		// No scheme, so no "://" for any credential rule to anchor on. By design rather than by
 		// defect, and here so one run also shows the boundary of what the anchor reaches.
 		{"no scheme, by design", "user@db:5432/app", "user@db"},
+	}
+	for _, c := range open {
+		t.Run(c.name, func(t *testing.T) {
+			masked := mustMask(t, New(), c.in)
+			if !strings.Contains(masked, c.leak) {
+				t.Errorf("this gap appears to be closed — update this test and the docs that call it open:\n"+
+					" in:  %q\n out: %q\n looking for: %q", c.in, masked, c.leak)
+			}
+		})
+	}
+}
+
+// TestIssue58RawAtInUserinfo is the named regression for #58, and it carries exact outputs for
+// the same reason TestIssue55PasswordlessUserinfo does: the failure was a tag on the wrong span,
+// and Contains cannot see that.
+//
+// Every credential class excluded '@' because '@' is "the delimiter they anchor on". So on
+// "postgres://user:p@ss@db" detector 4 stopped at the FIRST '@', 9a read the "ss" behind it as an
+// authority and tagged it HOST, and the real host "db" went to the configured model endpoint in
+// the clear. A raw '@' in the USERNAME was worse: "us@er:pass@db" sent the password AND the host.
+// Mask returned nil, residue() returned "", the escalation was SENT. v0.4.0 -> v0.9.2, sixteen
+// tagged releases.
+//
+// A raw '@' in a userinfo is illegal — RFC 3986 §3.2.1 requires %40 — and common, because people
+// put '@' in passwords and paste DSNs into logs without encoding them. It is NOT an unparseable
+// URI: §3.2 makes the delimiter the LAST '@' before the authority ends, and net/url already does
+// exactly that (user="user" pass="p@ss" host="db", no error). The rule here now says the same.
+//
+// THE FIX IS NOT ONE CHARACTER, and the 4c row is why. Admitting '@' into the classes and nothing
+// else leaves detector 4 free to take a PREFIX of the userinfo when a tag sits between a raw '@'
+// and the real delimiter -- "us@er:<TOKEN_1>@db" matched as "us@" -- and with 9a then reading to
+// the last '@', the "er" went out in the clear where it used to be mis-tagged as a host. Trading a
+// host leak for a username-fragment leak is the wrong direction, so detector 4 carries the second
+// half of the RFC's rule as a trailing context (authorityTail): the delimiting '@' is the one
+// after which NO further '@' appears before the authority ends. With that, 4 declines on the
+// blocked shape and 4c takes the half, as it was written to.
+func TestIssue58RawAtInUserinfo(t *testing.T) {
+	const sk = "sk-livekeyabcdefghij0123456789XYZ"
+	cases := []struct{ name, in, want string }{
+		// The issue's own example, and the ordinary compose shapes around it.
+		{"bare host", "postgres://user:p@ss@db", "postgres://<TOKEN_1>@<HOST_1>"},
+		{"port and path", "postgres://user:p@ss@db:5432/app", "postgres://<TOKEN_1>@<HOST_1>:5432/app"},
+		// The accidental rescue: the email detector took "ss@db.acme.com" whole, under the wrong
+		// tag. Nothing left the process here, which is why a reproduction against a fully
+		// qualified host shows nothing wrong -- the same accident #46 and #55 hid behind.
+		{"dotted host", "postgres://user:p@ss@db.acme.com/prod", "postgres://<TOKEN_1>@<HOST_1>/prod"},
+		// An address literal: the IP was masked, but "ss" still went out tagged as a HOST.
+		{"address host", "postgres://user:p@ss@10.0.0.5:5432/app", "postgres://<TOKEN_1>@<IP_1>:5432/app"},
+		{"bracketed ipv6 host", "postgres://user:p@ss@[2001:db8::1]:5432/app",
+			"postgres://<TOKEN_1>@[<IP_1>]:5432/app"},
+		// The username side, which the issue did not name and which leaks MORE: the password
+		// sits behind the first '@' and goes out with the host.
+		{"raw '@' in the username", "postgres://us@er:pass@db", "postgres://<TOKEN_1>@<HOST_1>"},
+		{"raw '@' in a password-less userinfo", "postgres://us@er@db", "postgres://<TOKEN_1>@<HOST_1>"},
+		{"two raw '@'s", "postgres://user:p@s@s@db", "postgres://<TOKEN_1>@<HOST_1>"},
+		{"empty username", "redis://:p@ss@redis:6379/0", "redis://<TOKEN_1>@<HOST_1>:6379/0"},
+		// #46's two cells with a raw '@' in the half the fallback must reach.
+		{"pre-masked username, raw '@' in the password (4b)",
+			"postgres://" + sk + ":p@ss@db", "postgres://<TOKEN_1>:<TOKEN_2>@<HOST_1>"},
+		// The cell that forces authorityTail. See the comment above.
+		{"raw '@' in the username, pre-masked password (4c)",
+			"postgres://us@er:" + sk + "@db", "postgres://<TOKEN_2>:<TOKEN_1>@<HOST_1>"},
+		// A replica-set URI: the credential is closed here; the second host is ISSUE-TBD, below.
+		{"multi-host, raw '@' in the password", "mongodb://user:p@ss@host1:27017,host2:27017/db",
+			"mongodb://<TOKEN_1>@<HOST_1>:27017,host2:27017/db"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			got := mustMask(t, m, c.in)
+			if got != c.want {
+				t.Errorf("raw '@' in a userinfo not masked to the last '@':\n in:   %q\n got:  %q\n want: %q",
+					c.in, got, c.want)
+			}
+			if r := m.Restore(got); r != c.in {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", c.in, r)
+			}
+		})
+	}
+
+	// Verify-eligibility, stated honestly. Detector 4 describes the WHOLE raw-'@' userinfo now, so
+	// one that ever survives masking whole mutes the escalation. That was true before too -- the
+	// old rule matched a PREFIX of it -- and it is not what failed: what failed was the LEFTOVER,
+	// and the leftover is a shape the re-scan reads as clean, which is #41's blindness and the
+	// reason the fix lives in the pattern rather than in residue().
+	if tag := New().residue("postgres://user:p@ss@db"); tag != tagToken {
+		t.Errorf("a raw-'@' userinfo is not verify-eligible: residue = %q, want %q", tag, tagToken)
+	}
+	if tag := New().residue("postgres://<TOKEN_1>@<HOST_1>@db"); tag != "" {
+		t.Errorf("residue() sees the old leftover as %q; the claim in the comment above is wrong", tag)
+	}
+
+	// The negative half, as ASSERTIONS that these gaps are open. Each goes red when its issue is
+	// fixed and is the reminder to update the docs that call it open.
+	open := []struct{ name, in, leak string }{
+		// A raw '/' in the password. net/url ERRORS on this one, and it errors the same way on a
+		// raw '?' and '#', which is the measurement that keeps those two out of THIS fix: bounding
+		// the userinfo at '?' and '#' would reopen "postgres://user:p?ss@db", fully masked today.
+		// All three are #59's class -- no reliable parse -- and #59's remedy, whatever it is.
+		{"raw '/' in the password (#59)", "postgres://user:p/ss@db", "p/ss"},
+		// #57 with a raw '@' behind the tag. Reading to the last '@' puts the HOST tag on the real
+		// host now, so what remains is the partly-recognised half's remainder (".prod@x") and
+		// nothing else -- before, ".prod" went out AND the host did, with the "x" mis-tagged as
+		// the host. Still #57; not closed here, and the assertion is on the part that leaks in
+		// both states.
+		{"partly-recognised half, raw '@' (#57)", "s3://AKIAIOSFODNN7EXAMPLE.prod@x@bucket", ".prod"},
+		// The second host of a replica set. The credential is right, the first host is right, and
+		// 9a's group stops at the port colon and the comma. Not interference and not a grammar
+		// gap: the detector's notion of the value is smaller than the value. ISSUE-TBD.
+		{"second host of a multi-host DSN (ISSUE-TBD)",
+			"mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0", "host2:27017,host3"},
 	}
 	for _, c := range open {
 		t.Run(c.name, func(t *testing.T) {
@@ -956,6 +1074,34 @@ var completenessRows = []completenessRow{
 		"dsn=postgres://", "appuser:hun:ter2", "@" + phMark + "db.acme.com" + phMark + "/prod"},
 	{"url-credentials/pct-encoded-at",
 		"dsn=postgres://", "appuser:p%40ss", "@" + phMark + "db.acme.com" + phMark + "/prod"},
+	// #58. A RAW '@' inside a half, and the credential is one value up to the LAST '@'. Flush at
+	// both ends by construction -- "//" before, the delimiting '@' after -- so an over-reach past
+	// the real delimiter and a stop at the wrong one both fail here. One row per position the '@'
+	// can occupy, plus #46's two cells with a raw '@' in the half the fallback has to reach; the
+	// 4c row is the one that needs detector 4 to DECLINE (see authorityTail), and is red under
+	// "admit '@' and nothing else".
+	{"url-credentials/raw-at-in-password",
+		"dsn=postgres://", "user:p@ss", "@" + phMark + "db" + phMark + ":5432/app"},
+	{"url-credentials/raw-at-in-username",
+		"dsn=postgres://", "us@er:pass", "@" + phMark + "db.acme.com" + phMark + "/prod"},
+	{"url-credentials/raw-at-no-password",
+		"dsn=postgres://", "us@er", "@" + phMark + "db" + phMark + ":5432/app"},
+	{"url-credentials/raw-at-two",
+		"dsn=postgres://", "user:p@s@s", "@" + phMark + "db" + phMark + ":5432/app"},
+	{"url-credentials/premasked-username/raw-at-password",
+		"dsn=postgres://" + phMark + "sk-abcdefghij0123456789XYZ" + phMark + ":", "p@ss7",
+		"@" + phMark + "db.acme.com" + phMark + "/prod"},
+	{"url-credentials/premasked-password/raw-at-username",
+		"dsn=postgres://", "us@er7",
+		":" + phMark + "sk-abcdefghij0123456789XYZ" + phMark + "@" + phMark + "db.acme.com" + phMark + "/prod"},
+	// A replica-set URI. This row proves the host list is NOT swallowed into the credential span
+	// -- the '@' that delimits is the one before host1, and the suffix is returned intact. The
+	// second host is LITERAL in that suffix on purpose: it is sent today, before and after #58,
+	// because 9a's group stops at the port colon and the comma (ISSUE-TBD). When that is fixed,
+	// host2 moves inside phMarks and this row is the reminder.
+	{"url-credentials/raw-at-multi-host",
+		"dsn=mongodb://", "user:p@ss",
+		"@" + phMark + "host1" + phMark + ":27017,host2:27017/db?replicaSet=rs0"},
 	// Greed guard: the host must stop at "/", not eat the path.
 	{"url-host", "call https://", "internal.acme.com", "/v1"},
 	{"bare-host", "host ", "worker.svc", " failed"},
@@ -1107,8 +1253,24 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// behind it. So the widening CLOSES a host leak as well as costing an over-mask, and that
 		// is what the trade rests on — the package's over-mask-rather-than-under-mask asymmetry is
 		// the second argument here, not the only one.
+		//
+		// LEFT AS IT IS BY #58, and that was measured rather than assumed. Admitting '@' into the
+		// class does not move this row: the run already reached the only '@' there is. Bounding
+		// the run at '?' and '#' -- RFC 3986 §3.2's other half, which would have RETIRED this row
+		// with the host still covered by 9a -- was measured and rejected, because it reopens a
+		// leak: "postgres://user:p?ss@db" is fully masked today and would send "p?ss" and "db".
+		// net/url errors on a raw '?', '#' and '/' in a password identically, so those two
+		// belong to #59's class and not to this fix.
 		{"url query absorbed as credentials, no colon",
 			"https://api.acme.com?q=a@b", "https://<TOKEN_1>@<HOST_1>"},
+		// #58's two costs, named. Reading to the LAST '@' reaches one query parameter further
+		// when the query carries two of them -- before, "&r=c@d" stayed in the clear -- and a
+		// credentialed URL whose QUERY carries an '@' now absorbs the host into the credential
+		// token, with the query's tail tagged as the host. Both are over-masks: nothing that was
+		// masked is unmasked, and Restore is exact. The second is the one new shape.
+		{"url query with two '@'s absorbed", "https://api.acme.com?q=a@b&r=c@d", "https://<TOKEN_1>@<HOST_1>"},
+		{"host absorbed when the query carries an '@'",
+			"postgres://user:pass@db?x=a@b", "postgres://<TOKEN_1>@<HOST_1>"},
 		// THE TRADED SIGNAL, recorded on purpose rather than arriving as a side effect of the
 		// merge. Detector 4 now spans the whole userinfo, so a colon beside an ABSENT half is
 		// captured with the half that is there: "redis://:<TOKEN_1>@" becomes "redis://<TOKEN_1>@".
@@ -1211,6 +1373,14 @@ var templatizedRows = []templatizedRow{
 	// TestEveryUncollapsedDetectorHasATemplatizedRow, not decoration.
 	{"url-credentials/no-password",
 		"dsn=postgres://\x00app7user\x00@\x00db01.corp.internal\x00:5432/app"},
+	// #58 through the composition. Red before the fix on the SAME accident as the raw path: the
+	// templatized line masked to "<TOKEN_1>@<EMAIL_1>/prod", the email detector taking the
+	// password's tail and the host as one value. The second row is the 4c cell, where detector 4
+	// must decline so the fallback can take "us@er<NUM>" whole.
+	{"url-credentials/raw-at-middle-digit",
+		"FATAL db postgres://\x00svc7user:p@ss7\x00@\x00db01.corp.internal\x00/prod lost"},
+	{"url-credentials/premasked-password/raw-at-username",
+		"dsn=postgres://\x00us@er7\x00:\x00sk-livekeyabcdefghij0123456789XYZ\x00@\x00db01.corp.internal\x00/prod"},
 	{"email/digit-in-local", "mail to \x00user01@corp.example.com\x00 bounced"},
 	{"email/digit-in-domain", "mail to \x00bob@db01.example.com\x00 bounced"},
 	{"email/digit-mid-token-both-sides", "mail to \x00us3r@corp7.example.com\x00 bounced"},
