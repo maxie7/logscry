@@ -886,20 +886,20 @@ func TestIssue61MultiHostAuthority(t *testing.T) {
 		// containment, unrepresentable in a linear chain -- but not #54's remedy: the inner tag is
 		// RIGHT here (an address in a list is an address), and a companion re-applied to a fixpoint
 		// would re-anchor on it, which is the named follow-up rather than the pre-pass. One pinned
-		// row per reachable tag. ISSUE-TBD-C.
-		{"address as a later member (ISSUE-TBD-C)", "mongodb://host1:27017,10.0.0.5:27017,host3:27017/db", "host3"},
-		{"unbracketed ipv6 as a later member (ISSUE-TBD-C)", "mongodb://h1,2001:db8::1,host3/db", "host3"},
-		{"bracketed ipv6 as a later member (ISSUE-TBD-C)", "mongodb://h1,[2001:db8::1]:27017,host3:27017/db", "host3"},
-		{"key-shaped later member, theoretical (ISSUE-TBD-C)", "mongodb://h1,AKIAIOSFODNN7EXAMPLE,host3/db", "host3"},
+		// row per reachable tag. #67.
+		{"address as a later member (#67)", "mongodb://host1:27017,10.0.0.5:27017,host3:27017/db", "host3"},
+		{"unbracketed ipv6 as a later member (#67)", "mongodb://h1,2001:db8::1,host3/db", "host3"},
+		{"bracketed ipv6 as a later member (#67)", "mongodb://h1,[2001:db8::1]:27017,host3:27017/db", "host3"},
+		{"key-shaped later member, theoretical (#67)", "mongodb://h1,AKIAIOSFODNN7EXAMPLE,host3/db", "host3"},
 		// #59's shape with a list: the authority ended at the raw '/', so host2 is PATH to the RFC
 		// and to net/url alike, and no context design reaches it. Still #59.
 		{"raw '/' in the password, with a list (#59)", "postgres://user:p/ss@h1.acme.com,host2/db", "host2"},
 		// An underscore in a hostname. '_' is legal in an RFC 3986 reg-name and ordinary in Docker
 		// container names, Kafka brokers and internal hosts, and it is absent from the host class,
 		// so 9a and 9c both stop at it: http://my_host:8080/x sends "_host" today. A SINGLE-host
-		// leak found while sweeping this one, live, and filed on its own. ISSUE-TBD-B.
-		{"underscore in a hostname (ISSUE-TBD-B)", "mongodb://host1,host_2/db", "_2"},
-		{"underscore in a single hostname (ISSUE-TBD-B)", "http://my_host:8080/x", "_host"},
+		// leak found while sweeping this one, live, and filed on its own. #66.
+		{"underscore in a hostname (#66)", "mongodb://host1,host_2/db", "_2"},
+		{"underscore in a single hostname (#66)", "http://my_host:8080/x", "_host"},
 	}
 	for _, c := range open {
 		t.Run(c.name, func(t *testing.T) {

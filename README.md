@@ -531,9 +531,9 @@ the authority at `?` and `#`, and bounding the userinfo there — which would ha
 on a raw `?`, `#` and `/` in a password identically, so those two belong to #59's class and not
 this one. And a replica-set URI (`mongodb://user:pass@host1:27017,host2:27017/db`) kept its
 credential and its first host masked, before and after — but its second host was sent, before and
-after; that was #61, closed in `TODO-VERSION`, and it has its own paragraph below.
+after; that was #61, closed in `v0.9.4`, and it has its own paragraph below.
 
-**Hosts 2..n of a multi-host connection string were sent in the clear before `TODO-VERSION`.**
+**Hosts 2..n of a multi-host connection string were sent in the clear before `v0.9.4`.**
 `mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0` masked the credential
 and `host1` and sent `host2` and `host3` — in the trigger line *and* in the masked template of the
 same request; `mysql://user:pass@host1,host2/db` sent `host2`. Replica-set and failover URIs are
@@ -547,7 +547,7 @@ fail-closed re-scan nor the completeness tests could see that, because both ask 
 group landed on the declared secret, and it did. Whether a later host actually left the process
 depended on its suffix:
 
-| a host after the first | before `TODO-VERSION` |
+| a host after the first | before `v0.9.4` |
 |---|---|
 | `h2.corp.internal` (a private suffix) | rescued by the bare-host rule, under its own tag |
 | `h2.acme.com`, `host2` (public suffix, bare name) | **sent** |
@@ -566,8 +566,8 @@ and last stay visible**, so `host1:27017,host2:27018,host3:27019` reads back as
 and CSV cells (`https://api.acme.com,200,12ms`) now reads as a host list and the cells are masked — a
 comma *with a space* after it, a path before it, or no scheme on the line are all untouched. What
 stays open, pinned as assertions: an address literal (or a key-shaped member) as a *later* member
-still blocks every member after it, which is ISSUE-TBD-C below; and an underscore in a hostname,
-found while sweeping this one, is ISSUE-TBD-B under *Known limitations*.
+still blocks every member after it, which is #67 below; and an underscore in a hostname,
+found while sweeping this one, is #66 under *Known limitations*.
 
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
@@ -579,7 +579,7 @@ what the interference audit examined and not about what the package leaked. The 
 closing the first of them found a credential gap the audit had no reason to look at (#55, closed
 in `v0.9.2`); the sweep run while closing *that* found three more, listed last below; and closing
 the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the sweeps had
-a category for (#61, closed in `TODO-VERSION`); and the sweep that closed *that* found a class it
+a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found a class it
 could not close and a single-host leak, both listed last below. Each time the audit's own count was
 right and its scope was narrower than the sentence sounded.
 
@@ -617,7 +617,7 @@ right and its scope was narrower than the sentence sounded.
   admitting `@` alone traded a host leak for a username-fragment leak on one shape, so the rule
   carries the RFC's full disambiguation rather than half of it.
 - ~~**#61** — hosts 2..n of a multi-host connection string are sent in the clear.~~ **Closed in
-  `TODO-VERSION`.** See the paragraph above. The host rule's notion of the value — `host[:port]` —
+  `v0.9.4`.** See the paragraph above. The host rule's notion of the value — `host[:port]` —
   was smaller than the value, `host[:port](,host[:port])*`; the rest of the list is a companion
   rule now, because widening the host rule itself was measured to open a leak on a comma-separated
   list of URLs.
@@ -628,7 +628,7 @@ right and its scope was narrower than the sentence sounded.
   meant. The honest candidate here is to **fail closed** rather than mask in part: a partial mask
   that leaks a host is worse than a skipped escalation.
 
-- **ISSUE-TBD-C** — **a placeholder minted on a later member of a host list blocks every member
+- **#67** — **a placeholder minted on a later member of a host list blocks every member
   after it.** `mongodb://host1:27017,10.0.0.5:27017,host3:27017/db` masks `host1` and the address
   and sends `host3`; an IPv6 literal, bracketed or not, or a key-shaped member does the same. The
   companion rule's group excludes `<` — the inertness invariant — so a tag inside the list ends the
@@ -765,7 +765,7 @@ logscry says so on stderr on the way out.
   `_host:8080` to the configured model endpoint with only `my` masked, in a single-host URL — a
   far more common shape than the multi-host list #61 was about, since `_` is ordinary in Docker
   container names, Kafka broker names and internal hosts, and legal in an RFC 3986 reg-name. This
-  is a **live disclosure defect**, found while sweeping #61 and filed as ISSUE-TBD-B rather than
+  is a **live disclosure defect**, found while sweeping #61 and filed as #66 rather than
   fixed in the same change; its frequency relative to #61 is **unmeasured** — the journald capture
   is not at hand, so neither shape's frequency could be counted — and deferring it was therefore a
   decision taken without data rather than a conclusion. Until it is closed, treat any URL whose

@@ -894,7 +894,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       only the userinfo production was swept — with a `net/url`-as-oracle test as its mechanised
       half (every row with `://` must have HOST/IP placeholders covering `url.Parse(row).Host`; it
       does not consult the detector, so class 5 does not defeat it by construction). Filed as
-      **ISSUE-TBD-A**.
+      **#65**.
       **The fix is a companion rule, 9c, and NOT a wider class on 9a — measured, not preferred,
       and it overturned the working hypothesis.** The hypothesis was to let 9a's group span the
       whole authority. Two forms were built and run over the whole battery: a negated class
@@ -924,7 +924,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       on 9a — is strictly dominated: more blast radius (`detector.group` becoming a list, with
       `apply`, `residue`, `completenessSecretFor` and two tests following) AND less complete, since
       9a's group cannot start on `<IP_n>` and an address-first list stays open under it. That an
-      address-first list defeats option 3 is evidence about #54 and is recorded in ISSUE-TBD-C.
+      address-first list defeats option 3 is evidence about #54 and is recorded in #67.
       Its merit: one placeholder for the whole list on the primary rule. Option 2 — 9c with a
       one-member group, re-applied by `apply` to a fixpoint — is rejected as **unmeasured, not as
       wrong**: it adds a rule that reads its own output, iterated to quiescence, which brings a
@@ -933,7 +933,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       in an adjacent field only when the two spans are identical, and under option 1 the list's
       tail maps to `host2:27017,host3` while `https://host2/x` in a context line maps `host2`
       alone — a different `<HOST_n>`, so the recurrence signal across fields is lost for members
-      2..n. It is the named follow-up, and it would also close ISSUE-TBD-C (below), which the
+      2..n. It is the named follow-up, and it would also close #67 (below), which the
       pre-pass #54 names would not need to.
       **The first member's tag set was derived by walking the chain, not sampled.** Before 9c
       runs, a tag can land on member 1 from 7 and 8 (an address literal, bracketed or not:
@@ -990,7 +990,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       directly after a path-less URL. Measured beside it: `tried https://api.acme.com, then gave
       up`, `url: https://api.acme.com: refused`, `https://api.acme.com/orders,200` (a path before
       the comma), and `bootstrap=host1:9092,host2:9092` (no scheme) are all untouched.
-      **What stays open is a CLASS, filed as one — ISSUE-TBD-C.** A tag minted on a LATER member
+      **What stays open is a CLASS, filed as one — #67.** A tag minted on a LATER member
       truncates 9c's group there, because the group excludes `<` (the inertness invariant), and
       every member after it is sent. Derived by the same walk: 7 and 8 reach a later member and
       are the ordinary way in (`mongodb://host1:27017,10.0.0.5:27017,host3:27017/db` sends `host3`;
@@ -1012,7 +1012,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       this issue's candidate; it was not needed**, because the list's members are peers of the
       first host rather than parts of it, and a companion can see a peer through the tag the first
       one left behind. The pre-pass would still be the remedy for #54's own cells.
-      **Found, not fixed, and it is a LIVE single-host leak — ISSUE-TBD-B.** `http://my_host:8080/x`
+      **Found, not fixed, and it is a LIVE single-host leak — #66.** `http://my_host:8080/x`
       sends `_host:8080` with only `my` masked. `_` is legal in an RFC 3986 reg-name and ordinary
       in Docker container names, Kafka broker names and internal hosts, and it is absent from the
       host class, so 9a and 9c both stop at it. A single-host URL is a far more common shape than
@@ -1033,7 +1033,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       survives literally — absence of known strings, not a survival threshold, so that a later move
       to per-member placeholders rewrites `want` and nothing else; fifteen byte-identical negatives
       including the comma-URL list and the seven bracketed-prose shapes; seven open assertions
-      (four ISSUE-TBD-C cells, #59 with a list, two ISSUE-TBD-B). The two #58 assertions that
+      (four #67 cells, #59 with a list, two #66). The two #58 assertions that
       pinned the leak flipped; four completeness rows flush at both ends; two templatized rows;
       9c's own output fed back to `TestPlaceholdersAreInert`; four over-mask rows. Red before the
       fix: 1 + 5 + 2 + 26 + 4. `TestNoDetectorGroupLandsOnOurOwnOutput`,
@@ -1051,8 +1051,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       never feeds `hashTemplate`, so no template hashes move. README corrected at seven sites — the
       "what it masks" sentence, the #58 paragraph's "before and after" sentence, the audit
       paragraph, the #61 bullet struck, the two-placeholders sentence, the re-scan sentence, a new
-      past-tense paragraph with the conditional table and the port asymmetry — plus ISSUE-TBD-C
-      beside #59 and ISSUE-TBD-B under "Known limitations". Released as `TODO-VERSION`.
+      past-tense paragraph with the conditional table and the port asymmetry — plus #67
+      beside #59 and #66 under "Known limitations". Released as `v0.9.4`.
 
 - [x] **A raw `@` inside a userinfo is masked to the last `@`** — #58, row 18 of the #55
       sweep. `--llm-anonymize` masked `postgres://user:p@ss@db` up to the FIRST `@`, 9a read the
