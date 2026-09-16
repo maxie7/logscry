@@ -873,6 +873,187 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
 
+- [x] **Hosts 2..n of a multi-host authority are masked** — #61, found and filed by #58's sweep
+      and pinned there as two assertions that the gap was open. `--llm-anonymize` masked
+      `mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0` to
+      `<TOKEN_1>@<HOST_1>:27017,host2:27017,host3:27017/db…` and sent `host2` and `host3` to the
+      configured model endpoint — measured on the wire before the fix, in the trigger line AND in
+      the masked template of the same request; `mysql://user:pass@host1,host2/db` sent `host2`.
+      v0.4.0 → v0.9.3, **seventeen tagged releases** (`git tag --contains 2da31be | wc -l` → 17).
+      **The cause is a fifth kind, and the first instance of it.** Not an under-matching pattern
+      (#41), not a value another component rewrote first (#43), not a detector blocked by another's
+      tag (#46/#48/#54/#57), not a shape no rule described (#55). Detector 9a matched exactly what
+      it was written for — one host, class `[a-z0-9.-]` — and stopped where its author thought the
+      value ended, at the port colon and the comma. **Its notion of the value was smaller than the
+      value.** `residue` could not see it: both host rules are `verify:false`, and had they been
+      eligible the leftover (`host2:27017,host3`) is not a shape any of them matches on its own —
+      #41's structural reason from the re-scan's side. The completeness rows could not see it
+      either: they ask whether the group landed on the DECLARED secret, and it did. **What would
+      have caught it** is the #55-style sweep of the AUTHORITY production (`host = IP-literal /
+      IPv4address / reg-name`, the port, the driver multi-host extension), which was never done —
+      only the userinfo production was swept — with a `net/url`-as-oracle test as its mechanised
+      half (every row with `://` must have HOST/IP placeholders covering `url.Parse(row).Host`; it
+      does not consult the detector, so class 5 does not defeat it by construction). Filed as
+      **ISSUE-TBD-A**.
+      **The fix is a companion rule, 9c, and NOT a wider class on 9a — measured, not preferred,
+      and it overturned the working hypothesis.** The hypothesis was to let 9a's group span the
+      whole authority. Two forms were built and run over the whole battery: a negated class
+      `[^/\s<>@]` bounded at `/`, whitespace, `>` and end of text (with and without `?#`), and
+      the exact grammar `host[:port](,host[:port])*` with the trailing port outside — which is
+      what `net/url` calls the Host of that URI (`Hostname()` of the replica-set URI is
+      `host1:27017,host2:27017,host3`, `Port()` `27017`). Both close every list shape and both
+      OPEN a leak on a shape masked today: `peers=https://a.com,https://b.com` is
+      `<HOST_1>,https://<HOST_2>` and becomes `<HOST_1>//b.com` / `<HOST_1>://b.com`. RFC 3986
+      §3.2.2 puts `,` in sub-delims, so `a.com,https` is a legal reg-name — `net/url` reads that
+      string as host `a.com,https`, path `//b.com` — and RE2 has no lookahead to refuse the member
+      that is the next URL's scheme. Three ways out, all rejected: accepting the regression
+      (forbidden: masked today); a REQUIRED trailing context on 9a rejecting `://` (a terminator on
+      a first-pass rule narrows what it already masks — every position it does not name becomes a
+      no-match, e.g. `https://a.com://b.com` masks `a.com` today and would not); relaxing 9a's
+      anchor to a bare `://` so the orphaned URL re-anchors (closes #52 incidentally by DROPPING
+      the anchor rather than making it tolerant — out of scope, not done). The negated form also
+      minted `<HOST_n>` for a lone `[` on a bracketed IPv6 host and absorbed every port. **The
+      durable result:** disambiguating trailing context is affordable only on a rule whose
+      failure is the status quo. 9c reads the first member's tag as context, as 4b/4c read a
+      credential half — the fifth rule to read one of our tags on purpose — and carries the `://`
+      rejection safely. It runs after 9a and **before 9b and 6**, both placements measured: after
+      9b, `h1.acme.com,h2.corp.internal,h3.acme.com` sent `h3.acme.com` (9b's own tag on the
+      second member blocked the group); after 6, `host1,<uuid>.acme.com` sent `.acme.com`.
+      **Options 2 and 3 were rejected on shape, not on disclosure, and each has one real merit.**
+      All three close the same leaks; they differ in OUTPUT SHAPE. Option 3 — two capture groups
+      on 9a — is strictly dominated: more blast radius (`detector.group` becoming a list, with
+      `apply`, `residue`, `completenessSecretFor` and two tests following) AND less complete, since
+      9a's group cannot start on `<IP_n>` and an address-first list stays open under it. That an
+      address-first list defeats option 3 is evidence about #54 and is recorded in ISSUE-TBD-C.
+      Its merit: one placeholder for the whole list on the primary rule. Option 2 — 9c with a
+      one-member group, re-applied by `apply` to a fixpoint — is rejected as **unmeasured, not as
+      wrong**: it adds a rule that reads its own output, iterated to quiescence, which brings a
+      termination obligation the inertness invariant does not currently carry. Its merit, measured
+      under option 1 so it is stated exactly: a repeated host gets the SAME token in the list and
+      in an adjacent field only when the two spans are identical, and under option 1 the list's
+      tail maps to `host2:27017,host3` while `https://host2/x` in a context line maps `host2`
+      alone — a different `<HOST_n>`, so the recurrence signal across fields is lost for members
+      2..n. It is the named follow-up, and it would also close ISSUE-TBD-C (below), which the
+      pre-pass #54 names would not need to.
+      **The first member's tag set was derived by walking the chain, not sampled.** Before 9c
+      runs, a tag can land on member 1 from 7 and 8 (an address literal, bracketed or not:
+      `mongodb://user:pass@10.0.0.5:27017,host2:27017/db` → `<TOKEN_1>@<IP_1>:27017,<HOST_1>:27017/db`),
+      from 9a (the ordinary case), from 1/2/3b only when a host literally IS a key
+      (`mongodb://AKIAIOSFODNN7EXAMPLE,host2/db` → `<TOKEN_1>,<HOST_1>/db`), and from 5 only through
+      #57's shape, where two tags sit adjacent with no comma between
+      (`s3://AKIA….prod@h1.acme.com,host2/db` → `<TOKEN_1><EMAIL_1>,<HOST_1>/db`, which the first
+      draft leaked). The #46 path by which the email rule swallowed `pass@h1.acme.com` is gone
+      since #55/#58 — measured, not recalled: `postgres://sk-…:hunter2@h1.acme.com,host2/db` →
+      `<TOKEN_1>:<TOKEN_2>@<HOST_1>,<HOST_2>/db`. #59's shape with a list
+      (`postgres://user:p/ss@h1.acme.com,host2/db` → `<HOST_1>:p/<EMAIL_1>,host2/db`) stays open and
+      is #59's: the authority ended at the raw `/`, so `host2` is PATH to the RFC and to `net/url`
+      alike. 3a is impossible (it needs whitespace, and none can precede member 1 inside an
+      authority); 4/4b/4c mint on the userinfo, never on a member — 4 can SWALLOW the list when
+      the query carries an `@` (`mongodb://host1,host2?x=a@b` → `<TOKEN_1>@<HOST_1>`, #58's pinned
+      over-mask, nothing leaks); 9b, 6 and 10 run after 9c. So the context admits one or more
+      adjacent tags of ours, a bracketed tag — ours, or the pipeline's `<IP>` on the Template
+      field, which the first draft missed and which leaked `host<NUM>` there — or a raw host run.
+      The raw branch is unreachable in the chain (9a has taken every raw first member this anchor
+      can reach, and declines only on `<` and `[`, where the raw branch cannot start either) and
+      exists for the two single-detector probes, `completenessSecretFor` and the
+      templatized-coverage test, exactly as 4b/4c's context does. Every excluded placement is
+      unreachable, not unobserved.
+      **What anchors 9c to an authority.** `scheme://` followed, with no whitespace anywhere, by
+      an optional userinfo run, member 1, one or more commas and a host run. So a bracketed
+      address in prose is never reached — `[10.0.0.5] connected, retrying`, `[10.0.0.5],retrying`,
+      `peer [10.0.0.5] , retrying`, two bracketed addresses with no scheme and no `@`, a scheme
+      earlier on the line, an `@` earlier on the line, `10.0.0.5,retrying`: all byte-identical bar
+      the address, raw and templatized, and all pinned as rows. The one URL-shaped string,
+      `https://x@[2001:db8::1],retrying`, tags `retrying` and is pinned as an over-mask.
+      **Boundary shapes, measured through the real `Templatize` as well.** No credential
+      (`<HOST_1>,<HOST_2>/db`); a list terminated by `?` or `#` — the group class is POSITIVE, so
+      those end it by construction, which is why #58's `?#` decision about a NEGATED userinfo
+      class was not imported by analogy; a single member with a trailing comma (unchanged,
+      `<HOST_1>,/db`); an empty member — `h1,,h2` sent `h2` in the first draft, and libpq accepts
+      an empty list item ("selects the default"), so the separator is `,+`; mixed case —
+      `mongodb://host1,Host2.ACME.com,host3/db` → `<HOST_1>,<HOST_2>/db`, because Go folds the
+      negated `listEnd` class under `(?i)` (measured character by character: `A` and `Z` do not
+      terminate, `:` `/` `?` `,` do), which mattered because an uppercase terminator would have
+      truncated a member with no test looking for it. Two members that templatize alike come back
+      as the same placeholder (`host<NUM>,host<NUM>` → `<HOST_1>,<HOST_1>`), correctly.
+      **What it costs, pinned in `TestAcceptedOverMasking`.** Hosts 2..n are ONE placeholder, so
+      the ports BETWEEN members are inside it while the first and last stay visible:
+      `host1:27017,host2:27018,host3:27019` → `<HOST_1>:27017,<HOST_2>:27019`. And a path-less URL
+      directly followed by a comma and CSV cells reads as a host list: `https://api.acme.com,200,12ms`
+      → `https://<HOST_1>,<HOST_2>`. **That row is a new kind of cost in this package, and it is
+      named so the next over-mask decision does not cite the old asymmetry unexamined.** Every
+      over-mask before it cost a placeholder in a restatement that is already lossy; this one costs
+      the PAYLOAD the model reasons about — a status code and a duration are exactly what an
+      explanation turns on. The over-mask-rather-than-under-mask asymmetry still holds and the row
+      stays, but "over-masking is cheap" is now two claims — cheap to Restore, and cheap to the
+      explanation — and only the first is structural. The boundary is narrow: a comma with NO space
+      directly after a path-less URL. Measured beside it: `tried https://api.acme.com, then gave
+      up`, `url: https://api.acme.com: refused`, `https://api.acme.com/orders,200` (a path before
+      the comma), and `bootstrap=host1:9092,host2:9092` (no scheme) are all untouched.
+      **What stays open is a CLASS, filed as one — ISSUE-TBD-C.** A tag minted on a LATER member
+      truncates 9c's group there, because the group excludes `<` (the inertness invariant), and
+      every member after it is sent. Derived by the same walk: 7 and 8 reach a later member and
+      are the ordinary way in (`mongodb://host1:27017,10.0.0.5:27017,host3:27017/db` sends `host3`;
+      an IPv6 literal bracketed or not does the same); 1, 2 and 3b reach it only when a member
+      literally IS a key (`mongodb://h1,AKIAIOSFODNN7EXAMPLE,host3/db` sends `host3`); 5 only through
+      #57's shape, since any `@` inside an authority is detector 4's delimiter first
+      (`mongodb://h1,bob@acme.com,host3/db` → `<TOKEN_1>@<HOST_1>,<HOST_2>/db`, nothing leaks); 3a
+      needs whitespace and 10 needs a `/`, and both end the authority; 6 and 9b run after 9c. One
+      pinned open assertion per reachable tag, so a cell is not a defect nobody reads — row 17 of
+      the #55 sweep taught that. On the Template field the address members collapse to `<IP>`,
+      which the tolerant class steps over, so the class is live on the raw path (#48's finding
+      again). **Same class as #54 by cause, a sibling by remedy, argued:** #54 is an inner
+      detector's tag inside a host value where a linear chain cannot say what the span is PART OF
+      — that is exactly this. But in #54's two cells the inner tag is WRONG (an address that is a
+      label inside a host) and only a pre-pass identifying the authority first can right it; here
+      the inner tag is RIGHT (an address in a list is an address, `<HOST_1>,<IP_1>,<HOST_2>` is the
+      wanted output) and a companion re-applied to a fixpoint would re-anchor on it, no pre-pass
+      needed. So the remedy is option 2 above, not #54's. **#58's entry named the #54 pre-pass as
+      this issue's candidate; it was not needed**, because the list's members are peers of the
+      first host rather than parts of it, and a companion can see a peer through the tag the first
+      one left behind. The pre-pass would still be the remedy for #54's own cells.
+      **Found, not fixed, and it is a LIVE single-host leak — ISSUE-TBD-B.** `http://my_host:8080/x`
+      sends `_host:8080` with only `my` masked. `_` is legal in an RFC 3986 reg-name and ordinary
+      in Docker container names, Kafka broker names and internal hosts, and it is absent from the
+      host class, so 9a and 9c both stop at it. A single-host URL is a far more common shape than
+      a multi-host DSN. **Its frequency relative to #61 is UNMEASURED**: the capture is not on this
+      machine, so deferring it is a decision taken without data rather than a conclusion, and it
+      is in README "Known limitations" for that reason — a disclosure defect present only here
+      would be documentation asserting the absence of a bug. Pinned as two open assertions.
+      **The corpus: no data.** The 612-record journald capture is not on this machine; per #43 it
+      contains zero lines with an `@`, so zero credentialed DSNs, and whether it holds a
+      credential-less multi-host authority could not be checked. The leak's frequency and the CSV
+      over-mask's cost are both recorded as costs no run has shown us paying.
+      **`residue` — nothing.** No new proviso on the README's re-scan paragraph: the re-scan was
+      never in a position to see this, and closing it changes nothing about what it can see. The
+      README sentence "not one that matches a value only partly" gains "not one whose notion of the
+      value is smaller than the value", which is #41's blindness stated from the pattern's side.
+      **Tests, red first.** `TestIssue61MultiHostAuthority` with exact outputs for 26 closed shapes
+      on both paths and, beside every exact span, a property assertion that no declared member
+      survives literally — absence of known strings, not a survival threshold, so that a later move
+      to per-member placeholders rewrites `want` and nothing else; fifteen byte-identical negatives
+      including the comma-URL list and the seven bracketed-prose shapes; seven open assertions
+      (four ISSUE-TBD-C cells, #59 with a list, two ISSUE-TBD-B). The two #58 assertions that
+      pinned the leak flipped; four completeness rows flush at both ends; two templatized rows;
+      9c's own output fed back to `TestPlaceholdersAreInert`; four over-mask rows. Red before the
+      fix: 1 + 5 + 2 + 26 + 4. `TestNoDetectorGroupLandsOnOurOwnOutput`,
+      `TestRestoreHasNoNestedMapping`, `TestPlaceholdersAreInert`, `TestMaskingIsComplete`,
+      `TestEveryDetectorHasACompletenessRow` and `TestEveryUncollapsedDetectorHasATemplatizedRow`
+      green throughout; 9c's group excludes `<` and `>`; without the templatized row the last of
+      those goes red naming detector 11, which is why the rows land in the first commit.
+      **Wire test, one run, two greps** on the same captured POST body (python `http.server`,
+      `--plain --llm-anonymize --warmup-lines 0`, a `[FATAL]` line carrying the replica-set URI
+      with #57's `s3://AKIA…EXAMPLE.prod@x@bucket` in its context — the level must be bracketed or
+      `level=`, a bare `FATAL` does not parse and nothing escalates): `host2`/`host3` → 2 before, 0
+      after; `.prod` → fires in both, as a release whose honesty is executable needs it to; the
+      truncation signature `,host` → 0 after.
+      `internal/pipeline` does not appear in the diff: this package runs at the LLM boundary and
+      never feeds `hashTemplate`, so no template hashes move. README corrected at seven sites — the
+      "what it masks" sentence, the #58 paragraph's "before and after" sentence, the audit
+      paragraph, the #61 bullet struck, the two-placeholders sentence, the re-scan sentence, a new
+      past-tense paragraph with the conditional table and the port asymmetry — plus ISSUE-TBD-C
+      beside #59 and ISSUE-TBD-B under "Known limitations". Released as `TODO-VERSION`.
+
 - [x] **A raw `@` inside a userinfo is masked to the last `@`** — #58, row 18 of the #55
       sweep. `--llm-anonymize` masked `postgres://user:p@ss@db` up to the FIRST `@`, 9a read the
       `ss` behind it as an authority and tagged it `<HOST_n>`, and the real host went to the
