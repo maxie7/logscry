@@ -324,6 +324,10 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		// show a group stepping over a tag to reach it. The group class still excludes '<', so the
 		// run cannot start on <TOKEN_1> and there is nothing before it to start on.
 		"dsn=postgres://<TOKEN_1>@<HOST_2>@<HOST_3>/prod",
+		// #61's output fed back: 9c reads the FIRST member's tag as context on purpose, so this is
+		// the string that would show its group landing on the second. The group class excludes
+		// '<', so it cannot start on <HOST_2>, and nothing raw follows the comma to start on.
+		"dsn=mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db?replicaSet=rs0",
 		"loaded from /home/<USER_1>/go/pkg/mod",
 		"call https://<HOST_1>/v1 and <UUID_1>",
 	}
@@ -642,9 +646,11 @@ func TestIssue58RawAtInUserinfo(t *testing.T) {
 		// The cell that forces authorityTail. See the comment above.
 		{"raw '@' in the username, pre-masked password (4c)",
 			"postgres://us@er:" + sk + "@db", "postgres://<TOKEN_2>:<TOKEN_1>@<HOST_1>"},
-		// A replica-set URI: the credential is closed here; the second host is #61, below.
+		// A replica-set URI: the credential is closed here. Until #61 this row pinned the second
+		// host LITERAL -- "<HOST_1>:27017,host2:27017/db" -- as an assertion that the gap was open;
+		// 9c takes the rest of the list now, and TestIssue61MultiHostAuthority owns the shape.
 		{"multi-host, raw '@' in the password", "mongodb://user:p@ss@host1:27017,host2:27017/db",
-			"mongodb://<TOKEN_1>@<HOST_1>:27017,host2:27017/db"},
+			"mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -686,11 +692,8 @@ func TestIssue58RawAtInUserinfo(t *testing.T) {
 		// the host. Still #57; not closed here, and the assertion is on the part that leaks in
 		// both states.
 		{"partly-recognised half, raw '@' (#57)", "s3://AKIAIOSFODNN7EXAMPLE.prod@x@bucket", ".prod"},
-		// The second host of a replica set. The credential is right, the first host is right, and
-		// 9a's group stops at the port colon and the comma. Not interference and not a grammar
-		// gap: the detector's notion of the value is smaller than the value. #61.
-		{"second host of a multi-host DSN (#61)",
-			"mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0", "host2:27017,host3"},
+		// The second host of a replica set sat here as #61 until it was closed; it is
+		// TestIssue61MultiHostAuthority now, with the open cells of ITS sweep pinned there.
 	}
 	for _, c := range open {
 		t.Run(c.name, func(t *testing.T) {
@@ -700,6 +703,220 @@ func TestIssue58RawAtInUserinfo(t *testing.T) {
 					" in:  %q\n out: %q\n looking for: %q", c.in, masked, c.leak)
 			}
 		})
+	}
+}
+
+// TestIssue61MultiHostAuthority is the named regression for #61, and it is the first of a FIFTH
+// kind of cause in this package. Not an under-matching pattern (#41), not a value another component
+// rewrote first (#43), not a detector blocked by another's tag (#46, #48, #54, #57), not a shape no
+// rule described (#55): detector 9a matched exactly what it was written for -- one host -- and
+// stopped where its author thought the value ended, at the port colon and the comma. Its notion of
+// the value was smaller than the value. mongodb://user:pass@host1:27017,host2:27017,host3:27017/db
+// sent host2 and host3 to the configured model endpoint, in the trigger line AND in the masked
+// template of the same request. v0.4.0 -> v0.9.3, seventeen tagged releases.
+//
+// Neither residue() nor the completeness rows could see it, by construction: both ask whether the
+// group landed on the DECLARED secret, and it did. What would have is a sweep of the authority
+// production the way #55 swept the userinfo production, which had not been done.
+//
+// THE FIX IS A COMPANION RULE, 9c, AND NOT A WIDER CLASS ON 9a -- measured rather than preferred.
+// Widening 9a's own group to span the list closes every shape below and OPENS a leak on a shape
+// masked today: "peers=https://a.com,https://b.com" is <HOST_1>,https://<HOST_2> and would become
+// <HOST_1>://b.com, because a comma member that is the next URL's scheme is a legal reg-name (RFC 3986
+// §3.2.2 puts ',' in sub-delims; net/url reads that string as host "a.com,https" and path "//b.com")
+// and RE2 has no lookahead to refuse it. A trailing context that rejects "://" cannot go on 9a --
+// a REQUIRED terminator on a first-pass rule narrows what it already masks -- but it can go on a
+// companion, because a companion's no-match is today's behaviour. So 9c reads the first member's
+// tag as context, the way 4b and 4c read a credential half, and takes hosts 2..n as ONE group.
+//
+// Two placeholders for a list of any length, then: the first member and the rest. Each closed case
+// below pins the exact output AND asserts that no declared member survives literally -- absence of
+// known strings, not a survival threshold (#41 rejected thresholds, and that stands) -- so that a
+// later move to one placeholder per member is a layout change that rewrites `want` and nothing else.
+func TestIssue61MultiHostAuthority(t *testing.T) {
+	const (
+		sk   = "sk-livekeyabcdefghij0123456789XYZ"
+		uuid = "550e8400-e29b-41d4-a716-446655440000"
+	)
+	closed := []struct {
+		name, in, want string
+		members        []string // every host of the list; none may appear literally in the output
+	}{
+		// The issue's example and its siblings: replica set, failover list, no credential at all.
+		{"replica set", "mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0",
+			"mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db?replicaSet=rs0", []string{"host1", "host2", "host3"}},
+		{"mysql failover", "mysql://user:pass@host1,host2/db",
+			"mysql://<TOKEN_1>@<HOST_1>,<HOST_2>/db", []string{"host1", "host2"}},
+		{"no credential", "mongodb://host1:27017,host2:27017/db?replicaSet=rs0",
+			"mongodb://<HOST_1>:27017,<HOST_2>:27017/db?replicaSet=rs0", []string{"host1", "host2"}},
+		{"bare names, no ports", "mongodb://host1,host2,host3/db",
+			"mongodb://<HOST_1>,<HOST_2>/db", []string{"host1", "host2", "host3"}},
+		{"redis sentinel", "redis://:pw@host1:6379,host2:6379/0",
+			"redis://<TOKEN_1>@<HOST_1>:6379,<HOST_2>:6379/0", []string{"host1", "host2"}},
+		// Suffixes in both orders. 9c runs BEFORE 9b, so a private-suffix member later in the list
+		// is part of the rest rather than 9b's own tag; after 9b it would have blocked 9c's group
+		// and sent every member behind it (measured: <HOST_1>,<HOST_2>,h3.acme.com/db).
+		{"private then public", "mongodb://user:pass@h1.corp.internal:27017,h2.acme.com:27017/db",
+			"mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db", []string{"h1.corp.internal", "h2.acme.com"}},
+		{"public, private, public", "mongodb://h1.acme.com,h2.corp.internal,h3.acme.com/db",
+			"mongodb://<HOST_1>,<HOST_2>/db", []string{"h1.acme.com", "h2.corp.internal", "h3.acme.com"}},
+		// Case: the group class sits under (?i) and Go folds the negated listEnd class too, so an
+		// uppercase character neither starts a member nor ends one (measured, not assumed).
+		{"mixed case members", "mongodb://host1,Host2.ACME.com,host3/db",
+			"mongodb://<HOST_1>,<HOST_2>/db", []string{"host1", "Host2.ACME.com", "host3"}},
+		{"mixed case, ports, credential", "MongoDB://user:pass@Host1:27017,HOST2:27017,Host3:27017/DB",
+			"MongoDB://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/DB", []string{"Host1", "HOST2", "Host3"}},
+		// A pre-masked credential half on either side: 9c's userinfo skip steps over the tags
+		// exactly as 9a's does.
+		{"pre-masked username", "mongodb://" + sk + ":pass@host1:27017,host2:27017/db",
+			"mongodb://<TOKEN_1>:<TOKEN_2>@<HOST_1>:27017,<HOST_2>:27017/db", []string{"host1", "host2"}},
+		{"pre-masked password", "mongodb://user:" + sk + "@host1:27017,host2:27017/db",
+			"mongodb://<TOKEN_2>:<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db", []string{"host1", "host2"}},
+		{"raw '@' in the password (#58's row)", "mongodb://user:p@ss@host1:27017,host2:27017/db",
+			"mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db", []string{"host1", "host2"}},
+		// THE FIRST MEMBER'S TAG SET, derived by walking the chain rather than sampled. Before 9c
+		// runs, a tag can land on member 1 from 7 and 8 (an address literal, bracketed or not), from
+		// 9a (the ordinary case), from 1/2/3b only when a host literally IS a key, and from 5 only
+		// through #57's shape, where two tags sit adjacent with no comma between. 3a is impossible
+		// (it needs whitespace, and none can precede member 1 inside an authority); 4 mints on the
+		// userinfo, never on a member; 9b, 6 and 10 run after 9c. The context therefore admits one
+		// or more adjacent tags of ours, a bracketed one (ours, or the pipeline's <IP> on the
+		// Template field), or a raw run -- and every excluded placement is unreachable, not
+		// unobserved. One row per reachable tag:
+		{"address first", "mongodb://user:pass@10.0.0.5:27017,host2:27017/db",
+			"mongodb://<TOKEN_1>@<IP_1>:27017,<HOST_1>:27017/db", []string{"host2"}},
+		{"address first, pre-masked username", "mongodb://" + sk + ":pass@10.0.0.5:27017,host2:27017/db",
+			"mongodb://<TOKEN_1>:<TOKEN_2>@<IP_1>:27017,<HOST_1>:27017/db", []string{"host2"}},
+		{"bracketed ipv6 first", "mongodb://user:pass@[2001:db8::1]:27017,host2:27017/db",
+			"mongodb://<TOKEN_1>@[<IP_1>]:27017,<HOST_1>:27017/db", []string{"host2"}},
+		{"unbracketed ipv6 first", "mongodb://2001:db8::1,host2/db",
+			"mongodb://<IP_1>,<HOST_1>/db", []string{"host2"}},
+		{"key-shaped first member (theoretical)", "mongodb://AKIAIOSFODNN7EXAMPLE,host2/db",
+			"mongodb://<TOKEN_1>,<HOST_1>/db", []string{"host2"}},
+		{"#57-shaped first member: adjacent tags", "s3://AKIAIOSFODNN7EXAMPLE.prod@h1.acme.com,host2/db",
+			"s3://<TOKEN_1><EMAIL_1>,<HOST_1>/db", []string{"host2"}},
+		// A UUID label as a later member. 9c runs before 6, so the member is a host run to it; after
+		// 6 it would have been <HOST_1>,<UUID_1>.acme.com/db (measured) -- #48's leak, one member in.
+		{"uuid-label member", "mongodb://host1," + uuid + ".acme.com/db",
+			"mongodb://<HOST_1>,<HOST_2>/db", []string{"host1", uuid + ".acme.com"}},
+		// The boundary shapes, measured rather than reasoned. The group class is positive, so '?' and
+		// '#' end it by construction -- this is NOT #58's decision about a negated userinfo class
+		// imported by analogy, it is what the class says.
+		{"list ends at '?'", "mongodb://host1,host2?replicaSet=rs0",
+			"mongodb://<HOST_1>,<HOST_2>?replicaSet=rs0", []string{"host1", "host2"}},
+		{"list ends at '#'", "mongodb://host1,host2#frag",
+			"mongodb://<HOST_1>,<HOST_2>#frag", []string{"host1", "host2"}},
+		{"list ends at end of text", "dsn=mongodb://user:pass@host1:27017,host2:27017",
+			"dsn=mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017", []string{"host1", "host2"}},
+		{"angle-bracketed", "<mongodb://user:pass@host1:27017,host2:27017/db>",
+			"<mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db>", []string{"host1", "host2"}},
+		// An empty member. libpq accepts one ("an empty item in the list selects the default"), so
+		// the separator is one or more commas; with a single comma this sent h2.
+		{"empty member", "mongodb://h1,,h2/db",
+			"mongodb://<HOST_1>,,<HOST_2>/db", []string{"h1", "h2"}},
+		{"trailing comma after the list", "mongodb://host1,host2,/db",
+			"mongodb://<HOST_1>,<HOST_2>,/db", []string{"host1", "host2"}},
+		{"two lists on one line", "mongodb://user:pass@host1:27017,host2:27017/db,mongodb://user:pass@host3:27017,host4:27017/db",
+			"mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_3>:27017/db,mongodb://<TOKEN_1>@<HOST_2>:27017,<HOST_4>:27017/db",
+			[]string{"host1", "host2", "host3", "host4"}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			got := mustMask(t, m, c.in)
+			if got != c.want {
+				t.Errorf("host list not masked as expected:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+			for _, member := range c.members {
+				if strings.Contains(got, member) {
+					t.Errorf("list member survived masking: %q still in %q", member, got)
+				}
+			}
+			if r := m.Restore(got); r != c.in {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", c.in, r)
+			}
+		})
+	}
+
+	// The negative half, part one: byte-identical before and after. What anchors 9c to an authority
+	// is "scheme://" followed, with no whitespace ANYWHERE, by an optional userinfo run, the first
+	// member, a comma and a host run. So a comma-separated list of URLs keeps every URL (the shape
+	// that decided the design), a space after the comma ends the URI, a member in scheme position is
+	// declined by the "://" rejection, a scheme-less list is prose by design, and a bracketed address
+	// in prose -- with or without a scheme or an '@' elsewhere on the line -- is never reached.
+	same := []struct{ name, in, want string }{
+		{"single host with a port", "postgres://user:pass@db:5432/app", "postgres://<TOKEN_1>@<HOST_1>:5432/app"},
+		{"comma-separated urls", "peers=https://a.com,https://b.com", "peers=https://<HOST_1>,https://<HOST_2>"},
+		{"comma-separated urls, credential in the second", "peers=https://a.com,https://u:p@b.com",
+			"peers=https://<HOST_1>,https://<TOKEN_1>@<HOST_2>"},
+		{"comma then space in prose", "tried https://api.acme.com, then gave up", "tried https://<HOST_1>, then gave up"},
+		{"colon then space in prose", "url: https://api.acme.com: refused", "url: https://<HOST_1>: refused"},
+		{"space after the comma ends the uri", "mongodb://host1:27017, host2:27017/db", "mongodb://<HOST_1>:27017, host2:27017/db"},
+		{"member in scheme position", "mongodb://host1,host2://x", "mongodb://<HOST_1>,host2://<HOST_2>"},
+		{"no scheme, by design", "bootstrap=host1:9092,host2:9092", "bootstrap=host1:9092,host2:9092"},
+		{"prose: bracketed address, comma", "[10.0.0.5] connected, retrying", "[<IP_1>] connected, retrying"},
+		{"prose: bracketed address glued to a comma", "[10.0.0.5],retrying", "[<IP_1>],retrying"},
+		{"prose: bracketed address, space before the comma", "peer [10.0.0.5] , retrying", "peer [<IP_1>] , retrying"},
+		{"prose: two bracketed addresses, no scheme, no '@'", "peer [10.0.0.5] down [10.0.0.6],restarting",
+			"peer [<IP_1>] down [<IP_2>],restarting"},
+		{"prose: a scheme earlier on the line", "GET https://api.acme.com/x from [10.0.0.5],retrying",
+			"GET https://<HOST_1>/x from [<IP_1>],retrying"},
+		{"prose: an '@' earlier on the line", "mail bob@corp.example.com from [10.0.0.5],retrying",
+			"mail <EMAIL_1> from [<IP_1>],retrying"},
+		{"prose: address glued to a comma, no scheme", "10.0.0.5,retrying", "<IP_1>,retrying"},
+	}
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			if got := mustMask(t, New(), c.in); got != c.want {
+				t.Errorf("a shape outside #61 moved:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	// The negative half, part two: ASSERTIONS that these gaps are open, in the style of the #55 and
+	// #58 tests. Each goes red when its issue is fixed and is the reminder to update the docs.
+	open := []struct{ name, in, leak string }{
+		// A TAG MINTED ON A LATER MEMBER BLOCKS EVERY MEMBER AFTER IT, and that is a class, not a
+		// cell. 9c's group excludes '<' -- the inertness invariant -- so a placeholder minted on
+		// member k >= 2 before 9c runs truncates the group there. Walking the chain: 7 and 8 reach
+		// a later member (an address literal, bracketed or not) and are the ordinary way in; 1, 2
+		// and 3b reach it only when a member literally IS a key; 5 only through #57's shape, since
+		// any '@' inside an authority is detector 4's delimiter first; 3a needs whitespace, 10 needs
+		// a '/', and both end the authority; 6 and 9b run after 9c. Same cause as #54 --
+		// containment, unrepresentable in a linear chain -- but not #54's remedy: the inner tag is
+		// RIGHT here (an address in a list is an address), and a companion re-applied to a fixpoint
+		// would re-anchor on it, which is the named follow-up rather than the pre-pass. One pinned
+		// row per reachable tag. #67.
+		{"address as a later member (#67)", "mongodb://host1:27017,10.0.0.5:27017,host3:27017/db", "host3"},
+		{"unbracketed ipv6 as a later member (#67)", "mongodb://h1,2001:db8::1,host3/db", "host3"},
+		{"bracketed ipv6 as a later member (#67)", "mongodb://h1,[2001:db8::1]:27017,host3:27017/db", "host3"},
+		{"key-shaped later member, theoretical (#67)", "mongodb://h1,AKIAIOSFODNN7EXAMPLE,host3/db", "host3"},
+		// #59's shape with a list: the authority ended at the raw '/', so host2 is PATH to the RFC
+		// and to net/url alike, and no context design reaches it. Still #59.
+		{"raw '/' in the password, with a list (#59)", "postgres://user:p/ss@h1.acme.com,host2/db", "host2"},
+		// An underscore in a hostname. '_' is legal in an RFC 3986 reg-name and ordinary in Docker
+		// container names, Kafka brokers and internal hosts, and it is absent from the host class,
+		// so 9a and 9c both stop at it: http://my_host:8080/x sends "_host" today. A SINGLE-host
+		// leak found while sweeping this one, live, and filed on its own. #66.
+		{"underscore in a hostname (#66)", "mongodb://host1,host_2/db", "_2"},
+		{"underscore in a single hostname (#66)", "http://my_host:8080/x", "_host"},
+	}
+	for _, c := range open {
+		t.Run(c.name, func(t *testing.T) {
+			masked := mustMask(t, New(), c.in)
+			if !strings.Contains(masked, c.leak) {
+				t.Errorf("this gap appears to be closed — update this test and the docs that call it open:\n"+
+					" in:  %q\n out: %q\n looking for: %q", c.in, masked, c.leak)
+			}
+		})
+	}
+
+	// Verify-eligibility, stated honestly: there is none. Both host detectors and 9c are
+	// verify:false, so the re-scan never looked at the old leftover -- and had they been eligible it
+	// would still have read it as clean, because "host2:27017,host3" is not a shape any of them
+	// matches on its own (#41's structural reason). The fix lives in the chain, not in residue().
+	if tag := New().residue("mongodb://<TOKEN_1>@<HOST_1>:27017,host2:27017/db"); tag != "" {
+		t.Errorf("residue() sees the old leftover as %q; the claim in the comment above is wrong", tag)
 	}
 }
 
@@ -1095,13 +1312,33 @@ var completenessRows = []completenessRow{
 		"dsn=postgres://", "us@er7",
 		":" + phMark + "sk-abcdefghij0123456789XYZ" + phMark + "@" + phMark + "db.acme.com" + phMark + "/prod"},
 	// A replica-set URI. This row proves the host list is NOT swallowed into the credential span
-	// -- the '@' that delimits is the one before host1, and the suffix is returned intact. The
-	// second host is LITERAL in that suffix on purpose: it is sent today, before and after #58,
-	// because 9a's group stops at the port colon and the comma (#61). When that is fixed,
-	// host2 moves inside phMarks and this row is the reminder.
+	// -- the '@' that delimits is the one before host1, and the suffix is returned intact. Until
+	// #61 the second host was LITERAL in that suffix on purpose, as the reminder that it was sent;
+	// it is a marked span now, and it is 9c's.
 	{"url-credentials/raw-at-multi-host",
 		"dsn=mongodb://", "user:p@ss",
-		"@" + phMark + "host1" + phMark + ":27017,host2:27017/db?replicaSet=rs0"},
+		"@" + phMark + "host1" + phMark + ":27017," + phMark + "host2" + phMark + ":27017/db?replicaSet=rs0"},
+	// #61. Hosts 2..n of a comma-separated authority are ONE value to detector 9c: the group runs
+	// from the second member to the last, with the ports BETWEEN members inside it and the last
+	// port outside, which is the same boundary 9a draws for a single host (and the one net/url
+	// draws: its Hostname() of the replica-set URI is "host1:27017,host2:27017,host3"). The first
+	// member is context -- 9a's tag in the chain, the raw run in this single-detector probe -- so
+	// the canonical row's prefix carries host1 as a marked span.
+	//
+	// Flush at both ends by construction: the prefix ends with the comma after member 1 and the
+	// suffix opens with the last port or the path, so an over-reach into the path and a stop at an
+	// interior port both fail here.
+	{"url-host/list-rest", "dsn=mongodb://" + phMark + "host1" + phMark + ":27017,",
+		"host2:27017,host3", ":27017/db?replicaSet=rs0"},
+	{"url-host/list-rest/no-ports", "dsn=mysql://" + phMark + "host1" + phMark + ",", "host2,host3", "/db"},
+	// The first member is an address literal: detector 8 (or 7) tagged it before 9a ran, 9a
+	// declined because its group cannot start on '<', and 9c's context admits the tag. These two
+	// rows pass only through the full chain -- 9c alone cannot match the raw address -- which is
+	// why the canonical row above comes first.
+	{"url-host/list-rest/address-first", "dsn=mongodb://" + phMark + "10.0.0.5" + phMark + ":27017,",
+		"host2", ":27017/db"},
+	{"url-host/list-rest/ipv6-first", "dsn=mongodb://[" + phMark + "2001:db8::1" + phMark + "]:27017,",
+		"host2", ":27017/db"},
 	// Greed guard: the host must stop at "/", not eat the path.
 	{"url-host", "call https://", "internal.acme.com", "/v1"},
 	{"bare-host", "host ", "worker.svc", " failed"},
@@ -1298,6 +1535,31 @@ func TestAcceptedOverMasking(t *testing.T) {
 		{"git remote username absorbed",
 			"git+ssh://git@github.com/org/repo.git cloned",
 			"git+ssh://<TOKEN_1>@<HOST_1>/org/repo.git cloned"},
+		// #61's costs, named. THE PORT ASYMMETRY first: hosts 2..n are one group, so the ports
+		// BETWEEN members sit inside the placeholder while the first and the last stay visible --
+		// 27018 below is inside <HOST_2>. Restore is exact; the model sees a two-member list where
+		// there were three. One placeholder per member would need apply to re-run 9c to a fixpoint,
+		// which is a mechanism this package does not have and is the named follow-up.
+		{"multi-host: interior ports absorbed",
+			"mongodb://user:pass@host1:27017,host2:27018,host3:27019/db",
+			"mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27019/db"},
+		// THE CSV CELL, and it is a NEW KIND OF COST in this table. Every row above costs a
+		// placeholder in a restatement that is already lossy; this one costs the PAYLOAD -- a status
+		// code and a duration are what an explanation turns on. The asymmetry that decides this
+		// package (over-mask rather than under-mask) still holds and the row stays, but the next
+		// over-mask decision should not cite that asymmetry without asking which kind of cost it is
+		// paying. The boundary is narrow: a comma with NO space directly after a path-less URL. A
+		// space after the comma, a path before it, or no scheme on the line are all untouched (see
+		// TestIssue61MultiHostAuthority's negatives).
+		{"csv cells after a path-less url absorbed as a host list",
+			"https://api.acme.com,200,12ms", "https://<HOST_1>,<HOST_2>"},
+		{"number after a path-less url absorbed as a host list",
+			"https://a.com,42", "https://<HOST_1>,<HOST_2>"},
+		// The same class with a bracketed address as the first member: URL-shaped, so 9c applies.
+		// A bracketed address in PROSE is not reached -- 9c needs "scheme://" with no whitespace
+		// anywhere before the group -- and those negatives are pinned in the #61 test.
+		{"word after a url-shaped bracketed address absorbed",
+			"https://x@[2001:db8::1],retrying", "https://<TOKEN_1>@[<IP_1>],<HOST_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1391,6 +1653,15 @@ var templatizedRows = []templatizedRow{
 	// including its domain goes out unmatched.
 	{"email/local-part-collapsed", "mail to \x00deadbeefcafe1234@corp.example.com\x00 bounced"},
 	{"url-host/middle-digit", "call https://\x00api-gw7x.prod.acme.com\x00/v1"},
+	// #61 through the composition. Every member carries a middle digit, and the interior port
+	// templatizes to <NUM> exactly as the members' digits do, so 9c has to read the pipeline's
+	// handwriting in the host runs AND in the port run between them.
+	{"url-host/list-rest/middle-digit",
+		"dsn=mongodb://\x00rs0a.acme.com\x00:27017,\x00rs0b.acme.com:27017,rs0c.acme.com\x00:27017/db?replicaSet=rs0"},
+	// With a credential in front and a private suffix on the second member: 9c runs before 9b,
+	// so the rest of the list is one span regardless of which suffixes it carries.
+	{"url-host/list-rest/credential-mixed-suffix",
+		"FATAL db mongodb://\x00svc7user:hun2ter\x00@\x00db01.acme.com\x00:27017,\x00db02.corp.internal:27017,db03.acme.com\x00:27017/db lost"},
 	{"bare-host/middle-digit", "host \x00db01x.corp.internal\x00 failed"},
 	{"bare-host/digit-in-middle-label", "host \x00db.eu1a.corp.internal\x00 failed"},
 	// #48 through the composition, and this row is green BOTH BEFORE AND AFTER the fix -- which
