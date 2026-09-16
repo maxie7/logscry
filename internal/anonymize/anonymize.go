@@ -73,6 +73,17 @@
 // changed is '?' and '#', which the same RFC paragraph also ends the authority at: bounding
 // there was measured and reopens a leak, and those two belong with the raw '/' in #59's class.
 //
+// THE HOST LIST IS A FIFTH RULE, NOT A WIDER CLASS (#61). 9a masks one host and stops at the port
+// colon and the comma; a replica-set or failover authority -- host[:port](,host[:port])* -- sent
+// every host after the first. The measured reason the list is a companion (9c) rather than a wider
+// group on 9a is a shape masked today: a comma-separated list of URLs, where a group admitting a
+// comma member eats the next URL's scheme and orphans its host. RE2 cannot refuse that member by
+// lookahead, and a required trailing context on a FIRST-PASS rule narrows what it already masks;
+// on a companion it costs nothing, because the companion's no-match is today's behaviour. So 9c
+// reads the first member's tag as context, as 4b/4c read a credential half, and is the fifth rule
+// to read one of our tags on purpose. What the one-group struct costs this time is that hosts 2..n
+// are ONE placeholder; per-member placeholders would need apply to iterate, which it does not.
+//
 // The one deliberate exception is the pipeline's own placeholders: see pipelinePH.
 package anonymize
 
@@ -169,6 +180,13 @@ func New(extraHostSuffixes ...string) *Mapper {
 // verify-eligible for the first time: a password-less userinfo that ever survives masking now
 // mutes the escalation instead of being sent. What stays invisible is the remainder of a half
 // only PARTLY recognised by an earlier detector, for exactly #46's reason; that is #57.
+//
+// #61 IS NOT A NARROWING EITHER, and it adds no proviso to the note above because the re-scan was
+// never in a position to see it: the host detectors are verify:false, and had they been eligible
+// the leftover of a multi-host authority ("host2:27017,host3") is not a shape any of them matches
+// on its own -- #41's structural reason from the re-scan's side. What separates it from #41 is the
+// pattern's intent: 9a matched exactly what it was written for, and what it was written for was
+// smaller than the value. Closing it (9c) changes nothing about what residue() can see.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -314,7 +332,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all thirteen rather than to the one detector known to need it, because
+// It is applied to all fifteen rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -535,8 +553,98 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     the shapes every credential rule declined, which are #57's: there the HOST tag now
 		//     lands on the real host and what leaks is the partly-recognised half's remainder,
 		//     where before both leaked.
+		//     THE GROUP IS ONE HOST, and since #61 that is a statement about this rule rather than
+		//     about the value. A multi-host authority -- host[:port](,host[:port])*, which MongoDB,
+		//     MySQL, libpq and Sentinel all write -- is masked by this rule up to the first port colon
+		//     or comma and by 9c from there; see 9c for why the rest of the list is a second rule and
+		//     not a wider class here.
 		{tagHost, mustLongest(
-			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/\s]*@)?(` + tolerant(`[a-z0-9.-]`) + `)`), 1, false},
+			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/\s]*@)?(` + hostRun + `)`), 1, false},
+		// 9c. Hosts 2..n of a comma-separated authority (#61). Runs after 9a, whose tag on the first
+		//     member is its context, and BEFORE 9b and 6, both measured: after 9b a later member on a
+		//     private suffix carried 9b's own tag and blocked the group ("h1.acme.com,h2.corp.internal,
+		//     h3.acme.com" sent h3.acme.com); after 6 a UUID label did the same one member in. The
+		//     audit table's numbering is kept -- 9c sits between 9a and 9b, and the chain indices of 9b,
+		//     6 and 10 shift by one; nothing hardcodes them.
+		//
+		//     THE CAUSE IS A FIFTH KIND, and the first instance of it. 9a matched exactly what it was
+		//     written for -- one host -- and stopped where its author thought the value ended, at the
+		//     port colon and the comma. Not an under-matching pattern (#41), not a value another
+		//     component rewrote first (#43), not a detector blocked by another's tag (#46, #48, #54,
+		//     #57), not a shape no rule described (#55): the detector's notion of the value was smaller
+		//     than the value. residue() could not see it (both host rules are verify:false, and would
+		//     have read the leftover as clean regardless, for #41's structural reason) and neither could
+		//     the completeness rows, which ask whether the group landed on the DECLARED secret -- it did.
+		//     mongodb://user:pass@host1:27017,host2:27017,host3:27017/db sent host2 and host3, in the
+		//     trigger line and in the masked template of the same request. v0.4.0 -> v0.9.3.
+		//
+		//     A COMPANION RULE, NOT A WIDER CLASS ON 9a, and that was measured rather than preferred.
+		//     Widening 9a's own group to span the list -- a negated class bounded at '/', whitespace and
+		//     '>', or the exact grammar with the trailing port outside, which is what net/url calls the
+		//     Host of that URI -- closes every list shape and OPENS a leak on one masked today:
+		//     "peers=https://a.com,https://b.com" is <HOST_1>,https://<HOST_2> and would become
+		//     <HOST_1>://b.com. A comma member that is the next URL's scheme is a legal reg-name (RFC
+		//     3986 §3.2.2 puts ',' in sub-delims, and net/url reads that string as host "a.com,https",
+		//     path "//b.com"), and RE2 has no lookahead to refuse it. A trailing context that rejects
+		//     "://" cannot go on 9a: a REQUIRED terminator on a first-pass rule narrows what it already
+		//     masks, since every position the terminator does not name becomes a no-match. It CAN go on
+		//     a companion, because a companion's no-match is today's behaviour -- and that is the durable
+		//     result here: disambiguating trailing context is affordable only on a rule whose failure is
+		//     the status quo. (Two capture groups on 9a would need `group int` to become a list, and
+		//     relaxing 9a's anchor to a bare "://" would close #52 by dropping the anchor rather than
+		//     making it tolerant; neither is done.)
+		//
+		//     THE SHAPE OF THE RULE, part by part.
+		//       anchor and userinfo skip: 9a's, verbatim, so the two rules read one string one way.
+		//       member 1, context:        a raw host run, one or more adjacent tags of ours, or a
+		//                                 bracketed tag (ours, or the pipeline's <IP> on the Template
+		//                                 field). Derived by walking the chain: before 9c runs a tag can
+		//                                 land on member 1 from 7 and 8 (an address literal), from 9a,
+		//                                 from 1/2/3b only when a host literally IS a key, and from 5
+		//                                 only through #57's shape, where two tags sit adjacent. 3a needs
+		//                                 whitespace, 4 mints on the userinfo, 9b/6/10 run later. The raw
+		//                                 branch is unreachable in the chain -- 9a has already taken every
+		//                                 raw first member this anchor can reach, and declines only on '<'
+		//                                 and '[', where the raw branch cannot start either -- and exists
+		//                                 for the single-detector probes completenessSecretFor and the
+		//                                 templatized-coverage test run, exactly as 4b/4c's context does.
+		//       its port, one or more commas: libpq accepts an empty list item, so ",," is a separator.
+		//       hosts 2..n, THE GROUP:    host runs with the ports BETWEEN them inside, and the last
+		//                                 port outside -- the boundary 9a draws for one host, and the one
+		//                                 net/url draws (Hostname() of the replica-set URI is
+		//                                 "host1:27017,host2:27017,host3"). The class is 9a's; '?', '#',
+		//                                 '/', '@', whitespace, '<' and '>' are out by construction, which
+		//                                 is why the '?'/'#' question #58 answered for a NEGATED userinfo
+		//                                 class does not arise here. Measured, not analogised.
+		//       listEnd:                  the group ends at end of text, at any character outside the
+		//                                 host class, or at a ':' that does not begin "://". Excluding '<'
+		//                                 from the terminator stops the run shrinking onto a pipeline
+		//                                 placeholder ("host<NUM>://x" masked "host" until it did); the
+		//                                 group cannot shrink onto a host character either, which is what
+		//                                 rules out a partial member. Case is folded under (?i), negated
+		//                                 class included -- measured, since an uppercase terminator would
+		//                                 have truncated a member with no test looking for it.
+		//
+		//     WHAT IT COSTS is pinned in TestAcceptedOverMasking: hosts 2..n are ONE placeholder, so the
+		//     ports between them are inside it while the first and last stay visible; and a path-less
+		//     URL directly followed by a comma and CSV cells reads as a host list -- a cost to the payload
+		//     the model reasons about rather than to a lossy restatement, named there as a new kind.
+		//     One placeholder per member would need apply to re-run this rule to a fixpoint, which is
+		//     the named follow-up and not a mechanism this package has.
+		//
+		//     WHAT STAYS OPEN is a class, not a cell, and it is pinned one row per reachable tag in
+		//     TestIssue61MultiHostAuthority: a tag minted on a LATER member -- an address literal from 7
+		//     or 8, or a key-shaped member from 1/2/3b -- truncates this group there, because the group
+		//     excludes '<' by the inertness invariant, and every member after it is sent. Same cause as
+		//     #54 (containment, unrepresentable in a linear chain), but not #54's remedy: the inner tag
+		//     is RIGHT here, and a companion re-applied to a fixpoint would re-anchor on it.
+		//
+		//     verify:false, for the same reason 9a and 9b are: a missed list member must not mute an
+		//     otherwise-safe escalation.
+		{tagHost, mustLongest(
+			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/\s]*@)?` +
+				`(?:` + hostRun + `|(?:` + ourPH + `)+|\[(?:` + ourPH + `|` + pipelinePH + `)\])(?:` + hostPort + `)?,+` +
+				`(` + hostRun + `(?:(?:` + hostPort + `)?,+` + hostRun + `)*)(?:` + hostPort + `)?` + listEnd), 1, false},
 		// 9b. Bare hostname — only the private/infra suffixes above (fuzzy: verify off).
 		//     Tolerant for the same reason: db01.corp.internal masked only "corp.internal" and
 		//     sent "db", and a digit in a middle label costs every label before it.
@@ -621,8 +729,8 @@ const pipelinePH = `<(?:TS|UUID|IP|HEX|NUM|STR)>`
 // pipelinePH by construction, on the same '_'-vs-'>' distinction the inertness argument above
 // already rests on: the pipeline's six names are untagged and carry no "_<n>".
 //
-// It appears in exactly one place -- the two one-sided credential fallbacks, 4b and 4c -- and
-// there only as CONTEXT, never inside a target group. That distinction is the whole of the
+// It appears in three rules -- the two one-sided credential fallbacks, 4b and 4c, and the host-list
+// rule 9c -- and in each only as CONTEXT, never inside a target group. That distinction is the whole of the
 // safety argument and it is worth stating precisely, because the invariant in the package
 // comment is loose where it says no detector may MATCH a placeholder.
 //
@@ -633,6 +741,20 @@ const pipelinePH = `<(?:TS|UUID|IP|HEX|NUM|STR)>`
 // TestNoDetectorGroupLandsOnOurOwnOutput holds the narrow claim against the real masked output
 // of every completeness row.
 const ourPH = `<[A-Z]+_\d+>`
+
+// hostRun is one host as 9a and 9c read it: a run of hostname characters, placeholder-tolerant
+// for the Template field. One definition, so that "a host" cannot drift between the two rules.
+var hostRun = tolerant(`[a-z0-9.-]`)
+
+// hostPort is the ":port" that may follow a host, tolerant because a port templatizes to <NUM>.
+var hostPort = `:` + tolerant(`[0-9]`)
+
+// listEnd is what may follow the last member of a host list in 9c: end of text, any character
+// outside the host class, or a ':' that does not begin "://". It is CONTEXT, never group, and it
+// exists to refuse exactly one thing -- a comma member that is the next URL's scheme -- which a
+// group alone cannot refuse, RE2 having no lookahead. '<' is excluded so the run cannot shrink onto
+// a pipeline placeholder to satisfy the terminator. See 9c.
+const listEnd = `(?:[^a-z0-9.:<-]|:(?:[^/]|/[^/]|$)|$)`
 
 // authorityTail is what follows the DELIMITING '@' of a userinfo: host[:port], then the end of
 // the authority. It is CONTEXT, never group, and it contains no '@' by construction -- which is
