@@ -357,7 +357,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       already shows the last entries before following, and a history knob is its own call), and any new
       module dependency — journalctl is a subprocess, not an import. Targets v0.8.0
 
-## Epic M12 — Replay  `[TODO-VERSION]`
+## Epic M12 — Replay  `[v0.10.0]`
 - [x] **`--replay`: the clock is the feature** — #35, the instrument the scoring half of this
       project had been missing. Before it, every calibration decision was either a six-hour
       laptop run or a synthetic fixture asserted by its author (#32's upper band edge is
@@ -428,7 +428,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       only until a second path set the value, which is #24's and #43's class.
       `TestReplayResolvesToNoLLMStage` runs resolution and stage construction back to back, and
       `TestReplayWithoutDryRunBuildsNoBackend` asserts zero requests reached a model endpoint,
-      not merely an exit code. Live-LLM replay is ISSUE-TBD-1, a display feature nothing
+      not merely an exit code. Live-LLM replay is #75, a display feature nothing
       blocked is waiting on.
 
       **Three determinism breakers, each measured and each fixed:**
@@ -441,7 +441,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
          it cannot outlive `Close`. The live writer still drops, and
          `TestDefaultWriterStillDrops` pins that.
       3. *The coalescer flushing in map order.* That turned out to be a live defect and landed
-         separately first (ISSUE-TBD-6, in Fixes below).
+         separately first (#69, in Fixes below).
 
       The coalescer also needed a capture clock. At replay speed a header and its continuation
       arrive microseconds apart, so a wall timer would fold lines a live run split and would
@@ -482,7 +482,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       `gen.go`, 115 KB. `TestReplayFixturesArePublishable` holds everything in that directory
       to four fields (a real entry carries 31, including `_HOSTNAME`, `_MACHINE_ID` and
       `_CMDLINE`), RFC 5737 / RFC 3849 addresses, reserved host names, 128 KB and 1,000 lines.
-      A sanitiser for real captures is ISSUE-TBD-3.
+      A sanitiser for real captures is #74.
 
       **Replay has NOT yet been validated against a real capture.** The fixture is synthetic,
       and synthetic fixtures are precisely what this instrument exists to replace. The first
@@ -491,13 +491,13 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       nothing did when the 612-record capture was lost.
 
       Found on the way and filed, not fixed:
-      - ISSUE-TBD-4: the prompt's "first seen N ago" subtracts a wall-clock `FirstSeen` from a
+      - #72: the prompt's "first seen N ago" subtracts a wall-clock `FirstSeen` from a
         source-time trigger, which is skewed or silently omitted on backlog lines. The prompt
         is the only place affected; it is named in README "Known limitations".
-      - ISSUE-TBD-5: export times carry the local zone (`Z` against `+09:00` for one instant).
-      - ISSUE-TBD-7: the live export's drop count reaches the user only at exit, as queue
+      - #71: export times carry the local zone (`Z` against `+09:00` for one instant).
+      - #70: the live export's drop count reaches the user only at exit, as queue
         messages labelled records (a 2× overstatement), with exit status 0.
-      - ISSUE-TBD-2: `--record` for sources without their own clock.
+      - #73: `--record` for sources without their own clock.
 
       **What this unblocks, stated and not built:**
       - #37: replay a real capture under today's lifetime `baseline()` and under a candidate,
@@ -507,7 +507,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       - #36: count distinct `template_hash` values against escalations on the post-#40
         corpus.
 
-      Targets TODO-VERSION
+      Targets v0.10.0
 
 ## Fixes — post-release corrections
 
@@ -699,7 +699,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       again. Blocked on #35 (replay): neither direction can be evaluated against synthetic
       fixtures, since the failure is about real rate histories. Fixing it is also what would
       let the upper edge of #32's admissible band be measured rather than assumed.
-      Replay landed in TODO-VERSION (#35 above): replay a real capture under both baselines and
+      Replay landed in v0.10.0 (#35 above): replay a real capture under both baselines and
       diff the two exports.
 
 - [x] **A card is a TEMPLATE, and its numbers are live** — #34, found by dogfooding, and a

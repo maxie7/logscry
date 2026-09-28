@@ -757,7 +757,7 @@ above, a unit with `-u`, or `journalctl -f -o json | tee capture.jsonl` to recor
 following. Entries go through the same decode as `--journald`, so `PRIORITY` still sets the
 level. A file with no timestamps is refused, not replayed with a frozen clock. Plain text,
 subprocess output and `docker logs` carry no timestamps and cannot be replayed yet
-(ISSUE-TBD-2).
+(#73).
 
 **Keep your captures, outside the repository.** A capture is the only way to ask a new
 scoring question about an old incident. A 612-record journald capture that every
@@ -778,7 +778,7 @@ disk instead of dropping records. Timestamps in the file are capture time as a l
 would have stamped it: a line held by multi-line grouping is stamped up to
 `--group-timeout` later than its journal entry. They are written in the local time zone, so
 exports made on machines in different zones differ in spelling, not in the instants they
-name (ISSUE-TBD-5).
+name (#71).
 
 **`--replay-speed`** only paces the lines. `max` (the default) is for calibration. `1x`
 replays in real time, which is for watching the TUI's cards appear when they would have.
@@ -847,13 +847,13 @@ validated.
   earlier. The model is then told an understated age, and when the result is negative the
   phrase is silently left out. **The prompt is the only place affected.** No card, no
   `--plain` line and no `--export` value is computed this way. Found while building replay
-  and filed as ISSUE-TBD-4.
+  and filed as #72.
 - **Export drops are reported only at exit, and overstated.** In a live run the export
   writer drops a record rather than stall ingestion when its queue is full, which needs a
   disk stalled for tens of minutes at the default rate limit. The only report is one
   stderr line when logscry exits, the exit status is still 0, and the count is of queue
-  messages (two per record), so it can overstate the records lost by up to 2×. Filed as
-  ISSUE-TBD-7. Replay does not drop.
+  messages (two per record), so it can overstate the records lost by up to 2×. Filed
+  as #70. Replay does not drop.
 - **`--docker-tail` defaults to 100 lines** of history per container on attach. An event
   further back than that won't appear until it recurs — use `--docker-tail all` for the
   full backlog.
