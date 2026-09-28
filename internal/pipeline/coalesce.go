@@ -97,7 +97,7 @@ type pending struct {
 // picked — different on every run. journald keys one stream per unit and Docker one per
 // container, so a multi-source run routinely holds many buffers, and the order they leave
 // in is the order the stream pane shows, --plain prints, and the scorer's context ring
-// records (ISSUE-TBD-6).
+// records (#69).
 func inOrder(buffers map[streamKey]*pending, byDeadline bool, keep func(*pending) bool) []streamKey {
 	var keys []streamKey
 	for k, p := range buffers {

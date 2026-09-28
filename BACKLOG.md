@@ -873,7 +873,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
 
-- [x] **Buffered streams flush in the order they arrived** — ISSUE-TBD-6, a LIVE-path defect
+- [x] **Buffered streams flush in the order they arrived** — #69, a LIVE-path defect
       found while building replay (#35) and deliberately kept out of it: nobody looking for a
       coalescer bug would look under a replay entry. `pipeline.Coalesce` holds one pending line
       per (source, stream) key in a map, and two paths flush several of them at once — the
@@ -899,7 +899,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       unmodified. `TestCoalesceFlushOrderIsArrivalOrder` pins both paths, 200 and 50 runs.
       Replay needs this — a byte-identical `--export` across two replays of one multi-unit
       capture is impossible while the coalescer shuffles — but it lands first, as its own change.
-      Targets TODO-VERSION
+      Targets v0.9.5
 
 - [x] **Hosts 2..n of a multi-host authority are masked** — #61, found and filed by #58's sweep
       and pinned there as two assertions that the gap was open. `--llm-anonymize` masked
