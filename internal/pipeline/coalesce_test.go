@@ -200,3 +200,68 @@ func TestCoalesceFlushesPartialAfterIdleTimeout(t *testing.T) {
 		t.Fatal("partial multi-line event was not flushed after the idle timeout")
 	}
 }
+
+// flushOrder feeds one header per source into a coalescer, then either closes the input
+// (atEOF) or leaves it open for the idle timer, and returns the sources in the order their
+// lines came out.
+func flushOrder(t *testing.T, sources []string, atEOF bool) string {
+	t.Helper()
+	in := make(chan model.LogLine, len(sources))
+	out := make(chan model.LogLine, len(sources))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for _, s := range sources {
+		in <- model.LogLine{Source: s, Raw: "header from " + s}
+	}
+	timeout := time.Hour
+	if !atEOF {
+		timeout = 20 * time.Millisecond
+	} else {
+		close(in)
+	}
+	go Coalesce(ctx, in, out, timeout)
+
+	var got []string
+	deadline := time.After(2 * time.Second)
+	for len(got) < len(sources) {
+		select {
+		case ln := <-out:
+			got = append(got, ln.Source)
+		case <-deadline:
+			t.Fatalf("only %d of %d buffered lines were flushed: %v", len(got), len(sources), got)
+		}
+	}
+	return strings.Join(got, ",")
+}
+
+// TestCoalesceFlushOrderIsArrivalOrder: when several streams are holding a line and they
+// are flushed together — at end of input, or by one firing of the idle timer — the lines
+// leave in the order their headers arrived.
+//
+// Both paths used to range over the buffer map, and Go randomises map order: four buffered
+// streams flushed at end of input came out in four different orders over 200 runs. That is
+// a live defect, not a curiosity. journald tags one source per unit and Docker one per
+// container, so every multi-source run holds many keys, and the order lines reach the
+// pipeline is the order the stream pane shows, --plain prints, and the scorer's context
+// ring records. It must not depend on the hash seed.
+func TestCoalesceFlushOrderIsArrivalOrder(t *testing.T) {
+	sources := []string{"journald:a", "journald:b", "journald:c", "journald:d", "journald:e"}
+	want := strings.Join(sources, ",")
+
+	t.Run("end of input", func(t *testing.T) {
+		for range 200 {
+			if got := flushOrder(t, sources, true); got != want {
+				t.Fatalf("end-of-input flush order = %s, want arrival order %s", got, want)
+			}
+		}
+	})
+	// The timer path can only disagree when several buffers expire in one firing, which
+	// depends on scheduling; enough runs make that the common case rather than a rare one.
+	t.Run("idle timer", func(t *testing.T) {
+		for range 50 {
+			if got := flushOrder(t, sources, false); got != want {
+				t.Fatalf("idle-timer flush order = %s, want arrival order %s", got, want)
+			}
+		}
+	})
+}
