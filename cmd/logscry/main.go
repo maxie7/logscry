@@ -24,6 +24,12 @@
 // consumed by another program instead of only read. The file is owned by its own goroutine
 // (see internal/export); this file only opens it and taps the two places a terminal
 // explanation is already consumed for display.
+//
+// Replay (#35): --replay plays a `journalctl -o json` capture through the same decode,
+// coalescer, pipeline, scorer and export, clocked by the capture instead of the wall. It is
+// dry-run only — it runs the scorer, not a model — and this file swaps in the three pieces
+// that differ: the source, the capture-clocked coalescer, and the export writer that waits
+// for its disk rather than dropping.
 package main
 
 import (
@@ -77,6 +83,7 @@ func run(ctx context.Context, args []string) error {
 	defer closeExport(exp)
 
 	sources, stdinOnly := sources(cfg)
+	replay, _ := sources[0].(*ingest.ReplaySource) // nil unless --replay: it is then the only source
 
 	term := tui.Resolve(cfg.Plain)
 	defer func() { _ = term.Close() }()
@@ -103,6 +110,10 @@ func run(ctx context.Context, args []string) error {
 		// printing it would corrupt the alternate screen.
 		if err := ingest.Run(ctx, sources, lines); err != nil && ctx.Err() == nil {
 			errs <- fmt.Errorf("ingest: %w", err)
+			return
+		}
+		if n := replayNotice(replay); n != nil {
+			errs <- n
 		}
 	}()
 
@@ -113,7 +124,13 @@ func run(ctx context.Context, args []string) error {
 	grouped := lines
 	if cfg.Group.Timeout > 0 {
 		g := make(chan model.LogLine, 1024)
-		go pipeline.Coalesce(ctx, lines, g, cfg.Group.Timeout)
+		coalesce := pipeline.Coalesce
+		if replay != nil {
+			// The idle flush measured on the capture's clock: at replay speed a wall-clock
+			// timer would never fire, and would fold lines a live run kept apart.
+			coalesce = pipeline.CoalesceSourceTime
+		}
+		go coalesce(ctx, lines, g, cfg.Group.Timeout)
 		grouped = g
 	}
 
@@ -127,9 +144,21 @@ func run(ctx context.Context, args []string) error {
 			fmt.Fprintf(os.Stderr, "logscry: raw log lines will be sent to %s; "+
 				"pass --llm-anonymize to mask IPs, emails, tokens, and hostnames first\n", host)
 		}
-		return runPlain(ctx, grouped, errs, sc, escalations, explanations, exp, cfg.ExplainDryRun)
+		return runPlainAt(ctx, grouped, errs, sc, escalations, explanations, exp, cfg.ExplainDryRun, replay != nil)
 	}
 	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, exp, cfg)
+}
+
+// replayNotice reports the lines of a finished replay whose time could not be followed, or
+// nil when there were none or this is not a replay. Both kinds were replayed rather than
+// dropped, and neither is an error — but each is a place the capture's clock stood still
+// when the capture says it moved, and a calibration run should know how many there were.
+func replayNotice(r *ingest.ReplaySource) error {
+	if r == nil || r.Untimed()+r.Backwards() == 0 {
+		return nil
+	}
+	return fmt.Errorf("replay: %d line(s) carried no timestamp and %d ran backwards; "+
+		"each was replayed at the capture's current time", r.Untimed(), r.Backwards())
 }
 
 // openExport opens the JSONL export file, or returns nil when --export was not given. A nil
@@ -138,7 +167,13 @@ func openExport(cfg config.Config) (*export.Writer, error) {
 	if cfg.Export == "" {
 		return nil, nil
 	}
-	w, err := export.Open(cfg.Export)
+	open := export.Open
+	if cfg.Replay != "" {
+		// A replay has no real-time contract and its export is the artifact that gets
+		// diffed, so a slow disk must cost time, never records (see export.OpenBlocking).
+		open = export.OpenBlocking
+	}
+	w, err := open(cfg.Export)
 	if err != nil {
 		return nil, fmt.Errorf("export: %w", err)
 	}
@@ -168,8 +203,12 @@ func closeExport(w *export.Writer) {
 // keeps the drop counter honest — a real channel with no reader would fill up and record
 // every later escalation as a drop, corrupting the very numbers dry-run exists to
 // calibrate.
+//
+// A replay never gets a stage either. Configuration already refuses --replay without
+// dry-run; this is the mechanism refusing on its own, reading the same resolved fields the
+// check did, so the two cannot drift apart.
 func startLLM(ctx context.Context, cfg config.Config) (chan score.EscalationRequest, chan model.Explanation) {
-	if cfg.ExplainDryRun {
+	if cfg.ExplainDryRun || cfg.Replay != "" {
 		return nil, nil
 	}
 
@@ -194,6 +233,10 @@ func startLLM(ctx context.Context, cfg config.Config) (chan score.EscalationRequ
 // stdin is the only one — which decides whether the TUI can have the terminal's
 // keyboard to itself (see run).
 func sources(cfg config.Config) ([]ingest.Source, bool) {
+	if cfg.Replay != "" {
+		// Configuration guarantees it is the only one (see config.validateReplay).
+		return []ingest.Source{ingest.NewReplaySource(cfg.Replay, cfg.ReplaySpeed)}, false
+	}
 	var out []ingest.Source
 	if len(cfg.Argv) > 0 {
 		out = append(out, ingest.NewSubprocessSource(cfg.Argv))
@@ -260,6 +303,7 @@ func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, 
 		Escalations:  escalations,
 		Explanations: explanations,
 		Export:       exp,
+		SourceTime:   cfg.Replay != "",
 	})
 	return term.Run(ctx, snaps, errs, tui.Options{
 		ExplainDryRun:  cfg.ExplainDryRun,
@@ -311,9 +355,18 @@ func runPlain(ctx context.Context, lines <-chan model.LogLine, errs <-chan error
 	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation,
 	exp *export.Writer, dryRun bool,
 ) error {
+	return runPlainAt(ctx, lines, errs, sc, escalations, explanations, exp, dryRun, false)
+}
+
+// runPlainAt is runPlain with the pipeline's clock chosen: the wall for a live run, the
+// lines' own timestamps for a replay (see pipeline.Options.SourceTime).
+func runPlainAt(ctx context.Context, lines <-chan model.LogLine, errs <-chan error,
+	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation,
+	exp *export.Writer, dryRun, sourceTime bool,
+) error {
 	events := make(chan pipeline.Event, 1024)
 	go pipeline.Run(ctx, lines, pipeline.Options{
-		Events: events, Scorer: sc, Escalations: escalations, Export: exp,
+		Events: events, Scorer: sc, Escalations: escalations, Export: exp, SourceTime: sourceTime,
 	})
 
 	for events != nil || explanations != nil {

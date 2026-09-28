@@ -575,3 +575,43 @@ func TestFlagGlyphIsOneCell(t *testing.T) {
 		t.Errorf("visWidth(%q) = %d, want 1", flagGlyph, got)
 	}
 }
+
+// TestCardRelativeTimeUsesSnapshotClock: in a replay the capture may be weeks old, and "3w
+// ago" on every card would be true of the file and useless about the incident. The snapshot
+// carries the capture's current time, and a card's relative times are measured against it.
+// A live snapshot carries none, and the wall clock is used exactly as before.
+func TestCardRelativeTimeUsesSnapshotClock(t *testing.T) {
+	wall := time.Date(2026, 9, 28, 9, 0, 0, 0, time.UTC)
+	capture := time.Date(2026, 8, 29, 10, 50, 0, 0, time.UTC)
+	ev := pipeline.Event{
+		Hash: "aaa", Pattern: "out of memory: killed process <NUM>",
+		Line:  model.LogLine{Source: "journald:kernel", Level: "FATAL"},
+		Count: 1, FirstSeen: capture.Add(-90 * time.Second), LastSeen: capture.Add(-90 * time.Second),
+		Score: 1, Escalate: true, Reasons: []string{"level FATAL"},
+	}
+	for _, tc := range []struct {
+		name    string
+		snapNow time.Time
+		want    string
+		mustNot string
+	}{
+		{"replay", capture, "1m ago", "d ago"},
+		{"live", time.Time{}, "d ago", "1m ago"},
+	} {
+		m := New(nil, nil, Options{ExplainDryRun: true})
+		m.now = func() time.Time { return wall }
+		sized, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		applied, _ := sized.(Model).Update(snapshotMsg(pipeline.Snapshot{
+			Escalations: []pipeline.Event{ev},
+			Stats:       pipeline.Stats{Escalations: 1},
+			Now:         tc.snapNow,
+		}))
+		view := applied.(Model).View()
+		if tc.want != "" && !strings.Contains(view, tc.want) {
+			t.Errorf("%s: card does not say %q:\n%s", tc.name, tc.want, view)
+		}
+		if strings.Contains(view, tc.mustNot) {
+			t.Errorf("%s: card says %q:\n%s", tc.name, tc.mustNot, view)
+		}
+	}
+}

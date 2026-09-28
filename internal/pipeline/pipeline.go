@@ -348,6 +348,30 @@ type Options struct {
 	// identical either way. The writes happen on the writer's own goroutine — this one must
 	// never block on a disk.
 	Export *export.Writer
+
+	// SourceTime clocks the run by the lines' OWN timestamps instead of the wall clock: it
+	// is what --replay sets (issue #35). Everything downstream already takes time as an
+	// argument — the scorer, the rate limiter, the cache, template first/last seen, the
+	// export — so this one switch is the whole of replaying time. See sourceClock.
+	SourceTime bool
+}
+
+// sourceClock is replay's time: the capture's timestamps, advanced by this goroutine as
+// each line arrives and never by anyone else, so it needs no lock and there is no second
+// owner of time.
+//
+// It is monotone. A line stamped earlier than its predecessor — journal files merged out of
+// order — does not rewind it, because the scorer's recent ring is append-ordered and
+// countSince stops at the first older entry: a rewind would quietly shrink every burst
+// window. A line with no timestamp holds it where it is rather than reading as the zero time
+// or as the wall clock.
+type sourceClock struct{ now time.Time }
+
+func (c *sourceClock) observe(t time.Time) time.Time {
+	if t.After(c.now) {
+		c.now = t
+	}
+	return c.now
 }
 
 // Run reads lines from in and processes each through a single goroutine-confined
@@ -372,6 +396,21 @@ func Run(ctx context.Context, in <-chan model.LogLine, opts Options) {
 	p.export = opts.Export
 	c := newCollector(opts.RingSize)
 
+	var src *sourceClock // nil: a live run, on the wall clock
+	if opts.SourceTime {
+		src = &sourceClock{}
+	}
+	// snapshot is taken on the wall clock in a live run, leaving Now zero so the renderer
+	// keeps its own clock. In a replay it is taken at the capture's current time and says so.
+	snapshot := func() Snapshot {
+		if src == nil {
+			return c.snapshot(p, time.Now())
+		}
+		snap := c.snapshot(p, src.now)
+		snap.Now = src.now
+		return snap
+	}
+
 	// Without a snapshot consumer there is nothing to tick for; a nil channel
 	// blocks forever in a select, which is exactly the "never fires" we want.
 	var ticks <-chan time.Time
@@ -394,7 +433,7 @@ func Run(ctx context.Context, in <-chan model.LogLine, opts Options) {
 			return
 		case <-ticks:
 			if c.dirty {
-				trySend(opts.Snapshots, c.snapshot(p, time.Now()))
+				trySend(opts.Snapshots, snapshot())
 			}
 		case ex, ok := <-explanations:
 			if !ok {
@@ -416,6 +455,9 @@ func Run(ctx context.Context, in <-chan model.LogLine, opts Options) {
 				continue
 			}
 			now := time.Now()
+			if src != nil {
+				now = src.observe(line.Time)
+			}
 			ev := p.Process(line, now)
 			if opts.Snapshots != nil {
 				c.observe(ev, now)
@@ -435,7 +477,7 @@ func Run(ctx context.Context, in <-chan model.LogLine, opts Options) {
 	// cancellation in case the consumer has already quit.
 	if opts.Snapshots != nil {
 		select {
-		case opts.Snapshots <- c.snapshot(p, time.Now()):
+		case opts.Snapshots <- snapshot():
 		case <-ctx.Done():
 		}
 	}
