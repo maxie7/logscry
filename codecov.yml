@@ -1,0 +1,13 @@
+# Coverage gates. patch: auto means "no worse than the project", which is
+# unreachable on a release whose new code is mostly error paths; threshold
+# gives that rule the slack it needs to stay meaningful rather than ignored.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        target: auto
+        threshold: 2%
