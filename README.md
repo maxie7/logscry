@@ -275,6 +275,8 @@ Key flags:
 | `--rate-limit <n>` | `10` | Global cap on LLM calls per minute (the cost cap) |
 | `--explain-dry-run` | off | Show what *would* escalate; build no LLM stage at all |
 | `--export <path>` | off | Append one JSON object per flagged anomaly to a file (see below) |
+| `--replay <file>` | — | Replay a recorded `journalctl -o json` capture on its own clock; needs `--explain-dry-run` (see below) |
+| `--replay-speed <s>` | `max` | Replay pacing: `max`, or a multiple of real time such as `1x` or `10x` |
 | `--llm-anonymize` | off | Mask sensitive values before sending to the LLM (see below) |
 | `--llm-stream` | off | Fill card fields in as the model completes them (see below) |
 | `--plain` | auto | Plain line output instead of the TUI |
@@ -723,6 +725,71 @@ mid-flight leaves a file whose every line still parses. If a write fails part-wa
 partial bytes are rolled back and that one record is lost rather than the file's validity;
 logscry says so on stderr on the way out.
 
+### Replay (`--replay <file>`)
+
+Calibrating the scorer used to mean one of two things: running logscry on a real machine
+for six hours, or writing a synthetic fixture and trusting its author. `--replay` is the
+third option. It plays a recorded capture through the same decode, grouping, templating,
+scoring and export as a live run. Time comes from the capture, not from the wall clock:
+
+```console
+$ journalctl -o json --since "2026-08-29 09:00" --until "2026-08-29 15:00" > capture.jsonl
+$ logscry --replay capture.jsonl --explain-dry-run --plain --export before.jsonl
+$ logscry --replay capture.jsonl --explain-dry-run --plain --export after.jsonl --burst-min-count 30
+$ diff before.jsonl after.jsonl
+```
+
+**The clock is what makes it a replay.** Piping the same file into stdin does not work.
+Every line arrives within one wall-clock second, so warmup never ends, no template gets
+old enough to have a baseline, and the file is never read as journal entries. Measured on
+the bundled fixture: stdin produces **0** escalations and `--replay` produces the **4** the
+capture contains.
+
+With `--replay`:
+- warmup, cooloff, burst windows, baselines, the rate limiter and the explanation cache all
+  run on the capture's timestamps;
+- ten virtual minutes replay in about 25 ms;
+- the limiter still admits 10 escalations per *capture* minute, so a replay flags what the
+  live run would have flagged.
+
+**It replays journald captures.** Record one with `journalctl -o json`: a time range as
+above, a unit with `-u`, or `journalctl -f -o json | tee capture.jsonl` to record while
+following. Entries go through the same decode as `--journald`, so `PRIORITY` still sets the
+level. A file with no timestamps is refused, not replayed with a frozen clock. Plain text,
+subprocess output and `docker logs` carry no timestamps and cannot be replayed yet
+(ISSUE-TBD-2).
+
+**Keep your captures, outside the repository.** A capture is the only way to ask a new
+scoring question about an old incident. A 612-record journald capture that every
+calibration discussion in this project leaned on was lost because nothing said to keep it.
+Store captures somewhere durable, never commit a real one (they hold host names, machine
+IDs and command lines), and file the path next to the issue it informed.
+
+**Replay is dry-run only, because replay runs the scorer, not a model.** Without
+`--explain-dry-run`, `--replay` refuses to start. Dry-run builds no LLM backend, so a
+replay at `1000x` cannot send a thousand times the rate-limited number of requests. It also
+keeps the output deterministic. A dry-run set in your config file counts. `--replay` cannot
+be combined with any live source.
+
+**The export is deterministic.** Two replays of one capture with one configuration write
+byte-identical `--export` files, and the test suite asserts it. That is what makes a `diff`
+between two threshold settings mean something. In a replay the export writer waits for the
+disk instead of dropping records. Timestamps in the file are capture time as a live run
+would have stamped it: a line held by multi-line grouping is stamped up to
+`--group-timeout` later than its journal entry. They are written in the local time zone, so
+exports made on machines in different zones differ in spelling, not in the instants they
+name (ISSUE-TBD-5).
+
+**`--replay-speed`** only paces the lines. `max` (the default) is for calibration. `1x`
+replays in real time, which is for watching the TUI's cards appear when they would have.
+Speed never changes what is flagged.
+
+**Not yet validated against a real capture.** The bundled fixture
+(`internal/ingest/testdata/replay/basic.jsonl`) is synthetic, which is exactly the kind of
+evidence replay exists to replace. The tests prove replay agrees with a live run fed the
+same lines in real time. The first real capture replayed for #37 is where it gets
+validated.
+
 ## Known limitations (v1)
 
 - **Multi-line grouping is heuristic.** logscry folds stack traces and goroutine dumps
@@ -737,8 +804,9 @@ logscry says so on stderr on the way out.
   without it. More often it does something subtler: a user outside the `systemd-journal`
   group gets a *working* follow of their own session only, with no system-service logs
   and no error to explain why. See [journald](#journald---journald-linux-only) for the
-  one-line fix. There is no cursor or replay: `-f` picks up from roughly now, so an event
-  further back won't appear until it recurs.
+  one-line fix. There is no cursor: `-f` picks up from roughly now, so an event
+  further back won't appear until it recurs. Record with `journalctl -o json` and use
+  [`--replay`](#replay---replay-file) to score history.
 - **Three IPv6 shapes are deliberately not masked in the pipeline's `<IP>` template mask.**
   The template mask requires a boundary before the match and at least two hex groups, because
   without that a C++ scope resolution operator reads as an address — `CNSSCertStore::CNSSCertStore` used to template as
@@ -770,6 +838,22 @@ logscry says so on stderr on the way out.
   is not at hand, so neither shape's frequency could be counted — and deferring it was therefore a
   decision taken without data rather than a conclusion. Until it is closed, treat any URL whose
   host carries an underscore as sent in the clear.
+- **The model's "first seen N ago" is wrong for journald and Docker backlog lines.** The
+  prompt computes it by subtracting the template's first-seen time, which is taken from
+  logscry's own clock when the line was processed, from the trigger line's own timestamp,
+  which journald and Docker record at the source. For lines followed live the two are
+  close. For backlog lines (`journalctl -f` prints recent entries first, and
+  `--docker-tail` fetches history on attach), the source time can be minutes or hours
+  earlier. The model is then told an understated age, and when the result is negative the
+  phrase is silently left out. **The prompt is the only place affected.** No card, no
+  `--plain` line and no `--export` value is computed this way. Found while building replay
+  and filed as ISSUE-TBD-4.
+- **Export drops are reported only at exit, and overstated.** In a live run the export
+  writer drops a record rather than stall ingestion when its queue is full, which needs a
+  disk stalled for tens of minutes at the default rate limit. The only report is one
+  stderr line when logscry exits, the exit status is still 0, and the count is of queue
+  messages (two per record), so it can overstate the records lost by up to 2×. Filed as
+  ISSUE-TBD-7. Replay does not drop.
 - **`--docker-tail` defaults to 100 lines** of history per container on attach. An event
   further back than that won't appear until it recurs — use `--docker-tail all` for the
   full backlog.

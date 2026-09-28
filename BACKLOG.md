@@ -357,6 +357,158 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       already shows the last entries before following, and a history knob is its own call), and any new
       module dependency — journalctl is a subprocess, not an import. Targets v0.8.0
 
+## Epic M12 — Replay  `[TODO-VERSION]`
+- [x] **`--replay`: the clock is the feature** — #35, the instrument the scoring half of this
+      project had been missing. Before it, every calibration decision was either a six-hour
+      laptop run or a synthetic fixture asserted by its author (#32's upper band edge is
+      "an assumption wearing a test's clothing" for exactly that reason), and the 612-record
+      journald capture every recent calibration argument leaned on was already lost.
+      `--replay <file>` plays a `journalctl -o json` capture through the same decode,
+      coalescer, pipeline, scorer, templater and export as a live run, clocked by the
+      capture's own timestamps.
+
+      **The premise it was filed on was wrong, and the measurement is why replay matters more
+      than it said.** Piping a capture through stdin was expected to make everything burst.
+      It does the opposite. A 703-line synthetic capture spanning ten virtual minutes holds:
+      - a novel ERROR at PRIORITY 3;
+      - `INFO: shutting down` at PRIORITY 3 (the #24 precedence case);
+      - an INFO retry storm on an established template;
+      - a PRIORITY 1 OOM.
+
+      Piped as `--plain --explain-dry-run`, it produced **zero** escalations:
+      - every line was tagged `stdin` with no level, and the JSON envelope was templated as
+        the message;
+      - warmup (30s) never elapses inside one wall second, so novelty stays muted;
+      - no template reaches `baseline()`'s 60s age, so nothing can burst;
+      - even the priority-1 OOM stayed quiet.
+
+      Through decode on the capture's clock, the same file gives **four**, one per fault. A
+      silent wrong answer is indistinguishable from a quiet healthy host, which is worse than
+      a loud one.
+
+      **The seam was one line.** The scorer took time as an argument everywhere:
+      - `Evaluate(…, now)`;
+      - `RateLimiter.Allow(now)`;
+      - the cache's `Hit/Mark(hash, now)`.
+
+      `Process(line, now)` handed that one `now` to `upsert`, `Evaluate` and `flagged`. The
+      only wall-clock read on the scoring path was `now := time.Now()` in `pipeline.Run`.
+      `Options.SourceTime` replaces it with `sourceClock`, which is:
+      - monotone, because the recent ring is append-ordered and `countSince` stops at the
+        first older entry, so a rewind would shrink every burst window;
+      - held where it is by an untimed line;
+      - advanced only by the pipeline goroutine, so there is no lock and no second owner of
+        time.
+
+      A `Clock` interface was rejected because replay time belongs to each LINE, not to the
+      moment: someone would have to advance it, and if the ingest goroutine did, that would be
+      a second owner. A `func(LogLine) time.Time` field was rejected as the same power with an
+      indirect call per line and one non-default implementation. **`git diff internal/score`
+      is empty.**
+
+      **The rate limiter answer.** It follows the capture's clock automatically (`decide`
+      passes Evaluate's `now`), so a replay admits 10 escalations per CAPTURE minute. That is
+      scoring fidelity: the replay flags what the live run would have flagged. It is NOT M4's
+      cost guarantee, which is about real calls per real minute; at 1000× a capture-clock
+      limiter in front of a real model would admit 10,000 real calls a minute. The two
+      properties need two limiters. Replay needs neither, because it is dry-run only.
+
+      **Dry-run only, as a decision.** Replay runs the scorer, not a model:
+      - everything it was built for (#37, #32's upper edge, #36's re-measurement) lives in the
+        scorer;
+      - `--explain-dry-run` already builds no backend, so requiring it inherits the cost
+        guarantee by construction;
+      - a live model would trade away the determinism the instrument exists for;
+      - a wall-clock `Explanation.At` beside a capture-clock `LastFlagged` would regress #34's
+        "answer predates the newest flag" silently, and only in replay.
+
+      The check reads the RESOLVED configuration, not the flag. `explain_dry_run: true` in a
+      config file satisfies it, and `startLLM` refuses a replay on its own from the same
+      fields. A guard and the mechanism it guards that consulted different objects would agree
+      only until a second path set the value, which is #24's and #43's class.
+      `TestReplayResolvesToNoLLMStage` runs resolution and stage construction back to back, and
+      `TestReplayWithoutDryRunBuildsNoBackend` asserts zero requests reached a model endpoint,
+      not merely an exit code. Live-LLM replay is ISSUE-TBD-1, a display feature nothing
+      blocked is waiting on.
+
+      **Three determinism breakers, each measured and each fixed:**
+      1. *The wall-clock read*, fixed by the seam.
+      2. *The export writer dropping under load.* Six virtual hours with a distinct FATAL every
+         5s gave 3,609 escalations. Across three replays of one input the file got 548, 561
+         and 574 records, with over 6,000 queue messages dropped each time. `OpenBlocking`
+         makes a replay's writer wait for the disk. Replay has no real-time contract to keep,
+         and its file is the artifact that gets diffed. The blocked send escapes on `quit`, so
+         it cannot outlive `Close`. The live writer still drops, and
+         `TestDefaultWriterStillDrops` pins that.
+      3. *The coalescer flushing in map order.* That turned out to be a live defect and landed
+         separately first (ISSUE-TBD-6, in Fixes below).
+
+      The coalescer also needed a capture clock. At replay speed a header and its continuation
+      arrive microseconds apart, so a wall timer would fold lines a live run split and would
+      never fire. `CoalesceSourceTime` flushes, before each line at capture time T, every
+      buffer whose deadline T has reached. It stamps each released line with the moment a
+      live run would have PROCESSED it:
+      - the next header's time, for a line flushed by that header;
+      - its deadline, for an idle flush;
+      - the last time seen, for the end-of-input flush.
+
+      Live stamps at processing time, and a held line reaches the pipeline up to one group
+      timeout after its entry, so exported times sit up to `--group-timeout` after the
+      journal's (measured: 10:43:20.2 in the capture, 20.4 in the file). Fan-in still runs;
+      with one source every stage has exactly one producer, and order is preserved end to end.
+
+      **No scoring drift, proved in two strengths:**
+      - `TestSourceTimeRunMatchesInjectedNow` is exact: `Run{SourceTime}` against a loop of
+        `Process(line, line.Time)`, the contract every existing test uses, must agree on every
+        event down to the reason strings byte for byte. The capture reaches every gate:
+        escalated, suppressed, cached, burst and cooloff.
+      - `TestReplayAtOneXMatchesWallClock` plays a six-second capture into today's program in
+        real time (wall-clock coalescer and pipeline) and at max speed on the capture's clock.
+        Both flag the same templates, in the same order, for the same kinds of reason, with the
+        same counters: 7 escalated, 1 suppressed, 8 cached. The capture covers first-seen and
+        cooloff novelty, a coalesced traceback, a burst, a FATAL and an empty token bucket.
+        What is NOT compared is stated in the test: digits inside reasons (measured by
+        whichever clock ran) and absolute timestamps. It passed 6 of 6 under `-race`.
+      - `TestWallClockAtMaxSpeedDiverges` shows the comparison can fail. The live program fed
+        the fixture at max speed through decode was predicted, not measured, to flag 1: the
+        FATAL, which needs no warmup. **Measured: 1** (the OOM), against replay's 4. The
+        number is logged, not asserted.
+
+      **No template hash moves:** `template.go` and `normalize.go` are untouched, and
+      `TestReplayHashesEqualLiveDecode` checks every fixture line against the live decode.
+      **No existing test was modified;** every changed `_test.go` file only gained lines.
+
+      The fixture is `internal/ingest/testdata/replay/basic.jsonl`: synthetic, generated by
+      `gen.go`, 115 KB. `TestReplayFixturesArePublishable` holds everything in that directory
+      to four fields (a real entry carries 31, including `_HOSTNAME`, `_MACHINE_ID` and
+      `_CMDLINE`), RFC 5737 / RFC 3849 addresses, reserved host names, 128 KB and 1,000 lines.
+      A sanitiser for real captures is ISSUE-TBD-3.
+
+      **Replay has NOT yet been validated against a real capture.** The fixture is synthetic,
+      and synthetic fixtures are precisely what this instrument exists to replace. The first
+      real use, a real multi-hour capture replayed for #37, is its validation. Keep captures
+      outside the repository from now on; the README's recording section says so, because
+      nothing did when the 612-record capture was lost.
+
+      Found on the way and filed, not fixed:
+      - ISSUE-TBD-4: the prompt's "first seen N ago" subtracts a wall-clock `FirstSeen` from a
+        source-time trigger, which is skewed or silently omitted on backlog lines. The prompt
+        is the only place affected; it is named in README "Known limitations".
+      - ISSUE-TBD-5: export times carry the local zone (`Z` against `+09:00` for one instant).
+      - ISSUE-TBD-7: the live export's drop count reaches the user only at exit, as queue
+        messages labelled records (a 2× overstatement), with exit status 0.
+      - ISSUE-TBD-2: `--record` for sources without their own clock.
+
+      **What this unblocks, stated and not built:**
+      - #37: replay a real capture under today's lifetime `baseline()` and under a candidate,
+        then `diff` the two exports; each changed burst record is one decision.
+      - #32's upper edge: sweep `--burst-min-count` over a capture holding a real incident;
+        the largest value that still flags it is the measured edge.
+      - #36: count distinct `template_hash` values against escalations on the post-#40
+        corpus.
+
+      Targets TODO-VERSION
+
 ## Fixes — post-release corrections
 
 Not milestone work and not new capability: recalibrations and bug fixes found by USING the
@@ -547,6 +699,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       again. Blocked on #35 (replay): neither direction can be evaluated against synthetic
       fixtures, since the failure is about real rate histories. Fixing it is also what would
       let the upper edge of #32's admissible band be measured rather than assumed.
+      Replay landed in TODO-VERSION (#35 above): replay a real capture under both baselines and
+      diff the two exports.
 
 - [x] **A card is a TEMPLATE, and its numbers are live** — #34, found by dogfooding, and a
       display bug rather than a scoring one: no weight, threshold or gate moved, and
