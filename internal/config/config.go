@@ -10,9 +10,12 @@
 package config
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,6 +100,63 @@ type Config struct {
 	// Argv is the subprocess to run, i.e. everything after "--". Not configurable
 	// from the file: it is positional by nature.
 	Argv []string `yaml:"-"`
+
+	// Replay is a `journalctl -o json` capture to play back on its own clock instead of
+	// following a live source (--replay, issue #35). ReplaySpeed is a multiple of real time,
+	// 0 meaning as fast as possible (--replay-speed max, the default).
+	//
+	// Flag-only, like Argv: a config file that silently turned every run into a replay would
+	// be a trap.
+	Replay      string  `yaml:"-"`
+	ReplaySpeed float64 `yaml:"-"`
+}
+
+// errReplayNeedsDryRun is the one line a replay without dry-run gets. Replay is a
+// calibration instrument: it runs the scorer, never a model, and --explain-dry-run is the
+// mode that builds no backend at all — so requiring it inherits M4's cost guarantee by
+// construction instead of re-proving it for a clock that can run at 1000×.
+var errReplayNeedsDryRun = errors.New("--replay requires --explain-dry-run: replay runs the scorer, not a model")
+
+// validateReplay checks a replay against the RESOLVED configuration — the same fields the
+// LLM stage and the sources are built from, never the flags that happened to set them. So
+// dry-run enabled in the config file satisfies it, and a guard and the mechanism it guards
+// cannot disagree about what was asked for.
+func (c Config) validateReplay() error {
+	if c.Replay == "" {
+		return nil
+	}
+	if !c.ExplainDryRun {
+		return errReplayNeedsDryRun
+	}
+	var live []string
+	if len(c.Argv) > 0 {
+		live = append(live, "a subprocess (--)")
+	}
+	if c.Docker.All || c.Docker.NameRegex != "" || len(c.Docker.Labels) > 0 {
+		live = append(live, "--docker-*")
+	}
+	if c.Journald.Enabled || len(c.Journald.Units) > 0 {
+		live = append(live, "--journald")
+	}
+	if len(live) > 0 {
+		return fmt.Errorf("--replay cannot be combined with %s: a replay is one capture on its own clock, "+
+			"and a live source would put a second clock into the same run", strings.Join(live, ", "))
+	}
+	return nil
+}
+
+// parseReplaySpeed reads --replay-speed: "max" for no pacing (0), or a positive multiple of
+// real time with an optional trailing x ("1", "1x", "10x", "0.5").
+func parseReplaySpeed(s string) (float64, error) {
+	v := strings.ToLower(strings.TrimSpace(s))
+	if v == "max" {
+		return 0, nil
+	}
+	n, err := strconv.ParseFloat(strings.TrimSuffix(v, "x"), 64)
+	if err != nil || n <= 0 || math.IsInf(n, 0) || math.IsNaN(n) {
+		return 0, fmt.Errorf("--replay-speed %q: want max, or a positive multiple of real time such as 1x or 10x", s)
+	}
+	return n, nil
 }
 
 // Defaults returns the zero-config configuration: quiet scoring, no Docker, and a
@@ -126,6 +186,12 @@ func Load(args []string) (Config, error) {
 	// set, so -h still lists them alongside everything else.
 	path := fs.String("config", "", "path to a logscry.yaml config file")
 	showVersion := fs.Bool("version", false, "print version and exit")
+	// --replay and --replay-speed are flag-only for the same reason "--" is: a mode of THIS
+	// invocation, never a setting a config file should be able to switch on.
+	replay := fs.String("replay", "",
+		"replay a `journalctl -o json` capture on its own clock (requires --explain-dry-run)")
+	replaySpeed := fs.String("replay-speed", "max",
+		"replay pacing: max, or a multiple of real time such as 1x or 10x")
 	b := bind(fs, cfg)
 
 	if err := fs.Parse(flagArgs); err != nil {
@@ -154,6 +220,12 @@ func Load(args []string) (Config, error) {
 
 	cfg.LLM.APIKey = os.Getenv(apiKeyEnv)
 	cfg.Argv = argv
+	cfg.Replay = *replay
+	speed, err := parseReplaySpeed(*replaySpeed)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ReplaySpeed = speed
 
 	if err := cfg.Score.Validate(); err != nil {
 		return Config{}, fmt.Errorf("score config: %w", err)
@@ -166,6 +238,9 @@ func Load(args []string) (Config, error) {
 	}
 	if err := cfg.Journald.Validate(); err != nil {
 		return Config{}, fmt.Errorf("journald config: %w", err)
+	}
+	if err := cfg.validateReplay(); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
 }

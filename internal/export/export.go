@@ -153,6 +153,9 @@ type Writer struct {
 	// was full. Atomic because both the pipeline goroutine and the --plain consumer send;
 	// read once, after the goroutine has finished.
 	dropped atomic.Uint64
+	// block makes send wait for room instead of dropping. Set only by OpenBlocking, before
+	// any send, and never changed afterwards.
+	block bool
 
 	// Owned by the writer goroutine — do not touch from anywhere else.
 	f       sink
@@ -177,6 +180,25 @@ func Open(path string) (*Writer, error) {
 		return nil, err
 	}
 	return newWriter(f, st.Size()), nil
+}
+
+// OpenBlocking is Open for a replay (--replay, issue #35): a full queue makes the sender WAIT
+// for the disk instead of dropping the record.
+//
+// That trade is wrong for a live run and right for a replay, for the same reason. A live
+// pipeline goroutine owns the template map and must never wait on a disk (RDI §3), so losing
+// a record is the price of ingestion never stalling. A replay has no real-time contract to
+// keep — it is reading a file — and its export is the artifact that gets diffed, so a record
+// lost to a slow disk is a result that differs from run to run. Measured with the dropping
+// writer: six virtual hours replayed at full speed wrote 548, 561 and 574 records in three
+// runs of one input that escalated 3,609 times.
+func OpenBlocking(path string) (*Writer, error) {
+	w, err := Open(path)
+	if err != nil {
+		return nil, err
+	}
+	w.block = true
+	return w, nil
 }
 
 // newWriter is Open's testable half: it takes the sink and the offset of the last complete
@@ -273,7 +295,19 @@ func (w *Writer) Close() error {
 // template map, and a blocking send would let a slow disk stall ingestion. It is the same
 // trade the escalation channel and the cap-1 snapshot channel already make — except that a
 // dropped record is a real loss, so it is counted and reported rather than shrugged off.
+//
+// A blocking writer (OpenBlocking) waits for room instead — but never past Close: once the
+// writer has been told to stop, nothing will read the queue again, and a sender waiting on
+// it would wait forever. That send is counted as a drop, which it is.
 func (w *Writer) send(m msg) {
+	if w.block {
+		select {
+		case w.in <- m:
+		case <-w.quit:
+			w.dropped.Add(1)
+		}
+		return
+	}
 	select {
 	case w.in <- m:
 	default:

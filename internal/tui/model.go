@@ -106,6 +106,16 @@ func New(snaps <-chan pipeline.Snapshot, errs <-chan error, opts Options) Model 
 	}
 }
 
+// clock is "now" for everything the renderer measures against: the capture's current time
+// when the snapshot carries one (a replay), the wall clock otherwise. A week-old capture
+// replayed today must say "3m ago" about the incident, not "7d ago" about the file.
+func (m Model) clock() time.Time {
+	if !m.snap.Now.IsZero() {
+		return m.snap.Now
+	}
+	return m.now()
+}
+
 // Init starts the two channel readers.
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(waitForSnapshot(m.snaps), waitForError(m.errCh))

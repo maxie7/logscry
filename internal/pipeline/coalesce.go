@@ -117,6 +117,99 @@ func inOrder(buffers map[streamKey]*pending, byDeadline bool, keep func(*pending
 	return keys
 }
 
+// grouper is the buffer state and the fold/flush rules both coalescers share. Only what
+// drives it differs: Coalesce is clocked by the wall and a timer, CoalesceSourceTime by the
+// lines' own timestamps. Owned by the one goroutine running either of them.
+type grouper struct {
+	ctx     context.Context
+	out     chan<- model.LogLine
+	timeout time.Duration
+	buffers map[streamKey]*pending
+	seq     uint64 // numbers headers as they arrive; see inOrder
+
+	// restamp sets each emitted line's Time to the moment it is released. Only replay wants
+	// it (see CoalesceSourceTime); a live line keeps the time its source gave it.
+	restamp bool
+}
+
+func newGrouper(ctx context.Context, out chan<- model.LogLine, timeout time.Duration, restamp bool) *grouper {
+	return &grouper{ctx: ctx, out: out, timeout: timeout, buffers: make(map[streamKey]*pending), restamp: restamp}
+}
+
+// emit sends p's merged line downstream at time at, reporting false on cancellation so the
+// caller can stop rather than block on a consumer that has already gone.
+func (g *grouper) emit(p *pending, at time.Time) bool {
+	line := p.line
+	if g.restamp {
+		line.Time = at
+	}
+	select {
+	case g.out <- line:
+		return true
+	case <-g.ctx.Done():
+		return false
+	}
+}
+
+// add folds line, observed at now, into the buffer for its stream — or, if it starts a new
+// logical line, flushes that stream's predecessor and holds this one in its place.
+func (g *grouper) add(line model.LogLine, now time.Time) bool {
+	key := streamKey{source: line.Source, stream: line.Stream}
+	if p := g.buffers[key]; p != nil && isContinuation(p, line.Raw) {
+		p.line.Raw += "\n" + line.Raw
+		p.count++
+		p.active = true
+		p.last = now
+		if p.count >= maxCoalesceLines || len(p.line.Raw) >= maxCoalesceBytes {
+			if !g.emit(p, now) {
+				return false
+			}
+			delete(g.buffers, key)
+		}
+		return true
+	}
+	// A header: flush any predecessor for this stream, then hold this line as the next
+	// potential header.
+	if p := g.buffers[key]; p != nil {
+		if !g.emit(p, now) {
+			return false
+		}
+	}
+	g.seq++
+	g.buffers[key] = &pending{
+		line:   line,
+		count:  1,
+		active: traceStartRe.MatchString(line.Raw),
+		last:   now,
+		seq:    g.seq,
+	}
+	return true
+}
+
+// flushIdle emits every buffer idle for at least the timeout as of now, earliest deadline
+// first. Each is released at its own deadline — the instant a live timer would have fired.
+func (g *grouper) flushIdle(now time.Time) bool {
+	expired := func(p *pending) bool { return now.Sub(p.last) >= g.timeout }
+	for _, key := range inOrder(g.buffers, true, expired) {
+		if !g.emit(g.buffers[key], g.buffers[key].last.Add(g.timeout)) {
+			return false
+		}
+		delete(g.buffers, key)
+	}
+	return true
+}
+
+// flushAll emits everything still buffered, in arrival order, at time now: ingestion ended.
+func (g *grouper) flushAll(now time.Time) bool {
+	all := func(*pending) bool { return true }
+	for _, key := range inOrder(g.buffers, false, all) {
+		if !g.emit(g.buffers[key], now) {
+			return false
+		}
+	}
+	return true
+}
+
 // Coalesce reads raw lines from in, folds continuation lines into the preceding
 // logical line, and writes coalesced lines to out. It runs as a single goroutine: all
 // buffer state is confined here, so the concurrency model needs no lock (RDI §3).
@@ -127,9 +220,7 @@ func inOrder(buffers map[streamKey]*pending, byDeadline bool, keep func(*pending
 // always drained, so the coalescer never blocks the ingestion path.
 func Coalesce(ctx context.Context, in <-chan model.LogLine, out chan<- model.LogLine, timeout time.Duration) {
 	defer close(out)
-
-	buffers := make(map[streamKey]*pending)
-	var seq uint64 // numbers headers as they arrive; see inOrder
+	g := newGrouper(ctx, out, timeout, false)
 
 	// One timer, repointed at the earliest pending deadline. Go 1.23+ makes Stop/Reset
 	// safe without draining the channel, so arm can reset freely.
@@ -140,7 +231,7 @@ func Coalesce(ctx context.Context, in <-chan model.LogLine, out chan<- model.Log
 	arm := func(now time.Time) {
 		var earliest time.Time
 		found := false
-		for _, p := range buffers {
+		for _, p := range g.buffers {
 			if d := p.last.Add(timeout); !found || d.Before(earliest) {
 				earliest, found = d, true
 			}
@@ -159,75 +250,66 @@ func Coalesce(ctx context.Context, in <-chan model.LogLine, out chan<- model.Log
 		timerC = timer.C
 	}
 
-	// emit sends p's merged line downstream, reporting false on cancellation so the
-	// caller can stop rather than block on a consumer that has already gone.
-	emit := func(p *pending) bool {
-		select {
-		case out <- p.line:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-timerC:
 			now := time.Now()
-			expired := func(p *pending) bool { return now.Sub(p.last) >= timeout }
-			for _, key := range inOrder(buffers, true, expired) {
-				if !emit(buffers[key]) {
-					return
-				}
-				delete(buffers, key)
+			if !g.flushIdle(now) {
+				return
 			}
 			arm(now)
 		case line, ok := <-in:
 			if !ok {
 				// Ingestion ended: flush everything still buffered, then let the
 				// deferred close of out drive Run's normal shutdown.
-				all := func(*pending) bool { return true }
-				for _, key := range inOrder(buffers, false, all) {
-					if !emit(buffers[key]) {
-						return
-					}
-				}
+				g.flushAll(time.Now())
 				return
 			}
 			now := time.Now()
-			key := streamKey{source: line.Source, stream: line.Stream}
-			if p := buffers[key]; p != nil && isContinuation(p, line.Raw) {
-				p.line.Raw += "\n" + line.Raw
-				p.count++
-				p.active = true
-				p.last = now
-				if p.count >= maxCoalesceLines || len(p.line.Raw) >= maxCoalesceBytes {
-					if !emit(p) {
-						return
-					}
-					delete(buffers, key)
-				}
-				arm(now)
-				continue
-			}
-			// A header: flush any predecessor for this stream, then hold this line as
-			// the next potential header.
-			if p := buffers[key]; p != nil {
-				if !emit(p) {
-					return
-				}
-			}
-			seq++
-			buffers[key] = &pending{
-				line:   line,
-				count:  1,
-				active: traceStartRe.MatchString(line.Raw),
-				last:   now,
-				seq:    seq,
+			if !g.add(line, now) {
+				return
 			}
 			arm(now)
+		}
+	}
+}
+
+// CoalesceSourceTime is Coalesce for a replay (--replay, issue #35): the same folding, with
+// the idle timeout measured on the capture's clock instead of the wall's.
+//
+// A wall-clock timer cannot work here. At replay speed a header and its continuation arrive
+// microseconds apart whatever their timestamps say, so a gap that split them live would be
+// folded, and a timer would never fire at all. Instead, before each line at capture time T,
+// every buffer whose deadline T has reached is flushed — which is the order and the moment a
+// live timer would have released it.
+//
+// Every emitted line is RESTAMPED with that release moment, because that is when the live
+// pipeline would have processed it: live stamps a line when it arrives (pipeline.Run), and a
+// held line arrives up to one timeout after its header. A line flushed by the next header is
+// released at that header's time; one flushed idle, at its deadline; one flushed at end of
+// input, at the last time seen. The output is therefore monotone by construction.
+//
+// A line with no timestamp (decode found none) happens at the current capture time.
+func CoalesceSourceTime(ctx context.Context, in <-chan model.LogLine, out chan<- model.LogLine, timeout time.Duration) {
+	defer close(out)
+	g := newGrouper(ctx, out, timeout, true)
+	var clock sourceClock
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case line, ok := <-in:
+			if !ok {
+				g.flushAll(clock.now)
+				return
+			}
+			now := clock.observe(line.Time)
+			if !g.flushIdle(now) || !g.add(line, now) {
+				return
+			}
 		}
 	}
 }

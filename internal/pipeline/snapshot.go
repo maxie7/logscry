@@ -76,6 +76,10 @@ type Snapshot struct {
 	// The renderer pins these: at any real log rate an escalation scrolls out of the
 	// stream in well under a second, which is no use to someone reading it.
 	Escalations []Event
+	// Now is the capture's current time in a replay (--replay), so "3m ago" on a card is
+	// measured against the capture rather than against today. Zero in a live run, where the
+	// renderer uses its own clock exactly as before.
+	Now time.Time
 }
 
 // collector accumulates the display state that the template map alone does not

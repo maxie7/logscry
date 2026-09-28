@@ -182,7 +182,7 @@ func (m Model) cardMeta(ev pipeline.Event) string {
 	if ev.Line.Source != "" {
 		parts = append(parts, ev.Line.Source)
 	}
-	if rel := relTime(ev.LastSeen, m.now()); rel != "" {
+	if rel := relTime(ev.LastSeen, m.clock()); rel != "" {
 		parts = append(parts, rel)
 	}
 	// Suppressed at one flag, which is almost every card: a badge that is always there
