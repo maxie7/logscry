@@ -873,6 +873,34 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
 
+- [x] **Buffered streams flush in the order they arrived** — ISSUE-TBD-6, a LIVE-path defect
+      found while building replay (#35) and deliberately kept out of it: nobody looking for a
+      coalescer bug would look under a replay entry. `pipeline.Coalesce` holds one pending line
+      per (source, stream) key in a map, and two paths flush several of them at once — the
+      end-of-input flush and one firing of the idle timer — by RANGING OVER THAT MAP. Go
+      randomises map order, so the lines left in whatever order the hash seed picked. Measured
+      before the fix: four buffered streams flushed at end of input, 200 runs, **four distinct
+      output orders**; the new test with five streams fails on both paths at once. v0.2.0 →
+      v0.9.4, twenty tagged releases (`git tag --contains 846bd24 | wc -l` → 20).
+      It is harmless with one source and bites the moment there are several, which since v0.8.0
+      is every `--journald` run: journald tags one source per unit (`journald:<unit>`), Docker
+      one per container. The order lines reach the pipeline is the order the stream pane shows,
+      `--plain` prints, and the scorer's context ring records — so the "preceding lines" an
+      escalation carries to the model could differ between two runs over identical input. It can
+      reach a DECISION in one narrow case: the rate limiter is global, so when two lines that both
+      clear the threshold are flushed together and one token is left, which of them escalates
+      followed the hash seed. Per-template state (count, recent ring, cooloff) is untouched by
+      interleaving across templates, and no recorded run shows the narrow case happening.
+      The fix numbers each header as it arrives and flushes in (idle deadline, arrival) order on
+      the timer path and arrival order at end of input — `inOrder`, one helper both paths call.
+      It only fixes the order among buffers flushed in the SAME instant, which was random;
+      nothing that was deterministic changes, no coalescing heuristic moved, `Coalesce`'s
+      signature is untouched, and every existing `TestCoalesce*` (all single-key) passed
+      unmodified. `TestCoalesceFlushOrderIsArrivalOrder` pins both paths, 200 and 50 runs.
+      Replay needs this — a byte-identical `--export` across two replays of one multi-unit
+      capture is impossible while the coalescer shuffles — but it lands first, as its own change.
+      Targets TODO-VERSION
+
 - [x] **Hosts 2..n of a multi-host authority are masked** — #61, found and filed by #58's sweep
       and pinned there as two assertions that the gap was open. `--llm-anonymize` masked
       `mongodb://user:pass@host1:27017,host2:27017,host3:27017/db?replicaSet=rs0` to

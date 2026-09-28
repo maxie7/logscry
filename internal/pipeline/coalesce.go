@@ -3,8 +3,10 @@
 package pipeline
 
 import (
+	"cmp"
 	"context"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -83,6 +85,36 @@ type pending struct {
 	count  int           // physical lines folded in so far (>= 1)
 	active bool          // a multi-line block is confirmed in progress
 	last   time.Time     // when the last line attached — the idle-flush anchor
+	seq    uint64        // arrival order of the header, which orders simultaneous flushes
+}
+
+// inOrder returns the buffered keys that pass keep, in the order they must be flushed:
+// earliest idle deadline first, then header arrival. At end of input every deadline is
+// irrelevant and arrival alone decides.
+//
+// It exists because the buffers live in a map, and ranging over a map to flush several of
+// them at once hands the pipeline its lines in whatever order the runtime's hash seed
+// picked — different on every run. journald keys one stream per unit and Docker one per
+// container, so a multi-source run routinely holds many buffers, and the order they leave
+// in is the order the stream pane shows, --plain prints, and the scorer's context ring
+// records (ISSUE-TBD-6).
+func inOrder(buffers map[streamKey]*pending, byDeadline bool, keep func(*pending) bool) []streamKey {
+	var keys []streamKey
+	for k, p := range buffers {
+		if keep(p) {
+			keys = append(keys, k)
+		}
+	}
+	slices.SortFunc(keys, func(a, b streamKey) int {
+		pa, pb := buffers[a], buffers[b]
+		if byDeadline {
+			if c := pa.last.Compare(pb.last); c != 0 {
+				return c
+			}
+		}
+		return cmp.Compare(pa.seq, pb.seq)
+	})
+	return keys
 }
 
 // Coalesce reads raw lines from in, folds continuation lines into the preceding
@@ -97,6 +129,7 @@ func Coalesce(ctx context.Context, in <-chan model.LogLine, out chan<- model.Log
 	defer close(out)
 
 	buffers := make(map[streamKey]*pending)
+	var seq uint64 // numbers headers as they arrive; see inOrder
 
 	// One timer, repointed at the earliest pending deadline. Go 1.23+ makes Stop/Reset
 	// safe without draining the channel, so arm can reset freely.
@@ -143,21 +176,21 @@ func Coalesce(ctx context.Context, in <-chan model.LogLine, out chan<- model.Log
 			return
 		case <-timerC:
 			now := time.Now()
-			for key, p := range buffers {
-				if now.Sub(p.last) >= timeout {
-					if !emit(p) {
-						return
-					}
-					delete(buffers, key)
+			expired := func(p *pending) bool { return now.Sub(p.last) >= timeout }
+			for _, key := range inOrder(buffers, true, expired) {
+				if !emit(buffers[key]) {
+					return
 				}
+				delete(buffers, key)
 			}
 			arm(now)
 		case line, ok := <-in:
 			if !ok {
 				// Ingestion ended: flush everything still buffered, then let the
 				// deferred close of out drive Run's normal shutdown.
-				for _, p := range buffers {
-					if !emit(p) {
+				all := func(*pending) bool { return true }
+				for _, key := range inOrder(buffers, false, all) {
+					if !emit(buffers[key]) {
 						return
 					}
 				}
@@ -186,11 +219,13 @@ func Coalesce(ctx context.Context, in <-chan model.LogLine, out chan<- model.Log
 					return
 				}
 			}
+			seq++
 			buffers[key] = &pending{
 				line:   line,
 				count:  1,
 				active: traceStartRe.MatchString(line.Raw),
 				last:   now,
+				seq:    seq,
 			}
 			arm(now)
 		}
