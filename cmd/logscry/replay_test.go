@@ -9,10 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+	_ "time/tzdata" // the zone test's child must load Asia/Tokyo on a host with no zoneinfo
 
 	"github.com/maxie7/logscry/internal/config"
 )
@@ -97,6 +101,76 @@ func TestReplayExportIsByteIdentical(t *testing.T) {
 			t.Fatalf("replay %d wrote a different export:\n--- first\n%s\n--- again\n%s", i+2, first, again)
 		}
 	}
+}
+
+// zoneChildEnv names the export path a TestReplayZoneChild process writes to. Unset, the
+// child has nothing to do.
+const zoneChildEnv = "LOGSCRY_REPLAY_ZONE_CHILD"
+
+// TestReplayExportIsZoneIndependent is #71 at the level the issue is about: one capture
+// replayed on two machines in different time zones must write the same bytes, because a
+// replay export is the artifact #37 diffs and nobody promised the two runs share a zone.
+//
+// The zone has to be set per PROCESS. time.Local is initialised once from TZ and is
+// process-global, so the test re-executes its own binary with TZ set, once per zone. Each
+// child reports the offset it actually ran under: a TZ that silently failed to load would
+// leave both children in one zone, and "two identical files" would then prove nothing.
+func TestReplayExportIsZoneIndependent(t *testing.T) {
+	dir := t.TempDir()
+	utc := replayInZone(t, "UTC", filepath.Join(dir, "utc.jsonl"), 0)
+	tokyo := replayInZone(t, "Asia/Tokyo", filepath.Join(dir, "tokyo.jsonl"), 9*3600)
+	if !bytes.Equal(utc, tokyo) {
+		t.Fatalf("one capture exported differently in two zones:\n--- TZ=UTC\n%s\n--- TZ=Asia/Tokyo\n%s", utc, tokyo)
+	}
+}
+
+// replayInZone re-executes this test binary as TestReplayZoneChild under TZ=zone and returns
+// the export it wrote. It fails the test on a child that did not exit cleanly (with the
+// child's output, so a crash is not misreported as "files differ"), on a child that ran in a
+// zone other than the one asked for, and on an empty export.
+func replayInZone(t *testing.T, zone, path string, wantOffset int) []byte {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestReplayZoneChild$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "TZ="+zone, zoneChildEnv+"="+path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("TZ=%s child: %v\n%s", zone, err, out)
+	}
+	offset, err := os.ReadFile(path + ".zone")
+	if err != nil {
+		t.Fatalf("TZ=%s child did not report its zone: %v", zone, err)
+	}
+	if got, _ := strconv.Atoi(string(offset)); got != wantOffset {
+		t.Fatalf("TZ=%s child ran at offset %ss, want %d: the zone did not take effect, so the comparison would prove nothing",
+			zone, offset, wantOffset)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) == 0 {
+		t.Fatalf("TZ=%s child wrote an empty export", zone)
+	}
+	return b
+}
+
+// TestReplayZoneChild is the child half of TestReplayExportIsZoneIndependent. Run directly,
+// it SKIPS rather than passes: a PASS that did nothing is the vacuous green the zone check
+// exists to rule out.
+func TestReplayZoneChild(t *testing.T) {
+	path := os.Getenv(zoneChildEnv)
+	if path == "" {
+		t.Skip("child of TestReplayExportIsZoneIndependent; runs only when re-executed by it")
+	}
+	_, offset := time.Now().Zone()
+	if err := os.WriteFile(path+".zone", []byte(strconv.Itoa(offset)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--replay", replayFixture, "--explain-dry-run", "--plain", "--export", path}
+	captureStdout(t, func() {
+		if err := run(context.Background(), args); err != nil {
+			t.Errorf("run: %v", err)
+		}
+	})
 }
 
 // TestReplaySpeedLeavesTheExportUnchanged: speed is pacing, never an input.

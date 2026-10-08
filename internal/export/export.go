@@ -78,7 +78,7 @@ type Flag struct {
 
 // Record is one line of the file. The json tags are a stable contract documented in the
 // README — snake_case, every key always present, no omitempty, so a consumer can index
-// fields without existence checks.
+// fields without existence checks. Times are RFC 3339 in UTC (see record).
 //
 // The _at_flag suffixes are deliberate. A bare "count" reads as a running total, and this
 // one is not: a re-occurrence bumps the in-memory count and appends nothing, so the number
@@ -451,11 +451,20 @@ func (w *Writer) closeFile() {
 }
 
 // record joins a flag and its resolution into the line that gets written.
+//
+// It is also where every time in the file is put into UTC, and the only place (#71). What
+// arrives is in time.Local — journald's timestamps and the pipeline's clock both are — and
+// encoding/json spells a time in its own zone, so one instant read "10:40:00.5Z" on one
+// machine and "19:40:00.5+09:00" on another, and a replay export diffed differently across
+// zones. The instant is untouched; only its spelling is fixed, here at the file boundary,
+// so the TUI and --plain keep showing local time.
 func record(f Flag, res resolution) Record {
 	reasons := f.Reasons
 	if reasons == nil {
 		reasons = []string{} // an empty list, never a null: consumers index this
 	}
+	ex := res.explanation
+	ex.At = ex.At.UTC()
 	return Record{
 		Kind:           res.kind,
 		TemplateHash:   f.Hash,
@@ -463,11 +472,11 @@ func record(f Flag, res resolution) Record {
 		Level:          f.Level,
 		Source:         f.Source,
 		CountAtFlag:    f.Count,
-		FirstSeen:      f.FirstSeen,
-		LastSeenAtFlag: f.LastSeen,
+		FirstSeen:      f.FirstSeen.UTC(),
+		LastSeenAtFlag: f.LastSeen.UTC(),
 		Score:          f.Score,
 		Reasons:        reasons,
-		Explanation:    res.explanation,
+		Explanation:    ex,
 	}
 }
 

@@ -157,6 +157,69 @@ func TestRecordCarriesTheDocumentedSchema(t *testing.T) {
 	}
 }
 
+// TestRecordTimesAreWrittenInUTC is #71. Every time the pipeline hands the exporter is in
+// time.Local (journald's time.UnixMicro, the pipeline's time.Now), and encoding/json spells a
+// time in its own zone — so one instant was "10:40:00.5Z" on one machine and
+// "19:40:00.5+09:00" on another, and two replays of one capture diffed as different files.
+//
+// The inputs here are in a fixed +09:00 zone on purpose. The schema test above feeds UTC and
+// could not see the bug; time.Local is no substitute either, because it is process-global
+// and initialised once, so nothing a test sets reaches it. Each field must spell "Z" AND name
+// the instant it was given — a fix that "normalised" by dropping the offset would pass the
+// first check and fail the second.
+func TestRecordTimesAreWrittenInUTC(t *testing.T) {
+	jst := time.FixedZone("JST", 9*3600)
+	firstSeen := time.Date(2026, 8, 29, 19, 40, 0, 500_000_000, jst)
+	lastSeen := time.Date(2026, 8, 29, 19, 40, 27, 0, jst)
+	at := time.Date(2026, 8, 29, 19, 40, 29, 0, jst)
+
+	flag := flagFor("abc123")
+	flag.FirstSeen, flag.LastSeen = firstSeen, lastSeen
+
+	want := []struct {
+		field string
+		get   func(rec map[string]any) any
+		in    time.Time
+		utc   string
+	}{
+		{"first_seen", func(r map[string]any) any { return r["first_seen"] }, firstSeen, "2026-08-29T10:40:00.5Z"},
+		{"last_seen_at_flag", func(r map[string]any) any { return r["last_seen_at_flag"] }, lastSeen, "2026-08-29T10:40:27Z"},
+		{"explanation.at", func(r map[string]any) any { return r["explanation"].(map[string]any)["at"] }, at, "2026-08-29T10:40:29Z"},
+	}
+	check := func(t *testing.T, rec map[string]any) {
+		t.Helper()
+		for _, w := range want {
+			got, _ := w.get(rec).(string)
+			if got != w.utc {
+				t.Errorf("%s = %q, want %q", w.field, got, w.utc)
+			}
+			parsed, err := time.Parse(time.RFC3339Nano, got)
+			if err != nil {
+				t.Errorf("%s = %q does not parse: %v", w.field, got, err)
+				continue
+			}
+			if !parsed.Equal(w.in) {
+				t.Errorf("%s names %s, want the instant it was given, %s", w.field, parsed, w.in)
+			}
+		}
+	}
+
+	t.Run("anomaly", func(t *testing.T) {
+		w, path := openTemp(t)
+		w.Flag(flag)
+		ex := doneFor("abc123")
+		ex.At = at
+		w.Resolve(ex)
+		check(t, decodeOne(t, closeAndRead(t, w, path)))
+	})
+	t.Run("would_escalate", func(t *testing.T) {
+		w, path := openTemp(t)
+		w.Flag(flag)
+		w.WouldEscalate("abc123", at)
+		check(t, decodeOne(t, closeAndRead(t, w, path)))
+	})
+}
+
 // TestPatternKeepsItsAngleBrackets: the masked signature is the thing people grep this file
 // for, and Go's default JSON escaping would spell it \u003cIP\u003e. That is valid JSON and
 // completely useless to `grep '<IP>'` — including the anonymization-leak check.

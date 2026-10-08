@@ -696,8 +696,8 @@ Every key is always present (no `omitempty`), so a consumer can index without ch
 | `level` | string | Level of the line that fired, `""` if none was detected |
 | `source` | string | e.g. `docker:api`, `stdin`, `proc:myapp`, `journald:nginx` |
 | `count_at_flag` | number | Occurrences of this template **when it was flagged** |
-| `first_seen` | string | RFC3339; the template's first occurrence |
-| `last_seen_at_flag` | string | RFC3339; its last occurrence **when it was flagged** |
+| `first_seen` | string | RFC3339 in UTC (`…Z`); the template's first occurrence |
+| `last_seen_at_flag` | string | RFC3339 in UTC (`…Z`); its last occurrence **when it was flagged** |
 | `score` | number | The escalation score |
 | `reasons` | array | Why it escalated, e.g. `["novel template (first seen)", "level ERROR"]` |
 | `explanation.state` | string | `explained`, `unavailable`, or `not_requested` (dry-run) |
@@ -706,7 +706,7 @@ Every key is always present (no `omitempty`), so a consumer can index without ch
 | `explanation.suggestion` | string | What to check or try |
 | `explanation.truncated` | bool | `true` when the answer was salvaged from a stream that died — real, but short |
 | `explanation.error` | string | Why the state is `unavailable`; `""` otherwise |
-| `explanation.at` | string | RFC3339; when that state was reached |
+| `explanation.at` | string | RFC3339 in UTC (`…Z`); when that state was reached |
 
 **In `--explain-dry-run` the file records what *would* have escalated.** That mode calls no
 model — it builds no backend at all — so those records carry `kind: "would_escalate"`,
@@ -776,9 +776,11 @@ byte-identical `--export` files, and the test suite asserts it. That is what mak
 between two threshold settings mean something. In a replay the export writer waits for the
 disk instead of dropping records. Timestamps in the file are capture time as a live run
 would have stamped it: a line held by multi-line grouping is stamped up to
-`--group-timeout` later than its journal entry. They are written in the local time zone, so
-exports made on machines in different zones differ in spelling, not in the instants they
-name (#71).
+`--group-timeout` later than its journal entry. They are written in UTC whatever the
+machine's time zone, so replay exports of one capture are byte-identical across machines in
+different zones too (#71); a live export is not deterministic even on one machine. Fractional
+seconds drop trailing zeros (`…:05Z`, `…:05.5Z`), so compare the times as times, not as
+strings.
 
 **`--replay-speed`** only paces the lines. `max` (the default) is for calibration. `1x`
 replays in real time, which is for watching the TUI's cards appear when they would have.

@@ -495,6 +495,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
         source-time trigger, which is skewed or silently omitted on backlog lines. The prompt
         is the only place affected; it is named in README "Known limitations".
       - #71: export times carry the local zone (`Z` against `+09:00` for one instant).
+        Fixed, in Fixes below.
       - #70: the live export's drop count reaches the user only at exit, as queue
         messages labelled records (a 2× overstatement), with exit status 0.
       - #73: `--record` for sources without their own clock.
@@ -1026,6 +1027,51 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       wrong by this change. Filed separately while auditing: a URL whose USERNAME is itself a
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
+
+- [x] **Export times are written in UTC** — #71, filed while building replay (#35) and fixed
+      before #37 so that every calibration artifact is born in the final format. Every time
+      the exporter receives is in `time.Local`: journald's `time.UnixMicro` and the pipeline's
+      `time.Now()` both are. `encoding/json` spells a time in its own zone, so one instant was
+      `"2026-08-29T10:40:00.5Z"` under `TZ=UTC` and `"2026-08-29T19:40:00.5+09:00"` under
+      `TZ=Asia/Tokyo`. A replay export was byte-identical run to run on one machine and NOT
+      across two machines in different zones, and a replay export is exactly the artifact #37
+      diffs.
+
+      **One seam, verified rather than assumed.** `Record` holds three times: `first_seen`,
+      `last_seen_at_flag` and `explanation.at`. Every line is built by `record()`, and both
+      sources of `explanation.at` reach it: `Resolve` through `explanationOf`, and
+      `WouldEscalate`'s `at` (the pipeline's `now`) directly. `record()` now calls `.UTC()` on
+      all three, and nothing else changed. No source and no pipeline stamp moved, so the TUI and
+      `--plain` keep showing local time. **This is a visible format change:** a consumer
+      matching `+09:00` sees `Z` instead. The instants are unchanged.
+
+      **Red first, at two levels.** `TestRecordTimesAreWrittenInUTC` feeds all three fields in a
+      fixed +09:00 zone, through both the anomaly path and the would_escalate path. It asserts
+      that each spells `Z` and parses back to the instant it was given. It uses
+      `time.FixedZone`, not `time.Local`, because `time.Local` is process-global and
+      initialised once, so nothing a test sets reaches it. The existing schema test could not
+      see the bug, because its inputs were already UTC.
+
+      `TestReplayExportIsZoneIndependent` tests the issue's own claim. It re-executes the test
+      binary over the replay fixture under `TZ=UTC` and `TZ=Asia/Tokyo` and compares the two
+      exports byte for byte. It guards against a vacuous pass in three ways:
+      - each child reports the offset it actually ran at, so a TZ that failed to load fails the
+        test instead of comparing two runs in one zone;
+      - a child that exits non-zero is reported with its output, not as "files differ";
+      - the child test SKIPS when run directly instead of passing having done nothing.
+
+      `time/tzdata` is imported by that test file only, so the zone loads on a host with no
+      zoneinfo.
+
+      **No existing test changed outcome.** The full suite ran under `-race` on `main` and on
+      the branch, each under `TZ=UTC` and `TZ=Asia/Tokyo`. It was 815 tests with no failure in
+      any of the four runs, and the only differences were the new tests. No existing test's
+      outcome depends on whether it runs at UTC or at +09:00.
+
+      The times are not claimed to be lexically sortable. `time.MarshalJSON` trims trailing
+      fractional zeros, so `…:05Z` sorts after `…:05.5Z`. Fixed-width fractions would be a
+      different format change, and nobody has asked for one. RDI unaffected: it does not specify
+      the export's time format. Targets v0.10.1
 
 - [x] **Buffered streams flush in the order they arrived** — #69, a LIVE-path defect
       found while building replay (#35) and deliberately kept out of it: nobody looking for a
