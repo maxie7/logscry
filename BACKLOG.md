@@ -1065,9 +1065,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       **No existing test changed outcome.** The full suite ran under `-race` on `main` and on
       the branch, each under `TZ=UTC` and `TZ=Asia/Tokyo`. It was 815 tests with no failure in
-      any of the four runs, and the only differences were the new tests. That was also the first
-      time the suite had run in a zone other than UTC: CI runs in UTC, and no zone dependency
-      turned up.
+      any of the four runs, and the only differences were the new tests. No existing test's
+      outcome depends on whether it runs at UTC or at +09:00.
 
       The times are not claimed to be lexically sortable. `time.MarshalJSON` trims trailing
       fractional zeros, so `…:05Z` sorts after `…:05.5Z`. Fixed-width fractions would be a
