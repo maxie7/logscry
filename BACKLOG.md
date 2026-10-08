@@ -1072,7 +1072,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       The times are not claimed to be lexically sortable. `time.MarshalJSON` trims trailing
       fractional zeros, so `…:05Z` sorts after `…:05.5Z`. Fixed-width fractions would be a
       different format change, and nobody has asked for one. RDI unaffected: it does not specify
-      the export's time format. Targets TODO-VERSION
+      the export's time format. Targets v0.10.1
 
 - [x] **Buffered streams flush in the order they arrived** — #69, a LIVE-path defect
       found while building replay (#35) and deliberately kept out of it: nobody looking for a
