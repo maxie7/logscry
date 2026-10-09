@@ -35,7 +35,7 @@ const (
 // buildMessages renders the request into the system + user pair sent to the model.
 //
 // The scorer's reasons are deliberately absent: ExplainRequest is pinned by RDI §7 to
-// the trigger, the context, the template, and the counts. Telling the model *why we
+// the trigger, the context, the template, the count, and the earliest source time. Telling the model *why we
 // flagged it* would invite it to agree with us rather than read the logs.
 func buildMessages(req ExplainRequest) []message {
 	return []message{
@@ -67,13 +67,24 @@ func userPrompt(req ExplainRequest) string {
 }
 
 // firstSeenSuffix renders how long this template has been around, which is what tells
-// the model "this is new" apart from "this has been happening all afternoon". It is
-// omitted rather than faked when the request carries no first-seen time.
+// the model "this is new" apart from "this has been happening all afternoon".
+//
+// Both sides are SOURCE time: the trigger's own timestamp minus the earliest one logscry
+// has read for the template (issue #72). Subtracting the pipeline's FirstSeen instead mixed
+// two clocks, and a backlog — source time hours old, processed in milliseconds — went
+// negative and silently lost the suffix. So the number is the spread of what logscry read:
+// a lower bound on the template's history, bounded by the backlog it attached to, and on
+// stdin and subprocess, where source time is read time, how long the reading took.
+//
+// It is omitted for a first occurrence, whose age is 0 by construction and whose
+// "Occurrences: 1" already says it; and rather than faked when either time is missing.
+// The pipeline folds the trigger into the min before the scorer sees it, so a negative age
+// takes two sources on different clocks; it is omitted too.
 func firstSeenSuffix(req ExplainRequest) string {
-	if req.Trigger.Time.IsZero() || req.FirstSeen.IsZero() {
+	if req.Count <= 1 || req.Trigger.Time.IsZero() || req.EarliestLineTime.IsZero() {
 		return ""
 	}
-	age := req.Trigger.Time.Sub(req.FirstSeen)
+	age := req.Trigger.Time.Sub(req.EarliestLineTime)
 	if age < 0 {
 		return ""
 	}

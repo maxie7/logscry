@@ -53,7 +53,10 @@ type Template struct {
 	Recent    []time.Time // ring buffer of recent occurrences for burst detection
 
 	// EarliestLineTime is the earliest LogLine.Time among the occurrences logscry has read:
-	// the SOURCE's clock, where FirstSeen and LastSeen are the pipeline's.
+	// the SOURCE's clock, where FirstSeen and LastSeen are the pipeline's. It is a running
+	// min, not the first, because source time is not monotone across containers and
+	// backlogs. Only the prompt's "first seen N ago" reads it, against the trigger's own
+	// time, so both sides of that subtraction are on one clock (issue #72).
 	EarliestLineTime time.Time
 
 	// The flag history: how many times this template has escalated, and when it first

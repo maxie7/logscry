@@ -73,11 +73,12 @@ func explain(ctx context.Context, b Backend, cfg Config, req score.EscalationReq
 	ex := model.Explanation{Hash: req.Hash, Pattern: req.Pattern, At: cfg.now()}
 
 	resp, err := b.Explain(ctx, ExplainRequest{
-		Trigger:   req.Trigger,
-		Context:   req.Context,
-		Template:  req.Pattern,
-		Count:     req.Count,
-		FirstSeen: req.FirstSeen,
+		Trigger:  req.Trigger,
+		Context:  req.Context,
+		Template: req.Pattern,
+		Count:    req.Count,
+
+		EarliestLineTime: req.EarliestLineTime,
 		OnPartial: func(p ExplainResponse) {
 			partial := ex
 			partial.State = model.ExplainPending

@@ -22,11 +22,10 @@ import (
 // testRequest is a representative escalation.
 func testRequest() ExplainRequest {
 	return ExplainRequest{
-		Trigger:   model.LogLine{Source: "docker:api", Stream: model.Stderr, Level: "PANIC", Raw: "panic: nil map write"},
-		Context:   []string{"GET /orders 200", "GET /orders 200"},
-		Template:  "panic: nil map write",
-		Count:     1,
-		FirstSeen: time.Now(),
+		Trigger:  model.LogLine{Source: "docker:api", Stream: model.Stderr, Level: "PANIC", Raw: "panic: nil map write"},
+		Context:  []string{"GET /orders 200", "GET /orders 200"},
+		Template: "panic: nil map write",
+		Count:    1,
 	}
 }
 

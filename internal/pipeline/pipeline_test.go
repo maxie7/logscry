@@ -200,12 +200,12 @@ func TestUpsertReportsPreviousLastSeen(t *testing.T) {
 	p := New(nil)
 	base := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 
-	_, prev := p.upsert("h", "pattern", base)
+	_, prev := p.upsert("h", "pattern", time.Time{}, base)
 	if !prev.IsZero() {
 		t.Errorf("prevLastSeen = %v for a brand-new template, want the zero time", prev)
 	}
 
-	_, prev = p.upsert("h", "pattern", base.Add(20*time.Minute))
+	_, prev = p.upsert("h", "pattern", time.Time{}, base.Add(20*time.Minute))
 	if !prev.Equal(base) {
 		t.Errorf("prevLastSeen = %v, want %v (the previous occurrence, not this one)", prev, base)
 	}
