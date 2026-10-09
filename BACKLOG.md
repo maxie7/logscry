@@ -1102,8 +1102,11 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       source-time argument, and a request literal lost `FirstSeen`.
 
       Found on the way and filed, not fixed: a restarted Docker container is re-attached with
-      `--docker-tail` and no `Since`, so lines already counted arrive again (#80;
-      README "Known limitations"). RDI §3 and §7 updated for the new field. Targets
+      `--docker-tail` and no `Since`, so lines already counted arrive again within
+      milliseconds (#80; README "Known limitations"). Confirmed on a daemon: five lines and
+      one restart gave `x15` where 10 were written. Computed from the code, not observed: a
+      template with an established rate can then cross the burst gate, so a restart can raise
+      a false burst. RDI §3 and §7 updated for the new field. Targets
       v0.10.2
 
 - [x] **Export times are written in UTC** — #71, filed while building replay (#35) and fixed
