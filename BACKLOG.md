@@ -1094,7 +1094,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       that never pops was run to confirm both rows go red. Full suite under `-race` on `main`
       and on the branch: 833 results, then 836. The only differences are the three new tests;
       no existing test changed outcome. README unchanged: it does not describe `Restore`'s
-      mechanics. Targets TODO-VERSION
+      mechanics. Targets v0.10.3
 
 - [x] **The prompt's "first seen" age is source time on both sides** — #72, filed while
       building replay (#35). `firstSeenSuffix` computed `Trigger.Time − FirstSeen`. The
