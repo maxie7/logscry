@@ -1218,25 +1218,23 @@ func TestNoDetectorGroupLandsOnOurOwnOutput(t *testing.T) {
 	}
 }
 
-// TestRestoreHasNoNestedMapping enforces the PRECONDITION that makes Restore correct, which is
-// not the same thing as making Restore correct — that is #50's job and it is not done here.
+// TestRestoreHasNoNestedMapping asserts that Mask never produces a NESTED mapping — one whose
+// VALUE contains another mapping's TOKEN.
 //
-// Restore iterates m.byToken (a Go map, randomised order) and substitutes each token ONCE, with
-// no fixpoint. That is only sound while no mapping's VALUE contains another mapping's TOKEN. If
-// one ever does, the answer depends on which order the runtime happened to walk the map:
-// measured with a directly constructed nested pair, wrong in 175 of 200 restores in one process,
-// at a rate set by the keys' hashes rather than a coin flip. A test written against that is
-// green four runs in five.
+// It used to guard Restore's correctness: Restore ranged over a Go map with one substitution per
+// token, so a nested mapping resolved by chance. Since #50 Restore resolves nesting by rule
+// (TestRestoreResolvesByRule), and that reason is gone. Three remain:
 //
-// The property holds today because every detector's target group excludes '<' and '>', so no
-// captured value can contain one of our tags. It is also the second and stronger half of why #46
-// was NOT fixed by letting the credential detector span our own tags — that fix would have
-// produced TOKEN_2 -> "<TOKEN_1>:password" directly. A rejection resting on a property nothing
-// enforces is not a rejection, which is why this lands with the fix rather than with #50.
+//   - A nested mapping is what a detector's target group landing on one of our tags looks like
+//     in the mapping table, and the inertness invariant forbids exactly that. It is #46's first
+//     ground for rejecting a wider detector 4, and it still stands.
+//   - Restore expands a known token inside a value, and cannot tell a nesting Mask created from an
+//     original that literally contained token-shaped text. With no nesting the question is moot.
+//   - It reads the mapping a SHARED Mapper accumulates across lines, which
+//     TestNoDetectorGroupLandsOnOurOwnOutput, checking one masked string at a time, does not.
 //
-// So this asserts the precondition over the real mappings Mask produces, and goes red the moment
-// a detector starts capturing one of our tags — before anyone has to debug an intermittently
-// wrong card.
+// The property holds because every detector's target group excludes '<' and '>', so no captured
+// value can contain one of our tags; this goes red the moment one starts capturing one.
 func TestRestoreHasNoNestedMapping(t *testing.T) {
 	tag := regexp.MustCompile(phPat)
 
@@ -1246,7 +1244,7 @@ func TestRestoreHasNoNestedMapping(t *testing.T) {
 			for _, nested := range tag.FindAllString(original, -1) {
 				if _, ok := m.byToken[nested]; ok {
 					t.Errorf("%s: mapping %s -> %q contains another mapping's token %s.\n"+
-						"Restore substitutes once, in map order, so this resolves by chance (see #50).",
+						"A detector's target group landed on one of our own tags, which the inertness invariant forbids.",
 						name, token, original, nested)
 				}
 			}
