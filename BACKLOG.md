@@ -1102,7 +1102,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       source-time argument, and a request literal lost `FirstSeen`.
 
       Found on the way and filed, not fixed: a restarted Docker container is re-attached with
-      `--docker-tail` and no `Since`, so lines already counted arrive again (ISSUE-TBD-1;
+      `--docker-tail` and no `Since`, so lines already counted arrive again (#80;
       README "Known limitations"). RDI §3 and §7 updated for the new field. Targets
       v0.10.2
 

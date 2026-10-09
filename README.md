@@ -857,7 +857,7 @@ validated.
   logscry re-attaches to it with `--docker-tail` and no "since", so up to that many lines it
   already counted arrive again within milliseconds. Counts inflate, and a template with an
   established rate can cross the burst gate, so a restart can raise a false burst. Found
-  while fixing #72 and filed as ISSUE-TBD-1.
+  while fixing #72 and filed as #80.
 - **Export drops are reported only at exit, and overstated.** In a live run the export
   writer drops a record rather than stall ingestion when its queue is full, which needs a
   disk stalled for tens of minutes at the default rate limit. The only report is one
