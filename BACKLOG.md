@@ -1029,6 +1029,73 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
 
+- [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
+      rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
+      ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
+      another mapping's TOKEN, the answer depended on which order the runtime walked the map.
+      **Latent:** no detector produces a nested mapping, because every target group excludes
+      `<` and `>`. So nothing changes for any input `Mask` can produce today, and there is no
+      Known limitations bullet to remove.
+
+      **Neither of the issue's fixes was taken as written.** Fix 1 (make nesting impossible and
+      test it) had already landed with #46: `TestNoDetectorGroupLandsOnOurOwnOutput` and
+      `TestRestoreHasNoNestedMapping`, whose failure message said the nesting "resolves by
+      chance (see #50)". Landing it would have closed nothing. Fix 2 as written (one pass with an
+      alternation over all tokens) is order-independent but deterministically WRONG on nesting.
+      It substitutes `<TOKEN_2>` with `<TOKEN_1>:hunter2` and never re-reads what it
+      substituted, so it fails the guard test the same issue proposes, on every run.
+
+      **The fix: one pass over `ourPH`, expanding recursively.** Each match is looked up in
+      `byToken`, and its value is expanded the same way. A token not in the map stays verbatim,
+      at the top level and inside a value. The pattern is compiled once, at package level.
+      Because the scan is one pass, a substituted value is never re-read together with the text
+      beside it. That closes a second order-dependence the issue did not name: `TOKEN_1 → "<IP"`
+      in front of a literal `_1>` used to become `IP_1`'s value whenever `TOKEN_1` was visited
+      first.
+
+      **Termination.** The expansion path is a STACK of the tokens being expanded. A token is
+      popped when its expansion returns, so a token repeated inside one value, or reached
+      twice through a diamond, resolves fully. Re-entering a token still on the stack is a
+      cycle. The stack holds distinct tokens, so depth is bounded by `len(byToken)` and no
+      acyclic nesting can reach the bound. A numeric depth counter would give the same outputs,
+      but it detects a cycle only after unrolling it, which costs exponential work when values
+      branch. **At a cycle the OUTERMOST token is emitted verbatim.** A cyclic mapping has no
+      value, and a partial unrolling would be an invented string shown as a real one. That is
+      exactly what `Restore`'s "better a stray `<IP_9>` than a wrong value" forbids.
+
+      **What it depends on now.** `Restore` finds tokens by `ourPH`, so a tag outside `[A-Z]+`
+      would mint a token it never restores. A future `IPV6` tag would do that.
+      `TestEveryTagMintsARestorableToken` reads the tags from the real detector tables, not
+      from a list written in the test, so adding such a tag turns it red.
+
+      **#46's argument loses one ground and keeps the other.** #46 rejected widening detector 4
+      on two grounds. The second was that nesting resolves nondeterministically, and this
+      removes it. The first was that no target group may land on our own tags, which is the
+      inertness invariant. That one is untouched and is sufficient on its own. No detector
+      changed, and #46 is not revisited. `TestRestoreHasNoNestedMapping` keeps its name and its
+      assertions; its comment and failure message now say what it guards: `Mask` never
+      produces a nested mapping. Two package comments that described the old single-pass
+      dependency are corrected.
+
+      **Tests.** Red first. `TestRestoreIsOrderIndependent` builds the nested pair directly in
+      `byToken` and restores it 1000 times with a fresh `Mapper` each run. On the old code it was
+      wrong in **861–882 of 1000** across four runs, and the neighbour-combination case was
+      wrong at the same rate. `TestRestoreResolvesByRule` pins these cases:
+      - two- and three-level nesting;
+      - unknown tokens;
+      - a repeated token;
+      - a glued token;
+      - a known token twice inside one value;
+      - a diamond;
+      - a two-token cycle, a self-cycle, and a token whose value reaches a cycle.
+
+      The repeated-in-a-value rows nest one level deeper on purpose. A leaf value is returned
+      before it is pushed, so leaves alone cannot tell a stack from a visited-set. A mutant
+      that never pops was run to confirm both rows go red. Full suite under `-race` on `main`
+      and on the branch: 833 results, then 836. The only differences are the three new tests;
+      no existing test changed outcome. README unchanged: it does not describe `Restore`'s
+      mechanics. Targets TODO-VERSION
+
 - [x] **The prompt's "first seen" age is source time on both sides** — #72, filed while
       building replay (#35). `firstSeenSuffix` computed `Trigger.Time − FirstSeen`. The
       trigger is the SOURCE's clock (journald's `__REALTIME_TIMESTAMP`, Docker's timestamp
