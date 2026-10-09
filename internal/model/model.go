@@ -52,6 +52,10 @@ type Template struct {
 	Count     int
 	Recent    []time.Time // ring buffer of recent occurrences for burst detection
 
+	// EarliestLineTime is the earliest LogLine.Time among the occurrences logscry has read:
+	// the SOURCE's clock, where FirstSeen and LastSeen are the pipeline's.
+	EarliestLineTime time.Time
+
 	// The flag history: how many times this template has escalated, and when it first
 	// and last did. It lives here rather than on the retained event the renderer holds
 	// because a card is bounded and a template is not — a template whose card aged out of

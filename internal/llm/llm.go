@@ -27,6 +27,8 @@ type ExplainRequest struct {
 	Count     int
 	FirstSeen time.Time
 
+	EarliestLineTime time.Time
+
 	// OnPartial, when set, receives the explanation as it fills in: a backend that streams
 	// calls it each time a FIELD completes, never mid-value. Optional — a backend that does
 	// not stream simply never calls it, which is why this is a field here rather than a
