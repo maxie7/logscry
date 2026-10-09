@@ -1104,7 +1104,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       Found on the way and filed, not fixed: a restarted Docker container is re-attached with
       `--docker-tail` and no `Since`, so lines already counted arrive again (ISSUE-TBD-1;
       README "Known limitations"). RDI §3 and §7 updated for the new field. Targets
-      TODO-VERSION
+      v0.10.2
 
 - [x] **Export times are written in UTC** — #71, filed while building replay (#35) and fixed
       before #37 so that every calibration artifact is born in the final format. Every time
