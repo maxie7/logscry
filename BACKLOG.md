@@ -494,6 +494,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       - #72: the prompt's "first seen N ago" subtracts a wall-clock `FirstSeen` from a
         source-time trigger, which is skewed or silently omitted on backlog lines. The prompt
         is the only place affected; it is named in README "Known limitations".
+        Fixed, in Fixes below.
       - #71: export times carry the local zone (`Z` against `+09:00` for one instant).
         Fixed, in Fixes below.
       - #70: the live export's drop count reaches the user only at exit, as queue
@@ -1027,6 +1028,86 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       wrong by this change. Filed separately while auditing: a URL whose USERNAME is itself a
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
+
+- [x] **The prompt's "first seen" age is source time on both sides** — #72, filed while
+      building replay (#35). `firstSeenSuffix` computed `Trigger.Time − FirstSeen`. The
+      trigger is the SOURCE's clock (journald's `__REALTIME_TIMESTAMP`, Docker's timestamp
+      prefix; the read time on stdin and subprocess). `FirstSeen` is the pipeline's clock at
+      upsert. On a backlog the source time is minutes or hours older than the pipeline's
+      clock, so the age went negative and the `< 0` guard silently dropped the phrase. The
+      prompt is the only reader: no card, `--plain` line or export value is computed this way.
+
+      **The issue's candidate fixed the wrong side.** It proposed pipeline time on both sides
+      (`LastSeen − FirstSeen`), which is consistent and meaningless on a backlog. The cell
+      that decided it is reachable at the defaults: Normalize strips a `LEVEL:` prefix from
+      the message and the template hashes the message, so `ERROR: db unreachable` ×5 then
+      `FATAL: db unreachable` is ONE template. The FATAL escalates alone at Count 6. In a
+      `--docker-tail` backlog all six arrive within milliseconds. The candidate would have
+      told the model `Occurrences: 6 (first seen 0s ago)` about lines its source spread over
+      an hour, turning "silently omitted" into "confidently misleading". The fix puts SOURCE
+      time on both sides instead, which the trigger already carries.
+      `model.Template.EarliestLineTime` is the running MIN of `LogLine.Time` over the
+      occurrences read, maintained in `upsert`. It is a min and not the first because source
+      time is not monotone across containers and backlogs, and a zero time contributes
+      nothing. It replaces `FirstSeen` on `EscalationRequest` and `ExplainRequest`, where only
+      the prompt read it; a pipeline-clock `FirstSeen` left beside it unread would invite #72
+      back. `upsert` runs before `Evaluate` and `emit` sends that same line, so the trigger is
+      inside the min and one source cannot produce a negative age. The `< 0` check stays as a
+      guard for templates fed by sources on different clocks. `FirstSeen`/`LastSeen` keep the
+      pipeline's clock and no stamp moved. `internal/score` changes only the request struct
+      and the emit literal, and no template hash moves.
+
+      **A first occurrence carries no age, by rule.** Its age is 0 by construction, and
+      "Occurrences: 1" already says it. Live it was already omitted, by accident: the trigger
+      is stamped microseconds before the pipeline's clock, so the old age was slightly
+      negative. Novel templates are most escalations, so the commonest prompt is
+      byte-identical.
+
+      **Every cell, computed from the code.** Source (stdin/subprocess, journald, Docker) ×
+      live/backlog × Count 1/>1. Count 1 is omitted everywhere, before by accident and now by
+      rule. For live Count > 1 the old age was right to within ingest latency and is unchanged.
+      Two cells change:
+      - **Backlog Count > 1** went from omitted to the source spread. It can escalate at the
+        defaults through the ERROR→FATAL shape above. Warmup mutes novelty in a backlog, and a
+        millisecond backlog has no baseline, so burst cannot fire.
+      - **Live after a backlog**, and **a container attached mid-run whose tail holds old
+        lines**, went from understated to the true spread.
+      What remains is named in README "Known limitations":
+      - it is a lower bound, bounded by what logscry read;
+      - stdin's source time is read time;
+      - one template from sources on different clocks is off by their skew;
+      - the card and the prompt now hold two different "first seen"s, on purpose.
+      Replay never builds a prompt, since `--replay` requires `--explain-dry-run`.
+
+      **Red first, through the chain as well as the unit.** `pool.explain` copies the request
+      field by field, and a zero time omits the suffix, which is indistinguishable from the
+      bug. So two tests drive real `pipeline.Process` → scorer `emit` → `llm.Run` → a
+      capturing backend and assert the rendered user prompt, one of them through the
+      anonymizing decorator: `TestBacklogEscalationCarriesSourceAge` and
+      `TestBacklogAgeSurvivesAnonymizer`. Both assert exactly one escalation at Count 6, so
+      that a lost template merge cannot pass vacuously. Also:
+      - `TestFirstSeenSuffix` pins the unit;
+      - `TestEarliestLineTimeIsRunningMin` feeds out-of-order source times and checks that
+        `FirstSeen`, `LastSeen` and the hash do not move;
+      - `TestFirstOccurrencePromptHasNoAge` has a production-shaped row (trigger 3µs before
+        the pipeline's clock) that is green before and after, and an equal-clocks row that
+        pins the rule.
+      `ExplainRequest.EarliestLineTime` and the template field were added in the red commit,
+      zero-valued and unused, so that the tests failed on assertions rather than on
+      compilation.
+
+      **No existing test changed outcome.** The full suite ran under `-race` on `main` and on
+      the branch: 820 results, then 833. The only differences are the 13 new tests and
+      subtests. Two existing tests were edited for compilation only: `upsert` gained the
+      source-time argument, and a request literal lost `FirstSeen`.
+
+      Found on the way and filed, not fixed: a restarted Docker container is re-attached with
+      `--docker-tail` and no `Since`, so lines already counted arrive again within
+      milliseconds (#80; README "Known limitations"). Confirmed on a daemon: five lines and
+      one restart gave `x15` where 10 were written. Computed from the code, not observed: a
+      template with an established rate can then cross the burst gate, so a restart can raise
+      a false burst. RDI §3 and §7 updated for the new field. Targets
+      v0.10.2
 
 - [x] **Export times are written in UTC** — #71, filed while building replay (#35) and fixed
       before #37 so that every calibration artifact is born in the final format. Every time

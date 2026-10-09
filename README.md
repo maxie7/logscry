@@ -840,16 +840,26 @@ validated.
   is not at hand, so neither shape's frequency could be counted — and deferring it was therefore a
   decision taken without data rather than a conclusion. Until it is closed, treat any URL whose
   host carries an underscore as sent in the clear.
-- **The model's "first seen N ago" is wrong for journald and Docker backlog lines.** The
-  prompt computes it by subtracting the template's first-seen time, which is taken from
-  logscry's own clock when the line was processed, from the trigger line's own timestamp,
-  which journald and Docker record at the source. For lines followed live the two are
-  close. For backlog lines (`journalctl -f` prints recent entries first, and
-  `--docker-tail` fetches history on attach), the source time can be minutes or hours
-  earlier. The model is then told an understated age, and when the result is negative the
-  phrase is silently left out. **The prompt is the only place affected.** No card, no
-  `--plain` line and no `--export` value is computed this way. Found while building replay
-  and filed as #72.
+- **There are two "first seen"s, on two clocks, and they can disagree.** The card's `first`
+  time and `--export`'s `first_seen` are **logscry's** clock: when logscry first processed
+  the template. The age the model is told ("first seen N ago") is the **source's** clock: the
+  trigger line's own timestamp minus the earliest one logscry has read for that template. On
+  a backlog these diverge by design. Six lines a container logged over the last hour arrive
+  in milliseconds on attach, so the model may say "for the past hour" while the card's
+  `first` time is the moment logscry attached, two minutes ago. That is not a bug: the card
+  says when logscry saw it; the model is told how long the source has been logging it. The
+  age is a **lower bound**. It covers only what logscry read (`--docker-tail` history, the
+  entries `journalctl -f` prints first), and it is left out for a first occurrence. On stdin
+  and subprocess the source time *is* the read time, so a file piped in reports how long the
+  read took. A template seen from sources with different clocks (a remote `DOCKER_HOST`
+  beside local journald) is off by their skew. Before #72 the age subtracted one clock from
+  the other.
+- **A restarted Docker container's history is read twice.** When a container restarts,
+  logscry re-attaches to it with `--docker-tail` and no "since", so up to that many lines it
+  already counted arrive again within milliseconds. Confirmed on a daemon: five lines and one
+  restart gave `x15` where 10 were written. Computed from the code, not observed: a template
+  with an established rate can then cross the burst gate, so a restart can raise a false
+  burst. Found while fixing #72 and filed as #80.
 - **Export drops are reported only at exit, and overstated.** In a live run the export
   writer drops a record rather than stall ingestion when its queue is full, which needs a
   disk stalled for tens of minutes at the default rate limit. The only report is one

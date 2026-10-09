@@ -129,6 +129,7 @@ type Template struct {
     LastSeen  time.Time
     Count     int
     Recent    []time.Time // ring buffer of recent occurrences for burst detection
+    EarliestLineTime time.Time // min LogLine.Time read: the SOURCE clock (FirstSeen/LastSeen are logscry's)
     Explained bool
     Explanation string   // last LLM explanation, if any
 }
@@ -208,7 +209,7 @@ type ExplainRequest struct {
     Context     []string // recent surrounding lines
     Template    string
     Count       int
-    FirstSeen   time.Time
+    EarliestLineTime time.Time // the template's min source time; the prompt's age is Trigger.Time minus this
 }
 type ExplainResponse struct {
     Summary     string   // one-line "what happened"
@@ -220,6 +221,8 @@ type Backend interface {
     Name() string
 }
 ```
+
+The prompt's "first seen N ago" subtracts two SOURCE times, never logscry's `FirstSeen`, which is a different clock (#72). It is omitted for `Count == 1`.
 
 **v1 implementation shortcut:** Ollama exposes an **OpenAI-compatible** endpoint, and so do OpenAI, Groq, etc. So a single `OpenAICompatible` backend with a configurable **base URL + model + API key** covers OpenAI, Groq, **and** local Ollama. Keep the `Backend` interface clean so a native Ollama client (or others) can be added later, but ship one configurable implementation in v1.
 

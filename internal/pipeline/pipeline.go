@@ -93,7 +93,7 @@ func New(sc *score.Scorer) *Pipeline {
 func (p *Pipeline) Process(line model.LogLine, now time.Time) Event {
 	line = Normalize(line)
 	pattern, hash := TemplatizeLine(line)
-	tmpl, prevLastSeen := p.upsert(hash, pattern, now)
+	tmpl, prevLastSeen := p.upsert(hash, pattern, line.Time, now)
 
 	ev := Event{
 		Line:      line,
@@ -281,16 +281,21 @@ func (p *Pipeline) Stats() score.Stats {
 //
 // New templates start at Count 1; existing ones bump Count, advance LastSeen, and push
 // now onto the bounded Recent ring.
-func (p *Pipeline) upsert(hash, pattern string, now time.Time) (tmpl *model.Template, prevLastSeen time.Time) {
+//
+// at is the line's own time, on its source's clock, and only ever lowers
+// EarliestLineTime; now stays the only clock FirstSeen, LastSeen and Recent are stamped
+// with. A zero at — a line with no time — contributes nothing.
+func (p *Pipeline) upsert(hash, pattern string, at, now time.Time) (tmpl *model.Template, prevLastSeen time.Time) {
 	tmpl, ok := p.templates[hash]
 	if !ok {
 		tmpl = &model.Template{
-			Hash:      hash,
-			Pattern:   pattern,
-			FirstSeen: now,
-			LastSeen:  now,
-			Count:     1,
-			Recent:    []time.Time{now},
+			Hash:             hash,
+			Pattern:          pattern,
+			FirstSeen:        now,
+			LastSeen:         now,
+			Count:            1,
+			Recent:           []time.Time{now},
+			EarliestLineTime: at,
 		}
 		p.templates[hash] = tmpl
 		return tmpl, time.Time{}
@@ -299,6 +304,9 @@ func (p *Pipeline) upsert(hash, pattern string, now time.Time) (tmpl *model.Temp
 	tmpl.Count++
 	tmpl.LastSeen = now
 	tmpl.Recent = pushRecent(tmpl.Recent, now)
+	if !at.IsZero() && (tmpl.EarliestLineTime.IsZero() || at.Before(tmpl.EarliestLineTime)) {
+		tmpl.EarliestLineTime = at
+	}
 	return tmpl, prevLastSeen
 }
 

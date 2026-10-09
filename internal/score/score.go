@@ -209,14 +209,15 @@ func (c Config) Validate() error {
 // EscalationRequest is what the LLM worker pool (M4) consumes: the line that fired,
 // what came before it, and why the scorer thought it mattered.
 type EscalationRequest struct {
-	Trigger   model.LogLine
-	Context   []string // recent lines across all sources, oldest first
-	Pattern   string   // the masked template, e.g. "user <NUM> failed"
-	Hash      string
-	Count     int // occurrences of this template so far
-	FirstSeen time.Time
-	Score     float64
-	Reasons   []string // human-readable: why this fired
+	Trigger model.LogLine
+	Context []string // recent lines across all sources, oldest first
+	Pattern string   // the masked template, e.g. "user <NUM> failed"
+	Hash    string
+	Count   int // occurrences of this template so far
+	Score   float64
+	Reasons []string // human-readable: why this fired
+
+	EarliestLineTime time.Time // the template's earliest SOURCE time read (see model.Template)
 }
 
 // Result is the scorer's verdict on one line, which the pipeline attaches to the
@@ -510,14 +511,15 @@ func (s *Scorer) emit(line model.LogLine, tmpl *model.Template, res Result) bool
 		return false
 	}
 	req := EscalationRequest{
-		Trigger:   line,
-		Context:   s.ring.Lines(),
-		Pattern:   tmpl.Pattern,
-		Hash:      tmpl.Hash,
-		Count:     tmpl.Count,
-		FirstSeen: tmpl.FirstSeen,
-		Score:     res.Score,
-		Reasons:   res.Reasons,
+		Trigger: line,
+		Context: s.ring.Lines(),
+		Pattern: tmpl.Pattern,
+		Hash:    tmpl.Hash,
+		Count:   tmpl.Count,
+		Score:   res.Score,
+		Reasons: res.Reasons,
+
+		EarliestLineTime: tmpl.EarliestLineTime,
 	}
 	select {
 	case s.out <- req:

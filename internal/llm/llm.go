@@ -21,11 +21,15 @@ import (
 
 // ExplainRequest is the context assembled for a single escalated event.
 type ExplainRequest struct {
-	Trigger   model.LogLine
-	Context   []string // recent surrounding lines
-	Template  string
-	Count     int
-	FirstSeen time.Time
+	Trigger  model.LogLine
+	Context  []string // recent surrounding lines
+	Template string
+	Count    int
+
+	// EarliestLineTime is the earliest SOURCE time among the template's occurrences logscry
+	// has read, the clock Trigger.Time is on — never the pipeline's FirstSeen, which is a
+	// different clock and made the prompt's age negative on backlog lines (issue #72).
+	EarliestLineTime time.Time
 
 	// OnPartial, when set, receives the explanation as it fills in: a backend that streams
 	// calls it each time a FIELD completes, never mid-value. Optional — a backend that does

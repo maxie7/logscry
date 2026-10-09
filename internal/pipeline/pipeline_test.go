@@ -200,14 +200,50 @@ func TestUpsertReportsPreviousLastSeen(t *testing.T) {
 	p := New(nil)
 	base := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 
-	_, prev := p.upsert("h", "pattern", base)
+	_, prev := p.upsert("h", "pattern", time.Time{}, base)
 	if !prev.IsZero() {
 		t.Errorf("prevLastSeen = %v for a brand-new template, want the zero time", prev)
 	}
 
-	_, prev = p.upsert("h", "pattern", base.Add(20*time.Minute))
+	_, prev = p.upsert("h", "pattern", time.Time{}, base.Add(20*time.Minute))
 	if !prev.Equal(base) {
 		t.Errorf("prevLastSeen = %v, want %v (the previous occurrence, not this one)", prev, base)
+	}
+}
+
+// TestEarliestLineTimeIsRunningMin: the template keeps the earliest SOURCE time among the
+// lines read for it (issue #72). It is a min, not the first, because source time is not
+// monotone across containers and backlogs; a line with no time contributes nothing. The
+// pipeline's own stamps and the template hash are untouched by it.
+func TestEarliestLineTimeIsRunningMin(t *testing.T) {
+	p := New(nil)
+	src := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	now := src.Add(3 * time.Hour)
+	_, wantHash := Templatize("db unreachable")
+
+	offsets := []time.Duration{30 * time.Minute, 10 * time.Minute, -1, 50 * time.Minute, 5 * time.Minute}
+	var last Event
+	for i, off := range offsets {
+		line := model.LogLine{Source: "docker:db", Raw: "ERROR: db unreachable"}
+		if off >= 0 {
+			line.Time = src.Add(off)
+		}
+		last = p.Process(line, now.Add(time.Duration(i)*time.Millisecond))
+		if last.Hash != wantHash {
+			t.Fatalf("line %d: hash = %s, want %s (the source time must not reach the hash)", i, last.Hash, wantHash)
+		}
+	}
+
+	tmpl := p.templates[wantHash]
+	if tmpl == nil || tmpl.Count != len(offsets) {
+		t.Fatalf("template = %+v, want one template with Count %d", tmpl, len(offsets))
+	}
+	if want := src.Add(5 * time.Minute); !tmpl.EarliestLineTime.Equal(want) {
+		t.Errorf("EarliestLineTime = %v, want %v (the min, not the first)", tmpl.EarliestLineTime, want)
+	}
+	if !tmpl.FirstSeen.Equal(now) || !tmpl.LastSeen.Equal(now.Add(4*time.Millisecond)) {
+		t.Errorf("FirstSeen/LastSeen = %v/%v, want the pipeline's clock %v/%v",
+			tmpl.FirstSeen, tmpl.LastSeen, now, now.Add(4*time.Millisecond))
 	}
 }
 
