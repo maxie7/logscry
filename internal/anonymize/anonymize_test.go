@@ -178,6 +178,137 @@ func TestResponseRestoresAllPlaceholders(t *testing.T) {
 	}
 }
 
+// withTokens builds a Mapper whose mapping is set DIRECTLY, for the shapes Mask cannot
+// produce — a nested or cyclic mapping — which are exactly the ones Restore must not leave to
+// chance (#50).
+func withTokens(pairs ...string) *Mapper {
+	m := New()
+	for i := 0; i+1 < len(pairs); i += 2 {
+		m.byToken[pairs[i]] = pairs[i+1]
+	}
+	return m
+}
+
+// TestRestoreIsOrderIndependent is #50's guard: a nested mapping restored many times, with a
+// FRESH Mapper each iteration, so Go's map-order randomisation is exercised rather than sampled
+// once. The rate a single-pass-per-token Restore gets this wrong is set by the keys' hashes, not a
+// coin flip, so the count is reported rather than stopping at the first failure.
+func TestRestoreIsOrderIndependent(t *testing.T) {
+	const runs = 1000
+	cases := []struct {
+		name  string
+		pairs []string
+		in    string
+		want  string
+	}{
+		{
+			name:  "nested pair",
+			pairs: []string{"<TOKEN_1>", "sk-livekeyabcdefghij0123456789XYZ", "<TOKEN_2>", "<TOKEN_1>:hunter2"},
+			in:    "credential <TOKEN_2> rejected",
+			want:  "credential sk-livekeyabcdefghij0123456789XYZ:hunter2 rejected",
+		},
+		{
+			// A substituted value must never combine with the text beside it into a new token:
+			// "<IP" + "_1>" is the ORIGINAL text "<IP_1>", not a reference to IP_1.
+			name:  "replacement combines with neighbouring text",
+			pairs: []string{"<TOKEN_1>", "<IP", "<IP_1>", "10.0.0.5"},
+			in:    "<TOKEN_1>_1>",
+			want:  "<IP_1>",
+		},
+	}
+	for _, c := range cases {
+		wrong, first := 0, ""
+		for i := 0; i < runs; i++ {
+			if got := withTokens(c.pairs...).Restore(c.in); got != c.want {
+				if wrong == 0 {
+					first = got
+				}
+				wrong++
+			}
+		}
+		if wrong > 0 {
+			t.Errorf("%s: Restore wrong in %d of %d runs; first bad result %q, want %q",
+				c.name, wrong, runs, first, c.want)
+		}
+	}
+}
+
+// TestRestoreResolvesByRule pins what Restore does with every shape a mapping can take, nested or
+// not. Each row's answer is independent of map order.
+func TestRestoreResolvesByRule(t *testing.T) {
+	cases := []struct {
+		name  string
+		pairs []string
+		in    string
+		want  string
+	}{
+		{"two-level nesting",
+			[]string{"<TOKEN_1>", "s3cr3t", "<TOKEN_2>", "<TOKEN_1>:hunter2"},
+			"dsn <TOKEN_2>", "dsn s3cr3t:hunter2"},
+		{"three-level nesting",
+			[]string{"<HOST_1>", "db", "<TOKEN_1>", "u:<HOST_1>", "<TOKEN_2>", "[<TOKEN_1>]"},
+			"<TOKEN_2>!", "[u:db]!"},
+		{"unknown token at top level stays verbatim",
+			[]string{"<IP_1>", "10.0.0.5"},
+			"<IP_1> and <IP_9>", "10.0.0.5 and <IP_9>"},
+		{"unknown token inside a value stays verbatim",
+			[]string{"<TOKEN_1>", "a<IP_9>b"},
+			"<TOKEN_1>", "a<IP_9>b"},
+		{"repeated token",
+			[]string{"<IP_1>", "10.0.0.5"},
+			"<IP_1> -> <IP_1>", "10.0.0.5 -> 10.0.0.5"},
+		{"token glued to text",
+			[]string{"<IP_1>", "10.0.0.5"},
+			"x<IP_1>y", "x10.0.0.5y"},
+		// The expansion path is a STACK: a token leaves it when its expansion returns. A
+		// visited-set that only grows would read the second visit below as a cycle. The repeated
+		// token must itself NEST, because a leaf value is returned before it is ever pushed.
+		{"known token twice in one value",
+			[]string{"<TOKEN_1>", "<TOKEN_2>:<TOKEN_2>", "<TOKEN_2>", "k<TOKEN_3>", "<TOKEN_3>", "v"},
+			"<TOKEN_1>", "kv:kv"},
+		{"diamond",
+			[]string{"<TOKEN_1>", "<TOKEN_2><TOKEN_3>", "<TOKEN_2>", "x<TOKEN_4>",
+				"<TOKEN_3>", "y<TOKEN_4>", "<TOKEN_4>", "z<TOKEN_5>", "<TOKEN_5>", "w"},
+			"<TOKEN_1>", "xzwyzw"},
+		// A cyclic mapping has no value, so the outermost token stays verbatim rather than
+		// becoming a partial unrolling presented as real; an unrelated token still restores.
+		{"two-token cycle",
+			[]string{"<TOKEN_1>", "a<TOKEN_2>", "<TOKEN_2>", "b<TOKEN_1>", "<IP_1>", "10.0.0.5"},
+			"<TOKEN_1> and <IP_1>", "<TOKEN_1> and 10.0.0.5"},
+		{"self-cycle",
+			[]string{"<TOKEN_1>", "x<TOKEN_1>"},
+			"see <TOKEN_1>", "see <TOKEN_1>"},
+		{"token whose value reaches a cycle",
+			[]string{"<TOKEN_1>", "a<TOKEN_2>", "<TOKEN_2>", "b<TOKEN_1>", "<TOKEN_3>", "c<TOKEN_1>"},
+			"<TOKEN_3>", "<TOKEN_3>"},
+	}
+	for _, c := range cases {
+		if got := withTokens(c.pairs...).Restore(c.in); got != c.want {
+			t.Errorf("%s: Restore(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+	}
+}
+
+// TestEveryTagMintsARestorableToken: Restore finds tokens by ourPH, so a token that does not match
+// it is never restored and reaches the card as a literal placeholder. The tags are read from the
+// real detector tables — apply is placeholder's only caller and it passes d.tag — so a future tag
+// such as "IPV6", whose digit fails [A-Z]+, turns this red instead of being absent from a list.
+func TestEveryTagMintsARestorableToken(t *testing.T) {
+	whole := regexp.MustCompile(`^(?:` + ourPH + `)$`)
+	for _, dets := range [][]detector{baseDetectors, buildDetectors([]string{"example"})} {
+		for _, d := range dets {
+			m := New()
+			tok := m.placeholder(d.tag, "value")
+			if !whole.MatchString(tok) {
+				t.Errorf("tag %q mints %q, which ourPH does not match: Restore would never restore it", d.tag, tok)
+			}
+			if got := m.Restore("x " + tok + " y"); got != "x value y" {
+				t.Errorf("tag %q: Restore(%q) = %q, want %q", d.tag, tok, got, "x value y")
+			}
+		}
+	}
+}
+
 // TestFailClosedOnResidue: the verifier reports residue when a raw, deterministic-shape
 // value is present. Verified by feeding residue() an unmasked string directly, since the
 // detectors are correct enough that Mask does not normally leave residue by construction.
@@ -1087,25 +1218,23 @@ func TestNoDetectorGroupLandsOnOurOwnOutput(t *testing.T) {
 	}
 }
 
-// TestRestoreHasNoNestedMapping enforces the PRECONDITION that makes Restore correct, which is
-// not the same thing as making Restore correct — that is #50's job and it is not done here.
+// TestRestoreHasNoNestedMapping asserts that Mask never produces a NESTED mapping — one whose
+// VALUE contains another mapping's TOKEN.
 //
-// Restore iterates m.byToken (a Go map, randomised order) and substitutes each token ONCE, with
-// no fixpoint. That is only sound while no mapping's VALUE contains another mapping's TOKEN. If
-// one ever does, the answer depends on which order the runtime happened to walk the map:
-// measured with a directly constructed nested pair, wrong in 175 of 200 restores in one process,
-// at a rate set by the keys' hashes rather than a coin flip. A test written against that is
-// green four runs in five.
+// It used to guard Restore's correctness: Restore ranged over a Go map with one substitution per
+// token, so a nested mapping resolved by chance. Since #50 Restore resolves nesting by rule
+// (TestRestoreResolvesByRule), and that reason is gone. Three remain:
 //
-// The property holds today because every detector's target group excludes '<' and '>', so no
-// captured value can contain one of our tags. It is also the second and stronger half of why #46
-// was NOT fixed by letting the credential detector span our own tags — that fix would have
-// produced TOKEN_2 -> "<TOKEN_1>:password" directly. A rejection resting on a property nothing
-// enforces is not a rejection, which is why this lands with the fix rather than with #50.
+//   - A nested mapping is what a detector's target group landing on one of our tags looks like
+//     in the mapping table, and the inertness invariant forbids exactly that. It is #46's first
+//     ground for rejecting a wider detector 4, and it still stands.
+//   - Restore expands a known token inside a value, and cannot tell a nesting Mask created from an
+//     original that literally contained token-shaped text. With no nesting the question is moot.
+//   - It reads the mapping a SHARED Mapper accumulates across lines, which
+//     TestNoDetectorGroupLandsOnOurOwnOutput, checking one masked string at a time, does not.
 //
-// So this asserts the precondition over the real mappings Mask produces, and goes red the moment
-// a detector starts capturing one of our tags — before anyone has to debug an intermittently
-// wrong card.
+// The property holds because every detector's target group excludes '<' and '>', so no captured
+// value can contain one of our tags; this goes red the moment one starts capturing one.
 func TestRestoreHasNoNestedMapping(t *testing.T) {
 	tag := regexp.MustCompile(phPat)
 
@@ -1115,7 +1244,7 @@ func TestRestoreHasNoNestedMapping(t *testing.T) {
 			for _, nested := range tag.FindAllString(original, -1) {
 				if _, ok := m.byToken[nested]; ok {
 					t.Errorf("%s: mapping %s -> %q contains another mapping's token %s.\n"+
-						"Restore substitutes once, in map order, so this resolves by chance (see #50).",
+						"A detector's target group landed on one of our own tags, which the inertness invariant forbids.",
 						name, token, original, nested)
 				}
 			}

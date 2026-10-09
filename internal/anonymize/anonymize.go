@@ -39,9 +39,10 @@
 // representable instead of inferred from order.
 //
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
-// safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and Restore's
-// single non-fixpoint pass is correct; that inertness is what keeps a home path in a Go stack
-// trace from tripping the verifier (see Mask).
+// safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
+// Mask records nests; that inertness is what keeps a home path in a Go stack trace from tripping
+// the verifier (see Mask). Restore no longer depends on it: since #50 it resolves a nested
+// mapping by rule rather than by map order.
 //
 // It is stated on the GROUP rather than on the whole match because that is what the code
 // depends on and because the looser form would forbid a detector that is fine. apply writes
@@ -201,15 +202,68 @@ func (m *Mapper) Mask(s string) (string, error) {
 // Restore reverses every placeholder this Mapper issued. Placeholders the model echoed
 // back but never received — or mangled — are left as literal text: better a stray "<IP_9>"
 // on a card than a wrong value.
+//
+// It is ONE pass over s by ourPHRe, and a token whose original itself contains a token of ours
+// is expanded recursively (see resolve). Until #50 it ranged over byToken — a Go map — with one
+// ReplaceAll per token and no fixpoint, so a nested mapping resolved correctly or did not
+// depending on iteration order (measured wrong in 861-882 of 1000). One pass also means a
+// substituted value is never re-read together with the text beside it, so a replacement cannot
+// combine with its neighbours into a token that was never there.
+//
+// Mask produces no nested mapping today (TestRestoreHasNoNestedMapping), so for every input it
+// can produce this returns what the old loop did: every token we mint matches ourPH whole, and
+// two ourPH matches cannot overlap, so the scan visits exactly the occurrences ReplaceAll did.
 func (m *Mapper) Restore(s string) string {
 	if len(m.byToken) == 0 {
 		return s
 	}
-	out := s
-	for token, original := range m.byToken {
-		out = strings.ReplaceAll(out, token, original)
+	return ourPHRe.ReplaceAllStringFunc(s, func(tok string) string {
+		if v, ok := m.resolve(tok, nil); ok {
+			return v
+		}
+		return tok
+	})
+}
+
+// resolve returns tok's original with every token of ours inside it expanded, or false if tok is
+// unknown or its expansion is cyclic.
+//
+// path is the STACK of tokens currently being expanded: a token is pushed for its own expansion
+// and popped when it returns, so a token repeated inside one value, or reached twice through a
+// diamond, resolves fully. Re-entering a token still on the stack is a cycle, and the bound
+// follows: the stack holds distinct tokens, so the depth never exceeds len(byToken), and no
+// acyclic nesting can reach it.
+//
+// A cycle fails the WHOLE expansion and the outermost token is left verbatim. A cyclic mapping
+// has no value, and any partial unrolling of it would be an invented string shown as a real one,
+// which is the one thing Restore's contract forbids. A token-shaped string inside a value that is
+// NOT in byToken is literal text of the original and is kept, not a failure.
+func (m *Mapper) resolve(tok string, path map[string]bool) (string, bool) {
+	v, ok := m.byToken[tok]
+	if !ok || path[tok] {
+		return "", false
 	}
-	return out
+	if !ourPHRe.MatchString(v) {
+		return v, true
+	}
+	if path == nil {
+		path = make(map[string]bool)
+	}
+	path[tok] = true
+	defer delete(path, tok)
+	cyclic := false
+	out := ourPHRe.ReplaceAllStringFunc(v, func(inner string) string {
+		if _, known := m.byToken[inner]; !known {
+			return inner
+		}
+		r, ok := m.resolve(inner, path)
+		if !ok {
+			cyclic = true
+			return inner
+		}
+		return r
+	})
+	return out, !cyclic
 }
 
 // danglingPlaceholder matches an INCOMPLETE placeholder left at the very end of a string —
@@ -478,12 +532,12 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     already masked begins with '<'.
 		//
 		//     THEY MASK ONLY THEIR OWN HALF, and that is not tidiness. Letting a group span our
-		//     own tag would make the mapping nest (TOKEN_2 -> "<TOKEN_1>:password"), and nesting
-		//     is not representable here: Restore iterates a Go map and substitutes ONCE, with no
-		//     fixpoint, so a nested mapping resolves correctly or does not depending on map
-		//     iteration order. Measured at 175 wrong out of 200 restores in one process. Both
-		//     groups therefore exclude '<' and '>' exactly as detector 4's do; only the opposite
-		//     half, which is context, admits a tag.
+		//     own tag would put a target group on our own output, which the inertness invariant
+		//     forbids, and would make the mapping nest (TOKEN_2 -> "<TOKEN_1>:password"). Until
+		//     #50 nesting also made Restore resolve by map order; it now resolves by rule, so that
+		//     second reason is gone and the first is the one that stands. Both groups therefore
+		//     exclude '<' and '>' exactly as detector 4's do; only the opposite half, which is
+		//     context, admits a tag.
 		//
 		//     The CONTEXT runs are '*' rather than '+' so a pre-masked half beside an absent one
 		//     still resolves -- "://<TOKEN_1>:@host". The empty-half shapes themselves stopped
@@ -741,6 +795,11 @@ const pipelinePH = `<(?:TS|UUID|IP|HEX|NUM|STR)>`
 // TestNoDetectorGroupLandsOnOurOwnOutput holds the narrow claim against the real masked output
 // of every completeness row.
 const ourPH = `<[A-Z]+_\d+>`
+
+// ourPHRe is ourPH compiled once, for Restore. A tag that does not match [A-Z]+ would mint a
+// token Restore never finds; TestEveryTagMintsARestorableToken reads the tags from the detector
+// tables so such a tag cannot be added unnoticed.
+var ourPHRe = regexp.MustCompile(ourPH)
 
 // hostRun is one host as 9a and 9c read it: a run of hostname characters, placeholder-tolerant
 // for the Template field. One definition, so that "a host" cannot drift between the two rules.
