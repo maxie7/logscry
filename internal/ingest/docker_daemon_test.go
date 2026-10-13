@@ -279,7 +279,7 @@ func (d *fakeDaemon) nextRequest() url.Values {
 
 // start re-starts the container and returns the query of the logs request logscry
 // re-attaches with. It re-sends the start event until that request arrives: Lines
-// ignores a start while the old follower is still unwinding (ISSUE-TBD-2), and that
+// ignores a start while the old follower is still unwinding (#85), and that
 // race is not what these tests are about. A start that arrives once the new follower
 // is running is ignored, as it is for a real duplicate event.
 func (d *fakeDaemon) start() url.Values {

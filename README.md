@@ -862,7 +862,7 @@ validated.
   the restart was never followed in 50 of 50 runs, and with 200 ms between them it was always
   followed. Not observed on a real daemon. There the gap is the container's stop and start,
   and a plain `docker restart` was followed while #80 was being measured, so how often a real
-  restart lands inside the window is not known. Filed as ISSUE-TBD-2.
+  restart lands inside the window is not known. Filed as #85.
 - **Stopping a busy Docker follower can leave it hung, so its container is never followed
   again.** For a container without a TTY, logscry splits the daemon's stream into stdout and
   stderr through two pipes. If the follower is stopped (the container died) while a chunk of
@@ -873,7 +873,7 @@ validated.
   trigger is a container still printing when it dies, a crash trace for example, while
   logscry is behind. TTY containers are not affected. Confirmed by a test (a large frame,
   nobody reading, then cancel; it did not return within 2 s in 3 of 3 runs), not observed on
-  a daemon. Found while fixing #80 and filed as ISSUE-TBD-1.
+  a daemon. Found while fixing #80 and filed as #84.
 - **Export drops are reported only at exit, and overstated.** In a live run the export
   writer drops a record rather than stall ingestion when its queue is full, which needs a
   disk stalled for tens of minutes at the default rate limit. The only report is one

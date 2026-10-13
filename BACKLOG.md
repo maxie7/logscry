@@ -1106,12 +1106,12 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       **Found on the way and filed, not fixed.** Both are in README "Known limitations", and
       both lose lines rather than duplicate them.
-      - **ISSUE-TBD-1:** stopping a non-TTY follower while a frame is mid-write into its
+      - **#84:** stopping a non-TTY follower while a frame is mid-write into its
         stdout or stderr pipe leaves `stdcopy` blocked forever. Nothing closes the pipe's read
         end once its reader returns. So the follower never ends, and that container is never
         followed again. Confirmed by a throwaway test that was not committed: it did not return
         within 2 s in 3 of 3 runs, and the stack was in `io.(*pipe).write`.
-      - **ISSUE-TBD-2:** a `start` that arrives before the old follower has removed itself is
+      - **#85:** a `start` that arrives before the old follower has removed itself is
         ignored, and the restarted container is never followed. Confirmed against the fake
         daemon with `die` and `start` back to back: lost in 50 of 50 runs, and always followed
         with 200 ms between them. Not observed on a real daemon. Targets v0.10.4
