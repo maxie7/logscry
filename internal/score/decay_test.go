@@ -100,3 +100,69 @@ func TestClusterIsNotAbsorbedIntoItsOwnBaseline(t *testing.T) {
 		}
 	}
 }
+
+// TestZeroHalfLifeIsTheLifetimeAverage: BaselineHalfLife 0 is the escape hatch back to
+// the baseline v0.10.3 shipped, Count/(now-FirstSeen), exactly — so the old behaviour is
+// one flag away and an A/B between the two is one binary.
+func TestZeroHalfLifeIsTheLifetimeAverage(t *testing.T) {
+	cfg := Defaults()
+	cfg.BaselineHalfLife = 0
+
+	t.Run("baseline is Count/age", func(t *testing.T) {
+		f := newFixture(t, cfg, nil)
+		l := line("irregular <NUM>")
+		at := t0
+		for i := range 400 {
+			at = at.Add(time.Duration(1+(i*7919)%23) * time.Second) // uneven gaps
+			f.feed(l, at)
+			tmpl := f.templates[l.Message]
+			got, ok := f.sc.baseline(tmpl, at)
+			if !ok {
+				continue
+			}
+			want := float64(tmpl.Count) / at.Sub(tmpl.FirstSeen).Seconds()
+			if got != want {
+				t.Fatalf("line %d: baseline = %v, want Count/age = %v", i+1, got, want)
+			}
+		}
+	})
+
+	t.Run("the formerly chatty template is missed again", func(t *testing.T) {
+		f := newFixture(t, cfg, nil)
+		l := line("worker processed job id=<NUM>")
+		f.repeat(l, t0, 7200, time.Second)
+		f.repeat(l, t0.Add(2*time.Hour), 60, time.Minute)
+		p3 := t0.Add(3 * time.Hour)
+		for k := range 60 {
+			if r := f.feed(l, p3.Add(time.Duration(k)*time.Second/3)); hasReason(r.Reasons, "burst:") {
+				t.Fatalf("incident line %d burst under the lifetime average: %v", k+1, r.Reasons)
+			}
+		}
+	})
+}
+
+// TestHalfLifeBaselineMeasuresASteadyRate: the exposure term is what makes the decayed
+// count a RATE. A template at a constant rate must measure that rate whether it is
+// younger or far older than the half-life — a bias here would turn steady traffic into
+// a ratio, which is the one thing burst must never do.
+func TestHalfLifeBaselineMeasuresASteadyRate(t *testing.T) {
+	f := newFixture(t, Defaults(), nil)
+	l := line("heartbeat <NUM>")
+	for i := range 3 * 3600 { // 1/s for 3 h: from a sliver of the half-life to six of them
+		at := t0.Add(time.Duration(i) * time.Second)
+		f.feed(l, at)
+		// 2%, not tighter, for the fencepost alone: at the 60 s baseline minimum, 61 lines
+		// in 60 s is 1.017/s under Count/age too.
+		if got, ok := f.sc.baseline(f.templates[l.Message], at); ok && (got < 0.98 || got > 1.02) {
+			t.Fatalf("at %s: baseline = %.4f/s, want 1/s", at.Sub(t0), got)
+		}
+	}
+}
+
+func TestNegativeHalfLifeIsRejected(t *testing.T) {
+	cfg := Defaults()
+	cfg.BaselineHalfLife = -time.Minute
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate accepted a negative baseline half-life")
+	}
+}
