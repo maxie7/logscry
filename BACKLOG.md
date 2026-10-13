@@ -780,7 +780,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       Seen and left alone, out of scope: #83 (logfmt lines collapse into one template), #36
       (one GLib event, four templates), #32's gate value.
 
-      Found on the way and filed, not fixed: **ISSUE-TBD-1**. Replay drops a journal entry
+      Found on the way and filed, not fixed: **#87**. Replay drops a journal entry
       whose MESSAGE is empty, after decode, while a live `--journald` run emits it as an empty
       line at the entry's priority. Every captured boot holds exactly one (kernel, priority
       3). Confirmed by a throwaway test that feeds the same entry through both paths (live 2

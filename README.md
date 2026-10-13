@@ -825,7 +825,7 @@ entry with an empty message.
   differ by one escalation if the empty line would have escalated. Every boot of the laptop
   measured for #37 logged exactly one: kernel, priority 3. Confirmed by a test that feeds
   the same entry through both paths, not observed as a changed escalation. Filed as
-  ISSUE-TBD-1.
+  #87.
 - **Three IPv6 shapes are deliberately not masked in the pipeline's `<IP>` template mask.**
   The template mask requires a boundary before the match and at least two hex groups, because
   without that a C++ scope resolution operator reads as an address — `CNSSCertStore::CNSSCertStore` used to template as
