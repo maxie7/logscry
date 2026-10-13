@@ -786,7 +786,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       3). Confirmed by a throwaway test that feeds the same entry through both paths (live 2
       lines, replay 1); it is in README "Known limitations". It does not touch this
       measurement: both legs of every A/B are replays, and the ab37 capture holds none.
-      RDI §6 updated. Targets TODO-VERSION
+      RDI §6 updated. Targets v0.11.0
 
 - [x] **A card is a TEMPLATE, and its numbers are live** — #34, found by dogfooding, and a
       display bug rather than a scoring one: no weight, threshold or gate moved, and
