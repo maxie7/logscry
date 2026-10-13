@@ -323,6 +323,8 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 		func(c *Config) *time.Duration { return &c.Score.BaselineMinAge })
 	b.intVar("baseline-min-count", s.BaselineMinCount, "a template has no baseline until seen this many times",
 		func(c *Config) *int { return &c.Score.BaselineMinCount })
+	b.durationVar("baseline-half-life", s.BaselineHalfLife, "a template's baseline counts an occurrence half as much after this long (0: lifetime average, never forgets)",
+		func(c *Config) *time.Duration { return &c.Score.BaselineHalfLife })
 
 	// Scoring: gates and context.
 	b.intVar("rate-limit", s.RatePerMin, "global cap on LLM calls per minute",

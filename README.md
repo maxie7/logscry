@@ -229,13 +229,19 @@ fatal-class level fire by themselves. That distinction is the whole calibration:
 | 25+ of one template in 10s, at 5× its own baseline | 1.00 | yes — a *change* in rate |
 | `FATAL` / `PANIC` | 1.00 | yes — even during warmup |
 
-A burst needs the count as well as the ratio. The baseline is a template's lifetime
-average, so one that appears every few minutes has a denominator near zero and *any*
-clustering of it reads as a huge multiple — and event-driven systems log in clusters by
-construction: a CI job starts ten containers inside a second. Ten lines in ten seconds is
-not a flood. At the default multiplier the count gate is the same statement as *"don't
-trust a ratio measured against a baseline below 0.5/s"*; templates busier than that are
-unaffected by it.
+A burst needs the count as well as the ratio. A template that appears every few minutes
+has a baseline near zero, so *any* clustering of it reads as a huge multiple — and
+event-driven systems log in clusters by construction: a CI job starts ten containers
+inside a second. Ten lines in ten seconds is not a flood. At the default multiplier the
+count gate is the same statement as *"don't trust a ratio measured against a baseline
+below 0.5/s"*; templates busier than that are unaffected by it.
+
+The baseline forgets: each occurrence counts half as much after `--baseline-half-life`
+(default `30m`). A template that was chatty for hours and then went quiet can burst again
+when it comes back at a multiple of its *recent* rate. A lifetime average never let it.
+A template resuming at its own former rate is not a burst unless it was silent for about
+70 minutes. A template younger than the half-life is scored exactly as by a lifetime
+average, and `--baseline-half-life 0` restores that average everywhere.
 
 Every number is a knob (`--weight-novelty`, `--threshold`, `--burst-min-count`, or the
 `score:` block in `logscry.yaml`); nothing is hardcoded. Turn novelty back up to `1.0` if
@@ -272,6 +278,7 @@ Key flags:
 | `--threshold <f>` | `1.0` | Escalate at or above this score |
 | `--weight-novelty <f>` | `0.45` | Weight of a never-seen template — below the threshold, so new alone stays quiet |
 | `--burst-min-count <n>` | `25` | Fewer than this many occurrences in the burst window is never a burst, whatever the ratio |
+| `--baseline-half-life <d>` | `30m` | How fast a template's baseline forgets: an occurrence counts half as much after this long (`0`: lifetime average) |
 | `--rate-limit <n>` | `10` | Global cap on LLM calls per minute (the cost cap) |
 | `--explain-dry-run` | off | Show what *would* escalate; build no LLM stage at all |
 | `--export <path>` | off | Append one JSON object per flagged anomaly to a file (see below) |
@@ -786,11 +793,13 @@ strings.
 replays in real time, which is for watching the TUI's cards appear when they would have.
 Speed never changes what is flagged.
 
-**Not yet validated against a real capture.** The bundled fixture
-(`internal/ingest/testdata/replay/basic.jsonl`) is synthetic, which is exactly the kind of
-evidence replay exists to replace. The tests prove replay agrees with a live run fed the
-same lines in real time. The first real capture replayed for #37 is where it gets
-validated.
+**Validated against a real capture once.** While fixing #37, a controlled experiment ran
+on a real laptop for three hours, with a live `--journald` run beside it. Replaying the
+recorded journal with the same binary and flags gave the live run's export record exactly:
+kind, template, count at flag and reasons. That is one escalation on one host, so it is
+evidence, not a proof. The bundled fixture (`internal/ingest/testdata/replay/basic.jsonl`)
+is still synthetic. One known divergence is listed under Known limitations: a journal
+entry with an empty message.
 
 ## Known limitations (v1)
 
@@ -809,6 +818,14 @@ validated.
   one-line fix. There is no cursor: `-f` picks up from roughly now, so an event
   further back won't appear until it recurs. Record with `journalctl -o json` and use
   [`--replay`](#replay---replay-file) to score history.
+- **Replay drops a journal entry whose message is empty, and a live run does not.** A live
+  `--journald` run emits such an entry as an empty line, at the entry's priority (an empty
+  kernel message at priority 3 becomes an empty `ERROR` line on stderr). `--replay` skips it,
+  so a replay can score one line fewer than the live run it recorded. That is enough to
+  differ by one escalation if the empty line would have escalated. Every boot of the laptop
+  measured for #37 logged exactly one: kernel, priority 3. Confirmed by a test that feeds
+  the same entry through both paths, not observed as a changed escalation. Filed as
+  #87.
 - **Three IPv6 shapes are deliberately not masked in the pipeline's `<IP>` template mask.**
   The template mask requires a boundary before the match and at least two hex groups, because
   without that a C++ scope resolution operator reads as an address — `CNSSCertStore::CNSSCertStore` used to template as

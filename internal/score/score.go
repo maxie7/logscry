@@ -18,6 +18,7 @@ package score
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -76,6 +77,11 @@ type Config struct {
 
 	BaselineMinAge   time.Duration `yaml:"baseline_min_age"`   // a template has no baseline until it is this old
 	BaselineMinCount int           `yaml:"baseline_min_count"` // ...and has been seen this many times
+
+	// BaselineHalfLife is how fast a template's baseline forgets: an occurrence counts
+	// half as much toward it after this long. 0 restores the lifetime average, which
+	// never forgets. See baseline, and Defaults for why 30 minutes.
+	BaselineHalfLife time.Duration `yaml:"baseline_half_life"`
 	// Gates.
 	RatePerMin int           `yaml:"rate_limit"` // global cap on LLM calls per minute
 	CacheTTL   time.Duration `yaml:"cache_ttl"`  // how long an explained template stays quiet
@@ -148,8 +154,26 @@ type Config struct {
 // A larger value would buy nothing anyway: no constant can bound an unbounded cluster (a
 // 64-way CI build lands 64 lines and clears any of them), so raising it past the band
 // pays a real detection for a defence that does not work. That failure belongs to the
-// baseline, not to this gate — baseline is a lifetime average and never forgets, which is
-// the root cause this calibration routes around rather than fixes (issue #37).
+// baseline, not to this gate.
+//
+// BaselineHalfLife is 30 minutes, inside a band whose edges are of two different kinds
+// (issue #37). The baseline used to be a lifetime average, so a template chatty for two
+// hours and quiet for one could never burst again: a controlled experiment on a real
+// journal — 1/s for 2 h, 1/min for 1 h, then 3/s for 20 s — held a baseline of 0.67/s at
+// the incident and the default multiplier missed it. With a half-life H:
+//
+//	H <= 80 min    MEASURED: that incident fires at its onset (25 lines, baseline
+//	               <= 0.5/s) only up to here; at 30 min its baseline is 0.26/s (9.6x)
+//	H >= ~26 min   POLICY: a template resuming at its OWN rate reads as a burst only
+//	               after about log2(5)*H of silence; 26 minutes holds that past the 1 h
+//	               cache TTL, the existing rule for "worth explaining afresh"
+//	H >  ~35 s     MEASURED: below it a real 25-line cluster is absorbed into its own
+//	               baseline (25/tau must stay under the 0.5/s gate) and a burst that
+//	               fires today goes silent
+//
+// Inside the band, ten replayed boots of a real laptop showed no escalation added or
+// removed. TestFormerlyChattyTemplateBurstsAgain, TestSameRateResumptionStaysQuietPastTheCacheTTL
+// and TestClusterIsNotAbsorbedIntoItsOwnBaseline enforce the three edges.
 func Defaults() Config {
 	return Config{
 		Threshold: 1.0,
@@ -170,6 +194,7 @@ func Defaults() Config {
 		BurstMinCount:    25,
 		BaselineMinAge:   60 * time.Second,
 		BaselineMinCount: 20,
+		BaselineHalfLife: 30 * time.Minute,
 		RatePerMin:       10,
 		CacheTTL:         time.Hour,
 		ContextLines:     30,
@@ -193,6 +218,9 @@ func (c Config) Validate() error {
 	if c.BurstMultiplier <= 1 {
 		return fmt.Errorf("burst multiplier must be > 1, got %g: at or below 1x, a template running at "+
 			"its own steady baseline would be reported as a burst", c.BurstMultiplier)
+	}
+	if c.BaselineHalfLife < 0 {
+		return fmt.Errorf("baseline half-life must be >= 0 (0 is the lifetime average), got %s", c.BaselineHalfLife)
 	}
 	if c.RatePerMin < 0 {
 		return fmt.Errorf("rate limit must be >= 0, got %d", c.RatePerMin)
@@ -287,6 +315,7 @@ func (s *Scorer) Evaluate(line model.LogLine, tmpl *model.Template, prevLastSeen
 		res.Score += s.cfg.Weights.Novelty
 		res.Reasons = append(res.Reasons, why)
 	}
+	s.remember(tmpl, now)
 	if burst, why := s.burst(tmpl, now); burst {
 		res.Score += s.cfg.Weights.Burst
 		res.Reasons = append(res.Reasons, why)
@@ -359,9 +388,10 @@ func (s *Scorer) warmedUp(now time.Time) bool {
 //
 // The volume gate is the other half, and it is not a weakened version of the absolute
 // trigger above: an OR trigger fires on "this system is busy", while an AND gate only
-// ever refuses. What it refuses is a ratio it has no business trusting. baseline is a
-// lifetime average, so a template seen once every few minutes has a denominator near
-// zero and ANY clustering of it produces an arbitrarily large multiple. Read the gate
+// ever refuses. What it refuses is a ratio it has no business trusting. A template seen
+// once every few minutes has a baseline near zero under ANY averaging (the half-life
+// changes nothing for a template that is always rare), so ANY clustering of it produces
+// an arbitrarily large multiple. Read the gate
 // through the arithmetic and it says so directly: it binds exactly when
 //
 //	baseline < BurstMinCount / (BurstMultiplier * BurstWindow)
@@ -424,16 +454,53 @@ func (s *Scorer) windowRate(recent []time.Time, now time.Time) (int, float64) {
 // baseline returns the template's established rate in occurrences/sec, and whether it
 // has one at all. A template earns a baseline only once it is old enough and frequent
 // enough for its average rate to mean something.
+//
+// The rate is half-life-weighted (issue #37): DecayedCount divided by the decayed
+// exposure since FirstSeen, tau*(1-e^(-age/tau)) with tau = BaselineHalfLife/ln 2. A
+// template at a constant rate measures that rate at any age, and for age much shorter
+// than the half-life the formula IS Count/age, the lifetime average it replaces: a young
+// template is scored exactly as before, and only one older than about a half-life
+// differs. What differs is what the lifetime average got wrong: rate history fades, so a
+// template that was chatty and went quiet can burst again, and one that was rare and
+// became steady is no longer burst-prone forever. BaselineHalfLife 0 restores Count/age.
 func (s *Scorer) baseline(tmpl *model.Template, now time.Time) (float64, bool) {
 	age := now.Sub(tmpl.FirstSeen)
 	if age < s.cfg.BaselineMinAge || age <= 0 || tmpl.Count < s.cfg.BaselineMinCount {
 		return 0, false
 	}
 	rate := float64(tmpl.Count) / age.Seconds()
+	if tau := s.tau(); tau > 0 {
+		// -Expm1 keeps the exposure exact while age is a sliver of tau, which is where
+		// it must agree with Count/age.
+		rate = tmpl.DecayedCount / (tau * -math.Expm1(-age.Seconds()/tau))
+	}
 	if rate <= 0 {
 		return 0, false
 	}
 	return rate, true
+}
+
+// remember folds this occurrence into the template's half-life-weighted count, decaying
+// what was there by the time since it was last advanced. A backwards step in time (a
+// replay's source clock can take one) decays nothing rather than growing the count.
+func (s *Scorer) remember(tmpl *model.Template, now time.Time) {
+	tau := s.tau()
+	if tau <= 0 {
+		return
+	}
+	if dt := now.Sub(tmpl.DecayedAt); !tmpl.DecayedAt.IsZero() && dt > 0 {
+		tmpl.DecayedCount *= math.Exp(-dt.Seconds() / tau)
+	}
+	if now.After(tmpl.DecayedAt) {
+		tmpl.DecayedAt = now
+	}
+	tmpl.DecayedCount++
+}
+
+// tau is the decay's time constant in seconds (the half-life over ln 2), or 0 when the
+// baseline is the lifetime average.
+func (s *Scorer) tau() float64 {
+	return s.cfg.BaselineHalfLife.Seconds() / math.Ln2
 }
 
 // severity is the additive weight of the line's stream and level, capped at

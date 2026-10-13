@@ -92,6 +92,9 @@ score:
   burst_min_count: 25 # ...but never on fewer occurrences in the window than this
   baseline_min_age: 60s # a template has no baseline until it is this old...
   baseline_min_count: 20 # ...and has been seen this many times
+  # The baseline forgets: an occurrence counts half as much after this long, so a template
+  # that was chatty and went quiet can burst again. 0 is the lifetime average (never forgets).
+  baseline_half_life: 30m
 
   # Gates and context.
   rate_limit: 10 # global cap on LLM calls per minute — the cost ceiling

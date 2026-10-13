@@ -52,6 +52,14 @@ type Template struct {
 	Count     int
 	Recent    []time.Time // ring buffer of recent occurrences for burst detection
 
+	// DecayedCount is the template's occurrence count with each occurrence weighted down
+	// by its age, halving every score.Config.BaselineHalfLife; DecayedAt is the instant it
+	// was last advanced. Together they are the burst baseline's memory, which forgets
+	// (issue #37) where Count/(now-FirstSeen) never did. score.Scorer is their only
+	// writer and reader; the pipeline never touches them.
+	DecayedCount float64
+	DecayedAt    time.Time
+
 	// EarliestLineTime is the earliest LogLine.Time among the occurrences logscry has read:
 	// the SOURCE's clock, where FirstSeen and LastSeen are the pipeline's. It is a running
 	// min, not the first, because source time is not monotone across containers and
