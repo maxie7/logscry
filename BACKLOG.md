@@ -1029,6 +1029,93 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       recognised secret leaves its password unmasked, independent of templating — #46, and it turned
       out to be the reported half of a symmetric defect. Closed below.
 
+- [x] **A restarted container resumes after the last line read** — #80, found while fixing
+      #72. On `die` the follower was cancelled. On `start` the same container ID was
+      re-attached with `Tail: --docker-tail` and no `Since`. The json-file log survives a
+      restart, so up to that many lines that were already counted arrived again within
+      milliseconds. Measured on a daemon: five lines and one `docker restart` gave `x15` where
+      10 were written. Computed, not observed: a template with an established rate can then
+      cross the burst gate.
+
+      **The daemon's read path, read in docker v28.5.2 rather than assumed.**
+      - `since` is **inclusive**: the loggerutils forwarder skips a message only if it is
+        `Before(since)`. The journald driver's `SeekRealtime` is inclusive too.
+      - The forwarder stops filtering at the first message at or after `since`, so older lines
+        can follow.
+      - **Tail is applied before since**, to the combined stdout+stderr log.
+      - Each stream is stamped by its own copier goroutine, so stamps are monotonic *within*
+        a stream and not across the two.
+      - The wire stamp always has nine fractional digits, so logscry has the exact nanosecond.
+
+      **The fix (`internal/ingest/docker.go` only).**
+      - Each follower returns a per-stream mark: the newest daemon stamp it delivered and how
+        many lines it delivered at exactly that stamp. `Lines` keeps the mark per container ID.
+      - It writes the mark in the same critical section that removes the follower, so `start`
+        sees either a running follower or that follower's final mark.
+      - A re-attach of a marked ID asks for `since` equal to the *earlier* stream's mark, with
+        tail `all`. Each stream then drops lines stamped before its own mark, plus the first n
+        stamped exactly at it.
+      - The count exists because `since` is inclusive. Within a stream, the n lines already
+        delivered are the first n at that stamp. A distinct line sharing the stamp is still
+        delivered: a later one on the same stream, or one on the other stream.
+      - The tail is `all` because a limit applied before `since` can only lose lines logged
+        between the restart and the re-attach.
+      - The mark advances only after a line is sent. A line cut off by the die is read again
+        rather than lost.
+      - A follower that delivered nothing leaves no mark, and the re-attach is a first attach.
+        A mark carries forward across a silent restart.
+      - No new lock on the per-line path: each stream goroutine owns its half of the mark, and
+        the follower reads it after both have finished.
+      - The first attach is unchanged.
+
+      **Residuals.**
+      - A daemon clock that steps backwards breaks per-stream monotonicity. Lines stamped
+        before the mark are then dropped, as Docker's own `since` would drop them.
+      - A line without a parseable stamp neither moves the mark nor is filtered. A real daemon
+        never sends one.
+      - Every re-attach makes the daemon decode the container's whole current log file. Only
+        new lines cross the wire.
+      - The marks map keeps one entry per container ID followed until logscry exits. Pruning
+        would need `destroy`.
+      - With `--docker-tail 0`, a container that delivered nothing before it restarted is
+        re-attached like a first attach. The lines it logs between the restart and the
+        re-attach are lost to re-attach latency. That is not history the user declined; it is
+        kept because it is an edge of an edge.
+
+      **Tests.** Red first. `docker_daemon_test.go` drives `Lines` end to end against a fake
+      daemon: an httptest server that `DOCKER_HOST` points at, with no production seam. Its
+      logs endpoint emulates the read path above and records each request's query, so the
+      re-attach's `since` and `tail` are asserted as they reach the wire.
+      - `TestDockerRestartDeliversEachLineOnce` (non-TTY and TTY) has #80's shape.
+      - `TestDockerRestartBoundary`: two stdout lines at T, one stderr line just before it,
+        then a new line at T on each stream.
+      - `TestDockerRestartReadsPastTail`: `--docker-tail 3`, and five lines in the gap.
+      - `TestDockerRestartCarriesTheInstantForward`: a silent restart, then another restart.
+      - `TestDockerRestartAfterReadingNothing` passes on `main` too, and pins the fallback.
+      - `TestReadDockerStreamMarksOnlyWhatItDelivered` was added with the fix, because it needs
+        the new signature.
+      - Three mutants were run, and the tests go red on each: a mark that advances before the
+        send, dropping everything at the mark rather than the first n, and keeping the tail on
+        a re-attach.
+      - The fake re-sends `start` until the re-attach arrives, because of the race below.
+
+      **No existing test changed outcome.** The full suite ran under `-race` on `main` and on
+      the branch: 836 results, then 848. The only differences are the 12 new tests and
+      subtests. The two existing `streamLogs` tests gained the mark argument, for compilation
+      only.
+
+      **Found on the way and filed, not fixed.** Both are in README "Known limitations", and
+      both lose lines rather than duplicate them.
+      - **#84:** stopping a non-TTY follower while a frame is mid-write into its
+        stdout or stderr pipe leaves `stdcopy` blocked forever. Nothing closes the pipe's read
+        end once its reader returns. So the follower never ends, and that container is never
+        followed again. Confirmed by a throwaway test that was not committed: it did not return
+        within 2 s in 3 of 3 runs, and the stack was in `io.(*pipe).write`.
+      - **#85:** a `start` that arrives before the old follower has removed itself is
+        ignored, and the restarted container is never followed. Confirmed against the fake
+        daemon with `die` and `start` back to back: lost in 50 of 50 runs, and always followed
+        with 200 ms between them. Not observed on a real daemon. Targets v0.10.4
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

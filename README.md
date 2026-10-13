@@ -262,7 +262,7 @@ Key flags:
 |---|---|---|
 | `--docker-all` | off | Follow all Docker containers, auto-attaching to new ones |
 | `--docker-name <re>` | — | Follow containers whose name matches a regexp |
-| `--docker-tail <n>` | `100` | Lines of history fetched per container on attach (`all` for everything) |
+| `--docker-tail <n>` | `100` | Lines of history fetched per container on first attach (`all` for everything); a restarted container resumes after the last line read |
 | `--journald` | off | Follow the systemd journal (Linux; see below) |
 | `--journald-unit <u>` | — | Follow only these units (repeatable, OR-combined); implies `--journald` |
 | `--journald-priority <n>` | `7` | Priority floor: `0` emerg … `7` debug (`3` = errors and worse) |
@@ -854,21 +854,38 @@ validated.
   read took. A template seen from sources with different clocks (a remote `DOCKER_HOST`
   beside local journald) is off by their skew. Before #72 the age subtracted one clock from
   the other.
-- **A restarted Docker container's history is read twice.** When a container restarts,
-  logscry re-attaches to it with `--docker-tail` and no "since", so up to that many lines it
-  already counted arrive again within milliseconds. Confirmed on a daemon: five lines and one
-  restart gave `x15` where 10 were written. Computed from the code, not observed: a template
-  with an established rate can then cross the burst gate, so a restart can raise a false
-  burst. Found while fixing #72 and filed as #80.
+- **A Docker container that restarts the instant it dies may not be followed again.** When
+  logscry sees `die` it stops that container's follower, and the follower removes itself a
+  moment later. A `start` for the same container that arrives inside that moment is ignored,
+  and nothing re-attaches afterwards, so the container's later lines are lost for the rest of
+  the run. Confirmed by a test against a fake daemon that sends `die` and `start` back to back:
+  the restart was never followed in 50 of 50 runs, and with 200 ms between them it was always
+  followed. Not observed on a real daemon. There the gap is the container's stop and start,
+  and a plain `docker restart` was followed while #80 was being measured, so how often a real
+  restart lands inside the window is not known. Filed as #85.
+- **Stopping a busy Docker follower can leave it hung, so its container is never followed
+  again.** For a container without a TTY, logscry splits the daemon's stream into stdout and
+  stderr through two pipes. If the follower is stopped (the container died) while a chunk of
+  output is still being written into a pipe, that write never finishes: its reader has gone
+  and the pipe is never closed. The follower then never finishes, so a restart of that
+  container is not followed, and the stuck goroutine and connection stay open until logscry
+  exits. Exit itself is not blocked, because neither mode waits for ingestion to return. The
+  trigger is a container still printing when it dies, a crash trace for example, while
+  logscry is behind. TTY containers are not affected. Confirmed by a test (a large frame,
+  nobody reading, then cancel; it did not return within 2 s in 3 of 3 runs), not observed on
+  a daemon. Found while fixing #80 and filed as #84.
 - **Export drops are reported only at exit, and overstated.** In a live run the export
   writer drops a record rather than stall ingestion when its queue is full, which needs a
   disk stalled for tens of minutes at the default rate limit. The only report is one
   stderr line when logscry exits, the exit status is still 0, and the count is of queue
   messages (two per record), so it can overstate the records lost by up to 2×. Filed
   as #70. Replay does not drop.
-- **`--docker-tail` defaults to 100 lines** of history per container on attach. An event
-  further back than that won't appear until it recurs — use `--docker-tail all` for the
-  full backlog.
+- **`--docker-tail` defaults to 100 lines** of history per container on first attach. An
+  event further back than that won't appear until it recurs — use `--docker-tail all` for
+  the full backlog. A restarted container is not read from its tail again: logscry resumes
+  after the last line it read. One edge: a container that delivered nothing before it
+  restarted is re-attached like a first attach, so with `--docker-tail 0` the lines it logs
+  between the restart and the re-attach (milliseconds) are lost.
 - **Reasoning models need a higher `--llm-max-tokens`.** A thinking model (e.g. `qwen3`,
   `deepseek-r1`) can spend the whole default budget on its chain of thought and return
   empty content with `finish_reason: length`. Prefer a plain instruct model such as

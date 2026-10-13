@@ -337,7 +337,7 @@ func bind(fs *flag.FlagSet, def Config) map[string]applyFunc {
 		func(c *Config) *bool { return &c.Docker.All })
 	b.stringVar("docker-name", def.Docker.NameRegex, "follow Docker containers whose name matches this regexp",
 		func(c *Config) *string { return &c.Docker.NameRegex })
-	b.stringVar("docker-tail", def.Docker.Tail, "number of trailing log lines to fetch per container on attach",
+	b.stringVar("docker-tail", def.Docker.Tail, "number of trailing log lines to fetch per container on first attach",
 		func(c *Config) *string { return &c.Docker.Tail })
 	b.listVar("docker-label", "follow Docker containers with this k=v label (repeatable, AND-combined)",
 		func(c *Config) *[]string { return &c.Docker.Labels })

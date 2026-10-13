@@ -99,7 +99,7 @@ func TestStreamLogsDemuxesNonTTY(t *testing.T) {
 	}
 
 	got := collect(t, func(ctx context.Context, out chan<- model.LogLine) error {
-		return streamLogs(ctx, &buf, false, "docker:x", out)
+		return streamLogs(ctx, &buf, false, "docker:x", &dockerMark{}, out)
 	})
 
 	byStream := map[model.Stream]model.LogLine{}
@@ -129,7 +129,7 @@ func TestStreamLogsDemuxesNonTTY(t *testing.T) {
 func TestStreamLogsTTYRaw(t *testing.T) {
 	input := "2024-03-04T05:06:07.000000000Z line one\n2024-03-04T05:06:08.000000000Z line two\n"
 	got := collect(t, func(ctx context.Context, out chan<- model.LogLine) error {
-		return streamLogs(ctx, strings.NewReader(input), true, "docker:x", out)
+		return streamLogs(ctx, strings.NewReader(input), true, "docker:x", &dockerMark{}, out)
 	})
 
 	if len(got) != 2 {
@@ -144,4 +144,39 @@ func TestStreamLogsTTYRaw(t *testing.T) {
 			t.Errorf("line %d = %q, want %q", i, ll.Raw, want[i])
 		}
 	}
+}
+
+// TestReadDockerStreamMarksOnlyWhatItDelivered: the mark is where a restart resumes,
+// so it must advance for a line that reached out and must NOT for a line read but cut
+// off by cancellation (a die), or that line would be lost on the re-attach. Whether a
+// cancelled read gets as far as the send is up to the scheduler, so the undelivered
+// half repeats to make a mark-before-send mutant fail rather than pass by luck.
+func TestReadDockerStreamMarksOnlyWhatItDelivered(t *testing.T) {
+	const line = "2024-03-04T05:06:07.000000005Z hello\n"
+	stamp, _ := time.Parse(time.RFC3339Nano, "2024-03-04T05:06:07.000000005Z")
+
+	t.Run("delivered", func(t *testing.T) {
+		var mark streamMark
+		out := make(chan model.LogLine, 1)
+		if err := readDockerStream(context.Background(), strings.NewReader(line), "docker:x", model.Stdout, &mark, out); err != nil {
+			t.Fatal(err)
+		}
+		if want := (streamMark{at: stamp, n: 1}); mark != want {
+			t.Errorf("mark = %+v, want %+v", mark, want)
+		}
+	})
+
+	t.Run("cut off by cancel", func(t *testing.T) {
+		prev := streamMark{at: stamp.Add(-time.Second), n: 2}
+		for i := 0; i < 200; i++ {
+			mark := prev
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			out := make(chan model.LogLine) // nobody reads it
+			_ = readDockerStream(ctx, strings.NewReader(line), "docker:x", model.Stdout, &mark, out)
+			if mark != prev {
+				t.Fatalf("run %d: mark = %+v, want it left at %+v", i, mark, prev)
+			}
+		}
+	})
 }

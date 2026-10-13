@@ -26,7 +26,7 @@ docker:
   all: false # follow every container, auto-attaching to new ones
   name: "" # ...or only those whose name matches this regexp
   label: [] # ...or those carrying these k=v labels (AND-combined)
-  tail: "100" # lines of history fetched per container on attach ("all" for everything)
+  tail: "100" # lines of history fetched per container on first attach ("all" for everything)
 
 # --- Sources: the systemd journal (Linux; runs `journalctl -f -o json`) ---
 # Reading the SYSTEM journal needs membership of the systemd-journal group, or root —
