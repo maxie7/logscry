@@ -1114,7 +1114,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       - **ISSUE-TBD-2:** a `start` that arrives before the old follower has removed itself is
         ignored, and the restarted container is never followed. Confirmed against the fake
         daemon with `die` and `start` back to back: lost in 50 of 50 runs, and always followed
-        with 200 ms between them. Not observed on a real daemon. Targets TODO-VERSION
+        with 200 ms between them. Not observed on a real daemon. Targets v0.10.4
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
