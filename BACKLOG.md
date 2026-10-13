@@ -695,14 +695,98 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       templates at or above 0.5/s, and this run carries no evidence about that regime.
       Targets v0.8.3
 
-- [ ] **`baseline()` never forgets** — #37, the root cause the entry above routes around: a
-      lifetime average with no decay, so rate history is permanent in both directions — a
-      formerly rare template stays burst-prone forever, a formerly chatty one can never burst
-      again. Blocked on #35 (replay): neither direction can be evaluated against synthetic
-      fixtures, since the failure is about real rate histories. Fixing it is also what would
-      let the upper edge of #32's admissible band be measured rather than assumed.
-      Replay landed in v0.10.0 (#35 above): replay a real capture under both baselines and
-      diff the two exports.
+- [x] **The burst baseline forgets** — #37, the root cause the entry above routed around.
+      `baseline()` was `Count / (now − FirstSeen)`, a lifetime average, so rate history was
+      permanent in both directions. A formerly rare template stayed burst-prone forever, and
+      a formerly chatty one could never burst again.
+
+      **The evidence is replay of real captures, the first use #35 was built for.**
+      - **Controlled experiment.** On a real laptop (SYSLOG_IDENTIFIER `ab37`), one INFO
+        template ran at 1/s for 2 h, 1/min for 1 h, then 3/s for 20 s, with a live
+        `--journald --burst-multiplier 4` run alongside.
+      - **Ground truth reproduced.** Replaying the recorded journal gave the live export record
+        exactly on kind, template_hash, count_at_flag (7287) and reasons. That is the first
+        validation of replay against a real capture.
+      - **The miss, under the lifetime baseline (0.67/s at the incident):** at the default
+        multiplier 5 the incident never fired. At 4.5 it fired at 31 lines.
+      - **Ten whole boots** (Oct 1–12, about 40 h) were probed at multiplier 1.01. They held 9
+        windows where a burst is possible at the 25 gate:
+        - 8 GLib clusters (113×–830× a near-zero baseline). An always-rare template is
+          near zero under any averaging, so these are #32/#36 evidence, not #37 evidence.
+        - 1 logfmt artifact of #83.
+        - Cutting each boot's first 5 minutes (the boot's own log storm, which a logscry
+          started after login never sees) removes the logfmt window and leaves the 8.
+        - So the natural data barely discriminates; the experiment does.
+
+      **The fix.** The baseline is half-life-weighted:
+      - A decayed occurrence count (`Template.DecayedCount`, advanced by the scorer on every
+        line) is divided by the decayed exposure since FirstSeen, `τ·(1 − e^(−age/τ))`, with
+        `τ = H/ln 2`.
+      - A constant rate measures that rate at any age.
+      - For age ≪ H it *is* `Count/age`, so a young template is scored as before.
+      - `--baseline-half-life` (yaml `baseline_half_life`) sets H. **0 restores the lifetime
+        average exactly**, the way raising novelty back to 1.0 restores #27's old behaviour.
+      - A windowed baseline was not taken. `Recent` (2048 entries) spans 30 min only below
+        1.1/s, and a hard window edge makes the baseline jump when a burst ages out.
+
+      **H = 30 min, inside a band whose edges are NOT the same kind of evidence.**
+      - **Data, upper edge: ≤ 80 min.** The ab37 incident fires at its onset (25 lines) only
+        while its baseline is ≤ 0.5/s. On a real replay that holds up to 80 min (0.50/s);
+        at 90 min the incident fires a line later.
+      - **Data, lower edge: > ~35 s.** Below it, a real 25-line GLib cluster is absorbed into
+        its own baseline: 25/τ must stay under the 0.5/s gate. On a real replay, H = 30 s
+        loses all 16 GLib escalations, and the ab37 incident with them; 60 s keeps them.
+      - **Policy, not measurement: ≥ ~26 min.** A template resuming at its *own* rate reads
+        as a burst after about log₂5·H of silence. Holding that past the 1 h cache TTL, the
+        existing rule for "worth explaining afresh", needs H ≳ 26 min. Nothing in the
+        captures puts this edge there. It is a choice, borrowed from the cache's.
+      - At 30 min, ab37 is caught at 0.26/s (10×, 1.9× above the multiplier) for any quiet
+        ≥ 35 min. A 3/s template resuming after 60 or 65 min of silence stays quiet; after 70
+        it fires. 45 min was the quieter alternative (resumption after about 104 min), but it
+        would hold ab37 at only 6.7×.
+
+      **What changed on real data** (v0.10.3 against the branch at 30 min; 21 replays: ten
+      boots full and trimmed, plus the ab37 capture):
+      - **ab37:** +1 record, count 7285, `2.5/s vs baseline 0.26/s (10×), 25 in the last 10s`.
+      - **Natural captures:** no record added or removed, full or trimmed.
+      - **GLib, 8 records** (Oct 8 20:19 and Oct 9 09:12): same count, same instant. Only the
+        printed ratio changes (113× → 97×, 830× → 255×), because the cluster now weighs more
+        than the old lines.
+      - **logfmt, 1 record** (Oct 8 20:19, full only): count_at_flag 157 → 156, at the same
+        microsecond. **The prediction that a decaying baseline would fire at the cluster's
+        onset (118) was wrong at this H.** The template is about two minutes old there, far
+        below the half-life, which is exactly the case where the formula reduces to the
+        lifetime average.
+      - `--baseline-half-life 0` reproduces v0.10.3's exports **byte for byte** on all 21
+        replays, plus ab37 at multiplier 4. The escape hatch is the old scorer.
+      - The probe count is unchanged: 9 full, 8 trimmed.
+
+      **Tests.** Red first. Every history is generated in code, and no capture line is in
+      the repository.
+      - `TestFormerlyChattyTemplateBurstsAgain`: the ab37 schedule. It fails on main.
+      - Two pins that also pass on main:
+        `TestSameRateResumptionStaysQuietPastTheCacheTTL` and
+        `TestClusterIsNotAbsorbedIntoItsOwnBaseline`.
+      - Together the three bound H from both sides. Mutants confirm each edge: H = 20 min
+        breaks the resumption test, 90 min and 0 break the onset test, and 30 s breaks the
+        cluster test.
+      - Added with the fix: `TestZeroHalfLifeIsTheLifetimeAverage`,
+        `TestHalfLifeBaselineMeasuresASteadyRate`, `TestNegativeHalfLifeIsRejected`.
+
+      **No existing test changed outcome.** The full suite ran under `-race` on `main` and on
+      the branch: 848 results, then 856. The only differences are the 8 new tests and
+      subtests; all 75 existing score results are unchanged.
+
+      Seen and left alone, out of scope: #83 (logfmt lines collapse into one template), #36
+      (one GLib event, four templates), #32's gate value.
+
+      Found on the way and filed, not fixed: **ISSUE-TBD-1**. Replay drops a journal entry
+      whose MESSAGE is empty, after decode, while a live `--journald` run emits it as an empty
+      line at the entry's priority. Every captured boot holds exactly one (kernel, priority
+      3). Confirmed by a throwaway test that feeds the same entry through both paths (live 2
+      lines, replay 1); it is in README "Known limitations". It does not touch this
+      measurement: both legs of every A/B are replays, and the ab37 capture holds none.
+      RDI §6 updated. Targets TODO-VERSION
 
 - [x] **A card is a TEMPLATE, and its numbers are live** — #34, found by dogfooding, and a
       display bug rather than a scoring one: no weight, threshold or gate moved, and
