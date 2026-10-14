@@ -56,6 +56,8 @@ func TestJournaldDefaultPriorityDefersToTheText(t *testing.T) {
 		{"ERROR: connection refused", "ERROR"},
 		{"[ERROR] connection refused", "ERROR"},
 		{`level=error msg="conn refused"`, "ERROR"},
+		// dockerd's and containerd's own shape: the level is not at the start (#83).
+		{`time="2026-07-13T12:00:00.250+02:00" level=error msg="conn refused"`, "ERROR"},
 		{`{"level":"error","msg":"conn refused"}`, "ERROR"},
 		{"WARN: retrying", "WARN"},
 		// No level token and no structured priority means no level, not a manufactured
