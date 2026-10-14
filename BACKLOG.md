@@ -1530,7 +1530,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Seen and left alone, out of scope: #85, which shares this lifecycle. A `start` that
       arrives while the old follower is still unwinding is ignored as before. The difference
-      is that the unwinding now ends. Targets TODO-VERSION
+      is that the unwinding now ends. Targets v0.12.2
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
