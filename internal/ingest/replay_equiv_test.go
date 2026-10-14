@@ -52,7 +52,7 @@ func runLeg(t *testing.T, src ingest.Source, cfg score.Config, sourceTime bool) 
 	lines := make(chan model.LogLine, 1024)
 	go func() {
 		defer close(lines)
-		if err := ingest.Run(ctx, []ingest.Source{src}, lines); err != nil {
+		if err := ingest.Run(ctx, []ingest.Source{src}, lines, nil); err != nil {
 			t.Errorf("ingest: %v", err)
 		}
 	}()

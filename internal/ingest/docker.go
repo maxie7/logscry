@@ -31,9 +31,10 @@ type DockerSelector struct {
 
 // DockerSource follows logs from Docker containers, auto-attaching to new ones.
 // It is a single long-running Source: its Lines call blocks until ctx is
-// cancelled, managing one log follower per matching container internally. The
-// fan-in (Run) closes the shared channel only when every Source ends, so Docker
-// — being long-lived and dynamic — must be one Source, not one per container.
+// cancelled or the daemon's event stream fails, managing one log follower per
+// matching container internally. The fan-in (Run) closes the shared channel only
+// when every Source ends, so Docker — being long-lived and dynamic — must be one
+// Source, not one per container.
 type DockerSource struct {
 	Selector DockerSelector
 	// Tail is how many trailing lines to fetch per container on first attach. A
@@ -55,6 +56,11 @@ func (s *DockerSource) Name() string { return "docker" }
 // come and go. It blocks until ctx is cancelled (a clean stop → nil) or the
 // event/client machinery fails.
 //
+// Without its event stream the source can no longer see a container start or stop,
+// so an events error ends it: it stops its followers, waits for them, and returns the
+// error (#97). The containers it was following stop streaming too; it does not
+// reconnect.
+//
 // A container's log survives a restart, so a re-attach to an ID logscry has read
 // from resumes after the last line read (see dockerMark) rather than fetching the
 // tail again: the tail's lines were already counted.
@@ -70,9 +76,14 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 	}
 	defer cli.Close()
 
+	// The followers' parent. Lines cancels it on an events error, so that waiting for them
+	// ends; the caller's ctx would stop them only at shutdown.
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// Per-follower errors are expected on shutdown and when a container disappears, so
 	// they degrade silently rather than crash the whole Docker source.
-	followers := newFollowerSet(ctx, func(fctx context.Context, id, name string, mark dockerMark) dockerMark {
+	followers := newFollowerSet(lctx, func(fctx context.Context, id, name string, mark dockerMark) dockerMark {
 		read, _ := s.followContainer(fctx, cli, id, name, mark, out)
 		return read
 	})
@@ -116,11 +127,11 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 				stop(msg.Actor.ID)
 			}
 		case err := <-errs:
+			cancel()
+			followers.wait()
 			if ctx.Err() != nil {
-				followers.wait()
 				return nil
 			}
-			followers.wait()
 			return fmt.Errorf("docker: events: %w", err)
 		}
 	}
@@ -138,7 +149,7 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 // was not stopped (a duplicate event, or the overlap between subscribing and listing at
 // startup) attaches nothing and leaves nothing pending, as before.
 type followerSet struct {
-	ctx    context.Context // every follower's parent, and the shutdown signal
+	ctx    context.Context // every follower's parent: cancelled at shutdown or when the source ends
 	follow func(ctx context.Context, id, name string, mark dockerMark) dockerMark
 
 	mu      sync.Mutex
@@ -190,8 +201,8 @@ func (s *followerSet) launchLocked(id, name string) {
 		// The mark is stored in the same critical section that removes the follower, so
 		// start sees either a running follower or its final mark — and a successor
 		// launched here reads that mark. Its wg.Add comes before this goroutine's Done,
-		// so the count cannot reach zero in between. Once Lines' ctx is cancelled no
-		// successor is launched.
+		// so the count cannot reach zero in between. Once the set's ctx is cancelled (at
+		// shutdown, or as the source ends on an events error) no successor is launched.
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.marks[id] = m
