@@ -1769,7 +1769,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       - **The TUI status bar shows only the newest error**, so a later one hides the Docker
         error. That is by design.
 
-      Targets TODO-VERSION
+      Targets v0.12.4
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
