@@ -265,3 +265,178 @@ func TestCoalesceFlushOrderIsArrivalOrder(t *testing.T) {
 		}
 	})
 }
+
+// TestIssue89SourcePositionLines is #89: a log line that merely CITES a Go source position
+// is not a stack frame. slog writes source=file.go:N, logrus file="file.go:N", and the
+// standard library's log with Lshortfile a file.go:N: prefix. The frame cue used to match
+// any file.go:N anywhere on a line, so each such line arriving inside the group timeout was
+// folded into the line before it, and an ERROR straight after an INFO vanished into the
+// INFO event, its level and novelty gone with it.
+//
+// Each pair arrives 50ms apart on one stream, well inside the default 200ms timeout, and is
+// driven through both coalescers: the replay one on the lines' own clock, and the live one.
+func TestIssue89SourcePositionLines(t *testing.T) {
+	tests := []struct {
+		name          string
+		first, second string
+		levels        [2]string
+	}{
+		{"slog",
+			`time=2026-07-13T12:00:00.000+02:00 level=INFO source=server.go:99 msg="listening"`,
+			`time=2026-07-13T12:00:00.050+02:00 level=ERROR source=worker.go:88 msg="worker exited"`,
+			[2]string{"INFO", "ERROR"}},
+		{"logrus",
+			`time="2026-07-13T12:00:00+02:00" level=info msg="starting" func=main.main file="main.go:42"`,
+			`time="2026-07-13T12:00:00+02:00" level=error msg="db unreachable" func=main.connect file="db.go:17"`,
+			[2]string{"INFO", "ERROR"}},
+		// A level after a prefix is #31's, so neither line gets one: the split is what this
+		// row pins.
+		{"log Lshortfile",
+			"2026/07/13 12:00:00 main.go:42: starting",
+			"2026/07/13 12:00:00 db.go:17: ERROR: db unreachable",
+			[2]string{"", ""}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			paths := map[string]func() []model.LogLine{
+				"source clock": func() []model.LogLine {
+					return driveAt(t, 200*time.Millisecond,
+						at(0, "journald:app", model.Stdout, tt.first),
+						at(50*time.Millisecond, "journald:app", model.Stdout, tt.second))
+				},
+				"wall clock": func() []model.LogLine { return drive(t, 200*time.Millisecond, tt.first, tt.second) },
+			}
+			for _, path := range []string{"source clock", "wall clock"} {
+				t.Run(path, func(t *testing.T) {
+					got := paths[path]()
+					if len(got) != 2 {
+						t.Fatalf("got %d events, want 2 (a cited source position was read as a frame):\n%s", len(got), dump(got))
+					}
+					for i, ev := range got {
+						if strings.Contains(ev.Raw, "\n") {
+							t.Errorf("event %d folded several lines: %q", i, ev.Raw)
+						}
+						if lvl := Normalize(ev).Level; lvl != tt.levels[i] {
+							t.Errorf("event %d level = %q, want %q", i, lvl, tt.levels[i])
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestGoFrameLineShape pins what the Go frame cue is: a line holding nothing but a source
+// position — a path ending in file.go:N, the PC offset " +0x…" when the runtime prints one,
+// and the "fp= sp= pc=" that GOTRACEBACK=system appends. Such a line continues the event
+// before it at any indentation and without an active block, because a producer or shipper
+// that strips indentation still leaves this shape, and nothing but a stack frame has it.
+// A line that carries a position among other text is a log line.
+func TestGoFrameLineShape(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want bool
+	}{
+		{"/build/app/main.go:15 +0x106", true},
+		{"/build/app/main.go:9", true}, // an inlined frame prints no PC offset
+		{"/go/pkg/mod/example.com/lib@v1.2.3/pool.go:40 +0x55", true},
+		{"example.com/app/cmd/app/main.go:21 +0x2f", true}, // -trimpath
+		{"C:/build/app/main.go:15 +0x106", true},
+		{"/build/app/main.go:15 +0x106 fp=0xc000067f48 sp=0xc000067ef8 pc=0x484f46", true},
+
+		{`time=2026-07-13T12:00:00.000+02:00 level=INFO source=server.go:99 msg="listening"`, false},
+		{`time="2026-07-13T12:00:00+02:00" level=info msg="starting" file="main.go:42"`, false},
+		{"2026/07/13 12:00:00 main.go:42: starting", false},
+		{"main.go:42: starting", false},
+		{"./main.go:12:5: undefined: foo", false},
+		{"source=server.go:99", false},
+		{"see main.go:42 for details", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			if got := isContinuation(&pending{}, tt.raw); got != tt.want {
+				t.Errorf("isContinuation(idle header, %q) = %v, want %v", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+// goroutineDump is a real Go 1.26 panic under GOTRACEBACK=all, with the build path
+// replaced: two goroutines, an inlined frame with no PC offset, and a "created by" line.
+var goroutineDump = []string{
+	"panic: runtime error: index out of range [3] with length 3",
+	"",
+	"goroutine 1 [running]:",
+	"main.lookup(...)",
+	"\t/build/app/main.go:9",
+	"main.main()",
+	"\t/build/app/main.go:15 +0x106",
+	"",
+	"goroutine 18 [chan receive]:",
+	"main.(*Pool).worker(...)",
+	"\t/build/app/main.go:7",
+	"created by main.main in goroutine 1",
+	"\t/build/app/main.go:13 +0x98",
+}
+
+// TestCoalesceGoFrameLines: anchoring the frame cue (#89) leaves real Go frames folding as
+// they did, and is what keeps a log line out of a trace.
+func TestCoalesceGoFrameLines(t *testing.T) {
+	stripped := func(lines []string) []string {
+		out := make([]string, len(lines))
+		for i, l := range lines {
+			out[i] = strings.TrimLeft(l, " \t")
+		}
+		return out
+	}
+	one := func(t *testing.T, lines []string) model.LogLine {
+		t.Helper()
+		got := drive(t, time.Second, lines...)
+		if len(got) != 1 {
+			t.Fatalf("got %d events, want 1:\n%s", len(got), dump(got))
+		}
+		if n := strings.Count(got[0].Raw, "\n") + 1; n != len(lines) {
+			t.Errorf("folded event holds %d physical lines, want %d:\n%q", n, len(lines), got[0].Raw)
+		}
+		return got[0]
+	}
+
+	t.Run("goroutine dump, indented", func(t *testing.T) { one(t, goroutineDump) })
+	// With the indentation gone the file lines fold on the frame cue alone.
+	t.Run("goroutine dump, indentation stripped", func(t *testing.T) { one(t, stripped(goroutineDump)) })
+
+	// The cue is not gated on an active block: a stripped file line continues the call
+	// line before it even with no panic header above.
+	t.Run("stripped frame after an idle header", func(t *testing.T) {
+		one(t, []string{"main.main()", "/build/app/main.go:15 +0x106"})
+	})
+
+	// Gating the old unanchored cue would not have fixed #89: any fold makes a block
+	// active, so a log line citing a position would still join the trace before it.
+	t.Run("log line after a dump", func(t *testing.T) {
+		slog := `time=2026-07-13T12:00:00.000+02:00 level=ERROR source=main.go:31 msg="restarting"`
+		got := drive(t, time.Second, append(append([]string{}, goroutineDump...), slog)...)
+		if len(got) != 2 || got[1].Raw != slog {
+			t.Fatalf("got %d events, want the dump then the log line on its own:\n%s", len(got), dump(got))
+		}
+	})
+
+	// #83's line-break guard stays: a logfmt line with a folded continuation is several
+	// physical lines, and keeps the text path's template and level.
+	t.Run("logfmt line with a folded frame", func(t *testing.T) {
+		ev := one(t, []string{
+			`time=2026-07-13T12:00:00.000+02:00 level=ERROR msg="worker exited"`,
+			"\t/build/app/worker.go:88 +0x2c",
+		})
+		line := Normalize(ev)
+		gotPattern, gotHash := TemplatizeLine(line)
+		wantLevel, msg := normalizePlain(ev.Raw)
+		wantPattern, wantHash := Templatize(msg)
+		if gotPattern != wantPattern || gotHash != wantHash {
+			t.Errorf("grouped event left the text path: %q/%s, want %q/%s", gotPattern, gotHash, wantPattern, wantHash)
+		}
+		if line.Level != wantLevel {
+			t.Errorf("Level = %q, want the text path's %q", line.Level, wantLevel)
+		}
+	})
+}

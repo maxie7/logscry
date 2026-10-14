@@ -34,6 +34,13 @@ const (
 // continuationRe matches stack-frame / dump markers at any indentation. These are the
 // explicit language cues that attach a line to the event in progress even when it is
 // not indented. Kept broad across Python, Java, and Go rather than tied to one format.
+//
+// The Go file line is matched as a WHOLE line: a path ending in file.go:N, the runtime's
+// " +0x…" PC offset when it prints one, the "fp= sp= pc=" GOTRACEBACK=system appends, and
+// nothing else. A line that merely cites a position is a log line — slog's
+// source=server.go:99, logrus's file="main.go:42", log's Lshortfile "main.go:42: …" — and an
+// unanchored cue folded each into the line before it (#89). The path holds no "=", so a
+// bare source=x.go:N is not one either.
 var continuationRe = regexp.MustCompile(strings.Join([]string{
 	`^\s*File ".*", line \d+`,   // Python:  File "app.py", line 10, in <module>
 	`^\s*at\s+[\w$.]+\(`,        // Java:    at com.foo.Bar.baz(Bar.java:1)
@@ -43,7 +50,7 @@ var continuationRe = regexp.MustCompile(strings.Join([]string{
 	`^goroutine \d+ \[`,         // Go:      goroutine 1 [running]:
 	`^\s*created by \S`,         // Go:      created by main.main
 	`^\s*\[signal\b`,            // Go:      [signal SIGSEGV: segmentation violation ...]
-	`\.go:\d+`,                  // Go:      /app/main.go:42 +0x1d
+	`^\s*[^\s=]+\.go:\d+(?: \+0x[0-9a-f]+)?(?: fp=0x[0-9a-f]+ sp=0x[0-9a-f]+ pc=0x[0-9a-f]+)?\s*$`, // Go: /app/main.go:42 +0x1d
 }, "|"))
 
 // traceStartRe recognizes a header that itself opens a multi-line block, so the lines
