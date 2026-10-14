@@ -1631,7 +1631,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
           ctx;
         - meanwhile, starts and restarts go unseen.
 
-        It is there since v0.1.0. Filed as ISSUE-TBD-eventserr. Targets TODO-VERSION
+        It is there since v0.1.0. Filed as ISSUE-TBD-eventserr. Targets v0.12.3
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
