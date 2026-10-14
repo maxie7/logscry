@@ -1942,7 +1942,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       It is the scheme anchor, not the host class, so it is #52's class: the anchor fails to
       recognise a URL, there because of a digit and here because of a `_`. It is offered as a
       comment on #52 and named under #52 in the README audit list. Seen, out of scope: #65's `~`,
-      sub-delim and pct-encoded cells; #67; #54. Targets TODO-VERSION
+      sub-delim and pct-encoded cells; #67; #54. Targets v0.12.5
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and

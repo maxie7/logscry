@@ -582,9 +582,9 @@ and CSV cells (`https://api.acme.com,200,12ms`) now reads as a host list and the
 comma *with a space* after it, a path before it, or no scheme on the line are all untouched. What
 stays open, pinned as assertions: an address literal (or a key-shaped member) as a *later* member
 still blocks every member after it, which is #67 below; and an underscore in a hostname,
-found while sweeping this one, was #66, closed in `TODO-VERSION` (next paragraph).
+found while sweeping this one, was #66, closed in `v0.12.5` (next paragraph).
 
-**An underscore in a hostname was sent in the clear before `TODO-VERSION`.** No host rule
+**An underscore in a hostname was sent in the clear before `v0.12.5`.** No host rule
 admitted `_`, which RFC 3986 allows anywhere in a hostname and which logs carry in container
 names, broker names and internal hosts, so every host rule stopped at the first one:
 `http://my_host:8080/x` went out as `http://<HOST_1>_host:8080/x`, `postgres://u:p@db_1.acme.com/app`
@@ -612,7 +612,7 @@ closing the first of them found a credential gap the audit had no reason to look
 in `v0.9.2`); the sweep run while closing *that* found three more, listed last below; and closing
 the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the sweeps had
 a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found a class it
-could not close, listed last below, and a single-host leak, #66, closed in `TODO-VERSION`.
+could not close, listed last below, and a single-host leak, #66, closed in `v0.12.5`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
