@@ -1634,6 +1634,143 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
         It is there since v0.1.0. Filed as #97. Targets v0.12.3
 
+- [x] **An events-stream error is reported, and so is any source error beside a live one** —
+      #97, found while working on #85. Two layers hid it.
+      - **`DockerSource.Lines`:** on an events error with its ctx alive, it waited for its
+        followers without stopping them. Followers ran under the caller's ctx, which only
+        shutdown cancels, so the wait lasted until every followed container stopped.
+        Meanwhile no start or die was seen, so new and restarted containers were not followed.
+      - **`ingest.Run`:** it returned the sources' errors only once every source had ended,
+        and `main` reported them only then, and not at all once ctx was cancelled.
+        journald ends only on Ctrl-C, and so does a healthy Docker source. So **every** source
+        error beside a live source stayed unseen for the whole run and was dropped on Ctrl-C:
+        - a Docker client or `docker: list` error, or a bad `--docker-name` regex (config never
+          compiles it);
+        - journalctl missing, denied, or exiting;
+        - a subprocess that fails to start or exits non-zero.
+
+        Fixing only the first layer would have changed nothing the user sees beside journald.
+        Confirmed on the old binary: `DOCKER_HOST=tcp://127.0.0.1:1 --docker-all -- sleep 5` and
+        `--docker-name=( -- sleep 5` each printed their error only after 5 s, when `sleep`
+        ended.
+
+      **Decisions.**
+      1. **On an events error the Docker source ends.** It cancels its followers, waits for
+         them, and returns `docker: events: …`. That is a trade, not a free win. The
+         containers already being followed stop streaming too. The error is shown at once.
+         To follow Docker again you restart logscry, which reads each container's
+         `--docker-tail` again on first attach.
+
+         Reconnecting was costed and not built:
+         - Re-subscribing with `since=<last event>` replays the gap from the daemon's event
+           buffer. A re-list catches what that misses, and the marks make each re-attach
+           exact.
+         - Still lost: containers that start and die in a gap longer than that buffer.
+         - It needs backoff and a give-up rule.
+         - Above all, it needs a way for a source to say "reconnecting" without ending. A
+           Source can only report by returning, so retrying would be silent, and silence was
+           this issue's failure.
+
+         Filed as ISSUE-TBD-reconnect.
+      2. **A source's error is reported the moment that source ends, and the others keep
+         running.** The run ends when every source has ended, as before. Ending the run on
+         the first error was rejected for two reasons:
+         - A subprocess's non-zero exit is a source error, and expected for a crashing target.
+           Ending the run would stop following the journal or the containers at the moment
+           `-- ./app` crashes.
+         - A dropped events connection says nothing about journald's health.
+
+         `Run` takes a `report func(error)`, called from the failing source's goroutine
+         before `Run` returns, and never for what a cancel stopped. `main` sends each report
+         into the error channel that `--plain` prints to stderr and the TUI shows in its
+         status bar. That is the only path: `Run`'s joined return is read only to skip the
+         replay notice after a failed replay, so nothing is reported twice. The channel holds
+         one error per source plus the two notices, so no sender blocks. **The exit status
+         stays 0**: a source's outcome, a watched app's crash included, is reported, not
+         exit-coded. What the exit status should mean is the question #70 also raises.
+      3. **Shutdown is unchanged.** On Ctrl-C nothing is reported. `Run` returns only after
+         every source has. A pending re-attach (#85) is not launched once the source is
+         ending, by the same check that stops it at shutdown. The marks are untouched.
+
+      **Found on the way and fixed here: plain mode could lose an error at the end of a run.**
+      `runPlain`'s loop left as soon as the events channel closed. An error still waiting in
+      the error channel then lost a coin toss in the `select`. Per-source reports made that
+      reachable: two sources failing together as the run ended lost one error in 1 of 50 runs
+      (`--docker-all` with an unreachable daemon beside `-- sh -c 'exit 3'`). The old binary
+      showed both in 50 of 50, as one joined message.
+
+      `run` closes the error channel before the lines channel, so when events closes every
+      error is already buffered. The loop now prints what is pending before it goes on. To
+      pin that without timing, the loop is now `printPlain`, called by `runPlainAt` with the
+      same behaviour.
+
+      The old single send raced the same `select`. In principle it could be lost too: if the
+      loop was still busy with the last event when the error arrived and events closed, both
+      were ready at its next `select`. It never was in 50 runs of 20,000 lines then a failure.
+
+      **Tests.** Red first, each failing on an assertion within its bound and never hanging
+      the run, in 5 of 5 runs:
+      - `TestDockerEventsErrorEndsTheSource` (TTY and not). The fake daemon's new
+        `endEvents()` ends `/events` while a container's log stream stays up. Lines must
+        return the error wrapping `io.EOF` within 2 s, and the follower must hang up. On
+        main: "Lines had not returned 2s after the events stream ended".
+      - `TestPlainReportsASourceErrorWhileOthersRun` runs `run` in `--plain`, with a fake
+        `journalctl` on `PATH` that never exits beside `-- sh -c 'exit 3'`. The error must be
+        on stderr within 2 s while the run goes on. After the cancel, stderr must hold exactly
+        one `ingest:` line. On main it fails at the 2 s bound.
+
+      Passing on main, pinning decision 2: `TestPlainSourceErrorExitStatus`. The error is
+      printed exactly once, and `run` returns nil, so the exit status is 0.
+
+      Added with the fix, because they need the new `report` parameter or `printPlain`:
+      - `TestRunReportsAFailureWhileOthersRun`: a failure is reported within 2 s, `Run` has
+        not returned, and the other source still delivers.
+      - `TestRunReportsNothingOnCancel`.
+      - `TestPlainPrintsEveryErrorAtTheEnd`: events already closed, and two errors waiting in
+        a closed channel; each is printed exactly once. Without the drain it fails in 37 of
+        50 runs.
+
+      **Flakiness and mutants.** Every new test passes 20 of 20 runs under `-race`. Seven
+      mutants each turn tests red:
+      - the events branch without the cancel (the old code) turns the docker test red;
+      - followers under the caller's ctx instead of Lines' own turns the docker test red;
+      - reporting after `wg.Wait` turns both while-others-run tests red;
+      - reporting without the ctx filter turns both Run tests red;
+      - `main` without the report turns both `--plain` `run` tests red;
+      - `main` also sending `Run`'s return turns the exit-status test red, in 50 of 50 runs.
+        Before the drain it was caught in only about half of them;
+      - no drain on events close turns the end-of-run test red.
+
+      Two mutants stay green, so those two lines are unpinned:
+      - **Cancel without the wait.** A cancelled follower exits within microseconds, so the
+        window in which it could outlive `Lines` is out of a test's reach. The docker test
+        closes `out` after Lines returns, so a straggler would panic sending on it; none did.
+      - **No ctx check in the events branch.** On a cancel, `ctx.Done()` is ready before the
+        events goroutine forwards `ctx.Err()`, so the select takes the shutdown branch. Over
+        20 runs no existing `stop()` saw the error.
+
+      **No existing test changed outcome.** The full suite ran under `-race` on main and on
+      the branch: 1,047 results, then 1,055. The only differences are the 8 new tests and
+      subtests. The three existing `Run` calls gained a nil `report`, for compilation only.
+
+      **On a real daemon.** MANUAL-CHECK-TBD
+
+      Seen and left alone, out of scope:
+      - **#98 is unchanged.** A follower's context is now a child of Lines' own. It is freed
+        when the Docker source ends, but it still accumulates during the run.
+      - **#70 is unchanged**, and the exit status stays 0 there too.
+      - **A Docker list error leaves the events subscription open until exit.** Lines
+        subscribes to events before listing. When the list fails, it returns, but the events
+        goroutine and its connection stay until the run's ctx is cancelled, because
+        `cli.Close` closes only idle connections. A throwaway test against a fake daemon
+        whose list answers 500 confirmed it in 3 of 3 runs: still open 2 s after Lines
+        returned, closed on cancel. It has no functional effect, and needs an events request
+        that succeeds beside a list that fails. Filed as ISSUE-TBD-listleak.
+      - **The TUI status bar shows only the newest error**, so a later one hides the Docker
+        error. That is by design.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
