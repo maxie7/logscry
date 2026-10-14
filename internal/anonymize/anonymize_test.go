@@ -1099,6 +1099,9 @@ func TestIssue66UnderscoreInHostname(t *testing.T) {
 		// Detector 5's domain class: the email did not match at all and the whole address was sent.
 		{"email with an underscore in the domain", "mail to user@my_host.example.com bounced",
 			"mail to <EMAIL_1> bounced", []string{"user@", "my_host", "example.com"}},
+		// The same rule is what reads an ssh-style user@host, so that was sent whole too.
+		{"ssh-style user@host", "ssh session for deploy@build_01.example.com",
+			"ssh session for <EMAIL_1>", []string{"deploy", "build_01"}},
 	}
 	for _, c := range closed {
 		t.Run(c.name, func(t *testing.T) {
@@ -1814,16 +1817,27 @@ func TestAcceptedOverMasking(t *testing.T) {
 		{"word after a url-shaped bracketed address absorbed",
 			"https://x@[2001:db8::1],retrying", "https://<TOKEN_1>@[<IP_1>],<HOST_1>"},
 		// #66's costs, and they are the whole of them. An over-mask from '_' needs a '_' to enter a
-		// group it used to end, and there are exactly three ways in. 9b's \b now starts before a
+		// group it used to end, and there are exactly four ways in. 9b's \b now starts before a
 		// word run glued to a host by '_' -- an identifier prefix, or a snake_case file name on a
 		// private suffix, which was untouched before because no \b preceded its last part. A label
 		// may now BEGIN with '_', which is what DNS service labels do, so an mDNS service type on
-		// .local is a host to 9b. And 9a's and 9c's group can END on a '_' glued after the host. Each
-		// costs text inside a placeholder that Restore puts back exactly; none sends anything.
+		// .local is a host to 9b. 9a's and 9c's group can END on a '_' glued after the host. And the
+		// email domain class admits '_', so a systemd template unit whose instance carries one reads
+		// as an address -- the fourth way, missed when this list said three and found by running the
+		// change over real journald captures, where it was the ONLY one that fired. Each costs text
+		// inside a placeholder that Restore puts back exactly; none sends anything.
 		{"identifier glued to a private host by an underscore", "peer env_db.corp.internal down", "peer <HOST_1> down"},
 		{"snake_case file name on a private suffix", "loaded app_settings.local", "loaded <HOST_1>"},
 		{"mdns service type", "browse _ipp._tcp.local", "browse <HOST_1>"},
 		{"trailing underscore after a url host", "see http://acme.com_", "see http://<HOST_1>"},
+		{"systemd template unit with an underscore read as an email",
+			"Started worker@job_runner.service", "Started <EMAIL_1>"},
+		// INHERITED, not introduced, and pinned here for the first time: a systemd template unit is
+		// unit@instance.service, which is an address to detector 5 whenever the instance fits its
+		// domain class -- and it always has. This is the cost the row above extends to a '_'
+		// instance, and it is a cost to TRIAGE rather than to a restatement: the model is told an
+		// address started, not which unit did.
+		{"systemd template unit read as an email", "Started backup@nightly.service", "Started <EMAIL_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

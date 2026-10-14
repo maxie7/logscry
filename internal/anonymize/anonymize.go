@@ -601,7 +601,9 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    The domain class admits '_' since #66. Without it an address whose domain carried one
 		//    matched nothing, no later rule reads a bare public domain, and the WHOLE address was
 		//    sent, local part included. A URL's userinfo is detector 4's before this rule runs, so
-		//    the widening reaches bare addresses only.
+		//    the widening reaches bare address shapes only -- an ssh-style user@host among them, and a
+		//    systemd template unit whose instance carries a '_', which reads as an address exactly as
+		//    one without a '_' always has (pinned in TestAcceptedOverMasking).
 		{tagEmail, mustLongest(
 			tolerant(`[A-Za-z0-9._%+-]`) + `@` + tolerant(`[A-Za-z0-9._-]`) + `\.[A-Za-z]{2,}\b`), 0, true},
 		// 6 ran HERE until #48 and now runs after 9b — see the block below and the package
