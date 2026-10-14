@@ -572,3 +572,53 @@ func TestDockerDieMidWriteIsFollowedAgain(t *testing.T) {
 
 	f.expect(model.Stdout, want...)
 }
+
+// TestDockerDieAndStartBackToBack is #85: a die and the restart's start, sent exactly once
+// each and back to back. Lines cancels the follower on the die and handles the start
+// straight after, while the cancelled follower is still unwinding. That start must not be
+// lost: the restart is followed from the mark the old follower stores on its way out, and
+// every line arrives exactly once.
+func TestDockerDieAndStartBackToBack(t *testing.T) {
+	for _, tty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tty=%v", tty), func(t *testing.T) {
+			first, firstRaws := lines("line", 1, 5, 0, out)
+			second, secondRaws := lines("line", 6, 10, 100, out)
+			d := newFakeDaemon(t, "ab-restart", tty, first...)
+			f := startFollow(t, NewDockerSource(DockerSelector{NameRegex: "^ab-restart$"}))
+
+			expectQuery(t, "first attach", d.nextRequest(), "", "100")
+			f.until(firstRaws...)
+			d.event(events.ActionDie)
+			d.event(events.ActionStart)
+			expectQuery(t, "re-attach", d.nextRequest(), wireSince(at(5)), "all")
+			d.logs(second...)
+			f.until(secondRaws...)
+			f.stop()
+
+			f.expect(model.Stdout, append(firstRaws, secondRaws...)...)
+		})
+	}
+}
+
+// TestDockerDuplicateStartIsIgnored: a start for a container whose follower is running —
+// a duplicate event, or the overlap between subscribing and listing at startup — attaches
+// nothing and leaves nothing pending, so the die that follows is not mistaken for a
+// restart.
+func TestDockerDuplicateStartIsIgnored(t *testing.T) {
+	first, firstRaws := lines("line", 1, 3, 0, out)
+	d := newFakeDaemon(t, "ab-dup", false, first...)
+	f := startFollow(t, NewDockerSource(DockerSelector{NameRegex: "^ab-dup$"}))
+
+	expectQuery(t, "first attach", d.nextRequest(), "", "100")
+	d.event(events.ActionStart)
+	f.until(firstRaws...)
+	d.die()
+	select {
+	case q := <-d.reqs:
+		t.Fatalf("a logs request %v arrived after a die with no start", q)
+	case <-time.After(300 * time.Millisecond):
+	}
+	f.stop()
+
+	f.expect(model.Stdout, firstRaws...)
+}
