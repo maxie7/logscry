@@ -463,6 +463,10 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"dsn=mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db?replicaSet=rs0",
 		"loaded from /home/<USER_1>/go/pkg/mod",
 		"call https://<HOST_1>/v1 and <UUID_1>",
+		// #66's OLD output fed back: a '_' is a host character now, and these put one directly
+		// behind our own tag, where a group that could start on the tag would show.
+		"call http://<HOST_1>_host:8080/x",
+		"peer db_primary.<HOST_1> down",
 	}
 	for _, s := range inert {
 		for _, d := range baseDetectors {
@@ -1027,12 +1031,8 @@ func TestIssue61MultiHostAuthority(t *testing.T) {
 		// #59's shape with a list: the authority ended at the raw '/', so host2 is PATH to the RFC
 		// and to net/url alike, and no context design reaches it. Still #59.
 		{"raw '/' in the password, with a list (#59)", "postgres://user:p/ss@h1.acme.com,host2/db", "host2"},
-		// An underscore in a hostname. '_' is legal in an RFC 3986 reg-name and ordinary in Docker
-		// container names, Kafka brokers and internal hosts, and it is absent from the host class,
-		// so 9a and 9c both stop at it: http://my_host:8080/x sends "_host" today. A SINGLE-host
-		// leak found while sweeping this one, live, and filed on its own. #66.
-		{"underscore in a hostname (#66)", "mongodb://host1,host_2/db", "_2"},
-		{"underscore in a single hostname (#66)", "http://my_host:8080/x", "_host"},
+		// An underscore in a hostname sat here as #66 until it was closed; it is
+		// TestIssue66UnderscoreInHostname now.
 	}
 	for _, c := range open {
 		t.Run(c.name, func(t *testing.T) {
@@ -1050,6 +1050,124 @@ func TestIssue61MultiHostAuthority(t *testing.T) {
 	// matches on its own (#41's structural reason). The fix lives in the chain, not in residue().
 	if tag := New().residue("mongodb://<TOKEN_1>@<HOST_1>:27017,host2:27017/db"); tag != "" {
 		t.Errorf("residue() sees the old leftover as %q; the claim in the comment above is wrong", tag)
+	}
+}
+
+// TestIssue66UnderscoreInHostname is the named regression for #66, and it is the fifth kind of cause
+// again, the second instance of it: the host class was smaller than the production. RFC 3986 puts
+// '_' in unreserved, so it is legal anywhere in a reg-name, and it is ordinary where logs come from
+// -- Docker container names, Kafka brokers, internal hosts. No host class admitted it, so every host
+// rule stopped at the first '_' and sent the rest: http://my_host:8080/x went out as
+// http://<HOST_1>_host:8080/x, and a dotted name lost its whole domain behind the '_'. The email
+// detector's domain class had the same gap, and there the WHOLE address was sent, local part
+// included. Mask returned nil and residue() returned "": 9a, 9b and 9c are verify:false, and no
+// declared secret in the completeness table carried a '_'. v0.4.0 onward.
+//
+// Each closed case pins the exact output, asserts that no fragment the old output sent survives,
+// and round-trips.
+func TestIssue66UnderscoreInHostname(t *testing.T) {
+	closed := []struct {
+		name, in, want string
+		sent           []string // what the old output sent; none may survive
+	}{
+		// The issue's shapes. 9a's group stopped at the '_'.
+		{"single host", "http://my_host:8080/x", "http://<HOST_1>:8080/x", []string{"my_host", "_host"}},
+		{"credentialed dsn", "postgres://u:p@my_db:5432/app",
+			"postgres://<TOKEN_1>@<HOST_1>:5432/app", []string{"my_db", "_db"}},
+		{"dotted domain behind the underscore", "postgres://u:p@db_1.acme.com/app",
+			"postgres://<TOKEN_1>@<HOST_1>/app", []string{"db_1", "acme.com"}},
+		{"two underscores and a digit", "http://my_host_2:8080/x", "http://<HOST_1>:8080/x", []string{"_host_2"}},
+		// 9c: the group is hostRun, so a later member stopped at its '_' the same way.
+		// "_2" alone is not checked: it occurs inside <HOST_2>.
+		{"host-list member", "mongodb://host1,host_2/db", "mongodb://<HOST_1>,<HOST_2>/db", []string{"host_2"}},
+		{"host list, both members", "mongodb://user:pass@my_db:27017,my_db_2:27017/db",
+			"mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db", []string{"my_db", "_db"}},
+		// 9b: its \b cannot start after a '_', so the label before the private suffix was sent.
+		{"bare private host", "peer db_primary.corp.internal down", "peer <HOST_1> down",
+			[]string{"db_primary", "corp.internal"}},
+		{"bare private host, snake_case", "snake_case_host.corp.internal", "<HOST_1>",
+			[]string{"snake_case_host", "corp.internal"}},
+		// Leading and trailing '_' in a label are admitted: a DNS service label begins with one, and
+		// refusing a trailing one buys nothing. The hyphen rule is unchanged.
+		{"leading underscore label", "lookup _dmarc.corp.internal failed", "lookup <HOST_1> failed",
+			[]string{"_dmarc"}},
+		{"two leading-underscore labels", "srv _sip._tcp.corp.internal", "srv <HOST_1>", []string{"_sip", "_tcp"}},
+		{"trailing underscore label", "peer db_.corp.internal down", "peer <HOST_1> down", []string{"db_"}},
+		// 9a's group could not START on a '_', so this host was sent whole.
+		{"url host starting with an underscore", "http://_svc.acme.com/x", "http://<HOST_1>/x",
+			[]string{"_svc", "acme.com"}},
+		// Detector 5's domain class: the email did not match at all and the whole address was sent.
+		{"email with an underscore in the domain", "mail to user@my_host.example.com bounced",
+			"mail to <EMAIL_1> bounced", []string{"user@", "my_host", "example.com"}},
+		// The same rule is what reads an ssh-style user@host, so that was sent whole too.
+		{"ssh-style user@host", "ssh session for deploy@build_01.example.com",
+			"ssh session for <EMAIL_1>", []string{"deploy", "build_01"}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			m := New()
+			got := mustMask(t, m, c.in)
+			if got != c.want {
+				t.Errorf("underscore host not masked as expected:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+			for _, frag := range c.sent {
+				if strings.Contains(got, frag) {
+					t.Errorf("a fragment the old output sent survived: %q still in %q", frag, got)
+				}
+			}
+			if r := m.Restore(got); r != c.in {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", c.in, r)
+			}
+		})
+	}
+
+	// The Template field, through the real pipeline.Templatize: a digit beside a '_' templatizes
+	// to <NUM> (my_host_2 -> my_host_<NUM>), and the tolerant host run must step over it.
+	templated := []struct{ name, raw, want string }{
+		{"single host", "http://my_host:8080/x", "http://<HOST_1>:<NUM>/x"},
+		{"digit after the underscore", "http://my_host_2:8080/x", "http://<HOST_1>:<NUM>/x"},
+		{"host-list member", "mongodb://host1,host_2/db", "mongodb://<HOST_1>,<HOST_2>/db"},
+		{"bare private host", "peer db_primary01.corp.internal down", "peer <HOST_1> down"},
+		{"email", "mail to ops@my_host7.example.com bounced", "mail to <EMAIL_1> bounced"},
+	}
+	for _, c := range templated {
+		t.Run("template/"+c.name, func(t *testing.T) {
+			in, _ := pipeline.Templatize(c.raw)
+			m := New()
+			if got := mustMask(t, m, in); got != c.want {
+				t.Errorf("templatized underscore host not masked as expected:\n raw:  %q\n in:   %q\n got:  %q\n want: %q",
+					c.raw, in, got, c.want)
+			}
+		})
+	}
+
+	// Byte-identical before and after.
+	same := []struct{ name, in, want string }{
+		// A space ends the token; 9b takes the host after it, as before.
+		{"identifier, space, host", "THE_HOST_IS db.corp.internal", "THE_HOST_IS <HOST_1>"},
+		// The one place widening would NARROW. A member in scheme position fails 9c's "://"
+		// rejection, so the group shrinks to end at a terminator; '_' stays one, and "h2" stays
+		// masked. Were '_' a host character there, no shorter member could end legally and h2 would
+		// be sent. What follows the "://" is #52's class (the scheme anchor), not this one.
+		{"member in scheme position", "mongodb://h1,h2_x://y", "mongodb://<HOST_1>,<HOST_2>_x://y"},
+		// No scheme and no private suffix: prose, by design.
+		{"no scheme, by design", "bootstrap=my_host:9092", "bootstrap=my_host:9092"},
+		{"bare public host, by design", "could not reach my_host.example.com", "could not reach my_host.example.com"},
+		{"snake_case identifier", "snake_case_var=1", "snake_case_var=1"},
+		{"dotted identifier, public-looking suffix", "pkg_name.sub", "pkg_name.sub"},
+	}
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			if got := mustMask(t, New(), c.in); got != c.want {
+				t.Errorf("a shape outside #66 moved:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	// Email is verify-eligible, so an address with a '_' in its domain that ever survives masking
+	// now MUTES the escalation; before, the re-scan read it as clean.
+	if tag := New().residue("user@my_host.example.com"); tag != tagEmail {
+		t.Errorf("an email with an underscore in its domain is not verify-eligible: residue = %q, want %q", tag, tagEmail)
 	}
 }
 
@@ -1493,6 +1611,13 @@ var completenessRows = []completenessRow{
 		"api.550e8400-e29b-41d4-a716-446655440000.acme.com", "/x"},
 	{"bare-host/uuid-label", "host ",
 		"worker-550e8400-e29b-41d4-a716-446655440000.corp.internal", " failed"},
+	// #66. An underscore in a hostname: every host class stopped at it. After the canonical rows,
+	// for the same reason as the #48 rows above.
+	{"url-host/underscore", "call http://", "my_host", ":8080/x"},
+	{"url-host/underscore/leading-label", "call http://", "_svc.acme.com", "/x"},
+	{"url-host/list-rest/underscore", "dsn=mongodb://" + phMark + "host1" + phMark + ",", "host_2,my_db_3", "/db"},
+	{"bare-host/underscore", "peer ", "db_primary.corp.internal", " down"},
+	{"email/underscore-domain", "mail to ", "user@my_host.example.com", " bounced"},
 	{"home-dir", "loaded from /home/", "maxie", "/go/pkg/mod"},
 }
 
@@ -1691,6 +1816,28 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// anywhere before the group -- and those negatives are pinned in the #61 test.
 		{"word after a url-shaped bracketed address absorbed",
 			"https://x@[2001:db8::1],retrying", "https://<TOKEN_1>@[<IP_1>],<HOST_1>"},
+		// #66's costs, and they are the whole of them. An over-mask from '_' needs a '_' to enter a
+		// group it used to end, and there are exactly four ways in. 9b's \b now starts before a
+		// word run glued to a host by '_' -- an identifier prefix, or a snake_case file name on a
+		// private suffix, which was untouched before because no \b preceded its last part. A label
+		// may now BEGIN with '_', which is what DNS service labels do, so an mDNS service type on
+		// .local is a host to 9b. 9a's and 9c's group can END on a '_' glued after the host. And the
+		// email domain class admits '_', so a systemd template unit whose instance carries one reads
+		// as an address -- the fourth way, missed when this list said three and found by running the
+		// change over real journald captures, where it was the ONLY one that fired. Each costs text
+		// inside a placeholder that Restore puts back exactly; none sends anything.
+		{"identifier glued to a private host by an underscore", "peer env_db.corp.internal down", "peer <HOST_1> down"},
+		{"snake_case file name on a private suffix", "loaded app_settings.local", "loaded <HOST_1>"},
+		{"mdns service type", "browse _ipp._tcp.local", "browse <HOST_1>"},
+		{"trailing underscore after a url host", "see http://acme.com_", "see http://<HOST_1>"},
+		{"systemd template unit with an underscore read as an email",
+			"Started worker@job_runner.service", "Started <EMAIL_1>"},
+		// INHERITED, not introduced, and pinned here for the first time: a systemd template unit is
+		// unit@instance.service, which is an address to detector 5 whenever the instance fits its
+		// domain class -- and it always has. This is the cost the row above extends to a '_'
+		// instance, and it is a cost to TRIAGE rather than to a restatement: the model is told an
+		// address started, not which unit did.
+		{"systemd template unit read as an email", "Started backup@nightly.service", "Started <EMAIL_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1801,6 +1948,12 @@ var templatizedRows = []templatizedRow{
 	// this host whole. The defect lived only on the RAW path -- Trigger.Raw and every context
 	// line -- and this row pins that the reorder does not break the path that was already right.
 	{"url-host/uuid-label", "call https://\x00550e8400-e29b-41d4-a716-446655440000.blob.core.windows.net\x00/x"},
+	// #66 through the composition: a digit beside a '_' templatizes to <NUM>, so the host run has
+	// to step over the pipeline's handwriting AND cross the underscore.
+	{"url-host/underscore", "call http://\x00my_host_2\x00:8080/x"},
+	{"url-host/list-rest/underscore", "dsn=mongodb://\x00host1\x00,\x00host_2\x00/db"},
+	{"bare-host/underscore", "host \x00db_primary01.corp.internal\x00 failed"},
+	{"email/underscore-domain", "mail to \x00ops@my_host7.example.com\x00 bounced"},
 	{"home-dir/middle-digit", "loaded from /home/\x00deploy2prod\x00/go/pkg/mod"},
 	{"home-dir/middle-digit-users", "path /Users/\x00jane7doe\x00/app.log missing"},
 	// The four widened at 2da31be, now held to completeness rather than to "a token appeared".

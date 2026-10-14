@@ -582,7 +582,24 @@ and CSV cells (`https://api.acme.com,200,12ms`) now reads as a host list and the
 comma *with a space* after it, a path before it, or no scheme on the line are all untouched. What
 stays open, pinned as assertions: an address literal (or a key-shaped member) as a *later* member
 still blocks every member after it, which is #67 below; and an underscore in a hostname,
-found while sweeping this one, is #66 under *Known limitations*.
+found while sweeping this one, was #66, closed in `v0.12.5` (next paragraph).
+
+**An underscore in a hostname was sent in the clear before `v0.12.5`.** No host rule
+admitted `_`, which RFC 3986 allows anywhere in a hostname and which logs carry in container
+names, broker names and internal hosts, so every host rule stopped at the first one:
+`http://my_host:8080/x` went out as `http://<HOST_1>_host:8080/x`, `postgres://u:p@db_1.acme.com/app`
+sent `_1.acme.com`, `peer db_primary.corp.internal down` sent `db_primary.`, and a host that
+*begins* with `_` (`http://_svc.acme.com/x`) was sent whole. The email rule had the same gap, and
+there the whole value went out, user included: `user@my_host.example.com`, or an ssh-style
+`deploy@build_01.example.com`. v0.4.0 → v0.12.4, thirty tagged releases. A label may now begin or
+end with `_`, so a DNS service name (`_dmarc.corp.internal`) masks whole. What it costs, pinned:
+an identifier glued to a private host by `_` (`env_db.corp.internal`) and a snake_case file name
+on a private suffix (`app_settings.local`) now mask as hosts, an mDNS service type
+(`_ipp._tcp.local`) is a host, a trailing `_` after a URL host goes into the placeholder, and a
+systemd template unit whose instance carries a `_` (`worker@job_runner.service`) reads as an
+address — as one without (`backup@nightly.service`) always has, which costs the model the name of
+the unit that started. Measured over one laptop's journal, 70,783 records: no host mask changed;
+the only effect was that last cell, on 378 records.
 
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
@@ -595,8 +612,8 @@ closing the first of them found a credential gap the audit had no reason to look
 in `v0.9.2`); the sweep run while closing *that* found three more, listed last below; and closing
 the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the sweeps had
 a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found a class it
-could not close and a single-host leak, both listed last below. Each time the audit's own count was
-right and its scope was narrower than the sentence sounded.
+could not close, listed last below, and a single-host leak, #66, closed in `v0.12.5`.
+Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
   `v0.9.1`.** A UUID used as a hostname label is now masked as part of the host. The audit
@@ -614,6 +631,9 @@ right and its scope was narrower than the sentence sounded.
 - **#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
   pre-masked template: `s3://…@bucket` sends `bucket`. Not an interference defect — a tolerance
   gap left over from #43 — but it is open and it leaks a host, so it belongs in the same list.
+  The same anchor misses a URL glued to a word by `_`, on the raw line too: `x_https://acme.com/x`
+  and `__https://acme.com__` send the host, because the scheme must start at a word boundary and
+  `_` is a word character.
 - **#51** — `sk-proj-…`, the current OpenAI key format, is not recognised as a secret at all.
 - ~~**#55** — a username with no password is not a credential to any detector.~~ **Closed in
   `v0.9.2`.** See the paragraph above. The sweep that closed it enumerated the whole
@@ -886,16 +906,6 @@ entry with an empty message.
   `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
   as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left
   in the template. JSON and logfmt lines decode their quoting and are not affected. Filed as #91.
-- **An underscore in a hostname is not masked past the underscore by `--llm-anonymize`.** The
-  host rules' character class is letters, digits, `.` and `-`, so `http://my_host:8080/x` sends
-  `_host:8080` to the configured model endpoint with only `my` masked, in a single-host URL — a
-  far more common shape than the multi-host list #61 was about, since `_` is ordinary in Docker
-  container names, Kafka broker names and internal hosts, and legal in an RFC 3986 reg-name. This
-  is a **live disclosure defect**, found while sweeping #61 and filed as #66 rather than
-  fixed in the same change; its frequency relative to #61 is **unmeasured** — the journald capture
-  is not at hand, so neither shape's frequency could be counted — and deferring it was therefore a
-  decision taken without data rather than a conclusion. Until it is closed, treat any URL whose
-  host carries an underscore as sent in the clear.
 - **There are two "first seen"s, on two clocks, and they can disagree.** The card's `first`
   time and `--export`'s `first_seen` are **logscry's** clock: when logscry first processed
   the template. The age the model is told ("first seen N ago") is the **source's** clock: the

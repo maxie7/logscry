@@ -1785,6 +1785,165 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.4
 
+- [x] **An underscore in a hostname is masked across it** — #66, found while sweeping #61 and
+      pinned there as two open assertions. `--llm-anonymize` had no `_` in any host class, so
+      every host rule stopped at the first one and sent the rest to the configured model
+      endpoint:
+      - `http://my_host:8080/x` → `http://<HOST_1>_host:8080/x`;
+      - `postgres://u:p@db_1.acme.com/app` sent `_1.acme.com`, the whole domain;
+      - `mongodb://host1,host_2/db` sent `_2` (9c);
+      - `peer db_primary.corp.internal down` → `peer db_primary.<HOST_1> down` (9b's `\b` cannot
+        start after a `_`);
+      - `http://_svc.acme.com/x` was sent whole, since 9a's group cannot start on a `_`;
+      - the email rule had the same gap in its domain class, so `user@my_host.example.com` and an
+        ssh-style `deploy@build_01.example.com` matched nothing and were sent whole.
+
+      The Template field behaved identically. `Mask` returned nil and `residue()` returned `""`:
+      9a, 9b and 9c are `verify:false`, and no declared secret in the completeness table carried a
+      `_`. v0.4.0 → v0.12.4, **thirty tagged releases** (`git tag --contains 2da31be | wc -l`
+      → 30).
+
+      **The cause is #61's fifth kind, its second instance.** The host class was smaller than the
+      production: RFC 3986 puts `_` in `unreserved`, legal anywhere in a reg-name, and logs carry
+      it in container names, Kafka brokers and internal hosts.
+
+      **One correction to the issue as filed.** It said `env_db.corp.internal` masks
+      `db.corp.internal` today. It masked `corp.internal` and sent `env_db.`, because no `\b`
+      precedes `db` there either. Measured on main, as were the other shapes.
+
+      **The fix (`internal/anonymize/anonymize.go` only).** Four classes widen by one character
+      each: `hostRun` (9a, and 9c's group and first-member context), 9b's `label` and `inner`, and
+      the email domain class.
+
+      **`listEnd` deliberately does not widen, and that was found while planning.** It is the one
+      place where admitting `_` would narrow. 9c's group can stop at a terminator only where the
+      full member fails, which is a member in scheme position. On `mongodb://h1,h2_x://y`, `_`
+      as a terminator lets the group fall back to `h2` and mask it, as before. As a host character
+      no shorter member ends legally, 9c declines, and `h2` is sent. The mutant measured it:
+      `mongodb://<HOST_1>,h2_x://y`. It is pinned as a byte-identical row.
+
+      **Decisions.**
+      1. **Nothing narrows, proven differentially.** The corpus was collected with an uncommitted
+         hook in `Mask` and `residue`, from every input the anonymize and llm tests feed them,
+         plus the raw and templatized form of every templatized row: 597 distinct inputs. Old
+         and new masking were compared position by position through `byToken`:
+         - 41 outputs changed;
+         - **0 narrowed**, 0 renumbered only, 0 changed whether `Mask` errors;
+         - every newly masked run contains a `_`;
+         - the only pre-existing inputs among the 41 are the two open assertions; nothing else
+           moved.
+      2. **A label may begin and end with `_`.** DNS service labels begin with one (`_dmarc`,
+         `_sip._tcp`), and refusing it would keep sending it. Refusing a trailing one buys nothing.
+         The hyphen rule is unchanged.
+      3. **The over-masks are four, enumerated in `TestAcceptedOverMasking`.** An over-mask from
+         `_` needs a `_` to enter a group it used to end:
+         - 9b's `\b` now starts before a word run glued to a host by `_`. That covers an
+           identifier prefix (`env_db.corp.internal`) and a snake_case file name on a private
+           suffix (`app_settings.local`, untouched before);
+         - a leading-`_` label that is not a host is one to 9b: an mDNS service type,
+           `_ipp._tcp.local`;
+         - 9a's and 9c's group can end on a trailing `_` (`http://acme.com_`);
+         - a systemd template unit whose instance carries a `_` reads as an address
+           (`worker@job_runner.service`).
+
+         **The plan said three, and the capture run found the fourth.** See the frequency
+         paragraph below.
+      4. **The email domain class widens, with its own rows.** Its gap sent the whole value, user
+         included. A URL's userinfo is detector 4's before email runs, so the widening reaches
+         bare address shapes only. Email is verify-eligible, so a `_`-domain address that ever
+         survives masking now mutes the escalation: `residue` returns `EMAIL` where it returned
+         `""`.
+      5. **Both paths.** Templatized rows go through the real `Templatize`, where `my_host_2`
+         becomes `my_host_<NUM>`, and through the logfmt wrapper. Completeness rows sit after
+         the canonical ones, so `completenessSecretFor` is unchanged.
+
+      **The systemd template unit was already an address, and is pinned now for the first
+      time.** `unit@instance.service` matches the email rule whenever the instance fits the domain
+      class: `backup@nightly.service` → `<EMAIL_1>` on main and before. Nothing tested it and nothing
+      wrote it down. It is an **accepted over-mask that costs triage context**: the model is told
+      an address started, not which unit did. It is recorded, not fixed and not filed here. #66's
+      cell only extends it to a `_` instance.
+
+      **Frequency, measured.** Run over the ten boot captures and the ab37 capture on this laptop
+      (70,783 records), raw and through `Templatize`, old against new, counts only.
+
+      **Prediction, recorded before the run:** under 100 records, nearly all 9b on `.local`; 9a
+      0–5; email 0. **It did not hold.** Results:
+      - **On this laptop's captures #66 changed zero host masks.** 9a, 9b and 9c changed
+        nothing.
+      - **Its real-world effect here was the email cell only:** 378 records (0.53%), raw and
+        template alike.
+      - All 378 were newly masked text, sent in the clear before.
+      - None of it was an address or a host: three distinct systemd template unit names, the
+        fourth over-mask cell above.
+      - Nothing narrowed, and nothing was renumbered only.
+
+      So the leak this fixes did not occur in this corpus, and the cost it adds did. Nothing from
+      the captures is in the repo: every test value is invented, and the tests were committed
+      before the captures were opened.
+
+      **Tests.** Red first:
+      - `TestIssue66UnderscoreInHostname`, with exact outputs, a check that no fragment the old
+        output sent survives, and a round trip. It carries:
+        - the issue's shapes, the decision-2 labels, and the email shapes;
+        - five Template-field rows;
+        - six byte-identical rows: `THE_HOST_IS db.corp.internal`, the scheme-position member,
+          no scheme, a bare public host, and two identifiers;
+        - the residue assertion.
+      - Five completeness rows, four templatized rows (eight more through the logfmt wrapper),
+        four over-mask rows, and the old leftovers fed back to `TestPlaceholdersAreInert`.
+      - Two completeness rows also turned `TestNoDetectorGroupLandsOnOurOwnOutput` red on main,
+        because masking produced no placeholder at all: that was the leak.
+
+      Main failed 45 result lines in 5 of 5 runs. The checks are deterministic. One fragment check
+      was wrong as first written: `_2` occurs inside `<HOST_2>`. It was corrected in the red
+      commit before the fix.
+
+      A later commit adds the two systemd-unit rows and the ssh-style row. On old code the
+      `_` rows fail and the plain-unit row passes, because that over-mask is inherited.
+
+      **Flakiness and mutants.** Every new and touched test passes 20 of 20 runs under `-race`.
+      Seven mutants each turn tests red:
+      - `_` only in `hostRun` turns the 9b rows red;
+      - `_` only in 9b turns the 9a/9c rows red;
+      - a leading `_` refused turns `_dmarc`, `_sip._tcp` and the mDNS row red;
+      - a trailing `_` refused turns `db_.corp.internal` red;
+      - the email domain not widened turns the email rows red;
+      - `listEnd` admitting `_` turns the scheme-position row red, the narrowing;
+      - `_` only in 9b's `inner` turns the leading and trailing rows red.
+
+      **No existing test changed outcome.** The full suite ran under `-race` on main and on the
+      branch: 1,055 results, then 1,102. The two open #66 assertions left
+      `TestIssue61MultiHostAuthority`, and 49 new results came in.
+
+      **Wire check.** One run per binary against a capturing endpoint (`--plain --llm-anonymize
+      --warmup-lines 0`). A `[FATAL]` line carried `http://my_host:8080/x`, with #57's
+      `s3://AKIA…EXAMPLE.prod@x@bucket` in its context. `_host`: 2 before (trigger line and
+      template), 0 after. `.prod` fires in both, so the grep is not vacuous.
+
+      **`residue`.** The host rules stay `verify:false`, so there is no new proviso on the README's
+      re-scan paragraph from them. Email is the one verify-eligible rule that widened.
+
+      `internal/pipeline` does not appear in the diff. README:
+      - the Known-limitations bullet goes;
+      - the #61 paragraph's pointer and the audit sentence move to past tense;
+      - a new past-tense paragraph carries the shapes, span, costs and the measured frequency.
+
+      The pre-v0.9.2 table row `svc_user@10.0.0.5` sent `_user` is this class, the host rule's
+      group stopping at a `_`. It is left as it is: it describes those releases truthfully, and
+      since #55 detector 4 masks the whole userinfo first, so the shape has been fully masked
+      since `v0.9.2` (`TestIssue55PasswordlessUserinfo`).
+
+      **Found on the way, not fixed: a `_` glued before a scheme hides the URL from 9a.**
+      `x_https://acme.com/x` and `__https://acme.com__` send the host on the raw line. 9a's anchor
+      needs a `\b` before the scheme, and `_` is a word character. Detector 4 has no anchor, so a
+      credential there is still masked. Confirmed with a throwaway test.
+
+      It is the scheme anchor, not the host class, so it is #52's class: the anchor fails to
+      recognise a URL, there because of a digit and here because of a `_`. It is offered as a
+      comment on #52 and named under #52 in the README audit list. Seen, out of scope: #65's `~`,
+      sub-delim and pct-encoded cells; #67; #54. Targets v0.12.5
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
