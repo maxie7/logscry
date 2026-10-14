@@ -1182,7 +1182,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         dump. So do dumps that begin at the goroutine header, as `debug.Stack()` written on
         its own does. Measured on real Go 1.26 output: a system panic splits 87 lines into
         13 events, or 22 with the tabs stripped, and a SIGQUIT dump 116 lines into 38 or
-        49. No capture contains one. Targets TODO-VERSION
+        49. No capture contains one. Targets v0.12.1
 
 - [x] **A partial match is a leak, not a near miss** — #41, the disclosure defect in the one
       package whose job is preventing disclosure. `--llm-anonymize` sent part of every
