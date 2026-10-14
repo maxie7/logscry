@@ -827,6 +827,17 @@ entry with an empty message.
   even with its indentation stripped. A line that cites a position among other text is an
   ordinary log line, so slog's `source=server.go:99`, logrus's `file="main.go:42"` and
   `log`'s `Lshortfile` prefix stay one event per line.
+- **A Go dump written with `gp=` goroutine headers arrives as many events.** Since Go 1.23,
+  a dump under `GOTRACEBACK=system` or `crash`, and every SIGQUIT dump, writes each
+  goroutine header as `goroutine 1 gp=0x… m=0 mp=0x… [running]:`. The coalescer does not
+  recognize that header, so the dump is split at every goroutine and each piece is
+  templated as its own event. Confirmed on real Go 1.26 output: a `GOTRACEBACK=system` panic
+  of 87 lines arrives as 13 events, and a SIGQUIT dump of 116 lines as 38 (22 and 49 if a
+  shipper strips the indentation). The event carrying the `panic:` line holds only the lines
+  before the first goroutine header. A `debug.Stack()` written on its own splits in two. A
+  panic under the default `GOTRACEBACK` (`single`, or `all`) is not affected and still
+  arrives as one event. This predates v0.12.1, which does not change it. None of the ten
+  recorded boots contains such a dump. Filed as #94.
 - **`--journald` needs `journalctl`, and journal access is a permission thing.** The
   source is Linux-only and shells out to `journalctl`, so it fails at startup on a host
   without it. More often it does something subtler: a user outside the `systemd-journal`
