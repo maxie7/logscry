@@ -540,3 +540,35 @@ func TestDockerRestartCarriesTheInstantForward(t *testing.T) {
 
 	f.expect(model.Stdout, "line 1", "line 2", "line 3")
 }
+
+// TestDockerDieMidWriteIsFollowedAgain is #84's shape end to end: a container logs a burst
+// faster than logscry drains it and dies mid-burst, then restarts. The follower is
+// back-pressured — out is full, so the demuxer is blocked writing into a pipe — when the
+// die cancels it. It must still return and remove itself, so the restart is followed, and
+// it resumes from the last line that reached out: the lines it had read but not delivered
+// come again, and none twice.
+func TestDockerDieMidWriteIsFollowedAgain(t *testing.T) {
+	burst, burstRaws := lines("burst", 1, 3000, 0, out)
+	after, afterRaws := lines("after", 1, 3, 10000, out)
+	d := newFakeDaemon(t, "ab-busy", false)
+	f := startFollow(t, NewDockerSource(DockerSelector{NameRegex: "^ab-busy$"}))
+
+	expectQuery(t, "first attach", d.nextRequest(), "", "100")
+	d.logs(burst...)
+	deadline := time.After(5 * time.Second)
+	for len(f.out) < cap(f.out) {
+		select {
+		case <-deadline:
+			t.Fatalf("out holds %d of %d lines after 5s: the follower was never back-pressured", len(f.out), cap(f.out))
+		case <-time.After(time.Millisecond):
+		}
+	}
+	d.die()
+	d.logs(after...)
+	expectQuery(t, "re-attach", d.start(), wireSince(at(cap(f.out))), "all")
+	want := append(burstRaws, afterRaws...)
+	f.until(want...)
+	f.stop()
+
+	f.expect(model.Stdout, want...)
+}

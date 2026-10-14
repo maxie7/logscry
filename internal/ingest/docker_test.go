@@ -5,6 +5,10 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -179,4 +183,137 @@ func TestReadDockerStreamMarksOnlyWhatItDelivered(t *testing.T) {
 			}
 		}
 	})
+}
+
+// stampedFrame returns ONE multiplexed frame on stream st holding n short lines, each with
+// its own daemon stamp a microsecond apart from base, plus those stamps.
+func stampedFrame(t *testing.T, st stdcopy.StdType, prefix string, n int, base time.Time) ([]byte, []time.Time) {
+	t.Helper()
+	var payload bytes.Buffer
+	stamps := make([]time.Time, n)
+	for i := range n {
+		stamps[i] = base.Add(time.Duration(i) * time.Microsecond)
+		fmt.Fprintf(&payload, "%s %s %d\n", stamps[i].Format(rfc3339NanoFixed), prefix, i+1)
+	}
+	var frame bytes.Buffer
+	if _, err := stdcopy.NewStdWriter(&frame, st).Write(payload.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	return frame.Bytes(), stamps
+}
+
+// liveBody stands in for a follow stream as the Docker client returns it: it yields
+// frames, then stays open like a running container's log, and fails with ctx's error once
+// ctx is cancelled, as the HTTP body does when the request's context ends.
+func liveBody(ctx context.Context, frames ...[]byte) io.Reader {
+	pr, pw := io.Pipe()
+	go func() {
+		for _, f := range frames {
+			if _, err := pw.Write(f); err != nil {
+				return
+			}
+		}
+	}()
+	context.AfterFunc(ctx, func() { pw.CloseWithError(ctx.Err()) })
+	return pr
+}
+
+// onlyCanceled reports whether err is non-nil and every error joined into it is a
+// cancellation: what a follower stopped by its context must return, and nothing else.
+func onlyCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range j.Unwrap() {
+			if e != nil && !onlyCanceled(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return errors.Is(err, context.Canceled)
+}
+
+// TestStreamLogsCancelIsQuiet is #84. A non-TTY follower demuxes through two pipes, and a
+// pipe write returns only once its reader has consumed every byte. When the follower is
+// cancelled while the demuxer is writing a frame its reader has stopped reading — the
+// reader returned at its next send — that write used to block forever: the follower never
+// returned, so a restart of its container was never followed again.
+//
+// The frame here is 2,000 short lines, so all but about 4 KB of it is still unconsumed
+// when the one line read from out leaves the reader blocked on the next send. The control
+// is the same cancel with no write pending. Both must return promptly, return nothing but
+// cancellations (so a die stays as quiet as it always was), and mark only the line that
+// reached out: the line held in the blocked send was read but not delivered, and a
+// re-attach must send it again (#80).
+func TestStreamLogsCancelIsQuiet(t *testing.T) {
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, tt := range []struct {
+		name  string
+		lines int
+	}{
+		{"no write pending", 1},
+		{"write pending", 2000},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			frame, stamps := stampedFrame(t, stdcopy.Stdout, "line", tt.lines, base)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			out := make(chan model.LogLine) // read once, then nobody reads it
+			var mark dockerMark
+			done := make(chan error, 1)
+			go func() { done <- streamLogs(ctx, liveBody(ctx, frame), false, "docker:x", &mark, out) }()
+
+			select {
+			case <-out:
+			case <-time.After(2 * time.Second):
+				t.Fatal("no line arrived")
+			}
+			cancel()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("streamLogs did not return within 2s of cancel: the demuxer is blocked writing to a pipe whose reader has stopped")
+			}
+			if !onlyCanceled(err) {
+				t.Errorf("streamLogs = %v, want only context.Canceled", err)
+			}
+			if want := (dockerMark{stdout: streamMark{at: stamps[0], n: 1}}); mark != want {
+				t.Errorf("mark = %+v, want only the delivered line: %+v", mark, want)
+			}
+		})
+	}
+}
+
+// TestStreamLogsStdoutEndingFirstKeepsStderr: closing a pipe's read end when its reader
+// returns must not cut the OTHER stream short. Stdout's frames all come first, then 2,000
+// stderr frames, more than a reader buffers, then the end of the stream. Every line
+// arrives on its own stream, in order, and the end of the stream is a clean nil.
+func TestStreamLogsStdoutEndingFirstKeepsStderr(t *testing.T) {
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	var buf bytes.Buffer
+	var wantOut, wantErr []string
+	for i := range 2 {
+		f, _ := stampedFrame(t, stdcopy.Stdout, fmt.Sprintf("out %d", i+1), 1, base.Add(time.Duration(i)*time.Millisecond))
+		buf.Write(f)
+		wantOut = append(wantOut, fmt.Sprintf("out %d 1", i+1))
+	}
+	for i := range 2000 {
+		f, _ := stampedFrame(t, stdcopy.Stderr, fmt.Sprintf("err %d", i+1), 1, base.Add(time.Second+time.Duration(i)*time.Millisecond))
+		buf.Write(f)
+		wantErr = append(wantErr, fmt.Sprintf("err %d 1", i+1))
+	}
+
+	got := collect(t, func(ctx context.Context, out chan<- model.LogLine) error {
+		return streamLogs(ctx, &buf, false, "docker:x", &dockerMark{}, out)
+	})
+
+	if got := rawsOf(got, model.Stdout); !slices.Equal(got, wantOut) {
+		t.Errorf("stdout = %q, want %q", got, wantOut)
+	}
+	if got := rawsOf(got, model.Stderr); !slices.Equal(got, wantErr) {
+		t.Errorf("stderr delivered %d lines, want all %d in order", len(got), len(wantErr))
+	}
 }
