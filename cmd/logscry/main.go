@@ -96,20 +96,25 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	lines := make(chan model.LogLine, 1024)
-	// Capacity 2 so the journald notice below and a later source error can both be put
-	// down without either sender blocking.
-	errs := make(chan error, 2)
+	// Room for the journald notice below, one error per source and the replay notice, so
+	// no sender ever blocks.
+	errs := make(chan error, len(sources)+2)
 	if notice := journaldNotice(cfg); notice != nil {
 		errs <- notice
 	}
 	go func() {
 		defer close(lines)
 		defer close(errs)
-		// Source errors end the run. A cancelled context (Ctrl-C) is an expected
-		// stop, not an error to report. In TUI mode the error goes to the model —
-		// printing it would corrupt the alternate screen.
-		if err := ingest.Run(ctx, sources, lines); err != nil && ctx.Err() == nil {
-			errs <- fmt.Errorf("ingest: %w", err)
+		// A source error is reported the moment that source ends, and the other sources
+		// keep running (#97): one failing source must not hide behind, or stop, the rest.
+		// Run does not report what a cancelled context (Ctrl-C) stopped. In TUI mode the
+		// error goes to the model — printing it would corrupt the alternate screen.
+		//
+		// report is the only path from a source error to errs. What Run returns is the same
+		// errors joined, and is read only to skip the replay notice after a failed replay,
+		// so nothing is reported twice.
+		report := func(err error) { errs <- fmt.Errorf("ingest: %w", err) }
+		if err := ingest.Run(ctx, sources, lines, report); err != nil && ctx.Err() == nil {
 			return
 		}
 		if n := replayNotice(replay); n != nil {
@@ -368,7 +373,15 @@ func runPlainAt(ctx context.Context, lines <-chan model.LogLine, errs <-chan err
 	go pipeline.Run(ctx, lines, pipeline.Options{
 		Events: events, Scorer: sc, Escalations: escalations, Export: exp, SourceTime: sourceTime,
 	})
+	return printPlain(ctx, events, errs, explanations, exp, dryRun)
+}
 
+// printPlain is runPlain's output loop: it prints events, background errors and
+// explanations as they arrive, until the pipeline has closed events and the pool has
+// drained explanations.
+func printPlain(ctx context.Context, events <-chan pipeline.Event, errs <-chan error,
+	explanations <-chan model.Explanation, exp *export.Writer, dryRun bool,
+) error {
 	for events != nil || explanations != nil {
 		select {
 		case <-ctx.Done():
@@ -402,6 +415,11 @@ func runPlainAt(ctx context.Context, lines <-chan model.LogLine, errs <-chan err
 				// Every source finished (e.g. stdin EOF) and the pipeline closed the
 				// events channel. Keep going until the last explanation lands.
 				events = nil
+				// run closes errs before lines, so every source error is already waiting in
+				// errs. Print it now: once events is closed, the select may otherwise leave
+				// the loop first, losing errors from sources that failed as the run ended
+				// (#97: each source reports its own).
+				errs = printPending(errs)
 				continue
 			}
 			// The running count makes dedup visible: repeated templates increment
@@ -418,6 +436,22 @@ func runPlainAt(ctx context.Context, lines <-chan model.LogLine, errs <-chan err
 		}
 	}
 	return nil
+}
+
+// printPending prints the errors already waiting in errs without blocking. It returns errs,
+// or nil once errs is closed.
+func printPending(errs <-chan error) <-chan error {
+	for {
+		select {
+		case err, ok := <-errs:
+			if !ok {
+				return nil
+			}
+			fmt.Fprintln(os.Stderr, "logscry:", err)
+		default:
+			return errs
+		}
+	}
 }
 
 // escalated renders the escalation itself, the moment it fires.

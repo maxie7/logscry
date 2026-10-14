@@ -5,12 +5,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/maxie7/logscry/internal/pipeline"
 )
 
 // stderrCapture swaps os.Stderr for a pipe and keeps what is written to it, readable while
@@ -158,5 +161,30 @@ func TestPlainSourceErrorExitStatus(t *testing.T) {
 	}
 	if n := strings.Count(got, "ingest:"); n != 1 {
 		t.Errorf("stderr has %d ingest: lines, want exactly 1:\n%s", n, got)
+	}
+}
+
+// TestPlainPrintsEveryErrorAtTheEnd: two sources that fail together as the run ends each
+// have their error printed, exactly once. By the time the pipeline closes events, every
+// error is already in errs (run closes errs before lines), so the output loop must print
+// what is waiting there rather than leave on the closed events channel. Here events is
+// closed before the loop starts, so nothing depends on timing.
+func TestPlainPrintsEveryErrorAtTheEnd(t *testing.T) {
+	stderr := captureStderr(t)
+	events := make(chan pipeline.Event)
+	close(events)
+	errs := make(chan error, 2)
+	errs <- errors.New("ingest: first source failed")
+	errs <- errors.New("ingest: second source failed")
+	close(errs)
+
+	if err := printPlain(context.Background(), events, errs, nil, nil, true); err != nil {
+		t.Fatalf("printPlain = %v, want nil", err)
+	}
+	got := stderr.final()
+	for _, want := range []string{"logscry: ingest: first source failed", "logscry: ingest: second source failed"} {
+		if n := strings.Count(got, want); n != 1 {
+			t.Errorf("stderr has %q %d times, want exactly 1:\n%s", want, n, got)
+		}
 	}
 }

@@ -233,7 +233,7 @@ func TestRunStreamsStdinAndTerminatesOnEOF(t *testing.T) {
 
 	out := make(chan model.LogLine, 8)
 	done := make(chan error, 1)
-	go func() { done <- Run(context.Background(), []Source{src}, out) }()
+	go func() { done <- Run(context.Background(), []Source{src}, out, nil) }()
 
 	var got []string
 	deadline := time.After(2 * time.Second)
@@ -285,7 +285,7 @@ func TestRunFansInAllSources(t *testing.T) {
 	ctx := context.Background()
 	out := make(chan model.LogLine, 16)
 	errCh := make(chan error, 1)
-	go func() { errCh <- Run(ctx, sources, out) }()
+	go func() { errCh <- Run(ctx, sources, out, nil) }()
 
 	counts := map[string]int{}
 	for i := 0; i < 3; i++ {
