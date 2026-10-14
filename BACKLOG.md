@@ -1441,6 +1441,97 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         daemon with `die` and `start` back to back: lost in 50 of 50 runs, and always followed
         with 200 ms between them. Not observed on a real daemon. Targets v0.10.4
 
+- [x] **A follower stopped mid-write returns** — #84, found while fixing #80. A non-TTY
+      container's stream is demuxed by `stdcopy.StdCopy` into two `io.Pipe`s, one per
+      stream, each read by `readDockerStream`. Only the write ends were ever closed.
+
+      **What went wrong.** A pipe write returns only once its reader has consumed every
+      byte. When `die` cancelled the follower:
+      - the reader blocked on a send returned, and left its read end open;
+      - if the demuxer was writing into that pipe, the write never finished;
+      - the other reader, parked waiting for input, ended only when the demuxer did.
+
+      So `streamLogs` never returned, and the follower never stored its mark or removed
+      itself. Every later `start` for that container was ignored for the rest of the run.
+      The follower, its readers and the HTTP body leaked until exit. Exit itself was not
+      blocked. TTY containers were unaffected, since they have no pipe.
+
+      **The trigger is back-pressure, not frame size.** dockerd sends one frame per log
+      message. Once the readers stop consuming, the demuxer's next write blocks whatever its
+      size. A container that logs faster than logscry drains it, and then dies, is enough.
+      The tests use one frame of 2,000 short lines only because it makes the hang certain:
+      the readers hold at most about 4 KB of it. A single long line never hung, because the
+      reader consumes a whole line before it sends.
+
+      **The fix (`internal/ingest/docker.go` only).** Each reader closes its pipe's read end
+      with its own result when it returns. On a cancel, things then unwind in order:
+      1. The reader that stopped consuming returns `context.Canceled`.
+      2. The demuxer's pending write fails with that error, and `StdCopy` returns it
+         unchanged.
+      3. Both write ends close.
+      4. The other reader ends.
+      5. `streamLogs` returns, and the follower stores its mark and removes itself.
+
+      **The error.** The read end is closed with the reader's own result, so a cancel yields
+      only cancellations. That is what a cancel with no write pending already returned, and
+      `Lines` discards follower errors as before, so a `die` stays quiet. Closing with `nil`
+      would have turned each such cancel into `io.ErrClosedPipe`.
+
+      **EOF vs cancel.** A reader reaches EOF only after the demuxer has finished and closed
+      both write ends. By then every byte of both streams has been consumed. So a reader
+      closing its own pipe on EOF touches nothing still in use, and the other stream's
+      remaining lines all arrive.
+
+      **No reader returns early on its own error.** Every return path other than EOF and a
+      cancel was checked:
+      - `readLines` fails only when a pipe read fails. A pipe read fails only with the error
+        its write end was closed with, and the demuxer closes both write ends at once when
+        it finishes. So a demux error reaches both readers together. A throwaway test
+        confirmed it: an unrecognized frame header surfaced three times and nothing hung.
+      - An over-long line is no error, because `ReadString` grows its buffer. The same
+        throwaway test delivered a 1 MiB line whole.
+      - `readDockerStream` adds only the cancel at its send.
+
+      **The mark (#80) is untouched.** It still advances only after a send, so the lines a
+      stopped follower read but never delivered are sent again on the re-attach.
+
+      **Tests.** Red first, each failing on an assertion within a bound and never hanging the
+      run, in 5 of 5 runs:
+      - `TestStreamLogsCancelIsQuiet`'s pending-write case fails at 2 s.
+      - `TestDockerDieMidWriteIsFollowedAgain` fails at 5 s. Against the fake daemon, a
+        3,000-line burst fills `out`, the container dies, then restarts. The test fails at
+        once instead if the follower is never back-pressured.
+
+      With the fix, these assert:
+      - only cancellations are returned;
+      - only the delivered line is marked;
+      - the re-attach asks from the last delivered line's stamp;
+      - every line arrives exactly once, in order.
+
+      Passing on main too:
+      - the cancel with no write pending;
+      - `TestStreamLogsStdoutEndingFirstKeepsStderr`: two stdout frames, then 2,000 stderr
+        frames, then EOF. Every line arrives and the end is a clean nil.
+
+      **Flakiness and mutants.** Every new test passes 20 of 20 runs under `-race`. Four
+      mutants each turn tests red:
+      - closing with `nil`;
+      - closing both read ends when either reader returns;
+      - advancing the mark before the send;
+      - no close at all.
+
+      **No existing test changed outcome.** The full suite ran under `-race` on main and on
+      the branch: 1,027 results, then 1,032. The only differences are the 5 new tests and
+      subtests.
+
+      **On a real daemon.** Neither the hang nor the fix had been observed before this
+      change. A manual A/B is in the PR: a container whose burst outruns a stalled `--plain`,
+      killed, then started again.
+
+      Seen and left alone, out of scope: #85, which shares this lifecycle. A `start` that
+      arrives while the old follower is still unwinding is ignored as before. The difference
+      is that the unwinding now ends. Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
