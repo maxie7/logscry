@@ -1611,11 +1611,12 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       the branch: 1,032 results, then 1,047. The only differences are the 15 new tests and
       subtests.
 
-      **On a real daemon.** A manual regression check is in the PR: 50 back-to-back
-      `docker kill` and `docker start` rounds per binary, counting the restarts followed. The
-      window is the old follower's unwind, well under the time `docker start` takes, so a
-      real daemon is not expected to reach it. The fake-daemon test is the evidence for the
-      fix.
+      **On a real daemon.** This was a regression check, not the proof: 50 back-to-back
+      `docker kill` and `docker start` rounds per binary, counting the restarts followed. Old
+      binary: followed 50 of 50. New binary: followed 50 of 50. So the rewritten restart path
+      follows every real restart, and the real daemon never reached the window. The window is
+      the old follower's unwind, well under the time `docker start` takes. The fake-daemon
+      test is the evidence for the fix.
 
       Seen and left alone, out of scope:
       - **The `fctx` of a follower that ends on its own is never cancelled.** When its stream
