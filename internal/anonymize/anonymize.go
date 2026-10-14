@@ -85,6 +85,13 @@
 // to read one of our tags on purpose. What the one-group struct costs this time is that hosts 2..n
 // are ONE placeholder; per-member placeholders would need apply to iterate, which it does not.
 //
+// AN UNDERSCORE IS A HOST CHARACTER (#66), and that is the fifth kind of cause again, its second
+// instance: no host class admitted '_', which RFC 3986 puts in unreserved and logs put in Docker
+// container names, Kafka brokers and internal hosts, so every host rule stopped at the first one and
+// sent the rest. The email detector's domain class had the same gap. The classes widen by one
+// character each; the one class that does NOT is listEnd, where '_' stays a terminator because
+// there it decides what 9c falls back to, and the fallback is today's output (see listEnd).
+//
 // The one deliberate exception is the pipeline's own placeholders: see pipelinePH.
 package anonymize
 
@@ -412,7 +419,13 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	suffixes := append(append([]string{}, defaultHostSuffixes...), extraHostSuffixes...)
 	// A hostname label is a grammar rather than a flat run — it may not begin or end with a
 	// hyphen — so tolerance goes on both halves of it rather than through tolerant().
-	label, inner := `(?:[a-z0-9]|`+pipelinePH+`)`, `(?:[a-z0-9-]|`+pipelinePH+`)`
+	//
+	// '_' is admitted on both halves since #66, so a label may also begin or end with one. A DNS
+	// service label begins with one (_dmarc, _sip._tcp), and refusing it would keep sending it;
+	// refusing a trailing one would buy nothing. What it costs is that \b now starts before a word
+	// run glued to a host by '_', and a leading-'_' label that is not a host (an mDNS service type
+	// on .local) is one to this rule -- both pinned in TestAcceptedOverMasking.
+	label, inner := `(?:[a-z0-9_]|`+pipelinePH+`)`, `(?:[a-z0-9_-]|`+pipelinePH+`)`
 	bareHost := mustLongest(
 		`(?i)\b(?:` + label + `(?:` + inner + `*` + label + `)?\.)+(?:` +
 			strings.Join(escapeAll(suffixes), "|") + `)\b`)
@@ -584,8 +597,13 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    collapsed WHOLE — <HEX>@corp.example.com from a hashed address — which '<' being a
 		//    non-word character made unmatchable, sending the entire address including its
 		//    domain. That last one is a leak, not a cost, and it is why the assertion goes.
+		//
+		//    The domain class admits '_' since #66. Without it an address whose domain carried one
+		//    matched nothing, no later rule reads a bare public domain, and the WHOLE address was
+		//    sent, local part included. A URL's userinfo is detector 4's before this rule runs, so
+		//    the widening reaches bare addresses only.
 		{tagEmail, mustLongest(
-			tolerant(`[A-Za-z0-9._%+-]`) + `@` + tolerant(`[A-Za-z0-9.-]`) + `\.[A-Za-z]{2,}\b`), 0, true},
+			tolerant(`[A-Za-z0-9._%+-]`) + `@` + tolerant(`[A-Za-z0-9._-]`) + `\.[A-Za-z]{2,}\b`), 0, true},
 		// 6 ran HERE until #48 and now runs after 9b — see the block below and the package
 		//    comment. The numbering is the audit table's, not the chain's.
 		// 7. IPv6 — before host and IPv4. The alternatives cover the :: elisions; forms
@@ -803,7 +821,12 @@ var ourPHRe = regexp.MustCompile(ourPH)
 
 // hostRun is one host as 9a and 9c read it: a run of hostname characters, placeholder-tolerant
 // for the Template field. One definition, so that "a host" cannot drift between the two rules.
-var hostRun = tolerant(`[a-z0-9.-]`)
+//
+// '_' is in the class since #66. RFC 3986 puts it in unreserved, so it is legal anywhere in a
+// reg-name, and without it http://my_host:8080/x sent "_host:8080" and a dotted name sent its
+// whole domain behind the '_'. A flat run, so '_' is admitted in any position, a trailing one
+// included -- that over-mask is pinned in TestAcceptedOverMasking.
+var hostRun = tolerant(`[a-z0-9._-]`)
 
 // hostPort is the ":port" that may follow a host, tolerant because a port templatizes to <NUM>.
 var hostPort = `:` + tolerant(`[0-9]`)
@@ -813,6 +836,12 @@ var hostPort = `:` + tolerant(`[0-9]`)
 // exists to refuse exactly one thing -- a comma member that is the next URL's scheme -- which a
 // group alone cannot refuse, RE2 having no lookahead. '<' is excluded so the run cannot shrink onto
 // a pipeline placeholder to satisfy the terminator. See 9c.
+//
+// '_' STAYS A TERMINATOR although hostRun admits it since #66, and that was measured, not missed.
+// The group can stop at a terminator only where the full member fails, which is a member in scheme
+// position: "mongodb://h1,h2_x://y". With '_' terminating, the group falls back to "h2" and masks
+// it, exactly as before #66. Were '_' a host character here, no shorter member could end legally,
+// 9c would decline, and "h2" would be sent: a widening that narrows.
 const listEnd = `(?:[^a-z0-9.:<-]|:(?:[^/]|/[^/]|$)|$)`
 
 // authorityTail is what follows the DELIMITING '@' of a userinfo: host[:port], then the end of
