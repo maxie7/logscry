@@ -1177,7 +1177,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Found on the way and filed, not fixed. It was confirmed by a throwaway test that was
       not committed, and identically on main:
-      - **ISSUE-TBD-gpheader:** Go dumps that write `goroutine N gp=… m=… [state]:`
+      - **#94:** Go dumps that write `goroutine N gp=… m=… [state]:`
         headers fragment. This covers `GOTRACEBACK=system` and `crash`, and every SIGQUIT
         dump. So do dumps that begin at the goroutine header, as `debug.Stack()` written on
         its own does. Measured on real Go 1.26 output: a system panic splits 87 lines into
