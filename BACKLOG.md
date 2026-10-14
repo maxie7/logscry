@@ -1671,7 +1671,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
            Source can only report by returning, so retrying would be silent, and silence was
            this issue's failure.
 
-         Filed as ISSUE-TBD-reconnect.
+         Filed as #100.
       2. **A source's error is reported the moment that source ends, and the others keep
          running.** The run ends when every source has ended, as before. Ending the run on
          the first error was rejected for two reasons:
@@ -1753,7 +1753,21 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       the branch: 1,047 results, then 1,055. The only differences are the 8 new tests and
       subtests. The three existing `Run` calls gained a nil `report`, for compilation only.
 
-      **On a real daemon.** MANUAL-CHECK-TBD
+      **On a real daemon.** A manual A/B against a real daemon: a proxy in front of the socket
+      cut only the events connection while an `alpine` container that logs twice a second was
+      followed. The proxy cut exactly one events connection in every run. Each binary ran
+      Docker alone, and Docker beside a subprocess printing a heartbeat.
+      - **Old binary.** No error after the break, and the container's lines kept flowing, so
+        the run looked healthy. A restart of the container was not followed. Alone, the
+        error appeared only once the restart ended the followed stream. Beside the
+        heartbeat, it never appeared.
+      - **New binary.** The error at once, `logscry: ingest: docker: events: unexpected EOF`,
+        and the container's lines stopped. Alone, logscry then exited, since its only source
+        had ended. Beside the heartbeat, the heartbeat kept running.
+      - Every run exited 0.
+
+      A real break reads as `unexpected EOF`, where the fake daemon's clean end reads as
+      `EOF`. Both arrive through the same events branch.
 
       Seen and left alone, out of scope:
       - **#98 is unchanged.** A follower's context is now a child of Lines' own. It is freed
@@ -1765,7 +1779,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         `cli.Close` closes only idle connections. A throwaway test against a fake daemon
         whose list answers 500 confirmed it in 3 of 3 runs: still open 2 s after Lines
         returned, closed on cancel. It has no functional effect, and needs an events request
-        that succeeds beside a list that fails. Filed as ISSUE-TBD-listleak.
+        that succeeds beside a list that fails. Filed under #98, which now covers both.
       - **The TUI status bar shows only the newest error**, so a later one hides the Docker
         error. That is by design.
 

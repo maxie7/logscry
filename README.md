@@ -917,7 +917,7 @@ entry with an empty message.
   Other sources (`--journald`, a subprocess) keep running. logscry does not reconnect: restart
   it to follow Docker again, which reads each container's `--docker-tail` lines again on first
   attach. A plausible trigger is a remote `DOCKER_HOST` behind a proxy or SSH tunnel that
-  closes the idle events connection. Reconnecting is filed as ISSUE-TBD-reconnect.
+  closes the idle events connection. Reconnecting is filed as #100.
 - **Export drops are reported only at exit, and overstated.** In a live run the export
   writer drops a record rather than stall ingestion when its queue is full, which needs a
   disk stalled for tens of minutes at the default rate limit. The only report is one
