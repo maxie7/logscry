@@ -5,7 +5,9 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -72,22 +74,24 @@ type fakeDaemon struct {
 	stopLen int           // len(log) at the last stop: what a stopped stream may still send
 	changed chan struct{} // closed and replaced on every change to log or gen
 
-	reqs   chan url.Values // one per logs request, sent once its history is snapshotted
-	gone   chan struct{}   // one per follow stream the client hung up on
-	events chan events.Message
+	reqs      chan url.Values // one per logs request, sent once its history is snapshotted
+	gone      chan struct{}   // one per follow stream the client hung up on
+	events    chan events.Message
+	eventsEnd chan struct{} // closed by endEvents: the events stream ends, logs go on
 }
 
 func newFakeDaemon(t *testing.T, name string, tty bool, history ...fakeEntry) *fakeDaemon {
 	t.Helper()
 	d := &fakeDaemon{
-		t:       t,
-		name:    name,
-		tty:     tty,
-		log:     history,
-		changed: make(chan struct{}),
-		reqs:    make(chan url.Values, 16),
-		gone:    make(chan struct{}, 16),
-		events:  make(chan events.Message, 64),
+		t:         t,
+		name:      name,
+		tty:       tty,
+		log:       history,
+		changed:   make(chan struct{}),
+		reqs:      make(chan url.Values, 16),
+		gone:      make(chan struct{}, 16),
+		events:    make(chan events.Message, 64),
+		eventsEnd: make(chan struct{}),
 	}
 	srv := httptest.NewServer(http.HandlerFunc(d.serve))
 	t.Cleanup(srv.Close)
@@ -132,6 +136,8 @@ func (d *fakeDaemon) serveEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-d.eventsEnd:
 			return
 		case m := <-d.events:
 			if err := enc.Encode(m); err != nil {
@@ -250,6 +256,10 @@ func (d *fakeDaemon) event(action events.Action) {
 		Actor:  events.Actor{ID: fakeID, Attributes: map[string]string{"name": d.name}},
 	}
 }
+
+// endEvents ends the events stream while every log stream stays open, as a proxy that
+// drops the idle events connection does. The client reads it as io.EOF.
+func (d *fakeDaemon) endEvents() { close(d.eventsEnd) }
 
 // die stops the container while logscry is still reading it: a die event, which makes
 // logscry cancel the follower, and only once the follower has hung up does the stream
@@ -616,4 +626,40 @@ func TestDockerDuplicateStartIsIgnored(t *testing.T) {
 	f.stop()
 
 	f.expect(model.Stdout, firstRaws...)
+}
+
+// TestDockerEventsErrorEndsTheSource is #97: the events stream ends while a container is
+// followed and its log stream stays up. The Docker source can no longer see starts and
+// stops, so it must end and say so: its follower stops and Lines returns the error, rather
+// than waiting for a follower nobody stopped.
+func TestDockerEventsErrorEndsTheSource(t *testing.T) {
+	for _, tty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tty=%v", tty), func(t *testing.T) {
+			history, historyRaws := lines("line", 1, 3, 0, out)
+			d := newFakeDaemon(t, "ab-events", tty, history...)
+			f := startFollow(t, NewDockerSource(DockerSelector{NameRegex: "^ab-events$"}))
+
+			d.nextRequest()
+			f.until(historyRaws...)
+			d.endEvents()
+			select {
+			case err := <-f.done:
+				if !errors.Is(err, io.EOF) || !strings.Contains(err.Error(), "docker: events") {
+					t.Errorf("Lines = %v, want the docker: events error wrapping io.EOF", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Lines had not returned 2s after the events stream ended")
+			}
+			select {
+			case <-d.gone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the follower did not hang up after the events stream ended")
+			}
+			// The caller closes out once Lines has returned. A follower still running would
+			// panic sending this line on it.
+			close(f.out)
+			d.logs(out(at(100), "after the end"))
+			time.Sleep(100 * time.Millisecond)
+		})
+	}
 }
