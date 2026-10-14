@@ -278,23 +278,18 @@ func (d *fakeDaemon) nextRequest() url.Values {
 }
 
 // start re-starts the container and returns the query of the logs request logscry
-// re-attaches with. It re-sends the start event until that request arrives: Lines
-// ignores a start while the old follower is still unwinding (#85), and that
-// race is not what these tests are about. A start that arrives once the new follower
-// is running is ignored, as it is for a real duplicate event.
+// re-attaches with. It sends one start event, as the daemon does, and waits for that
+// request: a start that arrives while the old follower is still unwinding is kept and
+// served when it exits (#85), so no test needs to send it twice.
 func (d *fakeDaemon) start() url.Values {
 	d.t.Helper()
-	deadline := time.After(5 * time.Second)
-	for {
-		d.event(events.ActionStart)
-		select {
-		case q := <-d.reqs:
-			return q
-		case <-time.After(20 * time.Millisecond):
-		case <-deadline:
-			d.t.Fatal("timed out waiting for the re-attach")
-			return nil
-		}
+	d.event(events.ActionStart)
+	select {
+	case q := <-d.reqs:
+		return q
+	case <-time.After(5 * time.Second):
+		d.t.Fatal("timed out waiting for the re-attach")
+		return nil
 	}
 }
 
