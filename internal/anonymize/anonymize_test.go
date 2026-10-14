@@ -4,9 +4,11 @@ package anonymize
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/maxie7/logscry/internal/model"
 	"github.com/maxie7/logscry/internal/pipeline"
 )
 
@@ -1846,6 +1848,90 @@ func TestTemplatizedMaskingIsComplete(t *testing.T) {
 				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", tPayload, got)
 			}
 		})
+	}
+}
+
+// TestLogfmtTemplatizedMaskingIsComplete is TestTemplatizedMaskingIsComplete for the logfmt
+// branch (#83). A logfmt line's template used to carry its msg as <STR>; it now carries the
+// msg's text, and the error's, templatized and re-quoted — text the model is sent in the
+// Masked template field. That is #43's exposure again in a new wrapper, so every templatized
+// row is embedded in a logrus-shaped line, once as the msg and once as the error, and the
+// value must still come back as exactly one placeholder with everything around it untouched.
+//
+// The raw-line suite needs no logfmt row: the trigger line was sent verbatim before this
+// branch and still is. Only the template changed.
+//
+// The expectation is derived, as in the suite above. The fragment the logfmt branch emits is
+// the text path's template re-quoted, so the marked expectation is the row's templatized
+// marked text inside the line's own template wrapper. A premise check holds the branch to
+// exactly that before anything is masked, and a row needing escapes is refused, since the
+// marks could not ride through strconv.Quote.
+func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
+	const (
+		head = `time="2026-07-13T12:00:00.250+02:00" level=error `
+		tail = ` module=store namespace=default`
+	)
+	fields := []struct {
+		name            string
+		before, tBefore string
+	}{
+		{"msg", `msg=`, `msg=`},
+		{"error", `msg="Failed to get event" error=`, `msg="Failed to get event" error=`},
+	}
+	// The one context this wrapper adds is a quote directly beside the value, which no
+	// templatized row has: each of these puts the secret against the closing or the
+	// opening quote.
+	//
+	// home-dir-last is skipped, not dropped. The home-dir detector's username class admits
+	// '"', so the closing quote goes into <USER_N>. That over-masks rather than discloses —
+	// nothing leaks and Restore round-trips — and it predates this branch: a raw line, a JSON
+	// template and `open("/home/bob")` do the same. Filed as #90; the fix turns it on.
+	skip := map[string]string{
+		"quote-edge/home-dir-last": "the home-dir detector takes a closing quote into the username (#90)",
+	}
+	quoteEdgeRows := []templatizedRow{
+		{"quote-edge/email-last", "login refused for \x00ops7@corp.example.com\x00"},
+		{"quote-edge/email-first", "\x00ops7@corp.example.com\x00 refused"},
+		{"quote-edge/home-dir-last", "cannot read /home/\x00deploy2prod\x00"},
+		{"quote-edge/url-host-last", "dial https://\x00db01.corp.internal\x00"},
+		{"quote-edge/sk-key-last", "rejected key \x00sk-abcdefghij0123456789XYZ\x00"},
+		{"quote-edge/aws-key-first", "\x00AKIAIOSFODNN7EXAMPLE\x00 denied"},
+	}
+	rows := append(append([]templatizedRow{}, templatizedRows...), quoteEdgeRows...)
+	for _, f := range fields {
+		for _, r := range rows {
+			t.Run(f.name+"/"+r.name, func(t *testing.T) {
+				if why, ok := skip[r.name]; ok {
+					t.Skip(why)
+				}
+				payload := payloadOf(r.text)
+				if strconv.Quote(payload) != `"`+payload+`"` {
+					t.Fatalf("premise broken: %q needs escaping inside a quoted value", payload)
+				}
+				raw := head + f.before + strconv.Quote(payload) + tail
+				tPayload, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: raw}))
+
+				tMarked, _ := pipeline.Templatize(r.text)
+				prefix := `time=<STR> level=error ` + f.tBefore + `"`
+				suffix := `"` + tail
+				if want := prefix + payloadOf(tMarked) + suffix; tPayload != want {
+					t.Fatalf("premise broken: the logfmt fragment is not the text path's template:\n line: %q\n got:  %q\n want: %q",
+						raw, tPayload, want)
+				}
+
+				m := New()
+				masked := mustMask(t, m, tPayload)
+
+				want := regexp.MustCompile(`^` + regexp.QuoteMeta(prefix) + expand(tMarked) + regexp.QuoteMeta(suffix) + `$`)
+				if !want.MatchString(masked) {
+					t.Errorf("templatized logfmt value not masked whole, or surrounding text disturbed:\n raw:  %q\n in:   %q\n got:  %q\n want: %v",
+						raw, tPayload, masked, want)
+				}
+				if got := m.Restore(masked); got != tPayload {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", tPayload, got)
+				}
+			})
+		}
 	}
 }
 

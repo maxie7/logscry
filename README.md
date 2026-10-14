@@ -208,9 +208,13 @@ flowchart TD
 You can't call an LLM on every log line in real time — cost, latency, and noise all
 forbid it. The interesting part is the pipeline that avoids doing so:
 
-1. **Normalize** each line (JSON or plain text) into a level and a message.
+1. **Normalize** each line (JSON, logfmt or plain text) into a level and a message.
 2. **Template** it — mask the variable parts (`<NUM>`, `<IP>`, `<UUID>`, …) down to a
-   signature, so `user 4821 failed` and `user 9933 failed` become one pattern.
+   signature, so `user 4821 failed` and `user 9933 failed` become one pattern. A JSON or
+   logfmt line is templated on its keys: field names stay, the message (and logfmt's
+   `error`) is masked like any other text, and other values become placeholders, so
+   `level=error msg="disk full"` and `level=error msg="connection refused"` stay two
+   templates.
 3. **Dedup and count** by that signature, tracking first/last seen and recent rate.
 4. **Score** it from independent signals — **novelty** (unseen, or unseen past a
    cooloff), **burst** (rate spiking above the template's own baseline), and **severity**
@@ -332,9 +336,11 @@ that is the one priority logscry does not treat as a level, falling back to read
 message instead. Everywhere else the priority still wins.
 
 > **What reading the message does and does not recover.** The fallback finds a level at
-> the *start* of a line — `ERROR: ...`, `[ERROR] ...`, `level=error ...` — and inside a
-> JSON payload, under any of `level`, `lvl`, `severity`, or `log.level`. It does **not**
-> find one in the middle of a line, which is the usual console format for a JVM or Spring
+> the *start* of a line — `ERROR: ...`, `[ERROR] ...`, `level=error ...` — and, under any of
+> `level`, `lvl`, `severity`, or `log.level`, inside a JSON payload or anywhere in a logfmt
+> line (`time="…" level=error msg="…"`, the shape dockerd, containerd and Go's slog write). A
+> line counts as logfmt only if all of it is `key=value` pairs. It does **not** find a level
+> in the middle of prose, which is the usual console format for a JVM or Spring
 > service (`2026-01-15 10:23:45.123 ERROR 12345 --- [http-nio-8080] com.example.Foo : ...`)
 > — the level sits after the service's own timestamp and is missed. Configure such a
 > service to log JSON and it is read correctly. Levels at priority **5** (notice) and **7**
@@ -715,6 +721,12 @@ Every key is always present (no `omitempty`), so a consumer can index without ch
 | `explanation.error` | string | Why the state is `unavailable`; `""` otherwise |
 | `explanation.at` | string | RFC3339 in UTC (`…Z`); when that state was reached |
 
+**`template_hash` and `pattern` changed for logfmt lines in `v0.12.0`.** Before it, a line
+like `time="…" level=error msg="disk full"` was recorded as `time=<STR> level=error msg=<STR>`.
+Now the message is kept, masked like any other text: `time=<STR> level=error msg="disk full"`.
+A record from an earlier version will not match a `v0.12.0` record of the same event by hash.
+No other line's hash moved.
+
 **In `--explain-dry-run` the file records what *would* have escalated.** That mode calls no
 model — it builds no backend at all — so those records carry `kind: "would_escalate"`,
 `state: "not_requested"`, and no summary, cause, or suggestion. They are the calibration
@@ -809,7 +821,13 @@ entry with an empty message.
   heuristic (indentation, frame markers, language cues) errs toward under-grouping, so an
   unusual continuation style may still split. A buffered event is flushed after
   `--group-timeout` (`group.timeout`, default `200ms`) of idle; set it to `0` to disable
-  grouping entirely.
+  grouping entirely. **A line that mentions a Go source position is read as a stack frame.**
+  Any `file.go:N` in a line counts, so slog's `source=server.go:99` and logrus's
+  `file="main.go:42"` do too. Such a line is folded into the line before it from the same
+  stream if it arrives within `--group-timeout`. An `ERROR` logged straight after an `INFO`
+  then disappears into the `INFO` event, and the group gets no level. Measured on ten boots
+  of one laptop: 11 events from ollama, which logs with `source=`, holding 99 of its 104
+  logfmt lines. Confirmed by a test, filed as #89.
 - **`--journald` needs `journalctl`, and journal access is a permission thing.** The
   source is Linux-only and shells out to `journalctl`, so it fails at startup on a host
   without it. More often it does something subtler: a user outside the `systemd-journal`
@@ -847,6 +865,17 @@ entry with an empty message.
   That is a gap in the anonymizer's own pattern (#49), filed rather than fixed here because the
   fix belongs to the same constant #42 is about. The two IPv6 patterns diverged in #40 and #41; #42
   decides whether they stay two.
+- **`--llm-anonymize` takes a closing quote into a home-directory username.** The username
+  rule stops at `/`, whitespace, `:`, `<` and `>`, but not at a quote or a bracket. So
+  `msg="cannot read /home/deploy2prod"` reaches the model as `…/home/<USER_1> …`, with the
+  closing quote inside the placeholder, and a JSON payload loses its `"}` the same way.
+  Nothing is disclosed and the payload round-trips exactly, but the model sees a broken
+  payload, and wherever its answer names `<USER_1>` the restored text carries the stray `"`
+  or `)`. Raw lines, JSON and logfmt templates are all affected. Filed as #90.
+- **A quoted value containing an escaped quote templates badly on the plain-text path.** The
+  `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
+  as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left
+  in the template. JSON and logfmt lines decode their quoting and are not affected. Filed as #91.
 - **An underscore in a hostname is not masked past the underscore by `--llm-anonymize`.** The
   host rules' character class is letters, digits, `.` and `-`, so `http://my_host:8080/x` sends
   `_host:8080` to the configured model endpoint with only `my` masked, in a single-host URL — a

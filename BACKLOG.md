@@ -943,6 +943,136 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       alternation. That copy is now the durable finding: this change makes the two DIVERGE.
       Filed separately as #42.
 
+- [x] **A logfmt line is templated on its keys, and its level is read where it sits** — #83,
+      found while preparing data for #37. `time="…" level=error msg="…"` is how dockerd,
+      containerd, logrus and slog's text handler write. It went down the text path, which
+      failed it twice:
+      - `strPat` masks every quoted string whole, so `msg="disk full"` and
+        `msg="connection refused"` were both `msg=<STR>`. Every message of one level was one
+        template. In one boot, 171 info lines from four daemons were a single template, and a
+        cluster of that union escalated as a burst.
+      - `level=` was read only at the start of a line, so a line beginning with `time=` got no
+        level. journald records these at PRIORITY 6, and stdin, subprocess and Docker have
+        nothing else, so `level=error` weighed nothing.
+
+      Together these meant a new dockerd or containerd error could not escalate on its own.
+
+      **What counts as logfmt.** The whole line has to parse as two or more `key=value` pairs
+      separated by spaces or tabs. A value is either a quoted string, which must terminate, or
+      a bare run with no `"` and no `=`. One key has to be a level or message key, from the
+      sets normalize already trusts for JSON.
+      - Prose fails at its first bare word, so `user=bob login failed`, the demo's
+        `INFO: request method=GET …` and the replay fixture keep the text path.
+      - The key requirement keeps out environment dumps (`HOME=/`) and audit records
+        (`apparmor="DENIED" operation=…`).
+      - A line break disqualifies an event. That one was found by measuring, not planned (see
+        below).
+      - On ten boots of one laptop (62,707 entries) the rule claims **2,437**: containerd 1,028,
+        nvidia-ctk 946, dockerd 293, ollama 104, sh 66. Every one begins with `time=` and
+        carries `level`, and no line that starts with a bare word is claimed.
+
+      **The template** keeps the keys literally and in their order, joined by single spaces.
+      - The message and `error` are unquoted, run through the text masker and re-quoted. That
+        is M9's `maskedMessage` computation, so the fragment is byte-identical to the text
+        path's template.
+      - Every other value keeps its text-path rule: quoted becomes `<STR>`, bare is masked.
+      - Keys are not sorted. A producer writes one order per call site, so sorting would only
+        move hashes.
+      - `error` is included because it is where the failure cause lives: both real dockerd
+        errors share `msg="Failed to get event"`. Including it costs +2 templates across all
+        ten boots. `err` is not included, because no captured line carries it.
+
+      **The level** is read from the first level key present, wherever it sits, and only
+      inside a logfmt line. Mid-line levels in prose stay #31's. A source-supplied level
+      still wins.
+
+      **Hash stability.** A non-logfmt line reaches `Templatize` over `normalizePlain`'s
+      message byte for byte. Measured on every line of the ten boots and the ab37 capture
+      (main against the branch):
+      - 2,415 hashes moved, all on claimed lines;
+      - **0** hashes moved on unclaimed lines;
+      - 0 levels changed on unclaimed lines.
+
+      The 22 claimed lines that did not move carry neither a quoted message nor a quoted error.
+
+      **What changed on real data.** The A/B covers 21 replays at default settings: ten boots,
+      full and with each boot's first 5 minutes cut, plus ab37. It runs main@3027afb against
+      the branch. A third leg, v0.10.3 against the branch at `--baseline-half-life 0`, gave
+      the same five changes, so none of them is #37's.
+
+      The prediction was made from the weights before any replay. Every logfmt line is
+      PRIORITY 6, which means stdout and no stderr weight. It predicted full +3 −1, trimmed
+      +1 −0, ab37 0. **It held exactly.**
+      - **Added, full:** boot Oct 10 13:44 at +103 s, dockerd `Failed to get event` twice.
+        These are two templates, one per containerd namespace, each novel + ERROR = 1.05.
+        Boot Oct 12 at +42 min, an ollama ERROR line, 1.05.
+      - **Added, trimmed:** the ollama line only. The dockerd pair falls inside the cut.
+      - **Removed, full:** boot Oct 8 20:19, the logfmt union burst #37 measured
+        (`6.3/s vs baseline 1.26/s (5×)`, count 156). With the union split, no logfmt template
+        reaches 25 lines in 10 s. It was already gone in the trimmed replay.
+      - **Unchanged:** every other record is byte-identical (90 records). No INFO or WARN
+        line escalates (0.45 and 0.65), so #27's rule holds.
+      - **Templates:** +104 per full boot (+106 on the two boots with standalone ollama lines),
+        +1 per trimmed boot (+3 on those two), ab37 +0.
+      - **Levels gained, per line:** INFO 2,223, WARN 211, ERROR 3. Per event (after
+        grouping): INFO 2,124, with WARN and ERROR unchanged. The difference is the line-break
+        rule below.
+
+      **The line-break rule, found by the replays.** The coalescer's Go-frame cue `\.go:\d+` is
+      unanchored, so slog's `source=server.go:99` folds each ollama line into the one before
+      it. In the captures that makes 11 events holding 99 of ollama's 104 logfmt lines. The
+      first version counted `\n` as whitespace and read each group as one logfmt line with
+      repeated keys: ambiguous message, and the first line's level. A grouped event is several
+      physical lines, so it is now refused and keeps the text path. The 11 events are
+      byte-identical to main. The coalescer defect itself is filed, not fixed (below).
+
+      **The anonymizer.** The template is sent to the model, and it now carries message and
+      error text that `<STR>` used to hide. That is #43's exposure in a new wrapper, so
+      `TestLogfmtTemplatizedMaskingIsComplete` runs every templatized row as a logfmt msg
+      value and as an error value, plus six rows with the secret against a quote.
+      - 58 pass.
+      - One row, run as msg and as error, is skipped. The home-dir rule takes the closing
+        quote into `<USER_N>`. That over-masks rather than discloses, it predates this change,
+        and raw lines and JSON templates do the same.
+      - The raw-line suite needs no row: the trigger line was sent verbatim before and still is.
+
+      **Tests.** Red first: `TestIssue83LogfmtLines`, the issue's four lines, failing on main
+      on templates, levels and counts. Added with the fix:
+      - `TestLogfmtRecognition`, `TestLogfmtTemplate`, `TestLogfmtLevel`;
+      - `TestNonLogfmtLinesKeepTheirTemplate` (prose, demo and fixture shapes, a grouped
+        event) and `TestFixtureLinesKeepTheirTemplate` (the replay fixture, line by line);
+      - `TestLogfmtErrorEscalatesOnItsOwn`. Its matrix covers stdout and stderr: a new INFO
+        scores 0.45, or 0.75 on stderr; a new WARN 0.65, or 0.95 on stderr (the loudest a
+        merely-new line gets); a known ERROR 0.60; a new ERROR 1.05, or 1.35 on stderr;
+      - a mid-line `level=error` row in `TestJournaldDefaultPriorityDefersToTheText`.
+
+      Mutants confirm the edges. Masking the message whole again, dropping the key
+      requirement, and allowing line breaks each turn tests red.
+
+      **No existing test changed outcome.** The full suite ran under `-race` on main and on the
+      branch: 856 results, then 997. Every difference is a new test or subtest, three of them
+      skips: the existing one and the two home-dir quote rows.
+
+      **What a user sees.** In exports, `template_hash` and `pattern` change for logfmt lines;
+      no other line's hash moves. A logfmt line now shows its level, and its card shows its
+      message.
+
+      Seen and left alone, out of scope: #31 (plaintext levels after a prefix); #36, visible in
+      the new templates (digit runs inside device names and library paths); #32, #84, #85 and #87; and
+      the anonymizer's detectors.
+
+      Found on the way and filed, not fixed, each confirmed by a throwaway test that was not
+      committed:
+      - **#89:** a line mentioning `file.go:N` is folded into the line before it,
+        so an ERROR can disappear into an INFO event.
+      - **#90:** the home-dir rule takes a closing quote into the username.
+      - **#91:** `strPat` ignores backslash escapes, so `"user \"bob\" …"`
+        templates as `<STR>bob\<STR>`.
+      - **#92:** M9's JSON msg fragment has no templatized-completeness test. A
+        throwaway run of all 24 rows passed, so this is a coverage gap, not a leak.
+
+      The first three are in README "Known limitations". Targets v0.12.0
+
 - [x] **A partial match is a leak, not a near miss** — #41, the disclosure defect in the one
       package whose job is preventing disclosure. `--llm-anonymize` sent part of every
       COMPRESSED IPv6 address to the configured model endpoint in the clear:

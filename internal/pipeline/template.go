@@ -152,17 +152,22 @@ func maskHex(match string) string {
 	return match
 }
 
-// TemplatizeLine produces the signature for a whole log line, choosing between two
+// TemplatizeLine produces the signature for a whole log line, choosing between three
 // branches. A line whose raw form is a single JSON object or array is templated on its KEY
-// STRUCTURE (see jsonshape.go); anything else runs the text masker over the normalized
+// STRUCTURE (see jsonshape.go); a logfmt line is templated on its keys with its message
+// kept (see logfmt.go, #83); anything else runs the text masker over the normalized
 // message, exactly as it always has.
 //
-// The JSON branch parses the line a second time — Normalize already parsed it for level
-// and message. That is one extra shallow decode per JSON line, and it is the price of
-// keeping "detect level/message" and "build a signature" two independent functions rather
-// than one that does both.
+// The JSON and logfmt branches parse the line a second time — Normalize already parsed it
+// for level and message. That is one extra shallow decode per structured line, and it is
+// the price of keeping "detect level/message" and "build a signature" two independent
+// functions rather than one that does both.
 func TemplatizeLine(line model.LogLine) (pattern, hash string) {
-	if pattern, ok := jsonShapeSignature(strings.TrimSpace(line.Raw)); ok {
+	trimmed := strings.TrimSpace(line.Raw)
+	if pattern, ok := jsonShapeSignature(trimmed); ok {
+		return pattern, hashTemplate(pattern)
+	}
+	if pattern, ok := logfmtSignature(trimmed); ok {
 		return pattern, hashTemplate(pattern)
 	}
 	return Templatize(line.Message)

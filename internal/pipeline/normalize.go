@@ -41,12 +41,13 @@ var (
 )
 
 // leadingLevelRe matches a leading level token in plain text: a bracketed
-// "[ERROR]", a "ERROR:" prefix, or a logfmt "level=error" at the start of the
-// line. The captured token is canonicalized; the whole match is the prefix that
-// may be stripped from the message.
+// "[ERROR]", a "ERROR:" prefix, or a "level=error" at the start of the line. The
+// captured token is canonicalized; the whole match is the prefix that may be
+// stripped from the message. A line that is logfmt throughout has its level read
+// wherever the key sits instead (logfmtLevel, #83).
 var leadingLevelRe = regexp.MustCompile(`(?i)^\s*(?:\[\s*([a-z]+)\s*\]|([a-z]+)\s*:|level\s*=\s*"?([a-z]+)"?)\s*`)
 
-// Normalize detects the line format (JSON vs plain text) and fills in Level and
+// Normalize detects the line format (JSON, logfmt or plain text) and fills in Level and
 // Message on the LogLine. Raw is never modified — display uses it.
 //
 // A Level the SOURCE already set wins over anything detected from the text. Such a level
@@ -73,6 +74,13 @@ func Normalize(line model.LogLine) model.LogLine {
 
 // detectLevelAndMessage runs the format detection: a JSON object yields its level and
 // message fields, anything else falls to the plaintext heuristics.
+//
+// A logfmt line (logfmt.go) takes its level from its level key, wherever that key sits:
+// `time="…" level=error msg="…"` begins with time=, so the leading-token heuristic never
+// saw it (#83). Its message is left as the heuristics produce it, because nothing on the
+// logfmt path reads it — TemplatizeLine templates such a line from Raw. A level found in
+// the middle of prose is still not a level: only a line that is logfmt throughout is read
+// this way, and the plaintext case is #31's.
 func detectLevelAndMessage(raw string) (level, message string) {
 	trimmed := strings.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
@@ -80,7 +88,11 @@ func detectLevelAndMessage(raw string) (level, message string) {
 			return level, msg
 		}
 	}
-	return normalizePlain(raw)
+	level, message = normalizePlain(raw)
+	if pairs, ok := parseLogfmt(trimmed); ok {
+		level = logfmtLevel(pairs)
+	}
+	return level, message
 }
 
 // normalizeJSON parses a JSON object and extracts a canonical level and message.
