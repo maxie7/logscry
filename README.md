@@ -827,7 +827,7 @@ entry with an empty message.
   stream if it arrives within `--group-timeout`. An `ERROR` logged straight after an `INFO`
   then disappears into the `INFO` event, and the group gets no level. Measured on ten boots
   of one laptop: 11 events from ollama, which logs with `source=`, holding 99 of its 104
-  logfmt lines. Confirmed by a test, filed as ISSUE-TBD-coalesce.
+  logfmt lines. Confirmed by a test, filed as #89.
 - **`--journald` needs `journalctl`, and journal access is a permission thing.** The
   source is Linux-only and shells out to `journalctl`, so it fails at startup on a host
   without it. More often it does something subtler: a user outside the `systemd-journal`
@@ -871,13 +871,11 @@ entry with an empty message.
   closing quote inside the placeholder, and a JSON payload loses its `"}` the same way.
   Nothing is disclosed and the payload round-trips exactly, but the model sees a broken
   payload, and wherever its answer names `<USER_1>` the restored text carries the stray `"`
-  or `)`. Raw lines, JSON and logfmt templates are all affected. Filed as
-  ISSUE-TBD-homequote.
+  or `)`. Raw lines, JSON and logfmt templates are all affected. Filed as #90.
 - **A quoted value containing an escaped quote templates badly on the plain-text path.** The
   `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
   as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left
-  in the template. JSON and logfmt lines decode their quoting and are not affected. Filed as
-  ISSUE-TBD-strpat.
+  in the template. JSON and logfmt lines decode their quoting and are not affected. Filed as #91.
 - **An underscore in a hostname is not masked past the underscore by `--llm-anonymize`.** The
   host rules' character class is letters, digits, `.` and `-`, so `http://my_host:8080/x` sends
   `_host:8080` to the configured model endpoint with only `my` masked, in a single-host URL — a

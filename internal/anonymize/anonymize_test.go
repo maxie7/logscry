@@ -1885,9 +1885,9 @@ func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
 	// home-dir-last is skipped, not dropped. The home-dir detector's username class admits
 	// '"', so the closing quote goes into <USER_N>. That over-masks rather than discloses —
 	// nothing leaks and Restore round-trips — and it predates this branch: a raw line, a JSON
-	// template and `open("/home/bob")` do the same. Filed as ISSUE-TBD-homequote; the fix turns it on.
+	// template and `open("/home/bob")` do the same. Filed as #90; the fix turns it on.
 	skip := map[string]string{
-		"quote-edge/home-dir-last": "the home-dir detector takes a closing quote into the username (ISSUE-TBD-homequote)",
+		"quote-edge/home-dir-last": "the home-dir detector takes a closing quote into the username (#90)",
 	}
 	quoteEdgeRows := []templatizedRow{
 		{"quote-edge/email-last", "login refused for \x00ops7@corp.example.com\x00"},

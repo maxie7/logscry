@@ -1063,12 +1063,12 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Found on the way and filed, not fixed, each confirmed by a throwaway test that was not
       committed:
-      - **ISSUE-TBD-coalesce:** a line mentioning `file.go:N` is folded into the line before it,
+      - **#89:** a line mentioning `file.go:N` is folded into the line before it,
         so an ERROR can disappear into an INFO event.
-      - **ISSUE-TBD-homequote:** the home-dir rule takes a closing quote into the username.
-      - **ISSUE-TBD-strpat:** `strPat` ignores backslash escapes, so `"user \"bob\" …"`
+      - **#90:** the home-dir rule takes a closing quote into the username.
+      - **#91:** `strPat` ignores backslash escapes, so `"user \"bob\" …"`
         templates as `<STR>bob\<STR>`.
-      - **ISSUE-TBD-jsonrow:** M9's JSON msg fragment has no templatized-completeness test. A
+      - **#92:** M9's JSON msg fragment has no templatized-completeness test. A
         throwaway run of all 24 rows passed, so this is a coverage gap, not a leak.
 
       The first three are in README "Known limitations". Targets v0.12.0
