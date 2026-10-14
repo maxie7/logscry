@@ -1524,9 +1524,9 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       the branch: 1,027 results, then 1,032. The only differences are the 5 new tests and
       subtests.
 
-      **On a real daemon.** Neither the hang nor the fix had been observed before this
-      change. A manual A/B is in the PR: a container whose burst outruns a stalled `--plain`,
-      killed, then started again.
+      **On a real daemon.** A manual A/B: a container whose burst outruns a stalled `--plain`
+      is killed mid-burst, then started again 2 s later. The old binary printed NOT-FOLLOWED
+      and the new one FOLLOWED.
 
       Seen and left alone, out of scope: #85, which shares this lifecycle. A `start` that
       arrives while the old follower is still unwinding is ignored as before. The difference
