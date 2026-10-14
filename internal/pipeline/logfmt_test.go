@@ -88,8 +88,8 @@ func TestLogfmtRecognition(t *testing.T) {
 		{"text glued to a closing quote", `level=info msg="a"b`, false},
 		{"key starts with a digit", `level=info 2fa=on`, false},
 		{"plaintext level", "[ERROR] disk full", false},
-		// Two logfmt lines the coalescer grouped (slog's source=file.go:N is a Go-frame cue):
-		// several physical lines, not one logfmt line.
+		// Two logfmt lines joined by a line break, as a grouped event carries them: several
+		// physical lines, not one logfmt line.
 		{"grouped lines", "time=2026-07-13T12:00:00.000+02:00 level=INFO source=api.go:31 msg=\"server config\"\n" +
 			"time=2026-07-13T12:00:00.001+02:00 level=ERROR source=worker.go:88 msg=\"worker exited\"", false},
 		{"carriage return", "level=info msg=a\r\nlevel=info msg=b", false},

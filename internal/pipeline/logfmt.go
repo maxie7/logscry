@@ -52,10 +52,10 @@ type logfmtPair struct {
 // line is not clean logfmt and the text path keeps it. The cost of a non-logfmt line is
 // small: prose fails at its first space, before any '='.
 //
-// A raw line break rejects the line outright. Grouped events are the reason: slog's
-// source=file.go:N matches the coalescer's Go-frame cue, so consecutive slog lines arrive
-// here joined by "\n", and reading them as one line of repeated keys would hand the
-// group its first line's level and leave the message ambiguous.
+// A raw line break rejects the line outright. Grouped events are the reason: a logfmt line
+// the coalescer folded a continuation into (an indented frame after it, say) arrives here
+// joined to it by "\n", and reading the group as one line of repeated keys would hand it
+// its first line's level and leave the message ambiguous.
 func parseLogfmt(trimmed string) (pairs []logfmtPair, ok bool) {
 	if strings.ContainsAny(trimmed, "\n\r") {
 		return nil, false

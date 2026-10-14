@@ -1073,6 +1073,117 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       The first three are in README "Known limitations". Targets v0.12.0
 
+- [x] **A Go frame cue is a frame line, not any mention of `file.go:N`** — #89, found while
+      building #83, whose line-break guard it forced. The coalescer's Go cue was `\.go:\d+`,
+      unanchored and not gated on an active block. Any line citing a Go source position was
+      folded into the line before it if it arrived within `--group-timeout` on the same
+      stream. That caught slog's `source=server.go:99`, logrus's `file="main.go:42"` and
+      `log`'s `Lshortfile` prefix (`main.go:42: …`). An ERROR straight after an INFO
+      disappeared into the INFO event. On the text path the group then had no level, so the
+      ERROR's severity and novelty were both lost.
+
+      **The rule.** The cue now matches a whole line that holds nothing but a frame position.
+      It is not gated.
+      - The line is a path ending in `file.go:N`. The path holds no whitespace and no `=`, so
+        a bare `source=x.go:N` is not a frame.
+      - The runtime's ` +0x…` PC offset may follow; an inlined frame prints none.
+      - So may the `fp= sp= pc=` that `GOTRACEBACK=system` appends.
+      - Nothing else is allowed on the line.
+
+      A real frame line is tab-indented and folds on indentation alone, so the cue only
+      matters for frames whose indentation a producer or shipper stripped. No logscry
+      ingest path strips it.
+
+      **Why not gate it on `p.active`, like `goFrameRe`.**
+      - Gating the old cue would not have fixed it. Every fold makes a block active, so a
+        log line after a trace still joined the trace.
+      - Gating the anchored cue costs real frames. A stripped file line after an idle call
+        line (`main.main()` with no `panic:` above) folds today and would split.
+
+      **What moved on real data.** The harness ran on the same 21 captures as #83: ten
+      boots, the same ten with each boot's first 5 minutes cut, and ab37. It compared
+      main@c1e638f with the branch on the source clock at the default 200 ms timeout.
+      - **Full boots.** 68 events split back into the 321 lines they held:
+        - ollama: 21 events, 109 lines, in the three boots that run it;
+        - snapd: 37 events, 172 lines, all ten boots;
+        - canonical-livepatchd: 10 events, 40 lines, all ten boots.
+      - **Trimmed boots.** Ollama is unchanged at 21/109, because its lines fall after the
+        cut. snapd splits 21 events holding 62 lines. livepatchd falls inside the cut.
+      - **ab37.** Nothing moves.
+      - **No event merged.** Every split event became single lines. No other source moved,
+        and no line holding only a frame position was split.
+      - **Why each line moved.** Every line in a split event cites a position, with one
+        exception. snapd and livepatchd write the `file.go:N: msg` prefix. Ollama's 10 other
+        lines are llama.cpp runner lines that headed a group of slog lines.
+      - **Reconciling #83's count.** #83 measured "11 events holding 99 lines". Those 11 are
+        the logfmt-headed events, holding 69 logfmt lines. The other 10 events are headed by
+        a runner line and hold the remaining 30.
+
+      **Logfmt and #83's guard.** All 104 of ollama's logfmt lines now arrive one per event,
+      and every one is claimed:
+      - levels: 103 INFO and 1 ERROR. The ERROR was already standalone and is unchanged.
+        None of the 99 that were grouped is above INFO, so in this data no error was hidden.
+        The defect is shown by the test, not by an escalation;
+      - templates: 26, of which 25 are INFO and 1 is ERROR. No template has more than 10
+        lines across the three boots or more than 2 in any 10 s window.
+
+      On main, 11 multi-line events in each of the full and trimmed sets had a first line the
+      logfmt path would claim. On the branch there are none, in all 21 captures. The guard
+      is kept because a logfmt line can still carry a folded continuation, and a test pins
+      that.
+
+      **Replays, predicted first.** The prediction was written from the weights before any
+      replay: **+0 −0 on all 21, every export byte-identical.**
+      - Every event the fix creates is stdout, at INFO or no level, so it scores 0.45 at
+        most.
+      - The old group templates had no level either.
+      - No new template comes near the burst gate of 25.
+      - The surviving templates whose count moves are ollama runner lines, which have no
+        level.
+      - On the full boots, warmup ends on the same line at the same time, 12 or 13 events
+        later by count.
+
+      **It held.** All 21 exports are byte-identical (94 records). The `--plain` streams grow
+      by exactly the split counts.
+
+      **Templates.** Full boots gain +16 or +17 templates, and +31 to +34 on the three boots
+      with ollama. Trimmed boots gain +4 or +5, and +19 to +21 with ollama. ab37 gains none.
+
+      **Tests.**
+      - Red first: `TestIssue89SourcePositionLines`. It runs slog, logrus and `Lshortfile`
+        pairs 50 ms apart on one stream through both coalescers and fails on the event
+        count. The levels it checks are INFO then ERROR, and none for `Lshortfile`, which
+        is #31's.
+      - Added with it, passing on main where the old rule was right:
+        - `TestGoFrameLineShape`, the rule's rows;
+        - `TestCoalesceGoFrameLines`. It checks that a real Go 1.26 goroutine dump folds
+          into one event both tabbed and stripped, that a stripped file line folds after an
+          idle call line, that a log line after a dump is its own event, and that a logfmt
+          line with a folded frame keeps the text path.
+      - Four mutants each turn a row red: deleting the cue, gating it unanchored, anchoring
+        and gating it, and dropping `fp= sp= pc=`.
+
+      **No existing test changed outcome.** The full suite ran under `-race`: 997 results on
+      main, 1,027 on the branch. All 30 new results pass.
+
+      **What a user sees.** A slog or logrus service's lines now show one per line in the
+      stream pane and `--plain`. Each gets its own template and level, so a new ERROR from
+      one can escalate on novelty + ERROR. README's #89 limitation is gone.
+
+      Seen and left alone, out of scope:
+      - #31: snapd's `WARNING:` after the `file.go:N:` prefix still gets no level;
+      - #36;
+      - the Python and Java cues.
+
+      Found on the way and filed, not fixed. It was confirmed by a throwaway test that was
+      not committed, and identically on main:
+      - **ISSUE-TBD-gpheader:** Go dumps that write `goroutine N gp=… m=… [state]:`
+        headers fragment. This covers `GOTRACEBACK=system` and `crash`, and every SIGQUIT
+        dump. So do dumps that begin at the goroutine header, as `debug.Stack()` written on
+        its own does. Measured on real Go 1.26 output: a system panic splits 87 lines into
+        13 events, or 22 with the tabs stripped, and a SIGQUIT dump 116 lines into 38 or
+        49. No capture contains one. Targets TODO-VERSION
+
 - [x] **A partial match is a leak, not a near miss** — #41, the disclosure defect in the one
       package whose job is preventing disclosure. `--llm-anonymize` sent part of every
       COMPRESSED IPv6 address to the configured model endpoint in the clear:

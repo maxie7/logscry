@@ -821,13 +821,12 @@ entry with an empty message.
   heuristic (indentation, frame markers, language cues) errs toward under-grouping, so an
   unusual continuation style may still split. A buffered event is flushed after
   `--group-timeout` (`group.timeout`, default `200ms`) of idle; set it to `0` to disable
-  grouping entirely. **A line that mentions a Go source position is read as a stack frame.**
-  Any `file.go:N` in a line counts, so slog's `source=server.go:99` and logrus's
-  `file="main.go:42"` do too. Such a line is folded into the line before it from the same
-  stream if it arrives within `--group-timeout`. An `ERROR` logged straight after an `INFO`
-  then disappears into the `INFO` event, and the group gets no level. Measured on ten boots
-  of one laptop: 11 events from ollama, which logs with `source=`, holding 99 of its 104
-  logfmt lines. Confirmed by a test, filed as #89.
+  grouping entirely. A Go frame cue is a line that holds nothing but a source position: a
+  path ending in `file.go:N`, optionally followed by the runtime's ` +0x…` offset and the
+  `fp= sp= pc=` that `GOTRACEBACK=system` appends. Such a line continues the event before it
+  even with its indentation stripped. A line that cites a position among other text is an
+  ordinary log line, so slog's `source=server.go:99`, logrus's `file="main.go:42"` and
+  `log`'s `Lshortfile` prefix stay one event per line.
 - **`--journald` needs `journalctl`, and journal access is a permission thing.** The
   source is Linux-only and shells out to `journalctl`, so it fails at startup on a host
   without it. More often it does something subtler: a user outside the `systemd-journal`
