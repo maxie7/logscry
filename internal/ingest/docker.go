@@ -252,6 +252,13 @@ func (m *streamMark) advance(t time.Time) {
 //
 // mark is read and advanced per stream; each stream's goroutine owns its own half,
 // and the caller reads it only after streamLogs returns, so it needs no lock.
+//
+// A pipe write returns only once its reader has consumed every byte, so each reader
+// closes its read end when it returns, with its own result. A reader stopped by
+// cancellation mid-frame then fails the demuxer's pending write with ctx's error instead
+// of leaving it blocked forever (#84); the demuxer returns, closes both write ends, and the
+// other reader ends too. A reader that returns on EOF closes nothing that is still in use:
+// EOF arrives only after the demuxer has finished and closed both write ends.
 func streamLogs(ctx context.Context, r io.Reader, tty bool, source string, mark *dockerMark, out chan<- model.LogLine) error {
 	if tty {
 		return readDockerStream(ctx, r, source, model.Stdout, &mark.stdout, out)
@@ -276,10 +283,12 @@ func streamLogs(ctx context.Context, r io.Reader, tty bool, source string, mark 
 	go func() {
 		defer wg.Done()
 		outErr = readDockerStream(ctx, outR, source, model.Stdout, &mark.stdout, out)
+		outR.CloseWithError(outErr)
 	}()
 	go func() {
 		defer wg.Done()
 		errErr = readDockerStream(ctx, errR, source, model.Stderr, &mark.stderr, out)
+		errR.CloseWithError(errErr)
 	}()
 	wg.Wait()
 

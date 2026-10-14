@@ -919,17 +919,6 @@ entry with an empty message.
   followed. Not observed on a real daemon. There the gap is the container's stop and start,
   and a plain `docker restart` was followed while #80 was being measured, so how often a real
   restart lands inside the window is not known. Filed as #85.
-- **Stopping a busy Docker follower can leave it hung, so its container is never followed
-  again.** For a container without a TTY, logscry splits the daemon's stream into stdout and
-  stderr through two pipes. If the follower is stopped (the container died) while a chunk of
-  output is still being written into a pipe, that write never finishes: its reader has gone
-  and the pipe is never closed. The follower then never finishes, so a restart of that
-  container is not followed, and the stuck goroutine and connection stay open until logscry
-  exits. Exit itself is not blocked, because neither mode waits for ingestion to return. The
-  trigger is a container still printing when it dies, a crash trace for example, while
-  logscry is behind. TTY containers are not affected. Confirmed by a test (a large frame,
-  nobody reading, then cancel; it did not return within 2 s in 3 of 3 runs), not observed on
-  a daemon. Found while fixing #80 and filed as #84.
 - **Export drops are reported only at exit, and overstated.** In a live run the export
   writer drops a record rather than stall ingestion when its queue is full, which needs a
   disk stalled for tens of minutes at the default rate limit. The only report is one
