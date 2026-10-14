@@ -1622,7 +1622,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         reaches EOF before the `die`, `stop` later finds no entry. The context stays
         registered on `Lines`' until exit. A throwaway test measured about 116 bytes retained
         per such run, freed when the parent was cancelled. It is there since v0.1.0, and the
-        moved code keeps it. Filed as ISSUE-TBD-ctxleak.
+        moved code keeps it. Filed as #98.
       - **An events-stream error hangs `Lines` instead of returning.** It waits for its
         followers without cancelling them. A throwaway test against the fake daemon ended
         the events stream with a follower attached:
@@ -1631,7 +1631,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
           ctx;
         - meanwhile, starts and restarts go unseen.
 
-        It is there since v0.1.0. Filed as ISSUE-TBD-eventserr. Targets v0.12.3
+        It is there since v0.1.0. Filed as #97. Targets v0.12.3
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
