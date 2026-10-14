@@ -910,15 +910,6 @@ entry with an empty message.
   read took. A template seen from sources with different clocks (a remote `DOCKER_HOST`
   beside local journald) is off by their skew. Before #72 the age subtracted one clock from
   the other.
-- **A Docker container that restarts the instant it dies may not be followed again.** When
-  logscry sees `die` it stops that container's follower, and the follower removes itself a
-  moment later. A `start` for the same container that arrives inside that moment is ignored,
-  and nothing re-attaches afterwards, so the container's later lines are lost for the rest of
-  the run. Confirmed by a test against a fake daemon that sends `die` and `start` back to back:
-  the restart was never followed in 50 of 50 runs, and with 200 ms between them it was always
-  followed. Not observed on a real daemon. There the gap is the container's stop and start,
-  and a plain `docker restart` was followed while #80 was being measured, so how often a real
-  restart lands inside the window is not known. Filed as #85.
 - **Export drops are reported only at exit, and overstated.** In a live run the export
   writer drops a record rather than stall ingestion when its queue is full, which needs a
   disk stalled for tens of minutes at the default rate limit. The only report is one
