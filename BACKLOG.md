@@ -1532,6 +1532,108 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       arrives while the old follower is still unwinding is ignored as before. The difference
       is that the unwinding now ends. Targets v0.12.2
 
+- [x] **A restart that lands during the old follower's unwind is followed** — #85, found
+      while fixing #80. `Lines` handles a restart's `die` and its `start` back to back. On
+      `die` it cancels the follower. The follower removes its own entry only once it has
+      unwound, in the critical section that stores its mark. `start` returned early whenever
+      an entry existed.
+
+      So a `start` handled in between was dropped, and no later event re-sends it. The
+      restarted container was never followed again, and its lines were lost for the rest of
+      the run. Since #84 the old follower always exits, so the window was finite, but the
+      loss was permanent. The fake daemon's `start()` used to re-send the event every 20 ms
+      just to step around this.
+
+      **The fix (`internal/ingest/docker.go` only).** The follower bookkeeping moves from
+      `Lines`' closures into `followerSet`:
+      - A `start` for a **stopped** follower, one `stop` was called on because a `die` was
+        seen, is recorded on it. The latest start's name wins.
+      - The exiting follower launches its successor in the same critical section that stores
+        its mark and removes its entry.
+      - `Lines` calls `start`, `stop` and `wait` where it called the closures and `wg.Wait`.
+
+      The moved code keeps today's behaviour exactly, including what it never did (below). It
+      is a type rather than closures so that a test can replace the follow function and hold
+      a stopped follower in its unwind for as long as a case needs. A real follower's unwind
+      cannot be steered from outside.
+
+      **Decisions.**
+      1. **Only a stopped follower takes a pending start.** A start for a running one is
+         ignored, as before. That covers a duplicate event, or the overlap between
+         subscribing and listing at startup. Events arrive in order, so a restart's `die` is
+         always handled before its `start`.
+      2. **The successor starts from the mark the old follower stores on exit.** Nothing is
+         captured when the `start` arrives, so every line arrives exactly once across the
+         restart.
+      3. **`die`, `start`, `die`, all before the old follower exits.**
+         - The pending start is kept. The second `stop` finds the old, already-cancelled
+           follower and changes nothing.
+         - The successor attaches to a container that is stopped again. dockerd v28.5.2
+           creates a logger just for that read, so `follow` is false: it sends the history
+           since the mark and ends the stream (`daemon/logs.go`, `getLogger`).
+         - So the lines the container logged between the two dies are delivered once, and
+           the successor exits on its own.
+         - Dropping the pending start would leave those lines unread until some later
+           `start`.
+      4. **Shutdown.**
+         - A successor is launched only while `Lines`' ctx is live, checked under the lock.
+           If the cancel lands just after the check, the successor's context is already
+           cancelled and it returns at once.
+         - Its `wg.Add` comes before the exiting follower's `Done`, so the count never
+           reaches zero in between, and a `wait` in progress covers the successor.
+      5. **The successor takes the start event's name**, so a container renamed across its
+         restart is sourced by the new name.
+
+      **Tests.** Red first:
+      - `TestDockerDieAndStartBackToBack` (TTY and not) sends `die` and `start` exactly once
+        each. On main it failed at the 5 s bound waiting for the re-attach, in 40 of 40
+        runs.
+      - `TestDockerDuplicateStartIsIgnored` passes on main and pins decision 1 end to end.
+
+      Added with the fix, because they need the new type:
+      - `docker_followers_test.go` holds one test per decision.
+      - Each drives `followerSet` with a follow that blocks until the test releases it.
+
+      **The harness.** `fakeDaemon.start()` now sends one start event, then waits for the
+      re-attach with its 5 s bound. Every existing docker test passes with it.
+
+      **Flakiness and mutants.** Every new test passes 20 of 20 runs under `-race`. Five
+      mutants each turn tests red:
+      - a pending start accepted for a running follower turns both decision-1 tests red;
+      - a successor started from the mark that existed when the start arrived turns red the
+        back-to-back test (TTY and not), decisions 2 and 3, and one run of
+        `TestDockerRestartBoundary`;
+      - a successor launched after cancel turns the shutdown test red;
+      - dropping the pending start on the second `die` turns decision 3 red;
+      - launching with the old name turns decisions 3 and 5 red.
+
+      **No existing test changed outcome.** The full suite ran under `-race` on main and on
+      the branch: 1,032 results, then 1,047. The only differences are the 15 new tests and
+      subtests.
+
+      **On a real daemon.** This was a regression check, not the proof: 50 back-to-back
+      `docker kill` and `docker start` rounds per binary, counting the restarts followed. Old
+      binary: followed 50 of 50. New binary: followed 50 of 50. So the rewritten restart path
+      follows every real restart, and the real daemon never reached the window. The window is
+      the old follower's unwind, well under the time `docker start` takes. The fake-daemon
+      test is the evidence for the fix.
+
+      Seen and left alone, out of scope:
+      - **The `fctx` of a follower that ends on its own is never cancelled.** When its stream
+        reaches EOF before the `die`, `stop` later finds no entry. The context stays
+        registered on `Lines`' until exit. A throwaway test measured about 116 bytes retained
+        per such run, freed when the parent was cancelled. It is there since v0.1.0, and the
+        moved code keeps it. Filed as #98.
+      - **An events-stream error hangs `Lines` instead of returning.** It waits for its
+        followers without cancelling them. A throwaway test against the fake daemon ended
+        the events stream with a follower attached:
+        - `Lines` had not returned 3 s later, and the follower kept delivering lines;
+        - only the cancel returned `docker: events: EOF`, which `main` drops on a cancelled
+          ctx;
+        - meanwhile, starts and restarts go unseen.
+
+        It is there since v0.1.0. Filed as #97. Targets v0.12.3
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

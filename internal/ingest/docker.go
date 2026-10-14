@@ -70,49 +70,13 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 	}
 	defer cli.Close()
 
-	var (
-		wg        sync.WaitGroup
-		mu        sync.Mutex
-		followers = map[string]context.CancelFunc{}
-		// marks outlives each follower: it is where a restart of the same id resumes.
-		marks = map[string]dockerMark{}
-	)
-
-	// start attaches a follower to id unless one is already running.
-	start := func(id, name string) {
-		mu.Lock()
-		defer mu.Unlock()
-		if _, ok := followers[id]; ok {
-			return
-		}
-		fctx, cancel := context.WithCancel(ctx)
-		followers[id] = cancel
-		prev := marks[id]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// A follower ending (log EOF, container gone, ctx cancel) removes its
-			// own entry so a later start of the same id can re-attach. IDs are
-			// unique, so there is no reuse race. Per-follower errors are expected
-			// on shutdown and when a container disappears, so they degrade
-			// silently rather than crash the whole Docker source.
-			m, _ := s.followContainer(fctx, cli, id, name, prev, out)
-			// The mark is stored in the same critical section that removes the
-			// follower, so start sees either a running follower or its final mark.
-			mu.Lock()
-			marks[id] = m
-			delete(followers, id)
-			mu.Unlock()
-		}()
-	}
-	// stop cancels a follower; the follower goroutine deletes its own map entry.
-	stop := func(id string) {
-		mu.Lock()
-		if cancel, ok := followers[id]; ok {
-			cancel()
-		}
-		mu.Unlock()
-	}
+	// Per-follower errors are expected on shutdown and when a container disappears, so
+	// they degrade silently rather than crash the whole Docker source.
+	followers := newFollowerSet(ctx, func(fctx context.Context, id, name string, mark dockerMark) dockerMark {
+		read, _ := s.followContainer(fctx, cli, id, name, mark, out)
+		return read
+	})
+	start, stop := followers.start, followers.stop
 
 	// Subscribe to events BEFORE listing so containers started in the gap between
 	// list and subscribe are not missed.
@@ -139,7 +103,7 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 	for {
 		select {
 		case <-ctx.Done():
-			wg.Wait()
+			followers.wait()
 			return nil
 		case msg := <-msgs:
 			switch msg.Action {
@@ -153,14 +117,104 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 			}
 		case err := <-errs:
 			if ctx.Err() != nil {
-				wg.Wait()
+				followers.wait()
 				return nil
 			}
-			wg.Wait()
+			followers.wait()
 			return fmt.Errorf("docker: events: %w", err)
 		}
 	}
 }
+
+// followerSet runs at most one follower per container ID, and remembers where each ID's
+// last follower stopped reading so that a restart of it resumes there (see dockerMark).
+//
+// A follower is stopped on die and removes its own entry only once it has unwound. A start
+// for the same ID can arrive in between: Lines handles the die and the restart's start
+// back to back, while the cancelled follower is still on its way out. Such a start is not
+// dropped (#85). It is recorded on the stopped follower, and the follower launches its
+// successor as it exits, in the critical section that stores its mark — so the successor
+// starts from that final mark and nothing is captured early. A start for a follower that
+// was not stopped (a duplicate event, or the overlap between subscribing and listing at
+// startup) attaches nothing and leaves nothing pending, as before.
+type followerSet struct {
+	ctx    context.Context // every follower's parent, and the shutdown signal
+	follow func(ctx context.Context, id, name string, mark dockerMark) dockerMark
+
+	mu      sync.Mutex
+	wg      sync.WaitGroup
+	running map[string]*follower
+	// marks outlives each follower: it is where a restart of the same id resumes.
+	marks map[string]dockerMark
+}
+
+// follower is one running follower's entry.
+type follower struct {
+	cancel      context.CancelFunc
+	stopped     bool   // stop was called: a die was seen for this run of the container
+	restart     bool   // a start arrived while this stopped follower was still unwinding
+	restartName string // that start's container name, the latest if there were several
+}
+
+func newFollowerSet(ctx context.Context, follow func(ctx context.Context, id, name string, mark dockerMark) dockerMark) *followerSet {
+	return &followerSet{ctx: ctx, follow: follow, running: map[string]*follower{}, marks: map[string]dockerMark{}}
+}
+
+// start attaches a follower to id unless one is already running. If the running one has
+// been stopped, the start is kept and its successor is launched when it exits.
+func (s *followerSet) start(id, name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f, ok := s.running[id]; ok {
+		if f.stopped {
+			f.restart, f.restartName = true, name
+		}
+		return
+	}
+	s.launchLocked(id, name)
+}
+
+// launchLocked starts a follower for id from its stored mark. s.mu must be held.
+func (s *followerSet) launchLocked(id, name string) {
+	fctx, cancel := context.WithCancel(s.ctx)
+	f := &follower{cancel: cancel}
+	s.running[id] = f
+	prev := s.marks[id]
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		// A follower ending (log EOF, container gone, ctx cancel) removes its own entry so
+		// a later start of the same id can re-attach. IDs are unique, so there is no reuse
+		// race.
+		m := s.follow(fctx, id, name, prev)
+		// The mark is stored in the same critical section that removes the follower, so
+		// start sees either a running follower or its final mark — and a successor
+		// launched here reads that mark. Its wg.Add comes before this goroutine's Done,
+		// so the count cannot reach zero in between. Once Lines' ctx is cancelled no
+		// successor is launched.
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.marks[id] = m
+		delete(s.running, id)
+		if f.restart && s.ctx.Err() == nil {
+			s.launchLocked(id, f.restartName)
+		}
+	}()
+}
+
+// stop cancels id's follower; the follower deletes its own entry as it exits.
+func (s *followerSet) stop(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f, ok := s.running[id]; ok {
+		f.stopped = true
+		f.cancel()
+	}
+}
+
+// wait blocks until every follower, including any successor launched on the way out,
+// has exited.
+func (s *followerSet) wait() { s.wg.Wait() }
 
 // followContainer opens the log stream for one container and pumps its lines
 // into out until ctx is cancelled or the stream ends. It returns how far it read,
