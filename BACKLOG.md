@@ -2122,6 +2122,157 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       offered as a comment on #54 and named under #54 in the README audit list; #54's pre-pass would
       close it. Seen, out of scope: #54's own cells, #57, #59 with a list, #65. Targets v0.12.6
 
+- [x] **An IPv4 address inside a hostname is masked as part of the host** — #54, the half of #48
+      that ordering could not reach, filed by #48 with the impossibility as a result. Detector 8
+      tagged an address on its own before any host rule ran, and every host class excludes `<`, so
+      an address that was a LABEL inside a name blocked the host rules and the rest of the name went
+      to the configured model endpoint:
+      - `https://10.0.0.5.nip.io/x` → `https://<IP_1>.nip.io/x`;
+      - `worker-10.0.0.5.corp.internal` → `worker-<IP_1>.<HOST_1>`;
+      - `https://api.10.0.0.5.nip.io/x` → `https://<HOST_1><IP_1>.nip.io/x`;
+      - `peer db.10.0.0.5.corp.internal down` sent `db.`;
+      - `mongodb://h1,10.0.0.5.nip.io,host3/db` sent `.nip.io` and `host3` (the issue's comment, from
+        #67's sweep).
+
+      `Mask` returned nil and `residue()` returned `""`: the host rules are `verify:false`, and the
+      leftover is not a shape any of them matches. v0.4.0 → v0.12.6, **thirty-two tagged releases**
+      (`git tag --contains 2da31be | wc -l` → 32).
+
+      **One correction to the issue as filed.** It treated the class as raw-path only, as #48's was.
+      On the Template field the address is the pipeline's `<IP>`, which the tolerant host runs step
+      over in a URL and on a private suffix, but a bare name on a public suffix is no host rule's
+      business: `resolve <IP>.nip.io failed` and `peer api.<IP>.nip.io down` sent the labels around
+      `<IP>`. Measured on main.
+
+      **The mechanism, chosen from the cells.** Two were compared before any code, and neither closed
+      every cell as stated:
+      - **The issue's pre-pass** defines a bare authority as `(label\.)+private-suffix`, so `resolve
+        10.0.0.5.nip.io failed` is not one and stays open on both paths. Making it one is the rule
+        below with a span machinery around it: spans carried through every `apply` while the string
+        is rewritten, the userinfo kept outside them, and `residue` made span-aware.
+      - **A post-pass gluing our `<IP_n>` to its neighbours** closes every raw cell and misses the
+        Template ones, where the address is not our tag. It would also put a target group on our own
+        output, mint from `Restore(run)` to avoid a nested mapping, and orphan `<IP_1>`, leaving a
+        numbering gap. Given the raw-address branch that `completenessSecretFor` needs anyway, its
+        tag-reading half closes nothing more: 7 is the only other rule that mints an IP tag, and `:`
+        ends a host.
+
+      **The fix (`internal/anonymize/anonymize.go` only) is the glue read on raw text one step
+      earlier: a new host rule, 9d, between 7 and 8.** It matches an address, 8's own pattern or the
+      pipeline's `<IP>`, joined to hostname labels across `.` or `-`. Each side starts and ends on a
+      label character, at least one side carries a letter outside the address, and the run sits
+      between non-label characters as context. It is not a reordering, so #48's result stands: 9d is
+      more specific than 8 on exactly the span they share and absent everywhere else, and every
+      address 8 masked whole before, it still does. `apply`, `residue`, `Restore` and 9c are
+      unchanged; 8 and 9d share `ipv4Pattern`.
+
+      **Decisions.**
+      1. **Placement after 4, 4b and 4c, measured.** `authorityTail` excludes `<`, so with 9d first,
+         4 declined on `postgres://u:p@10.0.0.5.nip.io/db` and only the password was masked.
+      2. **The tag is HOST and the value is the whole name.** Restore gives back `10.0.0.5.nip.io`;
+         the name recurs under one placeholder across a request, as a list member and in a URL; the
+         address alone elsewhere is a different value with its own `<IP_n>`. All pinned.
+      3. **`residue` needs no change.** 9d is `verify:false` like every host rule. The old leftover
+         still reads as clean, and a raw address left inside a name is still detector 8's and mutes
+         the escalation; both are pinned.
+      4. **9c is untouched and the cap still counts what #67 pinned.** 9d runs before 9a and 9c, so a
+         fused member reaches 9c as one tag and the list re-anchors on it at no cost in passes. A new
+         termination shape alternates `10.0.0.i.nip.io` with names up to 65 members. A fused member
+         numbers before the members around it (`<HOST_2>,<HOST_1>,<HOST_3>`).
+      5. **The letter rule.** A DNS name's top label is alphabetic, and nothing cheaper tells a name
+         from an address beside a number, so `10.0.0.5.443` (BSD netstat's address.port),
+         `10.0.0.5-20` and `10.0.0.5-10.0.0.9` stay `<IP_n>`. Pinned byte-identical, raw and
+         templatized, with the address that is the authority, `:8080`, `/24`, a sentence dot, prose,
+         #67's address-as-member and a partial octet.
+
+      **What it costs, pinned in `TestAcceptedOverMasking`.** Text glued to an address by `.` or `-`
+      that carries a letter is a host now. Each row was `<IP_1>` beside text in the clear and is one
+      `<HOST_1>`: a file name (`dump-10.0.0.5.log`), a missing space after a sentence dot, a word
+      before the address, a version with a pre-release tag (`1.2.3.4-beta`, `<IP_1>-beta` on main),
+      and a reverse-DNS name. On the Template field, where the pipeline does not validate octets,
+      `worker-10.0.0.256` becomes `worker-<IP>` and is masked whole too.
+
+      **Pinned, not targeted.** An access key as a host label, the sweep's "theoretical" cell, keeps
+      main's `https://<TOKEN_1>.prod.acme.com/x`; the same key as a later list member is #57's shape
+      and still sends `.prod` and `host3`.
+
+      **No narrowing, shown differentially.** The corpus came from uncommitted hooks in `Mask` and
+      `residue`, carried by `-overlay` copies of the source so nothing was edited or stashed, and run
+      under the anonymize and llm tests of both main and the branch. The templatized form of every
+      input was added: 2,066 distinct inputs. Old and new masking were compared by per-byte coverage
+      bitmaps rebuilt from `byToken`. Results:
+      - **0 narrowed**, 0 mixed, 0 error changes, 0 unrebuildable;
+      - 1,896 unchanged;
+      - 104 widened: the new tests' inputs;
+      - 66 layout only: templatized host lists in which the fused member now numbers first.
+
+      Restricted to the 994 inputs main's own tests feed: 993 unchanged, and the one widened is the
+      old open row.
+
+      **Frequency, measured.** The ten boot captures and the ab37 capture, 70,783 records, raw and
+      through `Templatize`, old against new, counts only. **Prediction, recorded before the run:** at
+      most 20 changed records, 0 narrowed, 0 error changes, and over-mask shapes rather than a closed
+      leak. **It held:** 10 records changed, raw and templatized alike, all widened, and every one a
+      reverse-DNS name. That is a cost category, not a leak closed: main had sent only the
+      `.in-addr.arpa` beside a masked address. It is the only category, and its row is invented.
+      Nothing narrowed, and there was no list effect. Nothing from the captures is in the repo.
+
+      **Tests.** Red first:
+      - `TestIssue54IPv4LabelInHostname`, carrying:
+        - exact outputs for 17 closed shapes, raw and through the real `Templatize`, with every
+          fragment main sent absent and a round trip;
+        - 11 byte-identical rows on both paths, plus the partial octet on the raw line;
+        - the two pinned key cells;
+        - the recurrence row and both `residue` claims.
+      - The #48 test's open row went, and three things were added:
+        - three completeness rows and three templatized rows (the URL one green on main, as #48's
+          was), each also run through the logfmt wrapper;
+        - five over-mask rows;
+        - #54's old outputs fed to `TestPlaceholdersAreInert`.
+      - The fixpoint shape.
+
+      Main failed 33 subtests, all by assertion. A later commit adds a sentence-dot row with text
+      after the dot. At the end of the text, a rule that ate the dot ties on length with one that
+      leaves it, and a mutant survived the first row.
+
+      **Flakiness and mutants.** The new and touched tests pass 20 of 20 runs under `-race`. Ten
+      mutants each turn tests red:
+      - 9d removed turns 34 subtests red, every closed, completeness, templatized, over-mask and
+        fixpoint row;
+      - the right-hand run allowed to end on `.`, in the letter alternative only, turns the
+        dot-then-space row red; in both alternatives it turns both sentence-dot rows red;
+      - `:` admitted to the label class turns the port rows red, raw, template and completeness;
+      - the letter rule dropped turns the netstat and both range rows red;
+      - no `<IP>` turns 13 red: the Template rows, logfmt included, and the templatized-coverage
+        test;
+      - no leading context turns the partial-octet row (`https://x10.0.0.5.nip.io/x`) red;
+      - no trailing context turns the raw partial-octet check red;
+      - 9d before detector 4 turns the credentialed-DSN row red;
+      - our own tag accepted as the address turns `TestPlaceholdersAreInert`, the three open #57 rows
+        in the #55 and #58 tests, and both pinned key rows red.
+
+      **The full suite** ran under `-race` on main and on the branch: 1,127 results, then 1,176.
+      - **No existing result changed outcome.**
+      - One left: the open #54 row.
+      - 50 new results came in.
+
+      **Wire check.** One run per binary against a capturing endpoint (`--plain --llm-anonymize
+      --warmup-lines 0`). A `[FATAL]` line carried `https://10.0.0.5.nip.io/x`, with #57's
+      `s3://AKIA…EXAMPLE.prod@x@bucket` in its context.
+      - `.nip.io`: 1 before (the trigger line), 0 after.
+      - `.prod` fires in both, so the grep is not vacuous.
+      - On the wire, the new trigger reads `https://<HOST_1>/x` and the template `https://<HOST_2>/x`.
+        That is the existing raw/template two-placeholder cost.
+
+      `internal/pipeline` does not appear in the diff. README:
+      - the #54 audit bullet is struck, and its impossibility argument kept as history;
+      - the later-member key cell moves to #57's bullet;
+      - the audit sentence gains #54;
+      - a new past-tense paragraph carries the shapes, span, costs and the measured frequency.
+
+      "Known limitations" never named #54, so nothing there moved. Seen, out of scope: #57, #59, #52,
+      #65. Targets v0.12.7
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
@@ -2908,8 +3059,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, FIXED** (#48) |
       | 6 → 9a | `https://api.550e8400-….acme.com/` | `.acme.com` | **DEFECT, FIXED** (#48) |
       | 6 → 9b | `worker-550e8400-….corp.internal` | `worker-` | **DEFECT, FIXED** (#48) |
-      | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT, open — #54.** Same cause, DIFFERENT remedy; see below |
-      | 8 → 9b | `worker-10.0.0.5.corp.internal` | `worker-` | **DEFECT, open — #54.** New in the #48 sweep; not in the original table |
+      | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT** (#54), **FIXED**. Same cause, DIFFERENT remedy: a more specific rule, not an order |
+      | 8 → 9b | `worker-10.0.0.5.corp.internal` | `worker-` | **DEFECT** (#54), **FIXED**. New in the #48 sweep; not in the original table |
       | 7 → 8 | `::ffff:192.168.1.1` | `.168.1.1` | **DEFECT, filed #49** |
       **Detector 10 has no defects at all**, and that is a computed result rather than an
       untested area: every interferer that can reach a `/home/` username masks it entirely.

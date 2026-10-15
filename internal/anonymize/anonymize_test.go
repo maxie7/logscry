@@ -471,6 +471,13 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		// behind our own tag, where a group that could start on the tag would show.
 		"call http://<HOST_1>_host:8080/x",
 		"peer db_primary.<HOST_1> down",
+		// #54's OLD output fed back: our own <IP_1> glued to hostname labels, which is exactly what
+		// the IPv4-label rule must NOT read as an address -- its address unit is a raw IPv4 or the
+		// pipeline's untagged <IP>, never ours. And its new output, a fused member in a list.
+		"resolver miss for https://<IP_1>.nip.io/x",
+		"peer worker-<IP_1>.<HOST_1> unreachable",
+		"peer db.<IP_1>.<HOST_1> down",
+		"dsn=mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db",
 	}
 	for _, s := range inert {
 		for _, d := range baseDetectors {
@@ -1251,6 +1258,14 @@ func TestHostListFixpoint(t *testing.T) {
 			return name(i)
 		}, ","},
 		{"empty items", name, ",,"},
+		// #54: a member that is an address inside a name reaches 9c already a whole tag, so it costs
+		// no pass, and the list re-anchors on it as it does on 8's.
+		{"address-label names between names", func(i int) string {
+			if i%2 == 0 {
+				return "10.0.0." + strconv.Itoa(i) + ".nip.io"
+			}
+			return name(i)
+		}, ","},
 	}
 	for _, sh := range shapes {
 		t.Run("terminates/"+sh.name, func(t *testing.T) {
@@ -1483,14 +1498,14 @@ func TestIssue66UnderscoreInHostname(t *testing.T) {
 // but Trigger.Raw, Trigger.Source and every context line reach Mask as raw text
 // (internal/llm/anonymizing.go), and that is most of a payload.
 //
-// The last case is the one that does NOT close, and it is here on purpose: one run shows both
-// what the fix reaches and what it does not. An IPv4 literal in a host label does exactly the
-// same thing, and it CANNOT be fixed the same way, because the two IPv4 cases want opposite
-// orders — https://10.0.0.5/x needs detector 8 to win (the address IS the authority, and the IP
-// tag is the product) while https://10.0.0.5.nip.io/x needs 9a to win (the address is a label
-// INSIDE the authority). No ordering of a linear chain satisfies both, because the right answer
-// depends on what the matched span is PART OF and the chain has no notion of that. Filed as
-// #54, with the impossibility carried as a result rather than left to be rediscovered.
+// An IPv4 literal in a host label did exactly the same thing, and it could NOT be fixed the same
+// way, because the two IPv4 cases want opposite orders — https://10.0.0.5/x needs detector 8 to
+// win (the address IS the authority, and the IP tag is the product) while
+// https://10.0.0.5.nip.io/x needs 9a to win (the address is a label INSIDE the authority). No
+// ordering of a linear chain satisfies both, because the right answer depends on what the matched
+// span is PART OF and the chain has no notion of that. That was filed as #54, with the
+// impossibility carried as a result, and it sat here as an open assertion until it was closed by a
+// rule rather than an order (TestIssue54IPv4LabelInHostname).
 func TestIssue48UUIDInHostname(t *testing.T) {
 	const uuid = "550e8400-e29b-41d4-a716-446655440000"
 
@@ -1531,16 +1546,185 @@ func TestIssue48UUIDInHostname(t *testing.T) {
 		})
 	}
 
-	// The negative half. This is an ASSERTION that the gap is still open, not a tolerated
-	// failure: when #54 is fixed this test goes red and is the reminder to update it.
-	t.Run("ipv4 label still open (#54)", func(t *testing.T) {
-		const in = "resolver miss for https://10.0.0.5.nip.io/x"
-		masked := mustMask(t, New(), in)
-		if !strings.Contains(masked, ".nip.io") {
-			t.Errorf("#54 appears to be fixed — update this test and the docs that call it open:\n"+
-				" in:  %q\n out: %q", in, masked)
+	// An IPv4 label sat here as #54, asserted open, until it was closed; it is
+	// TestIssue54IPv4LabelInHostname now.
+}
+
+// TestIssue54IPv4LabelInHostname is the named regression for #54, the half of #48 that ordering
+// could not reach. Detector 8 ran before every host rule, so an address that was a LABEL inside a
+// hostname was tagged <IP_n> on its own, and every host class excludes '<': the host rules were
+// blocked or truncated and the rest of the name went to the configured model endpoint.
+// https://10.0.0.5.nip.io/x sent ".nip.io", worker-10.0.0.5.corp.internal sent "worker-", and as a
+// later member of a host list the mixed member ended the list and sent every member after it. Mask
+// returned nil and residue() returned "": the host rules are verify:false, and the leftover is not
+// a shape any of them matches. v0.4.0 onward.
+//
+// Running 9a first is not the answer, and that is the impossibility #48 recorded:
+// https://10.0.0.5/x must keep coming back <IP_1>. The fix is a MORE SPECIFIC rule, not a new
+// order: one that matches only an address joined to hostname labels across '.' or '-', and so
+// never an address that stands alone. Every address 8 masked whole before, it still does.
+//
+// The Template field was NOT safe either. There the address is the pipeline's <IP>, and the
+// tolerant host runs step over it in a URL or on a private suffix -- but a bare name on a public
+// suffix is no host rule's business, so "resolve <IP>.nip.io failed" sent ".nip.io".
+func TestIssue54IPv4LabelInHostname(t *testing.T) {
+	closed := []struct {
+		name, in, want, tmpl string
+		sent                 []string // what main sent; none may survive in either output
+	}{
+		// The issue's shapes and the comment's later member.
+		{"url, public suffix", "resolver miss for https://10.0.0.5.nip.io/x",
+			"resolver miss for https://<HOST_1>/x", "resolver miss for https://<HOST_1>/x", []string{"nip.io", "10.0.0.5"}},
+		{"bare, private suffix", "peer worker-10.0.0.5.corp.internal unreachable",
+			"peer <HOST_1> unreachable", "peer <HOST_1> unreachable", []string{"worker-", "corp.internal"}},
+		// 9d runs before 9a, so the fused member is HOST_1 and the members around it number after it.
+		{"later member of a host list", "mongodb://h1,10.0.0.5.nip.io,host3/db",
+			"mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db", "mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db",
+			[]string{"nip.io", "host3", "h1"}},
+		{"later member with ports", "mongodb://h1,10.0.0.5.nip.io:27017,host3:27017/db",
+			"mongodb://<HOST_2>,<HOST_1>:27017,<HOST_3>:27017/db", "mongodb://<HOST_2>,<HOST_1>:<NUM>,<HOST_3>:<NUM>/db",
+			[]string{"nip.io", "host3", "h1"}},
+		{"first member of a host list", "mongodb://10.0.0.5.nip.io,host2/db",
+			"mongodb://<HOST_1>,<HOST_2>/db", "mongodb://<HOST_1>,<HOST_2>/db", []string{"nip.io", "host2"}},
+		// No scheme and a public suffix: on the Template field too, where no host rule reached it.
+		{"bare, public suffix", "resolve 10.0.0.5.nip.io failed",
+			"resolve <HOST_1> failed", "resolve <HOST_1> failed", []string{"nip.io"}},
+		{"url with a port", "https://10.0.0.5.nip.io:8443/x",
+			"https://<HOST_1>:8443/x", "https://<HOST_1>:<NUM>/x", []string{"nip.io"}},
+		{"credentialed dsn", "postgres://u:p@10.0.0.5.nip.io/db",
+			"postgres://<TOKEN_1>@<HOST_1>/db", "postgres://<TOKEN_1>@<HOST_1>/db", []string{"nip.io", "u:p"}},
+		// The address as label 2: main masked "api." as a host and sent the rest.
+		{"url, address as label 2", "https://api.10.0.0.5.nip.io/x",
+			"https://<HOST_1>/x", "https://<HOST_1>/x", []string{"api", "nip.io"}},
+		{"bare, address as label 2", "peer api.10.0.0.5.nip.io down",
+			"peer <HOST_1> down", "peer <HOST_1> down", []string{"api", "nip.io"}},
+		// The address last before a private suffix: 9b took the suffix and sent the label before.
+		{"bare, address before a private suffix", "peer db.10.0.0.5.corp.internal down",
+			"peer <HOST_1> down", "peer <HOST_1> down", []string{"db.", "corp.internal"}},
+		{"url, address before a private suffix", "https://db.10.0.0.5.corp.internal/x",
+			"https://<HOST_1>/x", "https://<HOST_1>/x", []string{"db.", "corp.internal"}},
+		{"hyphen after the address", "https://10.0.0.5-lb.acme.com/x",
+			"https://<HOST_1>/x", "https://<HOST_1>/x", []string{"lb.acme.com"}},
+		{"two addresses in one name", "x 10.0.0.5.10.0.0.6.nip.io y",
+			"x <HOST_1> y", "x <HOST_1> y", []string{"nip.io", "10.0.0.6"}},
+		{"mixed case", "https://10.0.0.5.NIP.IO/x", "https://<HOST_1>/x", "https://<HOST_1>/x", []string{"NIP.IO"}},
+		// A sentence dot after a fused name stays outside it, as it does after a bare address.
+		{"sentence dot after the name", "reached api.10.0.0.5.nip.io.",
+			"reached <HOST_1>.", "reached <HOST_1>.", []string{"api", "nip.io"}},
+		// The same with text after the dot. At the end of the text a rule that ate the dot would tie
+		// on length with one that leaves it as context; here eating it is longer, so this row is the
+		// one that tells them apart.
+		{"sentence dot, then a space", "reached api.10.0.0.5.nip.io. Retrying",
+			"reached <HOST_1>. Retrying", "reached <HOST_1>. Retrying", []string{"api", "nip.io"}},
+		// The address alone elsewhere on the line keeps its own tag and numbering.
+		{"an address beside the name", "https://10.0.0.5.nip.io/x from 10.0.0.6",
+			"https://<HOST_1>/x from <IP_1>", "https://<HOST_1>/x from <IP>", []string{"nip.io"}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				m := New()
+				got := mustMask(t, m, p.in)
+				if got != p.want {
+					t.Errorf("address in a hostname not masked as part of it:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+				for _, frag := range c.sent {
+					if strings.Contains(got, frag) {
+						t.Errorf("a fragment main sent survived: %q still in %q", frag, got)
+					}
+				}
+				if r := m.Restore(got); r != p.in {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", p.in, r)
+				}
+			}
+		})
+	}
+
+	// Byte-identical with main, raw and templatized. An address that IS the authority, or stands
+	// alone in prose with a port, a prefix length or a sentence dot, is still 8's. So is one beside
+	// text that is not a name: a run with no letter outside the address (a BSD netstat port, a
+	// range) is not a DNS name, whose top label is alphabetic. A partial octet is no address, and
+	// an address glued to a word with no separator is 9a's whole host, as before.
+	same := []struct{ name, in, want, tmpl string }{
+		{"the address is the authority", "https://10.0.0.5/x", "https://<IP_1>/x", "https://<HOST_1>/x"},
+		{"address and port", "connect 10.0.0.5:8080 refused", "connect <IP_1>:8080 refused", "connect <IP>:<NUM> refused"},
+		{"sentence dot", "connected to 10.0.0.5.", "connected to <IP_1>.", "connected to <IP>."},
+		{"sentence dot, then a space", "connected to 10.0.0.5. Retrying", "connected to <IP_1>. Retrying", "connected to <IP>. Retrying"},
+		{"prefix length", "route 10.0.0.5/24 added", "route <IP_1>/24 added", "route <IP>/<NUM> added"},
+		{"address in prose", "peer 10.0.0.5 down", "peer <IP_1> down", "peer <IP> down"},
+		{"address as a list member (#67)", "mongodb://h1,10.0.0.5,host3/db",
+			"mongodb://<HOST_1>,<IP_1>,<HOST_2>/db", "mongodb://<HOST_1>,<HOST_2>,<HOST_3>/db"},
+		{"bsd netstat address.port", "tcp 10.0.0.5.443 ESTABLISHED", "tcp <IP_1>.443 ESTABLISHED", "tcp <IP>.<NUM> ESTABLISHED"},
+		{"range, numeric end", "scan 10.0.0.5-20 done", "scan <IP_1>-20 done", "scan <IP><NUM> done"},
+		{"range of two addresses", "scan 10.0.0.5-10.0.0.9 done", "scan <IP_1>-<IP_2> done", "scan <IP>-<IP> done"},
+		{"partial octet", "https://x10.0.0.5.nip.io/x", "https://<HOST_1>/x", "https://<HOST_1>/x"},
+	}
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a shape outside #54 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+	// A partial octet on the raw line: no address, so no rule reads it, exactly as on main. (The
+	// pipeline does not validate octets, so on the Template field it is "worker-<IP>", which is
+	// TestAcceptedOverMasking's "word glued before an address" row, masked whole now.)
+	if got := mustMask(t, New(), "peer worker-10.0.0.256 down"); got != "peer worker-10.0.0.256 down" {
+		t.Errorf("a partial octet moved: %q", got)
+	}
+
+	// Pinned, not targeted: the class's other inner tag. A host label that literally IS an access key
+	// is the sweep's "theoretical" cell, and the same key as a later list member is #57's shape. Both
+	// keep main's output; they are here so a change to either shows up as a diff.
+	pinned := []struct{ name, in, want, tmpl string }{
+		{"key-shaped host label (theoretical)", "https://AKIAIOSFODNN7EXAMPLE.prod.acme.com/x",
+			"https://<TOKEN_1>.prod.acme.com/x", "https://<TOKEN_1>.prod.acme.com/x"},
+		{"key-shaped later member (#57)", "mongodb://h1,AKIAIOSFODNN7EXAMPLE.prod,host3/db",
+			"mongodb://<HOST_1>,<TOKEN_1>.prod,host3/db", "mongodb://<HOST_1>,<TOKEN_1>.prod,host<NUM>/db"},
+	}
+	for _, c := range pinned {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a pinned shape moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// The name is ONE value: it recurs under one placeholder across the request, as a list member
+	// and in a URL, and the address on its own is a different value with its own tag.
+	t.Run("the name recurs under one placeholder", func(t *testing.T) {
+		m := New()
+		mustMask(t, m, "mongodb://h1,10.0.0.5.nip.io,host3/db")
+		for _, c := range []struct{ in, want string }{
+			{"dial https://10.0.0.5.nip.io/x failed", "dial https://<HOST_1>/x failed"},
+			{"resolve 10.0.0.5.nip.io failed", "resolve <HOST_1> failed"},
+			{"peer 10.0.0.5 down", "peer <IP_1> down"},
+		} {
+			if got := mustMask(t, m, c.in); got != c.want {
+				t.Errorf("recurrence:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+		}
+		if got := m.Restore("<HOST_1>"); got != "10.0.0.5.nip.io" {
+			t.Errorf("Restore(<HOST_1>) = %q, want the whole name", got)
 		}
 	})
+
+	// residue() needs no change, and these two say why. The old leftover reads as clean, so the fix
+	// lives in the chain; and a RAW address left inside a name -- the new rule missing it -- is still
+	// caught by detector 8 and mutes the escalation, exactly as on main.
+	if tag := New().residue("https://<IP_1>.nip.io/x"); tag != "" {
+		t.Errorf("residue() sees the old leftover as %q; the claim in the comment above is wrong", tag)
+	}
+	if tag := New().residue("https://10.0.0.5.nip.io/x"); tag != tagIP {
+		t.Errorf("a raw address inside a name no longer mutes: residue = %q, want %q", tag, tagIP)
+	}
 }
 
 // TestUUIDOutsideAHostKeepsItsOwnTag is the other half of #48's tag change, and it is not
@@ -1907,6 +2091,12 @@ var completenessRows = []completenessRow{
 		"," + phMark + "my_db_3" + phMark + "/db"},
 	{"bare-host/underscore", "peer ", "db_primary.corp.internal", " down"},
 	{"email/underscore-domain", "mail to ", "user@my_host.example.com", " bounced"},
+	// #54. An IPv4 address that is a LABEL inside a hostname: detector 8 tagged it alone and every
+	// host rule was blocked behind the tag. After the canonical rows, for the same reason as the #48
+	// rows. Flush at both ends: a path, a port, a space.
+	{"url-host/ipv4-label", "call https://", "10.0.0.5.nip.io", "/x"},
+	{"url-host/ipv4-label/label-2", "call https://", "api.10.0.0.5.nip.io", ":8443/x"},
+	{"bare-host/ipv4-label", "peer ", "worker-10.0.0.5.corp.internal", " down"},
 	{"home-dir", "loaded from /home/", "maxie", "/go/pkg/mod"},
 }
 
@@ -2130,6 +2320,23 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// instance, and it is a cost to TRIAGE rather than to a restatement: the model is told an
 		// address started, not which unit did.
 		{"systemd template unit read as an email", "Started backup@nightly.service", "Started <EMAIL_1>"},
+		// #54's costs. The IPv4-label rule fuses an address with text joined to it by '.' or '-'
+		// whenever that text carries a letter, because a name's top label is alphabetic and nothing
+		// cheaper tells a name from a word glued to an address. Each row was <IP_1> plus the glued
+		// text in the clear before; now the address and the text are one HOST placeholder, so the
+		// model is told "a host" where the value was an address beside a word. Nothing is sent that
+		// was masked before, and Restore is exact.
+		{"file name carrying an address", "dump-10.0.0.5.log written", "<HOST_1> written"},
+		{"missing space after a sentence dot", "connected to 10.0.0.5.Retrying", "connected to <HOST_1>"},
+		{"word glued before an address", "peer worker-10.0.0.5 down", "peer <HOST_1> down"},
+		// A four-part version with a pre-release tag was already an address (<IP_1>-beta, an
+		// over-mask inherited from detector 8); it is a host now.
+		{"version string with a pre-release tag", "release 1.2.3.4-beta", "release <HOST_1>"},
+		// A reverse-DNS name is a real name, and it is masked whole; main sent ".in-addr.arpa" beside
+		// the reversed address. Here because the tag moves, not because anything leaked. It was the
+		// only shape that changed when this rule ran over one laptop's journal (70,783 records): ten
+		// records, raw and templatized alike, all of them names like this one.
+		{"reverse-dns name", "PTR 5.0.0.10.in-addr.arpa", "PTR <HOST_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -2246,6 +2453,13 @@ var templatizedRows = []templatizedRow{
 	{"url-host/list-rest/underscore", "dsn=mongodb://\x00host1\x00,\x00host_2\x00/db"},
 	{"bare-host/underscore", "host \x00db_primary01.corp.internal\x00 failed"},
 	{"email/underscore-domain", "mail to \x00ops@my_host7.example.com\x00 bounced"},
+	// #54 through the composition. The address collapses to the pipeline's <IP>, which the tolerant
+	// host runs already stepped over in a URL and on a private suffix -- the third row is green
+	// before and after, as #48's was. A bare name on a public suffix was no host rule's business, so
+	// the first two sent the labels around <IP> on the Template field too.
+	{"bare-host/ipv4-label/public-suffix", "resolve \x0010.0.0.5.nip.io\x00 failed"},
+	{"bare-host/ipv4-label/label-2", "peer \x00api.10.0.0.5.nip.io\x00 down"},
+	{"url-host/ipv4-label", "call https://\x00api.10.0.0.5.nip.io\x00/x"},
 	{"home-dir/middle-digit", "loaded from /home/\x00deploy2prod\x00/go/pkg/mod"},
 	{"home-dir/middle-digit-users", "path /Users/\x00jane7doe\x00/app.log missing"},
 	// The four widened at 2da31be, now held to completeness rather than to "a token appeared".
