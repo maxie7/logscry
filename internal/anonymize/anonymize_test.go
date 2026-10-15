@@ -1611,6 +1611,11 @@ func TestIssue54IPv4LabelInHostname(t *testing.T) {
 		// A sentence dot after a fused name stays outside it, as it does after a bare address.
 		{"sentence dot after the name", "reached api.10.0.0.5.nip.io.",
 			"reached <HOST_1>.", "reached <HOST_1>.", []string{"api", "nip.io"}},
+		// The same with text after the dot. At the end of the text a rule that ate the dot would tie
+		// on length with one that leaves it as context; here eating it is longer, so this row is the
+		// one that tells them apart.
+		{"sentence dot, then a space", "reached api.10.0.0.5.nip.io. Retrying",
+			"reached <HOST_1>. Retrying", "reached <HOST_1>. Retrying", []string{"api", "nip.io"}},
 		// The address alone elsewhere on the line keeps its own tag and numbering.
 		{"an address beside the name", "https://10.0.0.5.nip.io/x from 10.0.0.6",
 			"https://<HOST_1>/x from <IP_1>", "https://<HOST_1>/x from <IP>", []string{"nip.io"}},
@@ -2328,7 +2333,9 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// over-mask inherited from detector 8); it is a host now.
 		{"version string with a pre-release tag", "release 1.2.3.4-beta", "release <HOST_1>"},
 		// A reverse-DNS name is a real name, and it is masked whole; main sent ".in-addr.arpa" beside
-		// the reversed address. Here because the tag moves, not because anything leaked.
+		// the reversed address. Here because the tag moves, not because anything leaked. It was the
+		// only shape that changed when this rule ran over one laptop's journal (70,783 records): ten
+		// records, raw and templatized alike, all of them names like this one.
 		{"reverse-dns name", "PTR 5.0.0.10.in-addr.arpa", "PTR <HOST_1>"},
 	}
 	for _, c := range cases {
