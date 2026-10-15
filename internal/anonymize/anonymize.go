@@ -741,8 +741,12 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     MySQL, libpq and Sentinel all write -- is masked by this rule up to the first port colon
 		//     or comma and by 9c from there; see 9c for why the rest of the list is a second rule and
 		//     not a wider class here.
+		//     THE SCHEME IS schemeAnchor, shared with 9c, and since #52 it reads a scheme the pipeline
+		//     damaged (s<NUM>://) and one glued to '_' or a digit (x_https://, 2https://). Until then
+		//     both rules carried their own copy of \b[a-z][a-z0-9+.-]*://, and #43 widened the host
+		//     group beside it without touching it -- see schemeAnchor.
 		{tagHost, mustLongest(
-			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/\s]*@)?(` + hostRun + `)`), 1, false, false},
+			`(?i)` + schemeAnchor + `(?:[^/\s]*@)?(` + hostRun + `)`), 1, false, false},
 		// 9c. Hosts 2..n of a comma-separated authority (#61). Runs after 9a, whose tag on the first
 		//     member is its context, and BEFORE 9b and 6, both measured: after 9b a later member on a
 		//     private suffix carried 9b's own tag and blocked the group ("h1.acme.com,h2.corp.internal,
@@ -774,8 +778,9 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     a companion, because a companion's no-match is today's behaviour -- and that is the durable
 		//     result here: disambiguating trailing context is affordable only on a rule whose failure is
 		//     the status quo. (Two capture groups on 9a would need `group int` to become a list, and
-		//     relaxing 9a's anchor to a bare "://" would close #52 by dropping the anchor rather than
-		//     making it tolerant; neither is done.)
+		//     relaxing 9a's anchor to a bare "://" would have closed #52 by dropping the anchor rather
+		//     than making it tolerant; neither was done, and #52 was closed by making it tolerant --
+		//     see schemeAnchor.)
 		//
 		//     ONE MEMBER PER MATCH, RE-APPLIED UNTIL NOTHING CHANGES (#67). Until #67 the group was hosts
 		//     2..n as one run, and that run excludes '<' -- the inertness invariant -- so a tag minted on a
@@ -791,7 +796,8 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     re-anchor on it rather than to undo it, and #54's pre-pass is not needed for it.
 		//
 		//     THE SHAPE OF THE RULE, part by part.
-		//       anchor and userinfo skip: 9a's, verbatim, so the two rules read one string one way.
+		//       anchor and userinfo skip: 9a's -- schemeAnchor, one definition since #52 -- so the two
+		//                                 rules read one string one way.
 		//       member 1, context:        a raw host run or a taggedMember. Derived by walking the chain:
 		//                                 before 9c runs a tag can land on member 1 from 7 and 8 (an
 		//                                 address literal), from 9a, from 1/2/3b only when a host literally
@@ -842,7 +848,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     verify:false, for the same reason 9a and 9b are: a missed list member must not mute an
 		//     otherwise-safe escalation.
 		{tagHost, mustLongest(
-			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/\s]*@)?` +
+			`(?i)` + schemeAnchor + `(?:[^/\s]*@)?` +
 				`(?:` + hostRun + `|` + taggedMember + `)(?:` + hostPort + `)?,+` +
 				`(?:` + taggedMember + `(?:` + hostPort + `)?,+)*` +
 				`(` + hostRun + `)(?:` + hostPort + `)?` + listEnd), 1, false, true},
@@ -912,6 +918,10 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 // the REAL Templatize → Mask composition — see TestEveryUncollapsedDetectorHasATemplatizedRow,
 // which re-derives the exemptions from the templatizer itself every run.
 //
+// #52 ADDED THE OTHER HALF: the rule covers a detector's ANCHORS, not only its group. 9a's scheme
+// was context, so the group checks above it were green while s3:// templatized to s<NUM>:// and the
+// host was sent; TestEveryDetectorsContextSurvivesTemplating asks the question of every context.
+//
 // This does not weaken the inertness invariant, but the argument for it is now in two parts
 // rather than one, because five of the nine carry no distinctive prefix to lean on:
 //
@@ -948,6 +958,32 @@ const ourPH = `<[A-Z]+_\d+>`
 // token Restore never finds; TestEveryTagMintsARestorableToken reads the tags from the detector
 // tables so such a tag cannot be added unnoticed.
 var ourPHRe = regexp.MustCompile(ourPH)
+
+// schemeAnchor is the URL scheme as 9a and 9c find it: a letter, then scheme characters or pipeline
+// placeholders, then "://". It is CONTEXT for both rules, never group, and it is ONE definition
+// because two copies of it were how it was missed (#52). TestSchemeAnchorIsShared holds both rules
+// to it.
+//
+// THE RUN IS TOLERANT. #43 made every detector's GROUP read the pipeline's placeholders and left
+// this anchor alone, so a scheme with a digit -- s3, h2 -- templatized to s<NUM>:// and both rules
+// went quiet on the Template field: url=s<NUM>://<TOKEN_1>:<TOKEN_2>@bucket sent "bucket". A
+// detector's tolerance has to cover its anchors, not only its group, and
+// TestEveryDetectorsContextSurvivesTemplating now checks that for every detector's context. The
+// leading letter needs none: a scheme begins with one, and the pipeline never replaces a lone letter.
+//
+// THERE IS NO LEADING ASSERTION, and that was argued rather than dropped. Leftmost-longest already
+// starts a scheme at the earliest letter whose run reaches "://", so a letter before a scheme is part
+// of it -- "xhttps" is a scheme, as it always was. What the old \b refused was only a start after a
+// '_' or after a digit no earlier letter reaches, and both were leaks: x_https://acme.com/x and
+// __https://acme.com__ were sent whole, and 2https://acme.com/x was sent on the raw line while its
+// template, <NUM>https://, was masked. With no assertion the anchor is (?:^|[^a-z]) in effect, and
+// nothing that may legally precede a scheme is refused. "foo_bar://" reads as scheme "bar"; it is
+// not a legal scheme either way, and masking the host behind it is the safe reading.
+//
+// What it does not reach is a scheme inside one of OUR tags: "Bearer https://acme.com/x" gives 3a
+// the scheme as a token, "<TOKEN_1>://acme.com/x", and no letter is left. That is interference, not
+// templating, and it is a cell of the authority audit (#65).
+const schemeAnchor = `[a-z](?:[a-z0-9+.-]|` + pipelinePH + `)*://`
 
 // hostRun is one host as 9a and 9c read it: a run of hostname characters, placeholder-tolerant
 // for the Template field. One definition, so that "a host" cannot drift between the two rules.

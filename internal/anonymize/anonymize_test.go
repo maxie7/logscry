@@ -478,6 +478,11 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"peer worker-<IP_1>.<HOST_1> unreachable",
 		"peer db.<IP_1>.<HOST_1> down",
 		"dsn=mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db",
+		// #52's new outputs fed back: the scheme anchor admits a pipeline placeholder inside the
+		// scheme and anything before it, and the group behind it must still refuse our own tags.
+		"see x_https://<HOST_1>/x",
+		"url=s<NUM>://<TOKEN_1>:<TOKEN_2>@<HOST_1>",
+		"mongodb://<HOST_1>,<HOST_3>_x://<HOST_2>",
 	}
 	for _, s := range inert {
 		for _, d := range baseDetectors {
@@ -1449,8 +1454,10 @@ func TestIssue66UnderscoreInHostname(t *testing.T) {
 		// The one place widening would NARROW. A member in scheme position fails 9c's "://"
 		// rejection, so the group shrinks to end at a terminator; '_' stays one, and "h2" stays
 		// masked. Were '_' a host character there, no shorter member could end legally and h2 would
-		// be sent. What follows the "://" is #52's class (the scheme anchor), not this one.
-		{"member in scheme position", "mongodb://h1,h2_x://y", "mongodb://<HOST_1>,<HOST_2>_x://y"},
+		// be sent. What follows the "://" was #52's class (the scheme anchor), and the one change to
+		// this row since: the anchor recognises "x://" after the '_' now, so "y" is masked as well
+		// (9a runs first, hence <HOST_2>) -- while h2 stays masked, which is what the row guards.
+		{"member in scheme position", "mongodb://h1,h2_x://y", "mongodb://<HOST_1>,<HOST_3>_x://<HOST_2>"},
 		// No scheme and no private suffix: prose, by design.
 		{"no scheme, by design", "bootstrap=my_host:9092", "bootstrap=my_host:9092"},
 		{"bare public host, by design", "could not reach my_host.example.com", "could not reach my_host.example.com"},
@@ -1724,6 +1731,166 @@ func TestIssue54IPv4LabelInHostname(t *testing.T) {
 	}
 	if tag := New().residue("https://10.0.0.5.nip.io/x"); tag != tagIP {
 		t.Errorf("a raw address inside a name no longer mutes: residue = %q, want %q", tag, tagIP)
+	}
+}
+
+// TestIssue52SchemeAnchor is the named regression for #52. 9a and 9c find a URL by its scheme,
+// `\b[a-z][a-z0-9+.-]*://`, and that anchor is CONTEXT -- outside the group -- so #43, which made
+// every group tolerant of the pipeline's placeholders, never touched it. It failed two ways:
+//
+//   - On the Template field a scheme with a digit templatizes to s<NUM>://, the scheme run could
+//     not step over the placeholder, and the rule went quiet: url=s<NUM>://<TOKEN_1>:<TOKEN_2>@bucket
+//     sent "bucket". The raw line was fine.
+//   - On the raw line \b fails before a scheme glued to '_', a word character:
+//     x_https://acme.com/x and __https://acme.com__ were sent whole. So was 2https://acme.com/x,
+//     where \b fails after the digit -- on the raw line only, since the digit is <NUM> in the
+//     template and \b holds after its '>'.
+//
+// Credentials were never affected: detector 4 anchors on a bare "://". Only hosts were sent. The
+// lesson the issue drew is the one TestEveryDetectorsContextSurvivesTemplating now enforces: a
+// detector's tolerance must cover its anchors, not only its group.
+func TestIssue52SchemeAnchor(t *testing.T) {
+	closed := []struct {
+		name, in, want, tmpl string
+		sent                 []string // what main sent on one path or both; none may survive
+	}{
+		// The issue's shapes: a digit in the scheme, the host on a PUBLIC suffix so 9b cannot rescue it.
+		{"digit scheme", "get s3://bucket.example.com/key failed",
+			"get s3://<HOST_1>/key failed", "get s<NUM>://<HOST_1>/key failed", []string{"bucket", "example.com"}},
+		{"digit scheme, credential, bare host", "url=s3://AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMIKauth@bucket",
+			"url=s3://<TOKEN_1>:<TOKEN_2>@<HOST_1>", "url=s<NUM>://<TOKEN_1>:<TOKEN_2>@<HOST_1>", []string{"bucket"}},
+		{"digit scheme, credential, public suffix", "url=s3://AKIAIOSFODNN7EXAMPLE:secret@bucket.example.com/x",
+			"url=s3://<TOKEN_1>:<TOKEN_2>@<HOST_1>/x", "url=s<NUM>://<TOKEN_1>:<TOKEN_2>@<HOST_1>/x",
+			[]string{"bucket", "example.com", "secret"}},
+		{"digit scheme, plain userinfo", "s3://u:p@bucket.example.com/x",
+			"s3://<TOKEN_1>@<HOST_1>/x", "s<NUM>://<TOKEN_1>@<HOST_1>/x", []string{"bucket", "u:p"}},
+		{"h2 scheme", "dial h2://api.acme.com/x", "dial h2://<HOST_1>/x", "dial h<NUM>://<HOST_1>/x", []string{"acme.com"}},
+		// 9c reads the same anchor: a digit-scheme host list went quiet as a whole. Members that
+		// templatize alike come back as one placeholder, as they always have.
+		{"digit scheme host list", "s3://h1,h2,h3/x",
+			"s3://<HOST_1>,<HOST_2>,<HOST_3>/x", "s<NUM>://<HOST_1>,<HOST_1>,<HOST_1>/x", []string{"h1", "h2", "h3"}},
+		{"digit scheme host list, dotted members", "s3://h1.acme.com,h2.acme.com,h3.acme.com/x",
+			"s3://<HOST_1>,<HOST_2>,<HOST_3>/x", "s<NUM>://<HOST_1>,<HOST_1>,<HOST_1>/x", []string{"acme.com"}},
+		// A '_' before the scheme, on both paths. The trailing "__" goes into the host, which is
+		// #66's pinned trailing-'_' cost, not a new one.
+		{"underscore before the scheme", "see x_https://acme.com/x",
+			"see x_https://<HOST_1>/x", "see x_https://<HOST_1>/x", []string{"acme.com"}},
+		{"markdown bold", "__https://acme.com__", "__https://<HOST_1>", "__https://<HOST_1>", []string{"acme.com"}},
+		{"identifier before the scheme", "svc_https://acme.com/x",
+			"svc_https://<HOST_1>/x", "svc_https://<HOST_1>/x", []string{"acme.com"}},
+		// A snake_case "scheme" is not a legal one; its last run after the '_' is read as the scheme,
+		// and the host behind it is masked.
+		{"snake_case scheme", "foo_bar://acme.com/x", "foo_bar://<HOST_1>/x", "foo_bar://<HOST_1>/x", []string{"acme.com"}},
+		{"digit and underscore before the scheme", "x9_https://acme.com/x",
+			"x9_https://<HOST_1>/x", "x<NUM>_https://<HOST_1>/x", []string{"acme.com"}},
+		// A digit before the scheme: sent on the raw line, masked in the template. Both paths agree now.
+		{"digit before the scheme", "2https://acme.com/x", "2https://<HOST_1>/x", "<NUM>https://<HOST_1>/x", []string{"acme.com"}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				m := New()
+				got := mustMask(t, m, p.in)
+				if got != p.want {
+					t.Errorf("url host not masked:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+				for _, frag := range c.sent {
+					if strings.Contains(got, frag) {
+						t.Errorf("a fragment main sent survived: %q still in %q", frag, got)
+					}
+				}
+				if r := m.Restore(got); r != p.in {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", p.in, r)
+				}
+			}
+		})
+	}
+
+	// Byte-identical with main, raw and templatized. A letter before a scheme is part of the
+	// scheme -- "xhttps" -- which is how it was always read, and the punctuation that ordinarily
+	// wraps a URL never stopped the anchor. k8s:// is the accident worth naming: in the template it
+	// was masked on main only because the anchor restarted at the 's' after <NUM>, reading the
+	// scheme as "s"; it reads as k<NUM>s now, and the output is the same. Scheme-like words in prose
+	// with no "://" are no one's business.
+	same := []struct{ name, in, want, tmpl string }{
+		{"the address is the authority", "https://10.0.0.5/x", "https://<IP_1>/x", "https://<HOST_1>/x"},
+		{"start of text", "https://acme.com/x", "https://<HOST_1>/x", "https://<HOST_1>/x"},
+		{"letter before the scheme", "xhttps://acme.com/x", "xhttps://<HOST_1>/x", "xhttps://<HOST_1>/x"},
+		{"parentheses", "(https://acme.com/x)", "(https://<HOST_1>/x)", "(https://<HOST_1>/x)"},
+		{"double quotes", `"https://acme.com/x"`, `"https://<HOST_1>/x"`, "<STR>"},
+		{"angle brackets", "<https://acme.com/x>", "<https://<HOST_1>/x>", "<https://<HOST_1>/x>"},
+		{"k8s scheme", "ctx k8s://cluster.acme.com/ns", "ctx k8s://<HOST_1>/ns", "ctx k<NUM>s://<HOST_1>/ns"},
+		{"scheme-like words in prose", "the s3 bucket and h2 frames over https",
+			"the s3 bucket and h2 frames over https", "the s<NUM> bucket and h<NUM> frames over https"},
+		{"scheme-like key in prose", "proto=s3 host=bucket.example.com",
+			"proto=s3 host=bucket.example.com", "proto=s<NUM> host=bucket.example.com"},
+		{"comma-separated urls", "peers=https://a.com,https://b.com",
+			"peers=https://<HOST_1>,https://<HOST_2>", "peers=https://<HOST_1>,https://<HOST_2>"},
+		{"plus in the scheme", "git+ssh://git@github.com/org/repo.git",
+			"git+ssh://<TOKEN_1>@<HOST_1>/org/repo.git", "git+ssh://<TOKEN_1>@<HOST_1>/org/repo.git"},
+		{"plus in a host-list scheme", "redis+sentinel://h1:26379,h2:26379/0",
+			"redis+sentinel://<HOST_1>:26379,<HOST_2>:26379/0", "redis+sentinel://<HOST_1>:<NUM>,<HOST_1>:<NUM>/<NUM>"},
+	}
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a shape outside #52 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// Pinned, not targeted: 3a's cell from #54's sweep. With nothing between "Bearer " and a URL, 3a
+	// takes the SCHEME as the token, and 9a finds "://" with no scheme letter before it, so the host
+	// is sent on both paths. The scheme is inside OUR tag here, not the pipeline's, so a run tolerant
+	// of the pipeline's placeholders cannot reach it; reading our own tag as a scheme would be an
+	// interference fix, not this one. Recorded as a cell of the authority audit (#65).
+	t.Run("bearer before a url (#65)", func(t *testing.T) {
+		const in, want = "Bearer https://acme.com/x", "Bearer <TOKEN_1>://acme.com/x"
+		tIn, _ := pipeline.Templatize(in)
+		for _, p := range []string{in, tIn} {
+			if got := mustMask(t, New(), p); got != want {
+				t.Errorf("a pinned shape moved:\n in:   %q\n got:  %q\n want: %q", p, got, want)
+			}
+		}
+	})
+
+	// residue() needs no change: 9a and 9c stay verify:false, and the old leftover reads as clean.
+	if tag := New().residue("url=s<NUM>://<TOKEN_1>:<TOKEN_2>@bucket"); tag != "" {
+		t.Errorf("residue() sees the old leftover as %q; the claim in the comment above is wrong", tag)
+	}
+}
+
+// TestSchemeAnchorIsShared holds 9a and 9c to ONE scheme anchor. Two copies of it are how #52 was
+// missed: each rule carried its own \b[a-z][a-z0-9+.-]*://, and #43 widened the groups beside them.
+// Exactly two rules compile schemeAnchor -- the URL host and the host list -- and no rule spells the
+// scheme class out on its own, in the default set or with extra suffixes.
+func TestSchemeAnchorIsShared(t *testing.T) {
+	const schemeClass = `[a-z0-9+.-]`
+	for _, dets := range [][]detector{baseDetectors, buildDetectors([]string{"example"})} {
+		users, fixpoint := 0, 0
+		for i, d := range dets {
+			src := d.re.String()
+			if rest := strings.ReplaceAll(src, schemeAnchor, ""); strings.Contains(rest, schemeClass) {
+				t.Errorf("detector %d (%s) spells out its own scheme class instead of using schemeAnchor:\n pattern: %s", i, d.tag, src)
+			}
+			if !strings.Contains(src, schemeAnchor) {
+				continue
+			}
+			users++
+			if d.fixpoint {
+				fixpoint++
+			}
+			if d.tag != tagHost || d.group != 1 || d.verify {
+				t.Errorf("an unexpected rule uses schemeAnchor: detector %d, tag %s, group %d, verify %v", i, d.tag, d.group, d.verify)
+			}
+		}
+		if users != 2 || fixpoint != 1 {
+			t.Errorf("%d rules use schemeAnchor (%d of them iterating); want 9a and 9c, exactly one iterating", users, fixpoint)
+		}
 	}
 }
 
@@ -2097,7 +2264,13 @@ var completenessRows = []completenessRow{
 	{"url-host/ipv4-label", "call https://", "10.0.0.5.nip.io", "/x"},
 	{"url-host/ipv4-label/label-2", "call https://", "api.10.0.0.5.nip.io", ":8443/x"},
 	{"bare-host/ipv4-label", "peer ", "worker-10.0.0.5.corp.internal", " down"},
+	// #52. A scheme with a digit in it: masked on the raw line, and the row exists for
+	// TestEveryDetectorsContextSurvivesTemplating, for which the '3' is a context digit -- the shape
+	// whose templatized form silenced 9a.
+	{"url-host/digit-scheme", "get s3://", "bucket.example.com", "/key failed"},
 	{"home-dir", "loaded from /home/", "maxie", "/go/pkg/mod"},
+	// The home-dir rule's second literal, so the context check proves it digit-free as well.
+	{"home-dir/users", "path /Users/", "jane", "/app.log"},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -2460,6 +2633,13 @@ var templatizedRows = []templatizedRow{
 	{"bare-host/ipv4-label/public-suffix", "resolve \x0010.0.0.5.nip.io\x00 failed"},
 	{"bare-host/ipv4-label/label-2", "peer \x00api.10.0.0.5.nip.io\x00 down"},
 	{"url-host/ipv4-label", "call https://\x00api.10.0.0.5.nip.io\x00/x"},
+	// #52 through the composition. A digit in the SCHEME templatizes to s<NUM>://, and the scheme
+	// anchor -- context, outside every group -- could not step over it, so 9a and 9c went quiet and
+	// the host was sent. The host is on a public suffix so 9b cannot rescue it.
+	{"url-host/digit-scheme", "get s3://\x00bucket.example.com\x00/key failed"},
+	{"url-host/digit-scheme/credential",
+		"url=s3://\x00AKIAIOSFODNN7EXAMPLE\x00:\x00secret\x00@\x00bucket.example.com\x00/x"},
+	{"url-host/list-rest/digit-scheme", "dsn=s3://\x00h1.acme.com\x00,\x00h2.acme.com\x00/x"},
 	{"home-dir/middle-digit", "loaded from /home/\x00deploy2prod\x00/go/pkg/mod"},
 	{"home-dir/middle-digit-users", "path /Users/\x00jane7doe\x00/app.log missing"},
 	// The four widened at 2da31be, now held to completeness rather than to "a token appeared".
@@ -2671,6 +2851,75 @@ func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 				"so it must recognize the templatized form and have a row in templatizedRows.\n pattern: %s",
 				i, d.tag, d.group, secret, templated, d.re.String())
 		}
+	}
+}
+
+// TestEveryDetectorsContextSurvivesTemplating is #52's lesson, mechanized: a detector's tolerance
+// has to cover its ANCHORS, not only its group. The test above asks whether each detector's GROUP
+// reads a templatized value; nothing asked about the context around it -- 9a's scheme, 3a's
+// "bearer", 10's /home/ -- and 9a's scheme was where the pipeline's <NUM> broke it (s3:// ->
+// s<NUM>://) with every group check green.
+//
+// It is a companion rather than an extension of that test because the two rest on different
+// exemptions. That one skips a detector whose value the pipeline collapses (IP, UUID); context
+// damage does not care whether the value collapses, and this reads every row a detector's group
+// lands on, not one canonical row.
+//
+// For every completeness row whose secret a detector's group lands on exactly, each CONTEXT
+// position -- inside the match, outside the group -- is replaced by a digit:
+//
+//   - if the detector no longer matches with its group on the secret, that position admits no
+//     digit and the pipeline cannot damage it there: proven, not skipped;
+//   - if it still matches, the row is templatized for real and the detector must still land its
+//     group on the templatized secret.
+//
+// The proof is per position, over the context the rows exercise. Literals inside a GROUP (eyJ,
+// AKIA, sk-, 9b's suffixes) are the test above's business.
+func TestEveryDetectorsContextSurvivesTemplating(t *testing.T) {
+	groupOn := func(d detector, s string, start, end int) []int {
+		for _, loc := range d.re.FindAllStringSubmatchIndex(s, -1) {
+			if loc[2*d.group] == start && loc[2*d.group+1] == end {
+				return loc
+			}
+		}
+		return nil
+	}
+	for i, d := range baseDetectors {
+		rows, digitFree, tolerant := 0, 0, 0
+		for _, r := range completenessRows {
+			prefix := payloadOf(r.prefix)
+			payload := prefix + r.secret + payloadOf(r.suffix)
+			start, end := len(prefix), len(prefix)+len(r.secret)
+			loc := groupOn(d, payload, start, end)
+			if loc == nil {
+				continue
+			}
+			rows++
+			for p := loc[0]; p < loc[1]; p++ {
+				if p >= start && p < end {
+					continue // the group: the test above's question
+				}
+				mut := payload[:p] + "7" + payload[p+1:]
+				if groupOn(d, mut, start, end) == nil {
+					digitFree++
+					continue
+				}
+				tMarked, _ := pipeline.Templatize(mut[:start] + phMark + r.secret + phMark + mut[end:])
+				tPayload, _ := pipeline.Templatize(mut)
+				parts := strings.Split(tMarked, phMark)
+				if len(parts) != 3 || payloadOf(tMarked) != tPayload {
+					t.Fatalf("premise broken: the marks perturbed templating of %q:\n marked:   %q\n unmarked: %q",
+						mut, payloadOf(tMarked), tPayload)
+				}
+				if groupOn(d, tPayload, len(parts[0]), len(parts[0])+len(parts[1])) == nil {
+					t.Errorf("detector %d (%s), row %s: a digit its context admits at %d is lost once templatized:\n raw:  %q\n tmpl: %q\n pattern: %s",
+						i, d.tag, r.name, p, mut, tPayload, d.re.String())
+					continue
+				}
+				tolerant++
+			}
+		}
+		t.Logf("detector %2d %-5s rows %2d, context positions: %3d digit-free, %3d tolerant", i, d.tag, rows, digitFree, tolerant)
 	}
 }
 
