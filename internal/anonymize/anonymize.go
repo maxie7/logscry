@@ -82,8 +82,9 @@
 // lookahead, and a required trailing context on a FIRST-PASS rule narrows what it already masks;
 // on a companion it costs nothing, because the companion's no-match is today's behaviour. So 9c
 // reads the first member's tag as context, as 4b/4c read a credential half, and is the fifth rule
-// to read one of our tags on purpose. What the one-group struct costs this time is that hosts 2..n
-// are ONE placeholder; per-member placeholders would need apply to iterate, which it does not.
+// to read one of our tags on purpose. Since #67 its group is ONE member and Mask re-applies it until
+// nothing changes, so each pass re-anchors on the last tag in the list whichever rule minted it, and
+// every member is its own placeholder; it is the one rule that iterates (see applyToFixpoint).
 //
 // AN UNDERSCORE IS A HOST CHARACTER (#66), and that is the fifth kind of cause again, its second
 // instance: no host class admitted '_', which RFC 3986 puts in unreserved and logs put in Docker
@@ -198,7 +199,14 @@ func New(extraHostSuffixes ...string) *Mapper {
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
-		out = m.apply(out, d)
+		if !d.fixpoint {
+			out = m.apply(out, d)
+			continue
+		}
+		var err error
+		if out, err = m.applyToFixpoint(out, d); err != nil {
+			return "", err
+		}
 	}
 	if tag := m.residue(out); tag != "" {
 		return "", fmt.Errorf("anonymize: a %s value survived masking", tag)
@@ -292,6 +300,9 @@ func TrimDanglingPlaceholder(s string) string {
 // used rather than ReplaceAllStringFunc because some detectors mask only a SUBMATCH (the
 // user:pass inside a URL, the token after "Bearer") while leaving the surrounding context —
 // the scheme, the host — intact for a later detector to handle.
+//
+// It is ONE pass for every detector. The one rule that needs more than one, 9c, is re-applied
+// by applyToFixpoint, which calls this unchanged.
 func (m *Mapper) apply(s string, d detector) string {
 	locs := d.re.FindAllStringSubmatchIndex(s, -1)
 	if locs == nil {
@@ -310,6 +321,39 @@ func (m *Mapper) apply(s string, d detector) string {
 	}
 	b.WriteString(s[prev:])
 	return b.String()
+}
+
+// maxHostListPasses is how many CHANGING passes applyToFixpoint allows before it gives up and
+// fails closed. One pass masks the next raw member of EVERY list on the line, so what it bounds is
+// the longest list, not the sum of them: two 40-member lists on one line take 39 passes, not 78.
+//
+// 64 is above MongoDB's 50-member replica-set limit, so no host list a driver accepts reaches it.
+// What does reach it is a path-less URL followed by a long run of comma-separated cells, which 9c
+// reads as a host list (TestAcceptedOverMasking). The cap exists for that shape: every pass scans
+// the whole line, so an unbounded loop is O(cells x length), and anyone who can write a log line
+// can make it take seconds.
+const maxHostListPasses = 64
+
+// applyToFixpoint re-applies d until a pass changes nothing, and is used for 9c alone.
+//
+// It TERMINATES, and the argument is short. A pass that changes s masks a raw run directly after
+// a comma, and from then on that comma is followed by '<' for good: no rule rewrites a tag, and
+// neither a tag nor the run it replaced contains a comma. So the passes that change anything are
+// at most the commas in s, which per list is the number of members after the first.
+//
+// It FAILS CLOSED at the cap rather than returning what it has. A string that stopped settling
+// still carries raw members, and sending it is the disclosure this rule exists to close; so the
+// caller gets no string, Mask returns the error, and the escalation is skipped the way a residue
+// hit skips it.
+func (m *Mapper) applyToFixpoint(s string, d detector) (string, error) {
+	for pass := 0; pass <= maxHostListPasses; pass++ {
+		next := m.apply(s, d)
+		if next == s {
+			return s, nil
+		}
+		s = next
+	}
+	return "", fmt.Errorf("anonymize: a host list with more than %d members after the first was not masked", maxHostListPasses)
 }
 
 // placeholder returns the stable token for one original value, minting a new one on first
@@ -362,13 +406,15 @@ const (
 )
 
 // detector is one masking rule: a compiled pattern, the submatch group to replace (0 = the
-// whole match), the tag its placeholder carries, and whether the fail-closed re-scan trusts
-// it (deterministic shapes yes; fuzzy hostnames no).
+// whole match), the tag its placeholder carries, whether the fail-closed re-scan trusts it
+// (deterministic shapes yes; fuzzy hostnames no), and whether Mask re-applies it until a pass
+// changes nothing (one rule, 9c; see applyToFixpoint).
 type detector struct {
-	tag    string
-	re     *regexp.Regexp
-	group  int
-	verify bool
+	tag      string
+	re       *regexp.Regexp
+	group    int
+	verify   bool
+	fixpoint bool
 }
 
 // baseDetectors is the default rule set, compiled once.
@@ -433,14 +479,14 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	return []detector{
 		// 1. JWT — three base64url segments; the header always starts "eyJ".
 		{tagToken, mustLongest(
-			`\beyJ` + tolerant(jwtChar) + `\.eyJ` + tolerant(jwtChar) + `\.` + tolerant(jwtChar)), 0, true},
+			`\beyJ` + tolerant(jwtChar) + `\.eyJ` + tolerant(jwtChar) + `\.` + tolerant(jwtChar)), 0, true, false},
 		// 2. AWS access-key id — a fixed, distinctive prefix and exactly 16 more characters.
 		{tagToken, mustLongest(
-			`\b(?:AKIA|ASIA)(?:[0-9A-Z]{16}\b|` + mangled(`[0-9A-Z]`) + `)`), 0, true},
+			`\b(?:AKIA|ASIA)(?:[0-9A-Z]{16}\b|` + mangled(`[0-9A-Z]`) + `)`), 0, true, false},
 		// 3a. Bearer token — mask the credential, not the word "Bearer".
-		{tagToken, mustLongest(`(?i)\bbearer\s+(` + tolerant(`[A-Za-z0-9._~+/=-]`) + `)`), 1, true},
+		{tagToken, mustLongest(`(?i)\bbearer\s+(` + tolerant(`[A-Za-z0-9._~+/=-]`) + `)`), 1, true, false},
 		// 3b. sk- style API keys (OpenAI and friends).
-		{tagToken, mustLongest(`\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`), 0, true},
+		{tagToken, mustLongest(`\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`), 0, true, false},
 		// 4. Credentials embedded in a URL / connection string: scheme://userinfo@host.
 		//    Runs before host and email so "@host" survives for the host detector and a userinfo
 		//    is not misread as an email address. Placeholder-tolerant: the pipeline turns hunter2
@@ -527,7 +573,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    either side of the minted tag and no single pattern reaches it. Open; #57. It is also
 		//    what makes the tail's "decline" work: a group that cannot start on or enter a tag has
 		//    nowhere else to go once the tail refuses.
-		{tagToken, mustLongest(`://(` + tolerant(`[^/\s<>]`) + `)@` + authorityTail), 1, true},
+		{tagToken, mustLongest(`://(` + tolerant(`[^/\s<>]`) + `)@` + authorityTail), 1, true, false},
 		// 4b/4c. The half of a credential detector 4 can no longer reach.
 		//
 		//     Detector 4 masks "user:pass" as ONE value, which is what makes it readable as a
@@ -577,9 +623,9 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     either side of the tag, so it is not two rules, it is none.
 		{tagToken, mustLongest(
 			`://(?:[^:/\s<>]|` + pipelinePH + `|` + ourPH + `)*:(` +
-				tolerant(`[^/\s<>]`) + `)@`), 1, true},
+				tolerant(`[^/\s<>]`) + `)@`), 1, true, false},
 		{tagToken, mustLongest(
-			`://(` + tolerant(`[^:/\s<>]`) + `):(?:[^/\s<>]|` + pipelinePH + `|` + ourPH + `)*@`), 1, true},
+			`://(` + tolerant(`[^:/\s<>]`) + `):(?:[^/\s<>]|` + pipelinePH + `|` + ourPH + `)*@`), 1, true, false},
 		// 5. Email — before host, since an address contains a domain. Both halves are
 		//    placeholder-tolerant: a digit ANYWHERE on either side of the '@' is enough for the
 		//    pipeline to split the address, and ordinary corporate addresses have digits, so
@@ -605,14 +651,14 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    systemd template unit whose instance carries a '_', which reads as an address exactly as
 		//    one without a '_' always has (pinned in TestAcceptedOverMasking).
 		{tagEmail, mustLongest(
-			tolerant(`[A-Za-z0-9._%+-]`) + `@` + tolerant(`[A-Za-z0-9._-]`) + `\.[A-Za-z]{2,}\b`), 0, true},
+			tolerant(`[A-Za-z0-9._%+-]`) + `@` + tolerant(`[A-Za-z0-9._-]`) + `\.[A-Za-z]{2,}\b`), 0, true, false},
 		// 6 ran HERE until #48 and now runs after 9b — see the block below and the package
 		//    comment. The numbering is the audit table's, not the chain's.
 		// 7. IPv6 — before host and IPv4. The alternatives cover the :: elisions; forms
 		//    without "::" and fewer than eight groups (times, MACs) do not match.
-		{tagIP, mustLongest(ipv6Pattern), 0, true},
+		{tagIP, mustLongest(ipv6Pattern), 0, true, false},
 		// 8. IPv4 — validated octets, and a leading \b so v1.2.3.4 (a version) is left alone.
-		{tagIP, mustLongest(`\b(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\b`), 0, true},
+		{tagIP, mustLongest(`\b(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\b`), 0, true, false},
 		// 9a. Host inside a URL/URI authority — masked regardless of TLD. The optional
 		//     userinfo run skips a (possibly already-masked) credential to reach the host.
 		//     Placeholder-tolerant: without it the host stopped at its first <NUM> and
@@ -633,7 +679,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     or comma and by 9c from there; see 9c for why the rest of the list is a second rule and
 		//     not a wider class here.
 		{tagHost, mustLongest(
-			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/\s]*@)?(` + hostRun + `)`), 1, false},
+			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/\s]*@)?(` + hostRun + `)`), 1, false, false},
 		// 9c. Hosts 2..n of a comma-separated authority (#61). Runs after 9a, whose tag on the first
 		//     member is its context, and BEFORE 9b and 6, both measured: after 9b a later member on a
 		//     private suffix carried 9b's own tag and blocked the group ("h1.acme.com,h2.corp.internal,
@@ -668,57 +714,74 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     relaxing 9a's anchor to a bare "://" would close #52 by dropping the anchor rather than
 		//     making it tolerant; neither is done.)
 		//
+		//     ONE MEMBER PER MATCH, RE-APPLIED UNTIL NOTHING CHANGES (#67). Until #67 the group was hosts
+		//     2..n as one run, and that run excludes '<' -- the inertness invariant -- so a tag minted on a
+		//     LATER member before this rule ran ended it there, and every member after the tag was sent:
+		//     mongodb://host1:27017,10.0.0.5:27017,host3:27017/db sent host3. 7 and 8 reach a later member
+		//     (an address literal, bracketed or not) and are the ordinary way in; 1, 2 and 3b only when a
+		//     member literally IS a key. Now the group is ONE member and the context steps over every
+		//     member already tagged, so each pass takes the first raw member after a run of tags -- and
+		//     the tags it steps over are its own from the pass before as readily as 7's or 8's. Mask
+		//     re-applies the rule until a pass changes nothing (applyToFixpoint, which states why that
+		//     terminates and what happens at its cap). This is the same containment #54 names, but the
+		//     inner tag is RIGHT here -- an address in a list is an address -- so the remedy is to
+		//     re-anchor on it rather than to undo it, and #54's pre-pass is not needed for it.
+		//
 		//     THE SHAPE OF THE RULE, part by part.
 		//       anchor and userinfo skip: 9a's, verbatim, so the two rules read one string one way.
-		//       member 1, context:        a raw host run, one or more adjacent tags of ours, or a
-		//                                 bracketed tag (ours, or the pipeline's <IP> on the Template
-		//                                 field). Derived by walking the chain: before 9c runs a tag can
-		//                                 land on member 1 from 7 and 8 (an address literal), from 9a,
-		//                                 from 1/2/3b only when a host literally IS a key, and from 5
-		//                                 only through #57's shape, where two tags sit adjacent. 3a needs
-		//                                 whitespace, 4 mints on the userinfo, 9b/6/10 run later. The raw
-		//                                 branch is unreachable in the chain -- 9a has already taken every
-		//                                 raw first member this anchor can reach, and declines only on '<'
-		//                                 and '[', where the raw branch cannot start either -- and exists
-		//                                 for the single-detector probes completenessSecretFor and the
-		//                                 templatized-coverage test run, exactly as 4b/4c's context does.
+		//       member 1, context:        a raw host run or a taggedMember. Derived by walking the chain:
+		//                                 before 9c runs a tag can land on member 1 from 7 and 8 (an
+		//                                 address literal), from 9a, from 1/2/3b only when a host literally
+		//                                 IS a key, and from 5 only through #57's shape, where two tags sit
+		//                                 adjacent. 3a needs whitespace, 4 mints on the userinfo, 9b/6/10
+		//                                 run later. The raw branch is unreachable in the chain -- 9a has
+		//                                 already taken every raw first member this anchor can reach, and
+		//                                 declines only on '<' and '[', where the raw branch cannot start
+		//                                 either -- and exists for the single-detector probes
+		//                                 completenessSecretFor and the templatized-coverage test run,
+		//                                 exactly as 4b/4c's context does.
 		//       its port, one or more commas: libpq accepts an empty list item, so ",," is a separator.
-		//       hosts 2..n, THE GROUP:    host runs with the ports BETWEEN them inside, and the last
-		//                                 port outside -- the boundary 9a draws for one host, and the one
-		//                                 net/url draws (Hostname() of the replica-set URI is
-		//                                 "host1:27017,host2:27017,host3"). The class is 9a's; '?', '#',
-		//                                 '/', '@', whitespace, '<' and '>' are out by construction, which
-		//                                 is why the '?'/'#' question #58 answered for a NEGATED userinfo
-		//                                 class does not arise here. Measured, not analogised.
+		//       members 2..k-1, context:  taggedMember only, each with its port and its commas. NO raw
+		//                                 member is admitted here, and that is what makes the parse unique:
+		//                                 were one admitted, leftmost-longest would take the LAST raw member
+		//                                 as the group. A bare pipeline <IP> on the Template field is not
+		//                                 admitted either; it is a host run, masked as a member, exactly
+		//                                 as 9a masks https://<IP>/x.
+		//       member k, THE GROUP:      one host run, its port outside -- the boundary 9a draws for one
+		//                                 host. The class is 9a's; '?', '#', '/', '@', ',', whitespace, '<'
+		//                                 and '>' are out by construction, which is why the '?'/'#'
+		//                                 question #58 answered for a NEGATED userinfo class does not arise
+		//                                 here. Measured, not analogised.
 		//       listEnd:                  the group ends at end of text, at any character outside the
-		//                                 host class, or at a ':' that does not begin "://". Excluding '<'
-		//                                 from the terminator stops the run shrinking onto a pipeline
-		//                                 placeholder ("host<NUM>://x" masked "host" until it did); the
-		//                                 group cannot shrink onto a host character either, which is what
-		//                                 rules out a partial member. Case is folded under (?i), negated
-		//                                 class included -- measured, since an uppercase terminator would
-		//                                 have truncated a member with no test looking for it.
+		//                                 host class -- the next comma included -- or at a ':' that does not
+		//                                 begin "://". Excluding '<' from the terminator stops the run
+		//                                 shrinking onto a pipeline placeholder ("host<NUM>://x" masked
+		//                                 "host" until it did); the group cannot shrink onto a host
+		//                                 character either, which is what rules out a partial member. Case
+		//                                 is folded under (?i), negated class included -- measured, since an
+		//                                 uppercase terminator would have truncated a member with no test
+		//                                 looking for it.
 		//
-		//     WHAT IT COSTS is pinned in TestAcceptedOverMasking: hosts 2..n are ONE placeholder, so the
-		//     ports between them are inside it while the first and last stay visible; and a path-less
-		//     URL directly followed by a comma and CSV cells reads as a host list -- a cost to the payload
-		//     the model reasons about rather than to a lossy restatement, named there as a new kind.
-		//     One placeholder per member would need apply to re-run this rule to a fixpoint, which is
-		//     the named follow-up and not a mechanism this package has.
+		//     WHAT IT COSTS is pinned in TestAcceptedOverMasking: a path-less URL directly followed by a
+		//     comma and CSV cells reads as a host list -- a cost to the payload the model reasons about
+		//     rather than to a lossy restatement, named there as a new kind -- and since #67 each cell is
+		//     its own placeholder, so equal cells share one. Past maxHostListPasses members the
+		//     escalation is skipped rather than sent (see applyToFixpoint). The cost #61 named first, the
+		//     ports between members hidden inside one placeholder, is gone: every port is visible now,
+		//     and a member that recurs elsewhere in the request gets the same placeholder there.
 		//
-		//     WHAT STAYS OPEN is a class, not a cell, and it is pinned one row per reachable tag in
-		//     TestIssue61MultiHostAuthority: a tag minted on a LATER member -- an address literal from 7
-		//     or 8, or a key-shaped member from 1/2/3b -- truncates this group there, because the group
-		//     excludes '<' by the inertness invariant, and every member after it is sent. Same cause as
-		//     #54 (containment, unrepresentable in a linear chain), but not #54's remedy: the inner tag
-		//     is RIGHT here, and a companion re-applied to a fixpoint would re-anchor on it.
+		//     WHAT IT DOES NOT REACH is a MIXED member, a tag with raw text glued to it: #54's address
+		//     inside a hostname (10.0.0.5.nip.io as a later member, <IP_1>.nip.io by the time this rule
+		//     runs) or #57's partly recognised key. That is neither a tag nor a host run, so the list
+		//     ends there as it did before #67. It is #54's and #57's, not this rule's.
 		//
 		//     verify:false, for the same reason 9a and 9b are: a missed list member must not mute an
 		//     otherwise-safe escalation.
 		{tagHost, mustLongest(
 			`(?i)\b[a-z][a-z0-9+.-]*://(?:[^/\s]*@)?` +
-				`(?:` + hostRun + `|(?:` + ourPH + `)+|\[(?:` + ourPH + `|` + pipelinePH + `)\])(?:` + hostPort + `)?,+` +
-				`(` + hostRun + `(?:(?:` + hostPort + `)?,+` + hostRun + `)*)(?:` + hostPort + `)?` + listEnd), 1, false},
+				`(?:` + hostRun + `|` + taggedMember + `)(?:` + hostPort + `)?,+` +
+				`(?:` + taggedMember + `(?:` + hostPort + `)?,+)*` +
+				`(` + hostRun + `)(?:` + hostPort + `)?` + listEnd), 1, false, true},
 		// 9b. Bare hostname — only the private/infra suffixes above (fuzzy: verify off).
 		//     Tolerant for the same reason: db01.corp.internal masked only "corp.internal" and
 		//     sent "db", and a digit in a middle label costs every label before it.
@@ -730,7 +793,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     behaviour: bare public hostnames are deliberately left alone, so verify-eligible
 		//     would fail closed on every escalation carrying api.example.com and mute exactly
 		//     the stack traces this feature protects.
-		{tagHost, bareHost, 0, false},
+		{tagHost, bareHost, 0, false, false},
 		// 6. UUID — a fixed 8-4-4-4-12 shape. It runs HERE, after both host detectors, and the
 		//    out-of-sequence number is deliberate: the audit table, the README and the issues all
 		//    say "detector 6", "9a", "9b", so renumbering the chain to match position would
@@ -754,13 +817,13 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//
 		//    Placement is between 9b and 10 rather than at the end: keeping it ahead of the
 		//    home-dir detector preserves /home/<uuid>/app.log as <UUID_1> rather than <USER_1>.
-		{tagUUID, mustLongest(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), 0, true},
+		{tagUUID, mustLongest(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`), 0, true, false},
 		// 10. Home directory — mask only the username segment, keeping the rest of the path
 		//     so /home/<USER_1>/go/pkg/mod/... stays useful in a stack trace. Tolerant, and the
 		//     awkward position is the one worth naming: a TRAILING digit was always harmless
 		//     (/home/maxie7 → /home/<USER_1><NUM> loses nothing), while a digit in the MIDDLE
 		//     split the value and sent the tail — /home/deploy2prod leaked "prod" (#43).
-		{tagUser, mustLongest(`(?:/home/|/Users/)(` + tolerant(`[^/<>\s:]`) + `)`), 1, true},
+		{tagUser, mustLongest(`(?:/home/|/Users/)(` + tolerant(`[^/<>\s:]`) + `)`), 1, true, false},
 	}
 }
 
@@ -832,6 +895,11 @@ var hostRun = tolerant(`[a-z0-9._-]`)
 
 // hostPort is the ":port" that may follow a host, tolerant because a port templatizes to <NUM>.
 var hostPort = `:` + tolerant(`[0-9]`)
+
+// taggedMember is a host-list member some rule has already masked, as 9c reads it for context:
+// one or more adjacent tags of ours, or a bracketed tag (ours, or the pipeline's <IP> on the
+// Template field). Member 1 and every member before 9c's group share it, so the two cannot drift.
+const taggedMember = `(?:(?:` + ourPH + `)+|\[(?:` + ourPH + `|` + pipelinePH + `)\])`
 
 // listEnd is what may follow the last member of a host list in 9c: end of text, any character
 // outside the host class, or a ':' that does not begin "://". It is CONTEXT, never group, and it
