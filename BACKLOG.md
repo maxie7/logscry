@@ -2273,6 +2273,151 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       "Known limitations" never named #54, so nothing there moved. Seen, out of scope: #57, #59, #52,
       #65. Targets v0.12.7
 
+- [x] **A URL is recognised whatever is glued before or inside its scheme** — #52, found in the #46
+      wire capture and left by #43, whose comment from #66's sweep added the raw-line half. 9a and 9c
+      find a URL by its scheme, `\b[a-z][a-z0-9+.-]*://`, and each carried its own copy of it. The
+      anchor is CONTEXT, outside the group, so #43's placeholder tolerance never reached it, and the
+      host went to the configured model endpoint two ways:
+      - **Template field.** A scheme with a digit templatizes to `s<NUM>://`, and both rules went
+        quiet: `url=s3://AKIA…:secret@bucket.example.com/x` →
+        `url=s<NUM>://<TOKEN_1>:<TOKEN_2>@bucket.example.com/x`; `h2://api.acme.com/x` sent the host;
+        `s3://h1,h2,h3/x` sent every member (9c).
+      - **Raw line.** `\b` fails before a scheme glued to `_`, a word character:
+        `x_https://acme.com/x`, `__https://acme.com__` and `svc_https://acme.com/x` were sent whole.
+        So was `2https://acme.com/x`, on the raw line only; in its template, `<NUM>https://`, `\b`
+        holds after the `>`, so the two paths disagreed.
+
+      Credentials were never affected: detector 4 anchors on `://` alone. `Mask` returned nil and
+      `residue()` returned `""`: 9a and 9c are `verify:false`. v0.4.0 → v0.12.7, **thirty-three tagged
+      releases** (`git tag --contains 2da31be | wc -l` → 33).
+
+      **One correction to the issue as filed.** It named `k8s://` with `s3://`. On main `k8s://`
+      was masked in the template, by accident: after `k<NUM>` the anchor restarted at the `s` and
+      read the scheme as `s`. It reads as `k<NUM>s` now, and the output is the same. It is pinned as
+      byte-identical, with the accident named.
+
+      **The fix (`internal/anonymize/anonymize.go` only).** One `schemeAnchor`, used by both rules:
+      a letter, then scheme characters or pipeline placeholders, then `://`.
+
+      **Decisions.**
+      1. **No leading assertion, argued.** Leftmost-longest already starts a scheme at the earliest
+         letter whose run reaches `://`, so a letter before a scheme is part of it: `xhttps://` is
+         scheme `xhttps`, as it always was, and is pinned. What `\b` refused was only a start after a
+         `_` or after a digit no earlier letter reaches, and both leaked. So nothing that may precede
+         a scheme is refused, and the anchor is `(?:^|[^a-z])` in effect. `foo_bar://` reads as scheme
+         `bar`; it is not a legal scheme either way, and masking the host behind it is the safe
+         reading. Pinned: `(…)`, `"…"`, `<…>`, start of text, and two prose rows with scheme-like
+         words and no `://`. The leading letter needs no tolerance, because the pipeline never
+         replaces a lone letter.
+      2. **One definition.** `TestSchemeAnchorIsShared`: exactly two rules compile `schemeAnchor`
+         (9a, and 9c iterating), and no rule spells the scheme class out on its own, in the default
+         set or with extra suffixes. It needs the const, so it follows the fix in its own commit.
+      3. **The issue's generalisation is a companion test,
+         `TestEveryDetectorsContextSurvivesTemplating`.** For every completeness row a detector's
+         group lands on, each CONTEXT position (inside the match, outside the group) is replaced
+         by a digit:
+         - if the detector stops matching, that position is proven digit-free;
+         - if it still matches, the row is templatized for real and the detector must still find
+           its secret.
+
+         **Results:**
+         - On main it is red on exactly 9a and 9c, naming every row.
+         - It proves 3a's "Bearer " (7 positions), 10's `/home/` and `/Users/` (13, with a new
+           `/Users/` completeness row) and 9d's edges (6) digit-free.
+         - 4, 4b and 4c are tolerant in theirs.
+
+         It is a companion and not an extension of `TestEveryUncollapsedDetectorHasATemplatizedRow`.
+         That test is about the GROUP and exempts values the pipeline collapses; context damage does
+         not depend on collapse, and this one reads every row. Group literals (`eyJ`, `AKIA`, `sk-`,
+         9b's suffixes) stay the other test's business.
+      4. **The 3a cell is not reached, measured.** `Bearer https://acme.com/x` →
+         `Bearer <TOKEN_1>://acme.com/x` on both paths: 3a takes the scheme as the token, and no
+         scheme letter is left. The damage is OUR tag, not the pipeline's, so it is interference,
+         not tolerance. It is pinned, and recorded as a cell of the authority audit, 65.
+
+      **What it costs.** No new over-mask category. Every new match is a `scheme://` the old anchor
+      refused, and the host behind it is masked. One existing row moved, and it had deferred to this
+      issue in its own comment: #66's member-in-scheme-position row,
+      `mongodb://h1,h2_x://y` → `mongodb://<HOST_1>,<HOST_3>_x://<HOST_2>`. `y` is masked now, and
+      `h2` stays masked, which is what the row guards.
+
+      **No narrowing, shown differentially.** The corpus came from uncommitted hooks in `Mask` and
+      `residue`, carried by `-overlay` copies of the source, and run under the anonymize and llm tests
+      of both main and the branch. The templatized form of every input was added: 2,179 distinct
+      inputs. Old and new masking were compared by per-byte coverage bitmaps rebuilt from `byToken`.
+      Results:
+      - **0 narrowed**, 0 mixed, 0 error changes, 0 layout-only;
+      - 2,144 unchanged;
+      - 34 widened: the new tests' inputs;
+      - 1 the bitmap cannot rebuild: #66's old output, which `Mask` feeds to `residue`; its `y` is
+        masked now.
+
+      Restricted to the 1,236 inputs main's own tests feed: 1,234 unchanged, the #66 row widened, and
+      the same unrebuildable leftover.
+
+      **Frequency, measured.** The ten boot captures and the ab37 capture, 70,783 records, raw and
+      through `Templatize`, old against new, counts only, classified in the harness by shape. Three
+      categories were defined: digit in the scheme, `_` before it, digit before it. **Prediction,
+      recorded before the run:** 0 to 5 changed records, 0 narrowed. **It held:** 0 changed records,
+      so no category appeared and no category row was due. Nothing from the captures is in the repo.
+
+      **Tests.** Red first:
+      - `TestIssue52SchemeAnchor`:
+        - exact outputs for 13 closed shapes, raw and through the real `Templatize`, with every
+          fragment main sent absent and a round trip;
+        - 12 byte-identical rows on both paths;
+        - the pinned 3a cell and the `residue` claim.
+      - `TestEveryDetectorsContextSurvivesTemplating`.
+      - Three templatized rows with a digit scheme (URL, credential, host list), each also run
+        through the logfmt wrapper.
+      - A digit-scheme and a `/Users/` completeness row.
+      - The new outputs fed to `TestPlaceholdersAreInert`.
+      - #66's row rewritten.
+
+      Main failed 23 subtests and the context test, all by assertion.
+
+      **Flakiness and mutants.** Every new and touched test passes 20 of 20 runs under `-race`. Five
+      mutants each turn tests red:
+      - tolerance on 9a only, so 9c keeps its old anchor: both digit-scheme host-list rows (on their
+        template path), the list's templatized row and its two logfmt runs, the context test and the
+        shared-anchor test;
+      - `\b` kept as the leading boundary: the six `_`- and digit-glued rows and #66's row;
+      - the scheme run not tolerant: 16 subtests, every digit-scheme row and templatized row, and
+        the context test;
+      - a boundary that refuses a digit, `(?:^|[^a-z0-9])`: the digit-before-the-scheme row;
+      - 9c with a drifted copy of the anchor, tolerant of `<NUM>` only: the shared-anchor test
+        alone, since the rows only ever carry `<NUM>`.
+
+      **The full suite** ran under `-race` on main and on the branch: 1,177 results, then 1,217.
+      - **No existing result changed outcome.** #66's row passes before and after under its
+        rewritten expectation.
+      - 40 new results came in.
+
+      **Wire check.** One run per binary against a capturing endpoint (`--plain --llm-anonymize
+      --warmup-lines 0`). A `[FATAL]` line carried `upload to s3://bucket.example.com/key failed`,
+      with #57's `s3://AKIA…EXAMPLE.prod@x@bucket` in its context.
+      - `bucket.example.com`: 1 before (the template field), 0 after.
+      - `.prod` fires in both, so the grep is not vacuous.
+      - The template now reads `s<NUM>://<HOST_1>/key`, the trigger line's placeholder, so the model
+        sees one host recur.
+
+      **`residue`.** Nothing new: 9a and 9c stay `verify:false`, and the old leftover still reads as
+      clean (pinned).
+
+      `internal/pipeline` does not appear in the diff. README:
+      - the #52 audit bullet is struck;
+      - the audit sentence gains #52;
+      - a new past-tense paragraph carries the shapes, span, decisions and measured frequency.
+
+      **Found on the way, not fixed: a configured bare-host suffix with a digit in it.**
+      `--llm-anonymize-suffix k8s` masks `db.k8s` on the raw line, but the template carries
+      `db.k<NUM>s` and 9b no longer matches it, so the name is sent there. It is this issue's
+      lesson on 9b's suffix literal, which sits inside the group, so neither the context test nor
+      the coverage test sees it: the coverage test reads only the built-in suffixes, none of which
+      has a digit. Confirmed with a throwaway test. It is reachable through configuration and no
+      open issue covers it, so it is filed as ISSUE-TBD and named under README "Known limitations".
+      Seen, out of scope: #57, #59, #65's sweep. Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
@@ -3078,7 +3223,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       the #46 wire capture rather than by a test, and the lesson generalises: **a detector's
       tolerance has to cover its ANCHORS, not only its capture** — which is also why the
       coverage test that should have caught it did not, since it checks a detector's GROUP and
-      the scheme is context.
+      the scheme is context. (Done with #52, in TODO-VERSION, together with a test that checks
+      every detector's context.)
       `internal/pipeline` does not appear in the diff and no template hashes move: this package
       runs at the LLM boundary and never feeds `hashTemplate`. README corrected at three sites,
       one of which asserted that the fail-closed re-scan catches a value a detector missed
