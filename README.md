@@ -961,7 +961,7 @@ entry with an empty message.
   it as `db.k<NUM>s`, which the bare-host rule no longer recognises, so the name reaches the model
   there. Only configured suffixes containing a digit are affected; the built-in ones (`internal`,
   `local`, `corp`, …) have none, and hosts inside URLs and connection strings are masked by their
-  own rules whatever the suffix. Filed as ISSUE-TBD.
+  own rules whatever the suffix. Filed as #105.
 - **A quoted value containing an escaped quote templates badly on the plain-text path.** The
   `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
   as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left

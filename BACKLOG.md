@@ -2415,7 +2415,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       lesson on 9b's suffix literal, which sits inside the group, so neither the context test nor
       the coverage test sees it: the coverage test reads only the built-in suffixes, none of which
       has a digit. Confirmed with a throwaway test. It is reachable through configuration and no
-      open issue covers it, so it is filed as ISSUE-TBD and named under README "Known limitations".
+      open issue covers it, so it is filed as #105 and named under README "Known limitations".
       Seen, out of scope: #57, #59, #65's sweep. Targets v0.12.8
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
