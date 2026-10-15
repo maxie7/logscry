@@ -51,3 +51,33 @@ func TestFailClosedSkipsInnerBackend(t *testing.T) {
 		t.Error("a masking failure was classified transient; it must not be retried")
 	}
 }
+
+// TestHostListCapFailsClosedLikeResidue: the anonymizer's other fail-closed path (#67). Past its
+// cap the host-list rule stops and Mask returns an error, and that error must reach the user by
+// exactly the road a residue hit takes -- maskErr, fatal, the inner backend never called, so the
+// card reads "explanation unavailable" with the reason and the export records it -- with a reason
+// that names the cause. The real anonymizer, not a stub: what is pinned is that this error is a
+// Mask error like any other, with no channel of its own.
+func TestHostListCapFailsClosedLikeResidue(t *testing.T) {
+	spy := &spyBackend{}
+	ms := make([]string, 70)
+	for i := range ms {
+		ms[i] = "rs" + string(rune('a'+i%26)) + string(rune('a'+i/26)) + ".acme.com"
+	}
+	req := ExplainRequest{
+		Trigger: model.LogLine{Raw: "FATAL lost mongodb://" + strings.Join(ms, ",") + "/db"},
+	}
+	_, err := NewAnonymizing(spy).Explain(context.Background(), req)
+	if err == nil {
+		t.Fatal("Explain returned nil error past the host-list cap, want it to fail closed")
+	}
+	if spy.called.Load() {
+		t.Fatal("the inner backend was called past the host-list cap: the unreached members could escape")
+	}
+	if want := "anonymization failed, escalation skipped: anonymize: a host list"; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("error = %q, want the residue path's wrapping and a cause that names the host list (%q...)", err.Error(), want)
+	}
+	if transient(err) {
+		t.Error("a host-list cap failure was classified transient; it must not be retried")
+	}
+}
