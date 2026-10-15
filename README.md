@@ -619,7 +619,7 @@ all — the explanation is skipped, as when the fail-closed check fires, with th
 line, and without it an 8 KB line of comma cells took 7.9 s. Measured over the same 70,783 records:
 nothing changed.
 
-**An IPv4 address inside a hostname sent the rest of the name before `TODO-VERSION`.** The address
+**An IPv4 address inside a hostname sent the rest of the name before `v0.12.7`.** The address
 rule ran before every host rule, so an address that was a *label* in a name was masked on its own
 and the host rules could not step over its placeholder: `https://10.0.0.5.nip.io/x` went out as
 `https://<IP_1>.nip.io/x`, `worker-10.0.0.5.corp.internal` sent `worker-`,
@@ -653,7 +653,7 @@ the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the 
 a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found a class it
 could not close then, #67, closed in `v0.12.6`, and a single-host leak, #66, closed in `v0.12.5`.
 Of the audit's own four, the half of #48 that ordering could not reach, #54, closed in
-`TODO-VERSION`.
+`v0.12.7`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -661,7 +661,7 @@ Each time the audit's own count was right and its scope was narrower than the se
   filed this and the IPv4 row below as one defect because they share a cause; fixing it showed
   they do not share a *remedy*, so the count above is right about how many were open and wrong
   about how many issues they were.
-- ~~**#54** — the half of #48 that ordering cannot reach.~~ **Closed in `TODO-VERSION`.** See the
+- ~~**#54** — the half of #48 that ordering cannot reach.~~ **Closed in `v0.12.7`.** See the
   paragraph above. It was refiled as its own class because an inner detector minted a placeholder
   inside a host detector's span and **no ordering resolves it**: the right answer depends on what
   the matched span is part of. `https://10.0.0.5.nip.io/x` sent `.nip.io` and

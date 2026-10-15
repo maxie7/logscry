@@ -2271,7 +2271,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       - a new past-tense paragraph carries the shapes, span, costs and the measured frequency.
 
       "Known limitations" never named #54, so nothing there moved. Seen, out of scope: #57, #59, #52,
-      #65. Targets TODO-VERSION
+      #65. Targets v0.12.7
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
