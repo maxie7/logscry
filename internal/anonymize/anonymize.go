@@ -34,9 +34,17 @@
 // 8 must win or the tag says HOST when the value is an IP. But https://10.0.0.5.nip.io/x needs 9a
 // to win, because there the address is a label inside the authority. No ordering of a linear chain
 // satisfies both, since the right answer depends on what the matched span is PART OF and a chain
-// has no notion of that. That half is NOT fixed here and is filed as #54; the candidate is a
-// pre-pass identifying the authority span before the inner detectors run, so containment becomes
-// representable instead of inferred from order.
+// has no notion of that. That half was filed as #54, with a pre-pass identifying the authority as
+// the candidate.
+//
+// #54 WAS CLOSED BY A RULE, NOT AN ORDER, and not by the pre-pass. 9d matches only an address
+// JOINED to hostname labels, so it is more specific than 8 on exactly the span they share and
+// absent everywhere else: the address that IS the authority is still 8's. The pre-pass was
+// measured on paper against the same cells and fell short where it was cheapest -- its bare
+// authority is a private-suffix name, and "resolve 10.0.0.5.nip.io" is not one -- while costing a
+// span-aware apply and residue. A post-pass gluing our own <IP_n> to its neighbours closed the
+// raw cells but not the Template field, where the address is the pipeline's <IP>, and would have
+// put a target group on our own output. 9d is that glue read on raw text one step earlier.
 //
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
@@ -175,12 +183,16 @@ func New(extraHostSuffixes ...string) *Mapper {
 // #48 CLOSES ONE MORE, and it is the one ordering could reach. A UUID inside a hostname is masked
 // as part of the host now, because detector 6 moved behind both host detectors — see the ordering
 // note above for why that is the specificity rule applied rather than broken. What remains of that
-// pair is the case ordering CANNOT reach: an IPv4 literal in a host label, where
-// https://10.0.0.5.nip.io/x sends ".nip.io" and worker-10.0.0.5.corp.internal sends "worker-",
+// pair was the case ordering CANNOT reach: an IPv4 literal in a host label, where
+// https://10.0.0.5.nip.io/x sent ".nip.io" and worker-10.0.0.5.corp.internal sent "worker-",
 // because the two IPv4 cases want opposite orders and no linear chain gives both. Filed as
 // #54, alongside an IPv4-mapped IPv6 address (#49). Fallbacks were added where the leak was
 // credential material; the audit table in BACKLOG.md, not this comment, is the record of what
 // remains.
+//
+// #54 CLOSES IT WITHOUT A PROVISO here. The host rules stay verify:false and so does 9d, so the
+// re-scan sees nothing new; what it saw before it still sees -- a raw address left inside a name
+// is detector 8's, and mutes the escalation.
 //
 // #55 IS NOT ONE OF THESE NARROWINGS, and separating it from them is the point of saying so. It
 // was not a detector blocked by a placeholder and not one matching in part: it was a SHAPE NO
@@ -439,7 +451,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all fifteen rather than to the one detector known to need it, because
+// It is applied to all sixteen rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -657,8 +669,59 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		// 7. IPv6 — before host and IPv4. The alternatives cover the :: elisions; forms
 		//    without "::" and fewer than eight groups (times, MACs) do not match.
 		{tagIP, mustLongest(ipv6Pattern), 0, true, false},
+		// 9d. An IPv4 address that is a LABEL inside a hostname (#54). It runs HERE, before 8, and the
+		//     out-of-sequence number is the same convention as 6's: it is a host rule, and the audit
+		//     table, the README and the issues number host rules 9a-9d.
+		//
+		//     Until #54, 8 tagged the address on its own and every host class excludes '<', so the host
+		//     rules were blocked behind the tag and the rest of the name was sent:
+		//     https://10.0.0.5.nip.io/x sent ".nip.io", worker-10.0.0.5.corp.internal sent "worker-",
+		//     and as a later list member the mixed member ended 9c's list. Running 9a before 8 is the
+		//     impossibility #48 recorded -- https://10.0.0.5/x must stay <IP_1> -- and that stands.
+		//     THIS IS NOT A REORDERING. It is a more specific rule: it matches only an address JOINED to
+		//     hostname labels across '.' or '-', so it never competes with 8 for an address that stands
+		//     alone, and every address 8 masked whole before, 8 still does. What is new is that the
+		//     chain can now say what the address is part of, for the one shape where that matters.
+		//
+		//     THE SHAPE, part by part.
+		//       the address:  ipv4Pattern, 8's own, or the pipeline's <IP> on the Template field --
+		//                     where a bare name on a public suffix ("resolve <IP>.nip.io") was no host
+		//                     rule's business and sent the labels around it.
+		//       the labels:   runs of hostname characters on either side, joined to the address by '.'
+		//                     or '-', each starting and ending on a label character -- so a sentence
+		//                     dot or a trailing hyphen stays outside -- and placeholder-tolerant.
+		//       a letter:     at least one side carries a letter outside the address. A DNS name's top
+		//                     label is alphabetic, and nothing cheaper tells a name from an address
+		//                     beside a number: "10.0.0.5.443" (BSD netstat's address.port), "10.0.0.5-20"
+		//                     and "10.0.0.5-10.0.0.9" stay 8's.
+		//       the edges:    CONTEXT, not group: the run starts at the beginning of the text or after
+		//                     a non-label character, and ends at one or at the end. \b cannot stand in
+		//                     front, because it fails ahead of <IP>; the trailing edge is what refuses a
+		//                     partial octet ("worker-10.0.0.256" stays as it was). ':' is in no class,
+		//                     so a port is never absorbed.
+		//
+		//     IT RUNS AFTER 4, 4b AND 4c, and that was measured: authorityTail excludes '<', so a HOST
+		//     tag behind the '@' made 4 decline on "postgres://u:p@10.0.0.5.nip.io/db" and only the
+		//     password was masked. After them it is a plain host behind a credential tag, as 9a sees
+		//     one. Before 9a and 9c, so a fused list member reaches 9c as a whole tag and the list
+		//     re-anchors on it at no cost to the pass cap.
+		//
+		//     Its group is raw text only: our own <IP_n> is not its address unit, so the inertness
+		//     invariant holds and the mapping cannot nest. The fused value is ONE host -- Restore gives
+		//     back "10.0.0.5.nip.io", it recurs under one placeholder, and the address alone elsewhere
+		//     is a different value with its own <IP_n>.
+		//
+		//     WHAT IT COSTS is pinned in TestAcceptedOverMasking: any text glued to an address by '.' or
+		//     '-' and carrying a letter is a host now -- a file name (dump-10.0.0.5.log), a missing space
+		//     after a sentence dot, a word before the address, a version with a pre-release tag
+		//     (1.2.3.4-beta, which 8 already read as an address). Each was <IP_1> beside text in the
+		//     clear; now it is one HOST. The other inner tag of this class, an access key as a host
+		//     label, is the sweep's "theoretical" cell and #57's shape in a list; neither is reached.
+		//
+		//     verify:false, as every host rule: a raw address it ever misses is still 8's on the re-scan.
+		{tagHost, mustLongest(ipv4LabelHost), 1, false, false},
 		// 8. IPv4 — validated octets, and a leading \b so v1.2.3.4 (a version) is left alone.
-		{tagIP, mustLongest(`\b(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\b`), 0, true, false},
+		{tagIP, mustLongest(`\b` + ipv4Pattern + `\b`), 0, true, false},
 		// 9a. Host inside a URL/URI authority — masked regardless of TLD. The optional
 		//     userinfo run skips a (possibly already-masked) credential to reach the host.
 		//     Placeholder-tolerant: without it the host stopped at its first <NUM> and
@@ -770,10 +833,11 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     ports between members hidden inside one placeholder, is gone: every port is visible now,
 		//     and a member that recurs elsewhere in the request gets the same placeholder there.
 		//
-		//     WHAT IT DOES NOT REACH is a MIXED member, a tag with raw text glued to it: #54's address
-		//     inside a hostname (10.0.0.5.nip.io as a later member, <IP_1>.nip.io by the time this rule
-		//     runs) or #57's partly recognised key. That is neither a tag nor a host run, so the list
-		//     ends there as it did before #67. It is #54's and #57's, not this rule's.
+		//     WHAT IT DOES NOT REACH is a MIXED member, a tag with raw text glued to it: #57's partly
+		//     recognised key (AKIA...EXAMPLE.prod as a later member, <TOKEN_1>.prod by the time this rule
+		//     runs). That is neither a tag nor a host run, so the list ends there as it did before #67.
+		//     #54's address inside a hostname was the other such member until 9d, which runs first and
+		//     hands this rule the whole name as one tag.
 		//
 		//     verify:false, for the same reason 9a and 9b are: a missed list member must not mute an
 		//     otherwise-safe escalation.
@@ -813,7 +877,8 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    never compete, and the only text they contend for is a UUID INSIDE a host — where
 		//    the host is the right answer. Containment, not competition.
 		//
-		//    An IP is the opposite case and stays where it is. See the package comment.
+		//    An IP is the opposite case and stays where it is; the address inside a name is 9d's, a
+		//    rule rather than a move. See the package comment.
 		//
 		//    Placement is between 9b and 10 rather than at the end: keeping it ahead of the
 		//    home-dir detector preserves /home/<uuid>/app.log as <UUID_1> rather than <USER_1>.
@@ -892,6 +957,36 @@ var ourPHRe = regexp.MustCompile(ourPH)
 // whole domain behind the '_'. A flat run, so '_' is admitted in any position, a trailing one
 // included -- that over-mask is pinned in TestAcceptedOverMasking.
 var hostRun = tolerant(`[a-z0-9._-]`)
+
+// ipv4Octet is one validated octet and ipv4Pattern an address of four: detector 8's, shared with 9d
+// so that "an address" cannot drift between the rule that masks one alone and the rule that masks
+// one inside a name.
+const (
+	ipv4Octet   = `(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])`
+	ipv4Pattern = `(?:` + ipv4Octet + `\.){3}` + ipv4Octet
+)
+
+// ipv4LabelHost is 9d: an address joined to hostname labels across '.' or '-', the group, between
+// two single characters of context. See 9d for each part.
+//
+// The group is two alternatives because "at least one side carries a letter" is not one regular
+// shape: the left side carries it and the right is optional, or the left is optional and the right
+// carries it. A side is a run that starts and ends on a label character; a side "with a letter" is
+// the same run with a literal [a-z] somewhere in it, which a pipeline placeholder's own letters
+// cannot supply, '<' being in no class.
+var ipv4LabelHost = func() string {
+	char := `(?:[a-z0-9_]|` + pipelinePH + `)`  // starts and ends a side
+	run := `(?:[a-z0-9_.-]|` + pipelinePH + `)` // anything inside one
+	addr := `(?:` + ipv4Pattern + `|<IP>)`
+	left := char + `(?:` + run + `*` + char + `)?[.-]`
+	right := `[.-]` + char + `(?:` + run + `*` + char + `)?`
+	leftL := `(?:` + char + run + `*)?[a-z](?:` + run + `*` + char + `)?[.-]`
+	rightL := `[.-](?:` + char + run + `*)?[a-z](?:` + run + `*` + char + `)?`
+	return `(?i)(?:^|[^a-z0-9_])(` +
+		leftL + addr + `(?:` + right + `)?` + `|` +
+		`(?:` + left + `)?` + addr + rightL +
+		`)(?:[^a-z0-9_]|$)`
+}()
 
 // hostPort is the ":port" that may follow a host, tolerant because a port templatizes to <NUM>.
 var hostPort = `:` + tolerant(`[0-9]`)
