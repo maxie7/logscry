@@ -1192,6 +1192,153 @@ func TestIssue67LaterMemberTag(t *testing.T) {
 	}
 }
 
+// TestHostListFixpoint pins the mechanism #67 added: 9c is the one rule Mask re-applies until a
+// pass changes nothing, the loop terminates within the bound applyToFixpoint argues, the bound
+// counts the LONGEST list on a line rather than the sum of them, and past maxHostListPasses Mask
+// fails closed instead of returning what it has.
+func TestHostListFixpoint(t *testing.T) {
+	tagRe := regexp.MustCompile(phPat)
+	// list builds "mongodb://" + n comma-separated members + "/db"; member(i) names member i.
+	list := func(n int, member func(i int) string) string {
+		ms := make([]string, n)
+		for i := range ms {
+			ms[i] = member(i + 1)
+		}
+		return "mongodb://" + strings.Join(ms, ",") + "/db"
+	}
+	name := func(i int) string { return "n" + strconv.Itoa(i) + "x" }
+	cells := func(n int) string {
+		var b strings.Builder
+		b.WriteString("https://api.acme.com")
+		for i := 0; i < n; i++ {
+			b.WriteString("," + strconv.Itoa(i%10))
+		}
+		return b.String()
+	}
+
+	t.Run("only 9c iterates", func(t *testing.T) {
+		for _, dets := range [][]detector{baseDetectors, buildDetectors([]string{"example"})} {
+			var n int
+			for _, d := range dets {
+				if d.fixpoint {
+					n++
+					if d.tag != tagHost || d.verify || d.group != 1 {
+						t.Errorf("an unexpected rule iterates: tag %s, group %d, verify %v\n pattern: %s",
+							d.tag, d.group, d.verify, d.re.String())
+					}
+				}
+			}
+			if n != 1 {
+				t.Errorf("%d rules iterate, want exactly one (9c): apply's one-pass contract is every other rule's", n)
+			}
+		}
+	})
+
+	// Termination, up to the cap: maxHostListPasses later raw members is the most a list may need,
+	// and every member comes back as its own placeholder. The shapes are the ones that change how
+	// many passes a list takes: every member raw, addresses between the names (fewer raw members,
+	// re-anchoring on a tag 8 minted), and an empty item between every pair.
+	shapes := []struct {
+		name   string
+		member func(i int) string
+		sep    string
+	}{
+		{"all raw", name, ","},
+		{"addresses between names", func(i int) string {
+			if i%2 == 0 {
+				return "10.0.0." + strconv.Itoa(i)
+			}
+			return name(i)
+		}, ","},
+		{"empty items", name, ",,"},
+	}
+	for _, sh := range shapes {
+		t.Run("terminates/"+sh.name, func(t *testing.T) {
+			for n := 2; n <= maxHostListPasses+1; n++ {
+				ms := make([]string, n)
+				for i := range ms {
+					ms[i] = sh.member(i + 1)
+				}
+				in := "mongodb://" + strings.Join(ms, sh.sep) + "/db"
+				m := New()
+				got, err := m.Mask(in)
+				if err != nil {
+					t.Fatalf("%d members: Mask errored below the cap: %v", n, err)
+				}
+				if c := len(tagRe.FindAllString(got, -1)); c != n {
+					t.Errorf("%d members came back as %d placeholders: %q", n, c, got)
+				}
+				for _, mem := range ms {
+					if strings.Contains(got, mem+",") || strings.Contains(got, mem+"/") {
+						t.Errorf("%d members: %q survived masking in %q", n, mem, got)
+					}
+				}
+				if r := m.Restore(got); r != in {
+					t.Errorf("%d members: round-trip mismatch", n)
+				}
+			}
+		})
+	}
+
+	// One pass masks the next member of EVERY list on the line, so the cap counts the longest
+	// list and not the sum. Two lists at the cap on one line need 64 passes, not 128.
+	t.Run("the cap counts the longest list, not the sum", func(t *testing.T) {
+		for _, n := range []int{40, maxHostListPasses + 1} {
+			one := list(n, name)
+			two := one + " " + list(n, func(i int) string { return "m" + strconv.Itoa(i) + "y" })
+			got, err := New().Mask(two)
+			if err != nil {
+				t.Fatalf("two %d-member lists on one line: %v", n, err)
+			}
+			if c := len(tagRe.FindAllString(got, -1)); c != 2*n {
+				t.Errorf("two %d-member lists came back as %d placeholders, want %d", n, c, 2*n)
+			}
+		}
+	})
+
+	// A list and a long CSV tail on one line behave as each would alone: masked the same way when
+	// both settle, and failing closed exactly when the tail alone would.
+	t.Run("a list beside a csv tail behaves as each alone", func(t *testing.T) {
+		shape := func(s string) string { return tagRe.ReplaceAllString(s, "<T>") }
+		lst := list(40, name)
+		for _, cellsN := range []int{60, maxHostListPasses + 1} {
+			tail := cells(cellsN)
+			aloneL, errL := New().Mask(lst)
+			aloneC, errC := New().Mask(tail)
+			both, errB := New().Mask(lst + " " + tail)
+			if errL != nil {
+				t.Fatalf("the 40-member list alone errored: %v", errL)
+			}
+			if (errB != nil) != (errC != nil) {
+				t.Errorf("%d cells: together err=%v, the tail alone err=%v", cellsN, errB, errC)
+			}
+			if errB == nil && shape(both) != shape(aloneL)+" "+shape(aloneC) {
+				t.Errorf("%d cells: together the line masked differently from each alone:\n both:  %q\n alone: %q",
+					cellsN, both, aloneL+" "+aloneC)
+			}
+		}
+	})
+
+	// THE CAP FAILS CLOSED. One raw member past it -- in a host list, or in comma cells after a
+	// path-less URL, which 9c reads the same way -- and Mask returns no string at all, so the caller
+	// can only skip the escalation. Returning what it had would send every member it had not reached.
+	t.Run("past the cap Mask fails closed", func(t *testing.T) {
+		for _, in := range []string{list(maxHostListPasses+2, name), cells(maxHostListPasses + 1)} {
+			got, err := New().Mask(in)
+			if err == nil {
+				t.Errorf("Mask did not fail closed past the cap; it returned %q", got)
+				continue
+			}
+			if got != "" {
+				t.Errorf("Mask returned text beside its error: %q", got)
+			}
+			if !strings.Contains(err.Error(), "host list") {
+				t.Errorf("the error does not name its cause: %v", err)
+			}
+		}
+	})
+}
+
 // TestIssue66UnderscoreInHostname is the named regression for #66, and it is the fifth kind of cause
 // again, the second instance of it: the host class was smaller than the production. RFC 3986 puts
 // '_' in unreserved, so it is legal anywhere in a reg-name, and it is ordinary where logs come from
