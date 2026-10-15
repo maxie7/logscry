@@ -619,6 +619,27 @@ all — the explanation is skipped, as when the fail-closed check fires, with th
 line, and without it an 8 KB line of comma cells took 7.9 s. Measured over the same 70,783 records:
 nothing changed.
 
+**An IPv4 address inside a hostname sent the rest of the name before `TODO-VERSION`.** The address
+rule ran before every host rule, so an address that was a *label* in a name was masked on its own
+and the host rules could not step over its placeholder: `https://10.0.0.5.nip.io/x` went out as
+`https://<IP_1>.nip.io/x`, `worker-10.0.0.5.corp.internal` sent `worker-`,
+`https://api.10.0.0.5.nip.io/x` sent `.nip.io`, and as a later member of a host list
+(`mongodb://h1,10.0.0.5.nip.io,host3/db`) it ended the list and sent `.nip.io` and `host3`. The
+pre-masked template was not safe either: a bare name on a public suffix (`resolve 10.0.0.5.nip.io
+failed`) sent `.nip.io` there too. v0.4.0 → v0.12.6, thirty-two tagged releases. Running the host
+rules first was never the answer, because `https://10.0.0.5/x` must keep coming back `<IP_1>`, and
+no order of the chain gives both. The fix is a more specific rule, not a new order: one that
+matches only an address joined to hostname labels by `.` or `-`, so an address that stands alone
+is masked as an address exactly as before, ports, prefix lengths, sentence dots and list members
+included. Each name is one placeholder, and it recurs under that placeholder across the request.
+What it costs, pinned: text glued to an address by `.` or `-` that carries a letter is a host now,
+so a file name (`dump-10.0.0.5.log`), a missing space after a sentence dot, a word before the
+address and a version with a pre-release tag (`1.2.3.4-beta`, already read as an address) come
+back as one host placeholder. A reverse-DNS name (`5.0.0.10.in-addr.arpa`) is masked whole. An
+address beside digits only (`10.0.0.5.443`, `10.0.0.5-20`) is still an address. Measured over the
+same 70,783 records: ten records changed, raw and templatized alike, every one of them a reverse-DNS
+name; nothing narrowed.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -631,6 +652,8 @@ in `v0.9.2`); the sweep run while closing *that* found three more, listed last b
 the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the sweeps had
 a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found a class it
 could not close then, #67, closed in `v0.12.6`, and a single-host leak, #66, closed in `v0.12.5`.
+Of the audit's own four, the half of #48 that ordering could not reach, #54, closed in
+`TODO-VERSION`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -638,15 +661,15 @@ Each time the audit's own count was right and its scope was narrower than the se
   filed this and the IPv4 row below as one defect because they share a cause; fixing it showed
   they do not share a *remedy*, so the count above is right about how many were open and wrong
   about how many issues they were.
-- **#54** — the half of #48 that ordering cannot reach, refiled as its own class: an inner
-  detector mints a placeholder inside a host detector's span and **no ordering resolves it**,
-  because the right answer depends on what the matched span is part of.
-  `https://10.0.0.5.nip.io/x` sends `.nip.io` and `worker-10.0.0.5.corp.internal` sends
-  `worker-`, while `https://10.0.0.5/x` must keep masking as `<IP_n>` — and no linear chain gives
-  both. The candidate is structural: identify the authority span before the inner detectors run.
-  The same cell as a *later* member of a host list also ends the list there, because a member that
-  is a placeholder with text glued to it is neither a placeholder nor a host to the list rule:
-  `mongodb://h1,10.0.0.5.nip.io,host3/db` sends `.nip.io` and `host3`.
+- ~~**#54** — the half of #48 that ordering cannot reach.~~ **Closed in `TODO-VERSION`.** See the
+  paragraph above. It was refiled as its own class because an inner detector minted a placeholder
+  inside a host detector's span and **no ordering resolves it**: the right answer depends on what
+  the matched span is part of. `https://10.0.0.5.nip.io/x` sent `.nip.io` and
+  `worker-10.0.0.5.corp.internal` sent `worker-`, while `https://10.0.0.5/x` must keep masking as
+  `<IP_n>`, and no linear chain gives both. That result stands. The candidate was structural, a
+  pre-pass identifying the authority first; what closed it is a rule more specific than the
+  address rule on exactly the span they share, an address joined to hostname labels, which no
+  ordering argument rules out.
 - **#49** — an IPv4-mapped IPv6 address masks only as far as its first octet:
   `::ffff:192.168.1.1` sends `.168.1.1`.
 - **#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
@@ -668,6 +691,9 @@ Each time the audit's own count was right and its scope was narrower than the se
   blocks every credential rule (all of their groups exclude `<`), and the remainder can lie on
   *either side* of it, so unlike #46 this is not closed by adding two rules: no single pattern
   reaches it. The candidate is structural — a second group or a second tag on the detector type.
+  The same key as a *later* member of a host list also ends the list there, because a member that
+  is a placeholder with text glued to it is neither a placeholder nor a host to the list rule:
+  `mongodb://h1,AKIA…EXAMPLE.prod,host3/db` sends `.prod` and `host3`.
 - ~~**#58** — a raw `@` in a password truncates the mask and sends the real host.~~ **Closed in
   `v0.9.3`.** See the paragraph above. The candidate was not as small as the issue said:
   admitting `@` alone traded a host leak for a username-fragment leak on one shape, so the rule
