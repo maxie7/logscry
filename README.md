@@ -573,7 +573,7 @@ preferred: widening the host rule to span the list closes every shape above and 
 shape masked today, a comma-separated list of URLs (`peers=https://a.com,https://b.com` would send
 `b.com`, because a comma member that is the next URL's scheme is a legal hostname character
 sequence and no pattern can refuse it without trailing context, which a first-pass rule cannot
-afford). The companion reads the first member's placeholder as context. Until `TODO-VERSION` it took
+afford). The companion reads the first member's placeholder as context. Until `v0.12.6` it took
 hosts 2..n as **one** placeholder, so a list of any length came back as two,
 `<HOST_1>:27017,<HOST_2>:27017`, with the ports between members inside the second while the first and
 last stayed visible; since then every member is its own placeholder (#67, two paragraphs down). What it
@@ -581,7 +581,7 @@ costs, pinned: a path-less URL directly followed by a comma and CSV cells
 (`https://api.acme.com,200,12ms`) now reads as a host list and the cells are masked — a comma *with a
 space* after it, a path before it, or no scheme on the line are all untouched. What stayed open at
 `v0.9.4`: an address literal (or a key-shaped member) as a *later* member still blocked every member
-after it, which was #67, closed in `TODO-VERSION`; and an underscore in a hostname, found while
+after it, which was #67, closed in `v0.12.6`; and an underscore in a hostname, found while
 sweeping this one, was #66, closed in `v0.12.5` (next paragraph).
 
 **An underscore in a hostname was sent in the clear before `v0.12.5`.** No host rule
@@ -601,7 +601,7 @@ address — as one without (`backup@nightly.service`) always has, which costs th
 the unit that started. Measured over one laptop's journal, 70,783 records: no host mask changed;
 the only effect was that last cell, on 378 records.
 
-**A host list sent every member after an address in it before `TODO-VERSION`.** The `v0.9.4` fix
+**A host list sent every member after an address in it before `v0.12.6`.** The `v0.9.4` fix
 masked hosts 2..n as one placeholder, and that placeholder's rule cannot step over another
 placeholder, so a tag minted on a *later* member ended it there:
 `mongodb://host1:27017,10.0.0.5:27017,host3:27017/db` masked `host1` and the address and sent
@@ -630,7 +630,7 @@ closing the first of them found a credential gap the audit had no reason to look
 in `v0.9.2`); the sweep run while closing *that* found three more, listed last below; and closing
 the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the sweeps had
 a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found a class it
-could not close then, #67, closed in `TODO-VERSION`, and a single-host leak, #66, closed in `v0.12.5`.
+could not close then, #67, closed in `v0.12.6`, and a single-host leak, #66, closed in `v0.12.5`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -689,7 +689,7 @@ The full interference table, including the pairs that turned out to be harmless 
 
 One value can still end up with two placeholders — `<HOST_1>` from the raw line and `<HOST_2>`
 from the pre-masked template — which slightly weakens the "the model sees one host recur"
-signal. Cosmetic, and now the only cost of its kind: until `TODO-VERSION` a host list also came back
+signal. Cosmetic, and now the only cost of its kind: until `v0.12.6` a host list also came back
 as two placeholders — the first member and the rest — so a member that recurred elsewhere in the
 payload was not seen to recur.
 

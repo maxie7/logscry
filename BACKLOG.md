@@ -2120,7 +2120,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       same, and so does an adjacent-tags member on the Template field, where a `<NUM>` follows the
       tags. It is #54's class, an inner tag that is wrong because it sits inside a host, so it is
       offered as a comment on #54 and named under #54 in the README audit list; #54's pre-pass would
-      close it. Seen, out of scope: #54's own cells, #57, #59 with a list, #65. Targets TODO-VERSION
+      close it. Seen, out of scope: #54's own cells, #57, #59 with a list, #65. Targets v0.12.6
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
