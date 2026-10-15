@@ -1944,6 +1944,184 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       comment on #52 and named under #52 in the README audit list. Seen, out of scope: #65's `~`,
       sub-delim and pct-encoded cells; #67; #54. Targets v0.12.5
 
+- [x] **A tag on a later member of a host list no longer ends the list** — #67, filed by #61 as
+      a class with four pinned open assertions, one per tag that can reach a later member. Since
+      #61, `--llm-anonymize` masked a multi-host authority as two placeholders: the first member,
+      and hosts 2..n as one group (9c). That group excludes `<`, the inertness invariant every
+      target group carries. So a tag minted on member k ≥ 2 before 9c ran ended the group there,
+      and every member after it went to the configured model endpoint:
+      - `mongodb://host1:27017,10.0.0.5:27017,host3:27017/db` sent `host3`;
+      - `mongodb://h1,2001:db8::1,host3/db` and `mongodb://h1,[2001:db8::1]:27017,host3:27017/db`
+        sent `host3`;
+      - `mongodb://h1,AKIAIOSFODNN7EXAMPLE,host3/db` sent `host3` (theoretical: a member that is a
+        key);
+      - `mongodb://10.0.0.5,10.0.0.6,host3/db` sent `host3`: two addresses first.
+
+      `Mask` returned nil and `residue()` returned `""`: 9c is `verify:false`, and the leftover is not
+      a shape it matches on its own. `v0.9.4` → `v0.12.5`; before `v0.9.4` every member after the
+      first was sent regardless, so the class is a remainder of #61 and strictly narrower than what
+      it replaced.
+
+      **One correction to the issue as filed.** It said the class was live on the raw path only,
+      because on the Template field an address collapses to the pipeline's `<IP>`, which the
+      tolerant host run steps over. That holds for an unbracketed address. A bracketed one becomes
+      `[<IP>]` and a key `<TOKEN_n>`, and 9c could start on neither. So
+      `mongodb://h<NUM>,[<IP>]:<NUM>,host<NUM>:<NUM>/db` and the AKIA row sent `host<NUM>` on the
+      Template field too. Measured on main.
+
+      **The fix (`internal/anonymize/anonymize.go` only) is the issue's option 2.** 9c's group is one
+      member. Its context steps over every member already tagged, a `taggedMember` shared with the
+      first-member context, whichever rule minted the tag. `Mask` re-applies 9c until a pass
+      changes nothing. Each pass takes the first raw member after a run of tags, so it re-anchors on
+      the last tag in the list, 8's or 2's as readily as its own. The example now comes back
+      `<HOST_1>:27017,<IP_1>:27017,<HOST_2>:27017/db`. #54's pre-pass was not needed: here the inner
+      tag is right, and the remedy is to re-anchor on it rather than undo it.
+
+      **Decisions.**
+      1. **Termination, argued and pinned.** A changing pass masks a raw run directly after a comma,
+         and that comma stays followed by `<` for good: no rule rewrites a tag, and neither a tag nor
+         the run it replaced contains a comma. So changing passes are bounded by the commas, which per
+         list is the members after the first. One pass masks the next member of **every** list on
+         the line, so the bound is the longest list, not the sum. Two 65-member lists on one line
+         settle in 64 passes, and a 40-member list beside a CSV tail masks as each would alone (both
+         pinned).
+      2. **A hard cap of 64 changing passes, and it fails closed.** It is reachable on purpose. Each
+         pass rescans the whole line, so an unbounded loop is O(cells × length). A path-less URL
+         followed by 4,200 comma cells (8 KB) took **7.9 s** per `Mask` uncapped, against 4.8 ms on
+         main, and anyone who can write a log line can produce that. 64 is above MongoDB's 50-member
+         replica-set limit.
+         - At the cap, `Mask` returns no string and the error `anonymize: a host list with more than
+           64 members after the first was not masked`.
+         - Measured with the cap, main against new: a 3-member replica set 127 µs → 121 µs; a 64 KB
+           line with 64 cells 62 ms → 220 ms; the 8 KB line 4.8 ms → 27 ms; a 64 KB line of 33k
+           cells 38 ms → 223 ms. The gate was 1 s or 20× main, and the worst case is 5.8×.
+      3. **The change is local to 9c.**
+         - `apply` is unchanged and still one pass.
+         - `detector` gains a `fixpoint` flag, and exactly one rule, 9c, carries it in both the
+           default set and with extra suffixes (pinned).
+         - Old and new chains with 9c removed are byte-identical on every differential input.
+      4. **One placeholder per member, deliberately.** The three-member rows of the #61 battery, three
+         list completeness rows (now one marked span per member), two templatized rows (×3 with the
+         logfmt wrapper) and the CSV over-mask row were rewritten.
+         - The interior-ports over-mask, #61's first named cost, is retired, since every port is
+           visible now; its row moved into the new test.
+         - The gain is pinned: a list member alone in a later line gets its list placeholder, where
+           before the list's tail was one value and the member minted a new one.
+      5. **The path-less-URL-then-CSV over-mask** covers exactly the characters it covered before. Each
+         cell is now its own placeholder, so equal cells share one, and a cell with a character
+         outside the host class ends the run where it always did. Past 64 cells the escalation is
+         skipped (decision 2).
+
+      **Why fail closed at the cap, and not main's shape (the rest of the list as one placeholder).**
+      Main's shape is the defect. A group spanning several members still cannot cross a tag, so
+      falling back to it would leak every member after a tag on exactly the lists that hit the cap,
+      #67's class restored where it is hardest to see. Making the fallback cross tags would put a
+      target group on our own output, which the inertness invariant forbids: a nested mapping, and
+      a `residue` that can fire on its own output. It would also be a second masking path that runs
+      only on pathological input, which no real log exercises and so nobody would notice rotting. The
+      package already has a rule for "cannot mask this confidently": don't send it, which is what a
+      `residue` hit does. The cost is one skipped explanation on a line with more than 64 members
+      after the first. No capture line came near it.
+
+      **How a cap-hit reaches the user: exactly as a `residue` mute does.** Both are `Mask` errors.
+      `maskErr` marks them fatal, and the escalation becomes an `ExplainFailed` with the reason. That
+      reason shows on the card ("explanation unavailable: anonymization failed, escalation skipped:
+      …"), in the status bar's `✗` counter, in the export record (`state: unavailable` with the
+      `error`), and on the `--plain` line. No channel was added, and `residue` mutes are not silent,
+      so there is no gap to record. `TestHostListCapFailsClosedLikeResidue` pins the road with the
+      real anonymizer.
+
+      **No narrowing, shown differentially.** The corpus came from uncommitted hooks in `Mask` and
+      `residue`, run under the anonymize and llm tests of both main and the branch, plus the
+      templatized form of every input: 1,750 distinct inputs. Old and new masking were compared by
+      per-byte coverage bitmaps rebuilt from `byToken`. A newly uncovered run that is exactly a
+      member separator (`(:port)?,+`, port digits possibly `<NUM>`) counts as layout, since it was
+      inside one placeholder before. Results:
+      - **0 narrowed**, 0 mixed;
+      - 1,301 unchanged;
+      - 365 layout only: lists of three or more members;
+      - 73 widened: later-member tags;
+      - 4 the bitmap cannot rebuild, because the input already carries a literal placeholder. They
+        are the old leftovers fed to `residue`, and all four widen (`host3` newly masked);
+      - 7 changed whether `Mask` errors, all of them the cap tests' own inputs;
+      - 9c-removed identity on all 1,750.
+
+      Restricted to what main's own tests feed (884): 846 unchanged, 28 layout, 6 widened (the four
+      open rows, plus the bracketed and AKIA Template rows), the 4 unrebuildable, 0 narrowed and
+      0 error changes.
+
+      **Frequency, measured.** The ten boot captures and the ab37 capture, 70,783 records, raw and
+      through `Templatize`, old against new, counts only. **Prediction, recorded before the run:**
+      0 changed records and 0 cap hits. **It held:** 0 and 0. As with #43 and #66, there is no
+      multi-host authority in this corpus. Nothing from the captures is in the repo.
+
+      **Tests.** Red first:
+      - `TestIssue67LaterMemberTag` has exact outputs, every member absent, and a round trip:
+        - the four former open rows;
+        - two consecutive addresses, addresses alternating with names, two addresses first, and
+          adjacent tags as a later member;
+        - an eight-member list, the retired interior-ports row, and two lists on one line;
+        - four Template-field rows through the real `Templatize`;
+        - address-last and address-first rows, byte-identical on main;
+        - the recurrence row, and the `residue` claim.
+      - The layout rewrites above, and 9c's output fed back to `TestPlaceholdersAreInert`.
+
+      Main failed 33 subtests, all by assertion. Main's own test file run against the new code fails
+      exactly the decision-4 rows and the four open rows, and nothing else. After the fix:
+      - `TestHostListFixpoint`: one rule iterates; lists of 2 to 65 members terminate below the cap
+        in three shapes; the cap counts the longest list; a list beside a CSV tail; past the cap,
+        `Mask` fails closed with a reason naming the host list.
+      - `TestHostListCapFailsClosedLikeResidue` in `internal/llm`.
+
+      These two use the new flag and cap, so they come after the fix rather than in the red commit.
+
+      **Flakiness and mutants.** Every new and touched test passes 20 of 20 runs under `-race`. Eight
+      mutants each turn tests red:
+      - no iteration turns 28 subtests and the llm test red: every multi-member and later-tag row,
+        the list completeness and templatized rows, the CSV rows and the cap rows;
+      - main's multi-member group, iterated, turns 27 subtests and the llm test red;
+      - re-anchoring only on `<HOST_n>` turns 11 red: every later-tag row, raw and template, and the
+        address-alternating termination row;
+      - the cap returning what it has ("send the rest") turns the fail-closed row and the llm test
+        red;
+      - the cap off by one turns the 65-member termination rows and the longest-list row red;
+      - no bracketed later member turns the bracketed rows red, raw and template;
+      - the group without `listEnd` turns the comma-separated-URL and scheme-position rows red;
+      - a single tag instead of adjacent tags turns both adjacent-tag rows red.
+
+      Main's 9c itself is the red commit.
+
+      **The full suite** ran under `-race` on main and on the branch: 1,102 results, then 1,127.
+      - **No existing result changed outcome.**
+      - Five left: the four open #67 rows, and the interior-ports row, which moved.
+      - 30 new results came in.
+
+      **Wire check.** One run per binary against a capturing endpoint (`--plain --llm-anonymize
+      --warmup-lines 0`). A `[FATAL]` line carried
+      `mongodb://host1:27017,10.0.0.5:27017,host3:27017/db`, with #57's
+      `s3://AKIA…EXAMPLE.prod@x@bucket` in its context.
+      - `host3`: 1 before (trigger line), 0 after.
+      - `.prod` fires in both, so the grep is not vacuous.
+      - On the wire, the new trigger reads `<HOST_1>:27017,<IP_1>:27017,<HOST_2>:27017/db`.
+
+      **`residue`.** Nothing new: 9c stays `verify:false`, and the old leftover still reads as clean
+      (pinned).
+
+      `internal/pipeline` does not appear in the diff. README:
+      - the #67 audit bullet goes;
+      - the audit sentence and the #61 paragraph's layout and #67 sentences move to past tense;
+      - the "two placeholders" cost sentence moves to past tense;
+      - a new past-tense paragraph carries the shapes, span, costs and the measured frequency.
+
+      **Found on the way, not fixed: a MIXED later member still ends the list.**
+      `mongodb://h1,10.0.0.5.nip.io,host3/db` sends `.nip.io` and `host3`, because by the time 9c runs
+      the member is `<IP_1>.nip.io`, a tag with text glued to it, and that is neither a tag nor a host
+      run. Confirmed with a throwaway test. A #57-shaped key (`h1,AKIA…EXAMPLE.prod,host3`) does the
+      same, and so does an adjacent-tags member on the Template field, where a `<NUM>` follows the
+      tags. It is #54's class, an inner tag that is wrong because it sits inside a host, so it is
+      offered as a comment on #54 and named under #54 in the README audit list; #54's pre-pass would
+      close it. Seen, out of scope: #54's own cells, #57, #59 with a list, #65. Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

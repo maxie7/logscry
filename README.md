@@ -573,16 +573,16 @@ preferred: widening the host rule to span the list closes every shape above and 
 shape masked today, a comma-separated list of URLs (`peers=https://a.com,https://b.com` would send
 `b.com`, because a comma member that is the next URL's scheme is a legal hostname character
 sequence and no pattern can refuse it without trailing context, which a first-pass rule cannot
-afford). The companion reads the first member's placeholder as context and takes hosts 2..n as
-**one** placeholder, so a list of any length comes back as two: `<HOST_1>:27017,<HOST_2>:27017`. One
-consequence to know about: **the ports between members are inside that placeholder while the first
-and last stay visible**, so `host1:27017,host2:27018,host3:27019` reads back as
-`<HOST_1>:27017,<HOST_2>:27019`. What it costs, pinned: a path-less URL directly followed by a comma
-and CSV cells (`https://api.acme.com,200,12ms`) now reads as a host list and the cells are masked — a
-comma *with a space* after it, a path before it, or no scheme on the line are all untouched. What
-stays open, pinned as assertions: an address literal (or a key-shaped member) as a *later* member
-still blocks every member after it, which is #67 below; and an underscore in a hostname,
-found while sweeping this one, was #66, closed in `v0.12.5` (next paragraph).
+afford). The companion reads the first member's placeholder as context. Until `TODO-VERSION` it took
+hosts 2..n as **one** placeholder, so a list of any length came back as two,
+`<HOST_1>:27017,<HOST_2>:27017`, with the ports between members inside the second while the first and
+last stayed visible; since then every member is its own placeholder (#67, two paragraphs down). What it
+costs, pinned: a path-less URL directly followed by a comma and CSV cells
+(`https://api.acme.com,200,12ms`) now reads as a host list and the cells are masked — a comma *with a
+space* after it, a path before it, or no scheme on the line are all untouched. What stayed open at
+`v0.9.4`: an address literal (or a key-shaped member) as a *later* member still blocked every member
+after it, which was #67, closed in `TODO-VERSION`; and an underscore in a hostname, found while
+sweeping this one, was #66, closed in `v0.12.5` (next paragraph).
 
 **An underscore in a hostname was sent in the clear before `v0.12.5`.** No host rule
 admitted `_`, which RFC 3986 allows anywhere in a hostname and which logs carry in container
@@ -601,6 +601,24 @@ address — as one without (`backup@nightly.service`) always has, which costs th
 the unit that started. Measured over one laptop's journal, 70,783 records: no host mask changed;
 the only effect was that last cell, on 378 records.
 
+**A host list sent every member after an address in it before `TODO-VERSION`.** The `v0.9.4` fix
+masked hosts 2..n as one placeholder, and that placeholder's rule cannot step over another
+placeholder, so a tag minted on a *later* member ended it there:
+`mongodb://host1:27017,10.0.0.5:27017,host3:27017/db` masked `host1` and the address and sent
+`host3`. An IPv6 literal, bracketed or not, did the same, and so would a member that literally is a
+key. The bracketed and key-shaped cases leaked on the masked template too. `v0.9.4` → `v0.12.5`;
+before `v0.9.4` every member after the first was sent regardless. The rule now takes **one member at
+a time** and is re-applied until nothing changes, re-anchoring each time on the last placeholder in
+the list whichever rule minted it, so the example comes back as
+`<HOST_1>:27017,<IP_1>:27017,<HOST_2>:27017/db`. Every member is its own placeholder, every port is
+visible, and a member that recurs elsewhere in the request is seen to recur. What it costs, pinned:
+the comma cells after a path-less URL above are now one placeholder per cell, so equal cells read as
+equal; and a list or a run of cells with **more than 64 members after the first** is not masked at
+all — the explanation is skipped, as when the fail-closed check fires, with the reason on the card.
+64 is above MongoDB's 50-member replica-set limit; the bound exists because each pass rescans the
+line, and without it an 8 KB line of comma cells took 7.9 s. Measured over the same 70,783 records:
+nothing changed.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -612,7 +630,7 @@ closing the first of them found a credential gap the audit had no reason to look
 in `v0.9.2`); the sweep run while closing *that* found three more, listed last below; and closing
 the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the sweeps had
 a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found a class it
-could not close, listed last below, and a single-host leak, #66, closed in `v0.12.5`.
+could not close then, #67, closed in `TODO-VERSION`, and a single-host leak, #66, closed in `v0.12.5`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -626,6 +644,9 @@ Each time the audit's own count was right and its scope was narrower than the se
   `https://10.0.0.5.nip.io/x` sends `.nip.io` and `worker-10.0.0.5.corp.internal` sends
   `worker-`, while `https://10.0.0.5/x` must keep masking as `<IP_n>` — and no linear chain gives
   both. The candidate is structural: identify the authority span before the inner detectors run.
+  The same cell as a *later* member of a host list also ends the list there, because a member that
+  is a placeholder with text glued to it is neither a placeholder nor a host to the list rule:
+  `mongodb://h1,10.0.0.5.nip.io,host3/db` sends `.nip.io` and `host3`.
 - **#49** — an IPv4-mapped IPv6 address masks only as far as its first octet:
   `::ffff:192.168.1.1` sends `.168.1.1`.
 - **#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
@@ -663,24 +684,14 @@ Each time the audit's own count was right and its scope was narrower than the se
   meant. The honest candidate here is to **fail closed** rather than mask in part: a partial mask
   that leaks a host is worse than a skipped escalation.
 
-- **#67** — **a placeholder minted on a later member of a host list blocks every member
-  after it.** `mongodb://host1:27017,10.0.0.5:27017,host3:27017/db` masks `host1` and the address
-  and sends `host3`; an IPv6 literal, bracketed or not, or a key-shaped member does the same. The
-  companion rule's group excludes `<` — the inertness invariant — so a tag inside the list ends the
-  group there. Filed as the class rather than as the address cell, with one pinned open assertion
-  per tag that can reach a later member (derived by walking the chain: the address rules, and the
-  secret rules only when a member literally *is* a key). Same cause as #54 — containment, which a
-  linear chain cannot represent — but not #54's remedy: the inner tag is *right* here, and a
-  companion re-applied until nothing changes would re-anchor on it.
-
 The full interference table, including the pairs that turned out to be harmless and why, is in
 `BACKLOG.md`.
 
 One value can still end up with two placeholders — `<HOST_1>` from the raw line and `<HOST_2>`
 from the pre-masked template — which slightly weakens the "the model sees one host recur"
-signal; and a host list comes back as two placeholders — the first member and the rest — rather
-than one per host, so a member that recurs elsewhere in the payload is not seen to recur. Both
-cosmetic, and now the only costs.
+signal. Cosmetic, and now the only cost of its kind: until `TODO-VERSION` a host list also came back
+as two placeholders — the first member and the rest — so a member that recurred elsewhere in the
+payload was not seen to recur.
 
 **This is best-effort risk reduction, not a guarantee.** Free-text log messages can
 contain anything, and logscry only masks what it recognizes. Bare **public** hostnames in
