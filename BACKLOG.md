@@ -2416,7 +2416,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       the coverage test sees it: the coverage test reads only the built-in suffixes, none of which
       has a digit. Confirmed with a throwaway test. It is reachable through configuration and no
       open issue covers it, so it is filed as ISSUE-TBD and named under README "Known limitations".
-      Seen, out of scope: #57, #59, #65's sweep. Targets TODO-VERSION
+      Seen, out of scope: #57, #59, #65's sweep. Targets v0.12.8
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
@@ -3223,7 +3223,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       the #46 wire capture rather than by a test, and the lesson generalises: **a detector's
       tolerance has to cover its ANCHORS, not only its capture** — which is also why the
       coverage test that should have caught it did not, since it checks a detector's GROUP and
-      the scheme is context. (Done with #52, in TODO-VERSION, together with a test that checks
+      the scheme is context. (Done with #52, in v0.12.8, together with a test that checks
       every detector's context.)
       `internal/pipeline` does not appear in the diff and no template hashes move: this package
       runs at the LLM boundary and never feeds `hashTemplate`. README corrected at three sites,

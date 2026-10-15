@@ -641,7 +641,7 @@ same 70,783 records: ten records changed, raw and templatized alike, every one o
 name; nothing narrowed.
 
 **A URL's host was sent when its scheme carried a digit or was glued to `_` before
-`TODO-VERSION`.** The URL-host and host-list rules find a URL by its scheme, and that part of the
+`v0.12.8`.** The URL-host and host-list rules find a URL by its scheme, and that part of the
 pattern never learned to read the pipeline's placeholders the way the host part did. So on the
 pre-masked template a scheme with a digit, `s3://` or `h2://`, became `s<NUM>://` and the rules went
 quiet: `url=s3://AKIA…:secret@bucket.example.com/x` reached the model as
@@ -670,7 +670,7 @@ the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the 
 a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found a class it
 could not close then, #67, closed in `v0.12.6`, and a single-host leak, #66, closed in `v0.12.5`.
 Of the audit's own four, the half of #48 that ordering could not reach, #54, closed in
-`v0.12.7`, and the anchor gap filed beside them, #52, in `TODO-VERSION`.
+`v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -690,7 +690,7 @@ Each time the audit's own count was right and its scope was narrower than the se
 - **#49** — an IPv4-mapped IPv6 address masks only as far as its first octet:
   `::ffff:192.168.1.1` sends `.168.1.1`.
 - ~~**#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
-  pre-masked template.~~ **Closed in `TODO-VERSION`.** See the paragraph above. `s3://…@bucket`
+  pre-masked template.~~ **Closed in `v0.12.8`.** See the paragraph above. `s3://…@bucket`
   sent `bucket`. It was not an interference defect but a tolerance gap left over from #43, listed
   here because it leaked a host. The same anchor missed a URL glued to a word by `_`, on the raw
   line too (`x_https://acme.com/x`, `__https://acme.com__`), because the scheme had to start at a
