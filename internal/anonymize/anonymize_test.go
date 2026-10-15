@@ -1864,6 +1864,36 @@ func TestIssue52SchemeAnchor(t *testing.T) {
 	}
 }
 
+// TestSchemeAnchorIsShared holds 9a and 9c to ONE scheme anchor. Two copies of it are how #52 was
+// missed: each rule carried its own \b[a-z][a-z0-9+.-]*://, and #43 widened the groups beside them.
+// Exactly two rules compile schemeAnchor -- the URL host and the host list -- and no rule spells the
+// scheme class out on its own, in the default set or with extra suffixes.
+func TestSchemeAnchorIsShared(t *testing.T) {
+	const schemeClass = `[a-z0-9+.-]`
+	for _, dets := range [][]detector{baseDetectors, buildDetectors([]string{"example"})} {
+		users, fixpoint := 0, 0
+		for i, d := range dets {
+			src := d.re.String()
+			if rest := strings.ReplaceAll(src, schemeAnchor, ""); strings.Contains(rest, schemeClass) {
+				t.Errorf("detector %d (%s) spells out its own scheme class instead of using schemeAnchor:\n pattern: %s", i, d.tag, src)
+			}
+			if !strings.Contains(src, schemeAnchor) {
+				continue
+			}
+			users++
+			if d.fixpoint {
+				fixpoint++
+			}
+			if d.tag != tagHost || d.group != 1 || d.verify {
+				t.Errorf("an unexpected rule uses schemeAnchor: detector %d, tag %s, group %d, verify %v", i, d.tag, d.group, d.verify)
+			}
+		}
+		if users != 2 || fixpoint != 1 {
+			t.Errorf("%d rules use schemeAnchor (%d of them iterating); want 9a and 9c, exactly one iterating", users, fixpoint)
+		}
+	}
+}
+
 // TestUUIDOutsideAHostKeepsItsOwnTag is the other half of #48's tag change, and it is not
 // optional.
 //
