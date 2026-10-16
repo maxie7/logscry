@@ -657,6 +657,26 @@ now checked against the pipeline's handwriting too, not only the value it captur
 not reached: an empty `Bearer ` directly before a URL turns the scheme into a token and the host is
 still sent (recorded under #65). Measured over the same 70,783 records: nothing changed.
 
+**A host on a suffix you configured was sent in the pre-masked template before
+`TODO-VERSION`, wherever the pipeline had rewritten the suffix.** The bare-host rule took each
+`--llm-anonymize-suffix` value as written, so on the template, where the pipeline had already
+rewritten it, the rule went quiet: with `--llm-anonymize-suffix k8s`, `peer db.k8s down` was masked
+on the raw line and reached the model as `peer db.k<NUM>s down` in the template. It was wider than
+a digit: `eu-1` and `v1.2` became `eu<NUM>` and `v<NUM>`, `deadbeef` and `0xcafe` became `<HEX>`
+with no digit at all, and a suffix starting with a digit lost the dot before it (`db1.2corp` became
+`db<NUM>corp`). The raw line, the built-in suffixes and hosts inside URLs were never affected, and a
+configured suffix that begins with a built-in one (`corp1`) was masked by the built-in by accident.
+v0.4.0 → v0.12.8, thirty-four tagged releases. The rule now reads each configured suffix both as
+written and as the pipeline rewrites it, asking the pipeline rather than keeping a copy of its
+patterns; the built-in rule is byte-identical. What it costs is on the template only: the
+placeholder stands for any run the pipeline rewrites the same way, so under `k8s` a `db.k88s` is a
+host there though not on the raw line, and the template's host gets a placeholder of its own,
+because its masked form differs from the raw line's. Changed with it, because it leaked too: a
+suffix written with a dot, `.acme` or `acme.`, never matched (this README writes the built-ins as
+`.internal`), so every host on it was sent on both paths. The dots are now stripped, and an empty
+suffix is refused at startup, where it used to mask every dotted prefix. Measured over the same
+70,783 records: nothing changed.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -956,12 +976,6 @@ entry with an empty message.
   Nothing is disclosed and the payload round-trips exactly, but the model sees a broken
   payload, and wherever its answer names `<USER_1>` the restored text carries the stray `"`
   or `)`. Raw lines, JSON and logfmt templates are all affected. Filed as #90.
-- **A host-suffix you configure with a digit in it is not masked in the template.**
-  `--llm-anonymize-suffix k8s` masks `db.k8s` on the raw line, but the pre-masked template carries
-  it as `db.k<NUM>s`, which the bare-host rule no longer recognises, so the name reaches the model
-  there. Only configured suffixes containing a digit are affected; the built-in ones (`internal`,
-  `local`, `corp`, …) have none, and hosts inside URLs and connection strings are masked by their
-  own rules whatever the suffix. Filed as #105.
 - **A quoted value containing an escaped quote templates badly on the plain-text path.** The
   `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
   as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left

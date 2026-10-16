@@ -2418,6 +2418,149 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       open issue covers it, so it is filed as #105 and named under README "Known limitations".
       Seen, out of scope: #57, #59, #65's sweep. Targets v0.12.8
 
+- [x] **A host on a configured suffix is masked in the pre-masked template** — #105, found in the work on
+      #52 and filed from it. `--llm-anonymize-suffix` extends 9b, and each value was spliced
+      in verbatim (`escapeAll` → `QuoteMeta`). The labels before a suffix were tolerant since #43;
+      the suffix was not. It is #52's lesson on a literal INSIDE the group, which is why neither
+      #52's context test nor the uncollapsed test saw it: the one reads context, the other reads
+      only the built-in suffixes. `New("k8s")`: `peer db.k8s down` → `peer <HOST_1> down` raw,
+      and `peer db.k<NUM>s down` sent whole on the Template field. `Mask` returned nil; 9b is
+      `verify:false`. v0.4.0 → v0.12.8, **thirty-four tagged releases** (`git tag --contains
+      2da31be | wc -l` → 34).
+
+      **Two corrections to the issue as filed, both measured with the real `Templatize`.**
+      - **It is not only digits.** NUM takes a sign and a decimal tail with it (`eu-1` → `eu<NUM>`,
+        `v1.2` → `v<NUM>`), HEX rewrites a suffix with no digit at all (`deadbeef`, `0xcafe` →
+        `<HEX>`), and a suffix beginning with a digit loses the dot before it after a label ending
+        in one (`db1.2corp`, `db-1.2corp` → `db<NUM>corp`).
+      - **`corp1`, the shape config_test.go uses, was not a leak.** The built-in `corp` read
+        `db.corp<NUM>` as a host on `corp` and left the `<NUM>` beside the tag, so no host text was
+        sent. It is pinned as moved: one `<HOST_1>` now.
+
+      **The fix (`internal/anonymize/anonymize.go`, and `internal/config` for the dots).**
+      `bareHostPattern` reads each suffix as written AND as `pipeline.Templatize` rewrites it.
+
+      **Decisions.**
+      1. **Derived, not hand-written.** A hand-written tolerance needs copies of UUID, HEX with its
+         letter rule, and NUM, in the pipeline's order: #42's class, a pattern duplicated across
+         two packages with no shared source. So anonymize imports pipeline. There is no cycle:
+         pipeline imports model, export and score, none of which imports anonymize or llm. The
+         direction is llm → anonymize → pipeline, the consumer of the Template field reading the
+         producer's handwriting. The masking stays separate, as the package comment requires.
+
+         What can touch a suffix-shaped string: NUM and HEX, as above; UUID only inside a suffix
+         that contains one; IPv4 only across numeric labels, which is 9d's on both paths; TS, IPv6
+         and STR need ':' or quotes. Derivation covers all of them without the list.
+
+         `Templatize(S)` alone gives what it gives in a host, because 9b demands a boundary after
+         the suffix and a NUM that takes a trailing `.5` keeps the prefix. The one context effect
+         is the dot BEFORE the suffix. It is measured on a probe, `Templatize("x9." + S)`. If the
+         dot is gone, the rest becomes a branch `labels* label inner* <NUM> rest`, added only when
+         the rest carries a letter (9d's rule), so an all-digit suffix cannot make every word glued
+         to a number a host.
+      2. **A form ending in a placeholder is closed by `\B`.** After '>' a `\b` demands a word
+         character next, the opposite of what the raw line asks after `corp1`. `\B` holds exactly
+         where the next character is not a word character, or the text ends. It is zero-width, so
+         9b keeps group 0. Pinned: end of text, a space, a dot, a port, another placeholder; and a
+         suffix glued to a letter or '_' is no host on either path. The merge branch's boundary is
+         read on `<NUM>` + rest, so the letter guard is the only thing that refuses an empty rest
+         (a mutant found the boundary refusing it by accident first).
+      3. **The built-ins are byte-identical.** Every built-in, and a configured suffix the pipeline
+         leaves alone, adds no form. `TestBareHostPatternUnchanged` rebuilds main's construction in
+         the test and compares the source for `baseDetectors`, `New()`, `New("acmecloud")` and
+         `New("acmecloud", "my-cloud")`.
+      4. **Config: dots stripped, empty refused.** Measured on main with throwaway tests:
+         - `/` and whitespace are matched literally: no leak;
+         - `<NUM>` never matches after `\b`, and a tag-shaped suffix at worst nests a mapping, which
+           `Restore` resolves by rule (#50): no leak;
+         - `""` was an empty alternative and masked every dotted prefix
+           (`java.lang.NullPointerException` → `<HOST_1>NullPointerException`);
+         - **`.acme` LEAKED**: `\.acme` needs `db..acme`, so every host on it was sent on both
+           paths, with no warning, and the README writes the built-ins as `.internal`. `acme.`
+           matched only before a word character.
+
+         So `config.Load` now trims leading and trailing dots from each resolved suffix, flag or
+         file alike, and refuses one that is empty after trimming, with an error naming
+         `--llm-anonymize-suffix` and `llm.anonymize_suffixes`. Case is left alone; 9b is `(?i)`.
+
+      **What it costs.** Pinned in `TestAcceptedOverMasking`, all on the template and only under a
+      configured suffix the pipeline rewrites. The placeholder stands for any run rewritten the same
+      way:
+      - `db.acme12` is a host under `acme1`;
+      - `db.k88s` is a host under `k8s`;
+      - any `word.<HEX>` is a host under `deadbeef`;
+      - `x12corp` is a host under `2corp`.
+      The template's host also gets its own placeholder: its masked form, `db.k<NUM>s`, differs
+      from the raw line's `db.k8s`.
+
+      **No narrowing, shown differentially.** Hooks in `Mask` and `residue`, carried by `-overlay`
+      copies of the source, collected every input the anonymize, llm and config tests feed, on
+      main's tests and the branch's; each input's templatized form was added: 2,364 distinct
+      inputs. Main's `anonymize.go` was overlaid as a sibling package and compared by per-byte
+      coverage from `byToken`, under `New()` and under `New("k8s", "corp1", "eu-1", "v1.2", "az2",
+      "deadbeef", "2corp")`:
+      - default Mapper: 2,364 unchanged;
+      - extra-suffix Mapper: 2,297 unchanged, **67 widened**, all of them the new tests'
+        templatized inputs; **0 narrowed**, 0 mixed, 0 error changes, 0 layout-only, 0 that the
+        bitmap cannot rebuild.
+
+      Restricted to the 2,177 inputs main's own tests feed: all unchanged, under both Mappers.
+
+      **Frequency.** The built-ins are untouched, so the default Mapper cannot change, and one run
+      shows it: the ten boot captures and the ab37 capture, 70,783 records, raw and through
+      `Templatize`, old against new, counts only: **0 changed**, 0 error changes. No configured
+      suffix was taken from capture content, so there is no category to report. Nothing from the
+      captures is in the repo.
+
+      **Tests.** Red first:
+      - `TestIssue105ConfiguredSuffix`:
+        - 16 closed rows, exact outputs raw and through the real `Templatize`, every fragment main
+          sent absent, a round trip; one logfmt msg row;
+        - the `corp1` moved row;
+        - 20 byte-identical rows: every built-in under `New()` and `New("k8s")`, `acmecloud`, a URL
+          host, three glued rows and an all-digit suffix.
+      - `TestBareHostPatternUnchanged`.
+      - `TestConfiguredSuffixesSurviveTemplating`: seven suffix shapes (digit inside, at the end,
+        hyphen-digit, dotted digit, all hex, leading digit, multi-label) in five positions, each
+        raw, templatized and inside a logfmt msg, derived from marked rows.
+      - Four `TestAcceptedOverMasking` rows; the new outputs fed to `TestPlaceholdersAreInert`
+        under a rule set with configured suffixes.
+      - Config: `TestAnonymizeSuffixNormalised` (flag and file), `TestAnonymizeSuffixEmptyRejected`
+        (flag and file), and `TestAnonymizeSuffixReachesTheMasker`, which runs `config.Load` into
+        `anonymize.New` on both paths.
+
+      `TestConfiguredSuffixesSurviveTemplating` is a third test, not an extension of the
+      uncollapsed test or of #52's context test. Both iterate the default rule set, and the
+      configuration is the dimension this class lives in.
+
+      Main failed 57 subtests and the three config tests, all by assertion; the guards passed.
+
+      **Flakiness and mutants.** Every new and touched test passes 20 of 20 runs under `-race`.
+      Eight mutants each turn tests red:
+      - a bare digit run only (`\d+` → `<NUM>` by hand): 20, every hyphen, dotted and hex row;
+      - a boundary per suffix, behaviour-equivalent on the built-ins: the unchanged-pattern test;
+      - `\b` kept after a trailing placeholder: 37, every row ending in one, and the glued rows;
+      - no assertion after a trailing placeholder: the three glued rows;
+      - no merge branch: 4, the dot-eaten rows;
+      - a rewritten form only when the suffix has a digit: 7, every hex row;
+      - the merge without its letter guard: the all-digit row;
+      - config without dot stripping: the three config tests.
+
+      **The full suite** ran under `-race` on main and on the branch: 1,217 results, then 1,300.
+      No existing result changed outcome; 83 new results came in.
+
+      **Wire check.** One run per binary against a capturing endpoint (`--plain --llm-anonymize
+      --llm-anonymize-suffix k8s --warmup-lines 0`). A `[FATAL] peer db.k8s down` line, with #57's
+      `s3://AKIA…EXAMPLE.prod@x@bucket` in its context.
+      - `db.k`: 1 before (the template field), 0 after.
+      - `.prod` fires in both, so the grep is not vacuous.
+      - The template now reads `peer <HOST_2> down`.
+
+      `internal/pipeline` does not appear in the diff. README: the #105 Known-limitations bullet
+      is gone, and a past-tense paragraph carries the shapes, span, cost and the dotted-suffix
+      change. The flag's help text and README's usage line say nothing about digits and stay.
+      Seen, out of scope: #57, #59, #65's sweep. Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
