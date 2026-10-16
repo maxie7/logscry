@@ -3,6 +3,7 @@
 package anonymize
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -483,11 +484,21 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"see x_https://<HOST_1>/x",
 		"url=s<NUM>://<TOKEN_1>:<TOKEN_2>@<HOST_1>",
 		"mongodb://<HOST_1>,<HOST_3>_x://<HOST_2>",
+		// #105's new outputs fed back, under the rewritten configured suffixes below: a placeholder
+		// now ends a suffix form, and the host tag beside a pipeline placeholder must stay inert.
+		"peer <HOST_1> and <HOST_2> down",
+		"<HOST_1>:<NUM> refused",
+		"<HOST_1><NUM> up",
+		"reach <HOST_1>. retrying",
+		`time=<STR> level=error msg="peer <HOST_1> down"`,
 	}
+	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
-		for _, d := range baseDetectors {
-			if loc := d.re.FindStringSubmatchIndex(s); loc != nil && loc[2*d.group] >= 0 {
-				t.Errorf("detector %s matched placeholder syntax %q", d.tag, s)
+		for _, dets := range [][]detector{baseDetectors, withSuffixes} {
+			for _, d := range dets {
+				if loc := d.re.FindStringSubmatchIndex(s); loc != nil && loc[2*d.group] >= 0 {
+					t.Errorf("detector %s matched placeholder syntax %q", d.tag, s)
+				}
 			}
 		}
 		// The same claim from the fail-closed side: re-scanning masked output is clean.
@@ -1894,6 +1905,173 @@ func TestSchemeAnchorIsShared(t *testing.T) {
 	}
 }
 
+// TestIssue105ConfiguredSuffix is #105: a suffix configured with --llm-anonymize-suffix was spliced
+// into 9b verbatim, so on the Template field, where the pipeline had already rewritten it, 9b went
+// quiet and the host was sent. The raw line was always masked.
+//
+// The rewrite is not only "a digit becomes <NUM>". The NUM pattern takes a sign and a decimal tail
+// with it (eu-1 -> eu<NUM>, v1.2 -> v<NUM>), the HEX pattern rewrites a suffix with no digit at
+// all (deadbeef, 0xcafe -> <HEX>), and a suffix that begins with a digit can lose the dot before it
+// when the label before it ends in one (db1.2corp -> db<NUM>corp).
+func TestIssue105ConfiguredSuffix(t *testing.T) {
+	closed := []struct {
+		name     string
+		suffixes []string
+		in, want string
+		tmpl     string
+		sent     []string // what main sent on the template; none may survive
+	}{
+		{"digit inside", []string{"k8s"}, "peer db.k8s down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"db."}},
+		// A digit at the end: a placeholder ends the suffix, and what may follow it is pinned
+		// position by position -- end of text, a space, a dot, a port, another placeholder.
+		{"digit at end, end of text", []string{"acme1"}, "dial db.acme1", "dial <HOST_1>", "dial <HOST_1>", []string{"db."}},
+		{"digit at end, before a space", []string{"acme1"}, "dial db.acme1 down", "dial <HOST_1> down", "dial <HOST_1> down", []string{"db."}},
+		{"digit at end, before a dot", []string{"acme1"}, "reach db.acme1.", "reach <HOST_1>.", "reach <HOST_1>.", []string{"db."}},
+		{"digit at end, before a port", []string{"acme1"}, "db.acme1:5432 refused",
+			"<HOST_1>:5432 refused", "<HOST_1>:<NUM> refused", []string{"db."}},
+		{"digit at end, before a placeholder", []string{"acme1"}, "db.acme1-2 up", "<HOST_1>-2 up", "<HOST_1><NUM> up", []string{"db."}},
+		{"all digits after a letter", []string{"az2"}, "peer db7.az2 down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"db"}},
+		{"hyphen-digit, the '-' eaten", []string{"eu-1"}, "peer db.eu-1 down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"db."}},
+		{"dotted digits, the '.' eaten", []string{"v1.2"}, "peer db.v1.2 down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"db."}},
+		{"multi-label, digit inside", []string{"eu1.acme"}, "peer a.eu1.acme down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"a."}},
+		// No digit at all: the HEX pattern rewrites an 8+ hex run with a letter, and 0x anywhere.
+		{"all hex, no digit", []string{"deadbeef"}, "peer db.deadbeef down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"db."}},
+		{"0x prefix", []string{"0xcafe"}, "peer db.0xcafe down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"db."}},
+		// A leading digit: the dot survives after a plain label, and is eaten after a digit.
+		{"leading digit", []string{"2corp"}, "peer db.2corp down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"db."}},
+		{"leading digit, dot eaten", []string{"2corp"}, "peer db1.2corp down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"db"}},
+		{"leading digit, dot and hyphen eaten", []string{"2corp"}, "peer db-1.2corp down", "peer <HOST_1> down", "peer <HOST_1> down", []string{"db"}},
+		{"two configured suffixes", []string{"k8s", "acme1"}, "peer db.k8s and cache.acme1 down",
+			"peer <HOST_1> and <HOST_2> down", "peer <HOST_1> and <HOST_2> down", []string{"db.", "cache."}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				m := New(c.suffixes...)
+				got := mustMask(t, m, p.in)
+				if got != p.want {
+					t.Errorf("host on a configured suffix not masked:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+				for _, frag := range c.sent {
+					if strings.Contains(got, frag) {
+						t.Errorf("a fragment main sent survived: %q still in %q", frag, got)
+					}
+				}
+				if r := m.Restore(got); r != p.in {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", p.in, r)
+				}
+			}
+		})
+	}
+
+	// The logfmt branch carries the msg's text templatized, so the same leak had a second wrapper.
+	t.Run("logfmt msg", func(t *testing.T) {
+		const raw = `time="2026-07-13T12:00:00Z" level=error msg="peer db.k8s down"`
+		tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: raw}))
+		if tIn != `time=<STR> level=error msg="peer db.k<NUM>s down"` {
+			t.Fatalf("premise broken: the logfmt template is %q", tIn)
+		}
+		m := New("k8s")
+		if got, want := mustMask(t, m, tIn), `time=<STR> level=error msg="peer <HOST_1> down"`; got != want {
+			t.Errorf("host on a configured suffix not masked in a logfmt template:\n got:  %q\n want: %q", got, want)
+		}
+	})
+
+	// Moved, not closed: corp1 was masked on main, by the built-in "corp". On the template 9b read
+	// db.corp<NUM> as a host on corp and left the <NUM> beside the tag, so no host text was sent;
+	// the value is one host now, as on the raw line. A suffix with a built-in prefix is the one
+	// shape where main's output was already safe.
+	t.Run("built-in prefix (corp1)", func(t *testing.T) {
+		tIn, _ := pipeline.Templatize("dial db.corp1 down")
+		if got := mustMask(t, New("corp1"), tIn); got != "dial <HOST_1> down" {
+			t.Errorf("corp1 on the template: got %q, want %q", got, "dial <HOST_1> down")
+		}
+	})
+
+	// Byte-identical with main, raw and templatized. Every built-in suffix, under the default
+	// Mapper and under one with a rewritten configured suffix beside it; a configured suffix the
+	// pipeline leaves alone; a host on a configured suffix inside a URL, which 9a has always had;
+	// and a configured suffix glued to a word character, which is no host on the raw line and must
+	// not become one on the template -- the placeholder carries the same boundary the digit did.
+	type sameRow struct {
+		name     string
+		suffixes []string
+		in, want string
+		tmpl     string
+	}
+	var same []sameRow
+	for _, s := range defaultHostSuffixes {
+		for _, extra := range [][]string{nil, {"k8s"}} {
+			same = append(same, sameRow{fmt.Sprintf("built-in %s, extra %v", s, extra), extra,
+				"peer db7." + s + " down", "peer <HOST_1> down", "peer <HOST_1> down"})
+		}
+	}
+	same = append(same,
+		sameRow{"configured, no rewrite", []string{"acmecloud"}, "peer db7.acmecloud down", "peer <HOST_1> down", "peer <HOST_1> down"},
+		sameRow{"configured, inside a url", []string{"k8s"}, "get https://db.k8s/x", "get https://<HOST_1>/x", "get https://<HOST_1>/x"},
+		sameRow{"configured, glued to a letter", []string{"acme1"}, "peer db.acme1x up", "peer db.acme1x up", "peer db.acme<NUM>x up"},
+		sameRow{"configured, glued to '_'", []string{"acme1"}, "peer db.acme1_x up", "peer db.acme1_x up", "peer db.acme<NUM>_x up"},
+		sameRow{"built-in prefix, glued to a letter", []string{"corp1"}, "peer db.corp1x up", "peer db.corp1x up", "peer <HOST_1><NUM>x up"},
+		// An all-digit suffix is accepted and masks on the raw line. On the template a label that
+		// ends in a digit merges with it into one <NUM>, and "word<NUM>" carries no suffix to
+		// recognise, so it stays as on main rather than masking every word before a number.
+		sameRow{"all-digit suffix, dot eaten", []string{"2"}, "peer v1.2 up", "peer <HOST_1> up", "peer v<NUM> up"},
+	)
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(c.suffixes...), p.in); got != p.want {
+					t.Errorf("a shape outside #105 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+}
+
+// TestBareHostPatternUnchanged holds 9b to main's pattern, byte for byte, wherever no configured
+// suffix is one the pipeline rewrites -- the built-ins alone, and a configured suffix with nothing
+// for the pipeline to touch. #105 adds forms only for a suffix the pipeline damages. The expected
+// source is main's construction, spelled out here rather than read from the package.
+func TestBareHostPatternUnchanged(t *testing.T) {
+	mainPattern := func(suffixes []string) string {
+		label, inner := `(?:[a-z0-9_]|`+pipelinePH+`)`, `(?:[a-z0-9_-]|`+pipelinePH+`)`
+		quoted := make([]string, len(suffixes))
+		for i, s := range suffixes {
+			quoted[i] = regexp.QuoteMeta(s)
+		}
+		return `(?i)\b(?:` + label + `(?:` + inner + `*` + label + `)?\.)+(?:` + strings.Join(quoted, "|") + `)\b`
+	}
+	bareHostOf := func(dets []detector) string {
+		var found []string
+		for _, d := range dets {
+			if d.tag == tagHost && d.group == 0 {
+				found = append(found, d.re.String())
+			}
+		}
+		if len(found) != 1 {
+			t.Fatalf("want exactly one HOST rule with group 0 (9b), found %d", len(found))
+		}
+		return found[0]
+	}
+	for _, c := range []struct {
+		name  string
+		dets  []detector
+		extra []string
+	}{
+		{"baseDetectors", baseDetectors, nil},
+		{"New()", New().dets, nil},
+		{"New(acmecloud)", New("acmecloud").dets, []string{"acmecloud"}},
+		{"New(acmecloud, my-cloud)", New("acmecloud", "my-cloud").dets, []string{"acmecloud", "my-cloud"}},
+	} {
+		want := mainPattern(append(append([]string{}, defaultHostSuffixes...), c.extra...))
+		if got := bareHostOf(c.dets); got != want {
+			t.Errorf("%s: 9b moved:\n got:  %s\n want: %s", c.name, got, want)
+		}
+	}
+}
+
 // TestUUIDOutsideAHostKeepsItsOwnTag is the other half of #48's tag change, and it is not
 // optional.
 //
@@ -2519,6 +2697,30 @@ func TestAcceptedOverMasking(t *testing.T) {
 			}
 		})
 	}
+
+	// #105's costs, all on the template and only under a configured suffix the pipeline rewrites.
+	// The placeholder that stands for the suffix's digits, or for its hex run, stands for ANY run
+	// the pipeline rewrites the same way, so a name the raw line does not read as a host on that
+	// suffix is one on the template. The raw line is unchanged in every row.
+	configured := []struct {
+		name, suffix   string
+		in, want, tmpl string
+	}{
+		{"a longer digit run", "acme1", "peer db.acme12 up", "peer db.acme12 up", "peer <HOST_1> up"},
+		{"a different digit run", "k8s", "peer db.k88s up", "peer db.k88s up", "peer <HOST_1> up"},
+		{"any hex label", "deadbeef", "blob.cafebabe up", "blob.cafebabe up", "<HOST_1> up"},
+		{"a word glued to a number", "2corp", "build x12corp up", "build x12corp up", "build <HOST_1> up"},
+	}
+	for _, c := range configured {
+		t.Run("configured "+c.suffix+"/"+c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(c.suffix), p.in); got != p.want {
+					t.Errorf("accepted over-masking moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2920,6 +3122,72 @@ func TestEveryDetectorsContextSurvivesTemplating(t *testing.T) {
 			}
 		}
 		t.Logf("detector %2d %-5s rows %2d, context positions: %3d digit-free, %3d tolerant", i, d.tag, rows, digitFree, tolerant)
+	}
+}
+
+// TestConfiguredSuffixesSurviveTemplating is #105's class, mechanized: a CONFIGURED suffix must
+// survive the pipeline as the built-in ones do. Neither test above can see it. The uncollapsed
+// test reads each detector's canonical secret from baseDetectors, so it only ever meets the
+// built-in suffixes, none of which the pipeline rewrites; the context test asks about CONTEXT,
+// and a suffix is inside 9b's group. What both lack is the configuration as an input, and that is
+// the dimension this class lives in.
+//
+// Each shape is one way the pipeline damages a suffix, and each is put in every position a host
+// takes on a line. The row is marked, templatized for real, on the text path and inside a logfmt
+// msg, and the host must come back as exactly one placeholder with the text around it untouched,
+// and round-trip. The expectation is derived, as in TestTemplatizedMaskingIsComplete.
+func TestConfiguredSuffixesSurviveTemplating(t *testing.T) {
+	shapes := []struct{ name, suffix string }{
+		{"digit inside", "k8s"},
+		{"digit at end", "acme1"},
+		{"hyphen-digit", "eu-1"},
+		{"dotted digit", "v1.2"},
+		{"all hex", "deadbeef"},
+		{"leading digit", "2corp"},
+		{"multi-label", "eu1.acme"},
+	}
+	positions := []struct{ name, text string }{
+		{"before a space", "peer \x00db.%s\x00 down"},
+		{"end of text", "dial \x00db.%s\x00"},
+		{"before a dot", "reach \x00db.%s\x00. retrying"},
+		{"before a port", "\x00db.%s\x00:5432 refused"},
+		{"digit label", "peer \x00db7.%s\x00 down"},
+	}
+	const head = `time="2026-07-13T12:00:00Z" level=error msg=`
+	for _, sh := range shapes {
+		for _, pos := range positions {
+			t.Run(sh.name+"/"+pos.name, func(t *testing.T) {
+				marked := fmt.Sprintf(pos.text, sh.suffix)
+				payload := payloadOf(marked)
+				tMarked, _ := pipeline.Templatize(marked)
+				tPayload, _ := pipeline.Templatize(payload)
+				if payloadOf(tMarked) != tPayload || strings.Count(tMarked, phMark) != 2 {
+					t.Fatalf("premise broken: the marks perturbed templating:\n marked:   %q\n unmarked: %q", tMarked, tPayload)
+				}
+				if tPayload == payload {
+					t.Fatalf("premise broken: %q was not rewritten by the pipeline masker", payload)
+				}
+				logfmt, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: head + strconv.Quote(payload)}))
+				prefix := `time=<STR> level=error msg="`
+				if logfmt != prefix+tPayload+`"` {
+					t.Fatalf("premise broken: the logfmt msg is not the text path's template:\n got:  %q\n want: %q", logfmt, prefix+tPayload+`"`)
+				}
+				for _, p := range []struct{ path, in, want string }{
+					{"raw", payload, expand(marked)},
+					{"template", tPayload, expand(tMarked)},
+					{"logfmt", logfmt, regexp.QuoteMeta(prefix) + expand(tMarked) + regexp.QuoteMeta(`"`)},
+				} {
+					m := New(sh.suffix)
+					got := mustMask(t, m, p.in)
+					if !regexp.MustCompile(`^` + p.want + `$`).MatchString(got) {
+						t.Errorf("%s: host on configured suffix %q not masked whole:\n in:   %q\n got:  %q\n want: %v", p.path, sh.suffix, p.in, got, p.want)
+					}
+					if r := m.Restore(got); r != p.in {
+						t.Errorf("%s: round-trip mismatch:\n in:  %q\n out: %q", p.path, p.in, r)
+					}
+				}
+			})
+		}
 	}
 }
 

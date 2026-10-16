@@ -6,9 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/maxie7/logscry/internal/anonymize"
+	"github.com/maxie7/logscry/internal/pipeline"
 	"github.com/maxie7/logscry/internal/score"
 )
 
@@ -178,6 +181,73 @@ func TestAnonymizeFlag(t *testing.T) {
 	}
 	if len(cfg.LLM.AnonymizeSuffixes) != 2 || cfg.LLM.AnonymizeSuffixes[0] != "acmecloud" {
 		t.Errorf("AnonymizeSuffixes = %v, want both repeats", cfg.LLM.AnonymizeSuffixes)
+	}
+}
+
+// TestAnonymizeSuffixNormalised: a configured suffix is read without its dots. The README
+// writes the built-ins as `.internal`, so `--llm-anonymize-suffix .acme` is the natural
+// spelling, and it used to be spliced into the bare-host rule verbatim: `\.acme` needs
+// "db..acme" and never matched, so every host on it was sent on both paths. A trailing dot
+// matched only before a word character. Both are stripped from the RESOLVED value, so the
+// config file is held to the same rule as the flag. Case is left alone: the rule is (?i).
+func TestAnonymizeSuffixNormalised(t *testing.T) {
+	want := []string{"acme", "acme", "acme", "eu1.acme", "Acme"}
+	cfg, err := Load([]string{"--llm-anonymize",
+		"--llm-anonymize-suffix", ".acme", "--llm-anonymize-suffix", "acme.",
+		"--llm-anonymize-suffix", "..acme..", "--llm-anonymize-suffix", ".eu1.acme",
+		"--llm-anonymize-suffix", "Acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.LLM.AnonymizeSuffixes, want) {
+		t.Errorf("flag: AnonymizeSuffixes = %q, want %q", cfg.LLM.AnonymizeSuffixes, want)
+	}
+
+	path := writeConfig(t, "llm:\n  anonymize: true\n  anonymize_suffixes: [\".acme\", \"acme.\"]\n")
+	if cfg, err = Load([]string{"--config", path}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"acme", "acme"}; !slices.Equal(cfg.LLM.AnonymizeSuffixes, want) {
+		t.Errorf("file: AnonymizeSuffixes = %q, want %q", cfg.LLM.AnonymizeSuffixes, want)
+	}
+}
+
+// TestAnonymizeSuffixEmptyRejected: a suffix that is empty, or empty once its dots are gone,
+// is refused at load with an error naming the flag. Spliced in, it was an empty alternative,
+// and the bare-host rule then masked every dotted prefix before a word character:
+// "java.lang.NullPointerException" reached the model as "<HOST_1>NullPointerException".
+func TestAnonymizeSuffixEmptyRejected(t *testing.T) {
+	for _, v := range []string{"", ".", ".."} {
+		_, err := Load([]string{"--llm-anonymize", "--llm-anonymize-suffix", "acme", "--llm-anonymize-suffix", v})
+		if err == nil || !strings.Contains(err.Error(), "--llm-anonymize-suffix") {
+			t.Errorf("flag %q: err = %v, want a rejection naming --llm-anonymize-suffix", v, err)
+		}
+	}
+	path := writeConfig(t, "llm:\n  anonymize_suffixes: [\"acme\", \"\"]\n")
+	if _, err := Load([]string{"--config", path}); err == nil || !strings.Contains(err.Error(), "--llm-anonymize-suffix") {
+		t.Errorf("file: err = %v, want a rejection naming --llm-anonymize-suffix", err)
+	}
+}
+
+// TestAnonymizeSuffixReachesTheMasker runs the two components back to back: the suffix as
+// config resolves it is the one the anonymizer is built from (cmd/logscry passes
+// cfg.LLM.AnonymizeSuffixes to it unchanged), and a host on it is masked on the raw line and
+// on the pre-masked template.
+func TestAnonymizeSuffixReachesTheMasker(t *testing.T) {
+	cfg, err := Load([]string{"--llm-anonymize", "--llm-anonymize-suffix", ".acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const raw = "peer db.acme down"
+	tmpl, _ := pipeline.Templatize(raw)
+	for _, in := range []string{raw, tmpl} {
+		got, err := anonymize.New(cfg.LLM.AnonymizeSuffixes...).Mask(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "peer <HOST_1> down" {
+			t.Errorf("host on a dotted suffix not masked:\n in:   %q\n got:  %q\n want: %q", in, got, "peer <HOST_1> down")
+		}
 	}
 }
 
