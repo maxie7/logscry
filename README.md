@@ -658,7 +658,7 @@ not reached: an empty `Bearer ` directly before a URL turns the scheme into a to
 still sent (recorded under #65). Measured over the same 70,783 records: nothing changed.
 
 **A host on a suffix you configured was sent in the pre-masked template before
-`TODO-VERSION`, wherever the pipeline had rewritten the suffix.** The bare-host rule took each
+`v0.12.9`, wherever the pipeline had rewritten the suffix.** The bare-host rule took each
 `--llm-anonymize-suffix` value as written, so on the template, where the pipeline had already
 rewritten it, the rule went quiet: with `--llm-anonymize-suffix k8s`, `peer db.k8s down` was masked
 on the raw line and reached the model as `peer db.k<NUM>s down` in the template. It was wider than

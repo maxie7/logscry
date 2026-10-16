@@ -2559,7 +2559,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       `internal/pipeline` does not appear in the diff. README: the #105 Known-limitations bullet
       is gone, and a past-tense paragraph carries the shapes, span, cost and the dotted-suffix
       change. The flag's help text and README's usage line say nothing about digits and stay.
-      Seen, out of scope: #57, #59, #65's sweep. Targets TODO-VERSION
+      Seen, out of scope: #57, #59, #65's sweep. Targets v0.12.9
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
