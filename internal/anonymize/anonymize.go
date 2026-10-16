@@ -12,6 +12,12 @@
 // The two must not be merged: they answer different questions and one changing would
 // silently change the other.
 //
+// One fact IS read from the pipeline rather than restated here: how a configured bare-host suffix
+// looks once the template masker has rewritten it (#105, see bareHostPattern). That is the
+// pipeline's handwriting, which this package has to read, not a second masker; asking the
+// pipeline for it means a change there moves the tolerance with it instead of leaving a copy
+// behind.
+//
 // Ordering matters for the same reason it does in the pipeline masker: an email contains a
 // host, a URL contains a host and maybe credentials, an IP is digits-and-dots a host regex
 // would grab. The more specific detector runs first (see buildDetectors).
@@ -108,6 +114,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/maxie7/logscry/internal/pipeline"
 )
 
 // Mapper is the reversible mapping for ONE request. It is not safe for concurrent use:
@@ -122,7 +130,9 @@ type Mapper struct {
 
 // New builds a Mapper. extraHostSuffixes extends the bare-hostname allowlist (detector 9b)
 // for sites with their own private suffixes; with none, the shared default detectors are
-// reused rather than recompiled.
+// reused rather than recompiled. Each suffix is read as written and as the pipeline rewrites
+// it (k8s and k<NUM>s), so a host on it is masked on the Template field too (#105). A suffix is
+// taken as given: internal/config strips its dots and refuses an empty one.
 func New(extraHostSuffixes ...string) *Mapper {
 	dets := baseDetectors
 	if len(extraHostSuffixes) > 0 {
@@ -475,18 +485,7 @@ func mustLongest(pat string) *regexp.Regexp {
 // is constant; only the bare-host suffix alternation varies with config.
 func buildDetectors(extraHostSuffixes []string) []detector {
 	suffixes := append(append([]string{}, defaultHostSuffixes...), extraHostSuffixes...)
-	// A hostname label is a grammar rather than a flat run — it may not begin or end with a
-	// hyphen — so tolerance goes on both halves of it rather than through tolerant().
-	//
-	// '_' is admitted on both halves since #66, so a label may also begin or end with one. A DNS
-	// service label begins with one (_dmarc, _sip._tcp), and refusing it would keep sending it;
-	// refusing a trailing one would buy nothing. What it costs is that \b now starts before a word
-	// run glued to a host by '_', and a leading-'_' label that is not a host (an mDNS service type
-	// on .local) is one to this rule -- both pinned in TestAcceptedOverMasking.
-	label, inner := `(?:[a-z0-9_]|`+pipelinePH+`)`, `(?:[a-z0-9_-]|`+pipelinePH+`)`
-	bareHost := mustLongest(
-		`(?i)\b(?:` + label + `(?:` + inner + `*` + label + `)?\.)+(?:` +
-			strings.Join(escapeAll(suffixes), "|") + `)\b`)
+	bareHost := mustLongest(bareHostPattern(suffixes))
 
 	return []detector{
 		// 1. JWT — three base64url segments; the header always starts "eyJ".
@@ -863,6 +862,9 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     behaviour: bare public hostnames are deliberately left alone, so verify-eligible
 		//     would fail closed on every escalation carrying api.example.com and mute exactly
 		//     the stack traces this feature protects.
+		//
+		//     A CONFIGURED SUFFIX IS TOLERANT TOO since #105, and the built-ins are byte-identical:
+		//     none of them is one the pipeline rewrites. See bareHostPattern.
 		{tagHost, bareHost, 0, false, false},
 		// 6. UUID — a fixed 8-4-4-4-12 shape. It runs HERE, after both host detectors, and the
 		//    out-of-sequence number is deliberate: the audit table, the README and the issues all
@@ -1095,6 +1097,110 @@ const ipv6Pattern = `(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}` +
 	`|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}` +
 	`|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}` +
 	`|:(?:(?::[0-9a-f]{1,4}){1,7}|:)`
+
+// bareHostPattern is 9b's source: dotted labels, then one of suffixes.
+//
+// A hostname label is a grammar rather than a flat run — it may not begin or end with a
+// hyphen — so tolerance goes on both halves of it rather than through tolerant().
+//
+// '_' is admitted on both halves since #66, so a label may also begin or end with one. A DNS
+// service label begins with one (_dmarc, _sip._tcp), and refusing it would keep sending it;
+// refusing a trailing one would buy nothing. What it costs is that \b now starts before a word
+// run glued to a host by '_', and a leading-'_' label that is not a host (an mDNS service type
+// on .local) is one to this rule -- both pinned in TestAcceptedOverMasking.
+//
+// A SUFFIX IS READ IN THE FORM THE PIPELINE LEAVES IT IN TOO (#105). The suffixes used to be spliced
+// in verbatim, and the labels were tolerant while the suffix was not -- #52's lesson, on a literal
+// inside the group this time. No built-in suffix is one the pipeline rewrites, but a configured one
+// can be, in more ways than "a digit becomes <NUM>": NUM takes the sign and the decimal tail with it
+// (eu-1 and v1.2 become eu<NUM> and v<NUM>), HEX takes a suffix with no digit at all (deadbeef, 0xcafe
+// become <HEX>), and a suffix beginning with a digit loses the dot before it when the label before
+// it ends in one (db1.2corp becomes db<NUM>corp). So on the Template field 9b went quiet and the
+// host was sent.
+//
+// THE REWRITTEN FORM IS DERIVED, NOT WRITTEN, and that is why this package imports the pipeline.
+// A hand-written tolerance would have to copy UUID, HEX with its letter rule, and NUM, in the
+// pipeline's order -- a second copy of another package's patterns, which is #42's class. Asking
+// pipeline.Templatize instead is exact for every pattern, today's and tomorrow's. The masking
+// itself stays separate, as the package comment requires; what is shared is the one fact this rule
+// has to agree with the pipeline about, how a suffix looks once rewritten.
+//
+// Each suffix's rewritten form T is an alternative beside it, and Templatize on the suffix alone
+// gives what it gives in a host: 9b demands a boundary after the suffix, so nothing after it can
+// join a run inside it, and a NUM that takes a trailing ".5" with it keeps the same prefix. The one
+// thing context changes is the dot BEFORE a suffix, and that is measured the same way, on a probe
+// label ending in a digit (mergedRest).
+//
+// A FORM ENDING IN A PLACEHOLDER IS CLOSED BY \B, NOT \b. After '>' a \b demands a word character
+// next, the opposite of what the raw line asks of a suffix ending in a digit. '>' is not a word
+// character, so \B holds exactly where the next character is not one, or the text ends: the same
+// edge \b draws after "corp1". It is zero-width, so the group is still the whole match.
+//
+// Built-in suffixes, and a configured one the pipeline leaves alone, add no form, and the source is
+// main's byte for byte (TestBareHostPatternUnchanged).
+func bareHostPattern(suffixes []string) string {
+	label, inner := `(?:[a-z0-9_]|`+pipelinePH+`)`, `(?:[a-z0-9_-]|`+pipelinePH+`)`
+	labels := `(?:` + label + `(?:` + inner + `*` + label + `)?\.)`
+
+	wordEnd := escapeAll(suffixes)
+	var phEnd, merged []string
+	for _, s := range suffixes {
+		if t, _ := pipeline.Templatize(s); t != s {
+			if endsInPipelinePH.MatchString(t) {
+				phEnd = append(phEnd, regexp.QuoteMeta(t))
+			} else {
+				wordEnd = append(wordEnd, regexp.QuoteMeta(t))
+			}
+		}
+		if rest, ok := mergedRest(s); ok {
+			merged = append(merged, regexp.QuoteMeta(rest)+closeSuffix("<NUM>"+rest))
+		}
+	}
+	suffix := `(?:` + strings.Join(wordEnd, "|") + `)\b`
+	if len(phEnd) > 0 {
+		suffix = `(?:` + suffix + `|(?:` + strings.Join(phEnd, "|") + `)\B)`
+	}
+	pat := labels + `+` + suffix
+	if len(merged) > 0 {
+		// The last label and the suffix's leading digits are one <NUM>, so there is no dot to
+		// find; at least one label character before the <NUM> is required, the label it ate.
+		pat = `(?:` + pat + `|` + labels + `*` + label + inner + `*<NUM>(?:` + strings.Join(merged, "|") + `))`
+	}
+	return `(?i)\b` + pat
+}
+
+// endsInPipelinePH matches a rewritten suffix that ends in one of the pipeline's placeholders.
+var endsInPipelinePH = regexp.MustCompile(pipelinePH + `$`)
+
+// closeSuffix is the boundary after a suffix form: \b after a word character, as it always was, and
+// \B after a placeholder's '>' (see bareHostPattern).
+func closeSuffix(form string) string {
+	if endsInPipelinePH.MatchString(form) {
+		return `\B`
+	}
+	return `\b`
+}
+
+// mergedRest reports what is left of suffix s after the pipeline has merged its leading digits
+// with the label before it: db1.2corp templatizes to db<NUM>corp, with no dot left for 9b to find.
+// It is measured, on a probe label that ends in a digit, rather than reasoned from the NUM pattern.
+//
+// It reports nothing unless the rest carries a letter outside a placeholder, which is 9d's rule
+// that a name's top label is alphabetic. An all-digit suffix would otherwise make every word glued
+// to a number a host.
+func mergedRest(s string) (string, bool) {
+	p, _ := pipeline.Templatize("x9." + s)
+	rest, ok := strings.CutPrefix(p, "x<NUM>")
+	if !ok || strings.HasPrefix(rest, ".") || !hasLetter.MatchString(pipelinePHRe.ReplaceAllString(rest, "")) {
+		return "", false
+	}
+	return rest, true
+}
+
+var (
+	pipelinePHRe = regexp.MustCompile(pipelinePH)
+	hasLetter    = regexp.MustCompile(`[A-Za-z]`)
+)
 
 // escapeAll quotes each suffix for safe interpolation into the bare-host alternation.
 func escapeAll(ss []string) []string {

@@ -145,6 +145,32 @@ func (c Config) validateReplay() error {
 	return nil
 }
 
+// normalizeAnonymizeSuffixes reads each configured bare-host suffix without its dots, on the
+// RESOLVED value, so the config file's anonymize_suffixes is held to the same rule as the flag.
+//
+// The anonymizer splices a suffix into its bare-host rule as written, after a literal dot. The
+// README spells the built-ins `.internal`, so `.acme` is the natural way to write one, and it
+// became "db..acme": it never matched, and every host on it was sent with no warning. A trailing
+// dot matched only before a word character. Both mean "acme", and are read as that (#105).
+//
+// An empty suffix, or one that is only dots, is refused: spliced in, it was an empty alternative,
+// and the rule masked every dotted prefix ("java.lang.X" reached the model as "<HOST_1>X"). Case
+// is left alone, because the rule is case-insensitive.
+func (c *Config) normalizeAnonymizeSuffixes() error {
+	if len(c.LLM.AnonymizeSuffixes) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.LLM.AnonymizeSuffixes))
+	for i, s := range c.LLM.AnonymizeSuffixes {
+		out[i] = strings.Trim(s, ".")
+		if out[i] == "" {
+			return fmt.Errorf("--llm-anonymize-suffix (llm.anonymize_suffixes) %q: a suffix must name at least one label", s)
+		}
+	}
+	c.LLM.AnonymizeSuffixes = out
+	return nil
+}
+
 // parseReplaySpeed reads --replay-speed: "max" for no pacing (0), or a positive multiple of
 // real time with an optional trailing x ("1", "1x", "10x", "0.5").
 func parseReplaySpeed(s string) (float64, error) {
@@ -226,6 +252,9 @@ func Load(args []string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.ReplaySpeed = speed
+	if err := cfg.normalizeAnonymizeSuffixes(); err != nil {
+		return Config{}, err
+	}
 
 	if err := cfg.Score.Validate(); err != nil {
 		return Config{}, fmt.Errorf("score config: %w", err)
