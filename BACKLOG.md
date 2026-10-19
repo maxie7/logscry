@@ -3160,7 +3160,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         as on main: `n` is a name character. Pinned, no behaviour change, not filed.
       - #59, #65's sweep, #51.
 
-      Targets TODO-VERSION
+      Targets v0.12.13
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
