@@ -677,7 +677,7 @@ suffix written with a dot, `.acme` or `acme.`, never matched (this README writes
 suffix is refused at startup, where it used to mask every dotted prefix. Measured over the same
 70,783 records: nothing changed.
 
-**A key with text beside it inside one value sent that text before `TODO-VERSION`.** The JWT,
+**A key with text beside it inside one value sent that text before `v0.12.10`.** The JWT,
 AWS-key and `sk-` rules run before every credential and host rule, so a key that was only *part* of
 a value was masked on its own and the rules after it could not step over its placeholder:
 `s3://AKIA…EXAMPLE.prod:secret@bucket` went out as `s3://<TOKEN_1>.prod:<TOKEN_2>@<HOST_1>`, sending
@@ -714,7 +714,7 @@ a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found
 could not close then, #67, closed in `v0.12.6`, and a single-host leak, #66, closed in `v0.12.5`.
 Of the audit's own four, the half of #48 that ordering could not reach, #54, closed in
 `v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`; of #55's three, the
-partly-recognised half, #57, in `TODO-VERSION`.
+partly-recognised half, #57, in `v0.12.10`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -746,7 +746,7 @@ Each time the audit's own count was right and its scope was narrower than the se
   family with #46 rather than with #55, because in each the grammar describes the value correctly
   and something else stops the rule reaching it.
 - ~~**#57** — a userinfo half that a detector recognised only in *part* leaves an
-  unreachable remainder.~~ **Closed in `TODO-VERSION`.** See the paragraph above.
+  unreachable remainder.~~ **Closed in `v0.12.10`.** See the paragraph above.
   `s3://AKIA…EXAMPLE.prod:secret@bucket` sent `.prod`, so **#46's own fix did not cover it**: an
   uncovered remainder of #46 rather than a leftover of #55. The tag minted mid-value blocked every
   credential rule, and the remainder could lie on either side of it, so no pattern run *after* the

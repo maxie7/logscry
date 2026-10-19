@@ -2746,7 +2746,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         `mongodb://h1,10.0.0.5.nip.io,10.0.0.6.nip.io,host4/db` sends `.nip.io` and `host4`.
         Confirmed with a throwaway test. It is an authority cell, offered as a comment on #65.
 
-      Seen, out of scope: #59, #65's sweep, #90, #51. Targets TODO-VERSION
+      Seen, out of scope: #59, #65's sweep, #90, #51. Targets v0.12.10
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
