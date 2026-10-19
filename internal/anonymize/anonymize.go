@@ -71,6 +71,13 @@
 // whole; moving 3a ahead of them would have closed the same cells and renumbered every line that carries
 // a bearer token and a key elsewhere.
 //
+// #51 IS 3b'S ALPHABET, NOT ITS ORDER. A current sk- key carries '-' and '_' in its tail (sk-proj-,
+// sk-svcacct-, sk-ant-api03-), and 3b wanted sixteen unbroken letters and digits straight after "sk-",
+// so every such key was sent whole and residue() read it as clean. The tail is now a run of the key's
+// alphabet carrying a witness (see skBody), and 4d, 9e and rule 11 read it through keyShapes as before.
+// What that costs a reader: text glued after an sk- key by '_' or '-' is the key's, since it is the key's
+// alphabet, and a userinfo half or a host-list member that is such a key is now a key half.
+//
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
 // Mask records nests; that inertness is what keeps a home path in a Go stack trace from tripping
@@ -595,7 +602,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		{tagToken, mustLongest(awsKey), 0, true, false},
 		// 3a. Bearer token — mask the credential, not the word "Bearer".
 		{tagToken, mustLongest(`(?i)\bbearer\s+(` + tolerant(bearerChar) + `)`), 1, true, false},
-		// 3b. sk- style API keys (OpenAI and friends).
+		// 3b. sk- style API keys (OpenAI and friends), '-' and '_' in the tail since #51 (see skBody).
 		{tagToken, mustLongest(skKey), 0, true, false},
 		// 4. Credentials embedded in a URL / connection string: scheme://userinfo@host.
 		//    Runs before host and email so "@host" survives for the host detector and a userinfo
@@ -1025,7 +1032,8 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	//
 	//     There the text beside a key is PROSE, #57's decision: the key is the value and the glue stays,
 	//     "key <TOKEN_1>_prod used", "key x_<TOKEN_1> used". The character before the key is context, not
-	//     group, which a key rule could not do: RE2 has no lookbehind, and 1, 2 and 3b mask group 0.
+	//     group, which a key rule could not do: RE2 has no lookbehind, and 1, 2 and 3b mask group 0. Since
+	//     #51 '_' and '-' are an sk key's own alphabet, so for an sk key only the glue BEFORE it is prose.
 	//
 	//     verify:true, as every key rule: a raw glued key that ever survives masking mutes the escalation.
 	//     Its group is a raw key only, so it cannot fire on our own output.
@@ -1207,21 +1215,87 @@ const (
 	awsChar   = `[0-9A-Z]`
 	skPrefix  = `sk-`
 	skChar    = `[A-Za-z0-9]`
+	skChars   = `A-Za-z0-9_-`
+	skRun     = `[` + skChars + `]`
 )
 
 var jwtBody = `eyJ` + tolerant(jwtChar) + `\.eyJ` + tolerant(jwtChar) + `\.` + tolerant(jwtChar)
+
+// skBody is what follows "sk-" in a key (#51). The tail is a run of skRun -- '-' and '_' are key
+// characters, as in every current format (sk-proj-, sk-svcacct-, sk-admin-, sk-ant-api03-) -- and a run
+// of that alphabet is a key only when it carries one of two witnesses, because kebab-case names that
+// start with a literal "sk-" word (sk-learn-compatible-estimator, sk-worker-pool-7f9c) are the same
+// alphabet:
+//
+//   - sixteen unbroken letters and digits anywhere in it: the classic key's own run, which until #51 had
+//     to start right after "sk-", allowed to come after a vendor prefix (sk-or-v1-<hex>);
+//   - an uppercase letter, with the whole tail sixteen long: a base62 or base64url body. Names on k8s,
+//     Docker, PyPI and npm are lowercase by rule. The floor is over the whole tail, not one run.
+//
+// On the Template field the pipeline breaks both witnesses' runs, and the placeholder is the evidence, as
+// for mangled: main's mangled form, then the rest of the run across separators -- so the key still ends
+// where its alphabet does -- or a run holding a placeholder and an uppercase letter. A placeholder alone
+// is not enough once '-' is admitted: sk-worker-pool-7f9c templatizes to sk-worker-pool<NUM>f<NUM>c.
+//
+// No alternative carries a trailing assertion. Each is maximal over skRun (with the pipeline's
+// placeholders on the template), so leftmost-longest ends a key where its alphabet ends, which is rule
+// 11's notion since #108; and that is what makes skRun the sk key's cont in keyShapes, for 4d and 9e.
+var skBody = func() string {
+	unit := `(?:` + skRun + `|` + pipelinePH + `)`
+	raw := skRun + `*` + skChar + `{16}` + skRun + `*|` + withUpper(16)
+	tmpl := mangled(skChar) + unit + `*|` +
+		unit + `*(?:` + pipelinePH + unit + `*[A-Z]|[A-Z]` + unit + `*` + pipelinePH + `)` + unit + `*`
+	return `(?:` + raw + `|` + tmpl + `)`
+}()
+
+// skDigitFirst is what follows "sk<NUM>": a classic key whose tail starts with a digit, on the Template
+// field, where NUM takes the sign and leaves no "sk-" (sk-7AbC... templatizes to sk<NUM>AbC...). Until
+// #51 the rest of the key was sent there.
+//
+// It carries a WITNESS, not a floor. The placeholder stands for an unknown count of digits, so any floor
+// is a guess, and an exact one would be withUpper over the placeholder-tolerant unit. And the placeholder
+// is weaker evidence here than in mangled, since it is also every "sk-1": so the witness is stronger than
+// the raw tail's, a letter of each case -- a base62 body carries both, while "sk-1 failed", "region sk-2"
+// and a size like "sk-2XL" carry at most one -- or sixteen unbroken letters and digits. A digit-first hex
+// body needs neither: HEX runs before NUM and keeps the "sk-" (sk-<HEX>).
+var skDigitFirst = func() string {
+	unit := `(?:` + skRun + `|` + pipelinePH + `)`
+	return unit + `*(?:[A-Z]` + unit + `*[a-z]|[a-z]` + unit + `*[A-Z]|` + skChar + `{16})` + unit + `*`
+}()
+
+// skLoose is the sk key with no edge of its own, rule 11's; skKey adds the leading \b.
+var skLoose = `(?:` + skPrefix + skBody + `|sk<NUM>` + skDigitFirst + `)`
+
+// withUpper is a run of at least n characters of skRun, one of them an uppercase letter. RE2 has no
+// intersection, so it is n branches, one per position the FIRST uppercase letter can take: before it
+// only non-uppercase characters, after it whatever the floor still needs.
+func withUpper(n int) string {
+	const lower, upper = `[a-z0-9_-]`, `[A-Z]`
+	alts := make([]string, 0, n)
+	for k := 0; k < n-1; k++ {
+		before := ""
+		if k > 0 {
+			before = fmt.Sprintf(`%s{%d}`, lower, k)
+		}
+		alts = append(alts, fmt.Sprintf(`%s%s%s{%d,}`, before, upper, skRun, n-1-k))
+	}
+	alts = append(alts, fmt.Sprintf(`%s{%d,}%s%s*`, lower, n-1, upper, skRun))
+	return `(?:` + strings.Join(alts, "|") + `)`
+}
 
 // jwtKey, awsKey and skKey are what detectors 1, 2 and 3b match: "a key", in one definition. 4d and
 // 9e read the same three to find a key inside a larger value, so the rule that would tag a key and the
 // rule that must get to it first cannot disagree about what one is (TestGluedKeyRulesReadTheKeyDetectors).
 //
-// These are the STRICT keys: a \b on both edges, so a key standing alone in its value. That is the
-// notion 4d and 9e rely on -- a key that stands alone keeps its own tag -- and it is why a key glued to
-// a word character is not one of these (#108; see looseKey).
+// These are the STRICT keys: a \b on the leading edge, and on the trailing one for JWT and AWS, so a key
+// standing alone in its value. That is the notion 4d and 9e rely on -- a key that stands alone keeps its
+// own tag -- and it is why a key glued to a word character is not one of these (#108; see looseKey). An
+// sk key's trailing edge is its alphabet since #51 (see skBody): '_' is in it, so no word character can
+// follow one.
 var (
 	jwtKey = `\b` + jwtBody
 	awsKey = `\b` + awsPrefix + `(?:` + awsChar + `{16}\b|` + mangled(awsChar) + `)`
-	skKey  = `\b` + skPrefix + `(?:` + skChar + `{16,}\b|` + mangled(skChar) + `)`
+	skKey  = `\b` + skLoose
 )
 
 // keyShapes pairs each key with the raw characters it could have continued with, as a class body.
@@ -1232,11 +1306,13 @@ var (
 // sixteen is a key too, as its mangled form always was. lead is what may NOT sit before a loose key:
 // the key's own letters and digits, which would make a longer word that merely contains the prefix
 // (XAKIA..., task-..., xeyJ...). '_' and '-' are separators, so a JWT's lead is its alphabet without
-// them, and an AWS key's, being uppercase, leaves a lowercase letter as glue.
+// them, and an AWS key's, being uppercase, leaves a lowercase letter as glue. An sk key's lead stays its
+// letters and digits although '_' and '-' are in its alphabet since #51: before "sk-" they are still
+// separators, so x_sk-... is a key glued to '_'.
 var keyShapes = []keyShape{
 	{jwtKey, `A-Za-z0-9_-`, jwtBody, `A-Za-z0-9`},
 	{awsKey, `0-9A-Z`, awsPrefix + `(?:` + awsChar + `{16,}|` + mangled(awsChar) + `)`, `0-9A-Z`},
-	{skKey, `A-Za-z0-9`, skPrefix + `(?:` + skChar + `{16,}|` + mangled(skChar) + `)`, `A-Za-z0-9`},
+	{skKey, skChars, skLoose, `A-Za-z0-9`},
 }
 
 // keyShape is one key as keyShapes lists it.
@@ -1344,9 +1420,9 @@ func tolerant(class string) string {
 
 // mangled builds a run that contains AT LEAST ONE pipeline placeholder.
 //
-// It exists for the two detectors carrying a length requirement — {16,} after "sk-", exactly
-// {16} after AKIA/ASIA — which a placeholder breaks by collapsing a whole digit run into one
-// token. Rather than lower those thresholds (which would widen false positives on ordinary
+// It exists for the two detectors carrying a length requirement — sixteen unbroken letters and
+// digits in an sk- tail, exactly {16} after AKIA/ASIA — which a placeholder breaks by collapsing a
+// whole digit run into one token. (The sk tail extends it over its separators; see skBody.) Rather than lower those thresholds (which would widen false positives on ordinary
 // prose for every payload, masked or not), the shortened form is accepted only when the run
 // provably came out of the pipeline masker. A false positive here costs one <TOKEN_n> in a
 // template that is already a lossy restatement of the trigger line; a false negative leaks a
