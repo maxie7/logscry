@@ -3323,7 +3323,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         the variable name. Confirmed with a throwaway test, reported, not filed.
       - #59, #49, #42, #65's sweep, #91, #92.
 
-      Targets TODO-VERSION
+      Targets v0.12.14
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
@@ -4127,7 +4127,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       `sk-proj-…`, the current OpenAI key format, which detector 3b does not match at all
       (**#51**) and which is anti-correlated with #46 — a key 3b cannot see cannot block
       detector 4, so fixing 3b alone would INTRODUCE this leak for those keys, and #51 must not
-      land before this does (Done with #51, in TODO-VERSION.);
+      land before this does (Done with #51, in v0.12.14.);
       and detector 9a's scheme anchor (**#52**), which #43 left
       non-tolerant while widening the host group beside it, so `s3://` templatizes to
       `s<NUM>://` and the host goes unmasked on the `Template` field. That last one was found in
