@@ -722,7 +722,7 @@ uppercase run that starts like an AWS key and is longer than one is masked whole
 template always masked it. Measured over the same 70,783 records: nothing changed. None carries an
 AWS or JWT prefix, and the 396 that contain `sk-` inside a word are untouched.
 
-**Text glued to a key behind `Bearer` was sent before `TODO-VERSION`.** The bearer rule masks the
+**Text glued to a key behind `Bearer` was sent before `v0.12.12`.** The bearer rule masks the
 whole value after `Bearer` as one token, but it ran after the JWT and AWS-key rules, and a
 placeholder stops it. So a key that was only part of a bearer value was masked alone and the text
 glued to it was sent: `hdr Bearer AKIA…EXAMPLE.prod expired` reached the model as
@@ -758,7 +758,7 @@ Of the audit's own four, the half of #48 that ordering could not reach, #54, clo
 `v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`; of #55's three, the
 partly-recognised half, #57, in `v0.12.10`; and the glued key the work on it found unseen on
 the raw line, #108, in `v0.12.11`; and the bearer remainder the work on *that* found, #110,
-in `TODO-VERSION`.
+in `v0.12.12`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in

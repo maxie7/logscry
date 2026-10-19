@@ -3038,7 +3038,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       **Found on the way:** nothing new.
 
-      Seen, out of scope: #51, #59, #65's sweep. Targets TODO-VERSION
+      Seen, out of scope: #51, #59, #65's sweep. Targets v0.12.12
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
