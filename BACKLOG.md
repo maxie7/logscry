@@ -2903,7 +2903,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         and a row is added below it. Confirmed with a throwaway test. No open issue covers it, so
         it is filed as ISSUE-TBD and named in README's Known limitations.
 
-      Seen, out of scope: #51, #59, #65's sweep. Targets TODO-VERSION
+      Seen, out of scope: #51, #59, #65's sweep. Targets v0.12.11
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and

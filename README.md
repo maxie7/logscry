@@ -700,7 +700,7 @@ as a host even outside a URL (`keys=a,AKIA…EXAMPLE.prod`). A key as a label of
 private suffix (`worker-AKIA…EXAMPLE.corp.internal`) is not reached and still sends `worker-`; it is
 as theoretical as the key-label cell was. Measured over the same 70,783 records: nothing changed.
 
-**A key glued to `_` or a letter was sent whole before `TODO-VERSION`.** The JWT, AWS-key and
+**A key glued to `_` or a letter was sent whole before `v0.12.11`.** The JWT, AWS-key and
 `sk-` rules ended a key at a word boundary on both sides, and `_` and letters are word characters,
 so on the raw line a key glued to one was not seen at all: `key AKIA…EXAMPLE_prod used`,
 `key sk-…XYZ_prod used`, `key x_AKIA…EXAMPLE used`, `key idAKIA…EXAMPLE used` and `token_eyJ…`
@@ -737,7 +737,7 @@ could not close then, #67, closed in `v0.12.6`, and a single-host leak, #66, clo
 Of the audit's own four, the half of #48 that ordering could not reach, #54, closed in
 `v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`; of #55's three, the
 partly-recognised half, #57, in `v0.12.10`; and the glued key the work on it found unseen on
-the raw line, #108, in `TODO-VERSION`.
+the raw line, #108, in `v0.12.11`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
