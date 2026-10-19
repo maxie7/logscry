@@ -2905,6 +2905,141 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Seen, out of scope: #51, #59, #65's sweep. Targets v0.12.11
 
+- [x] **A bearer value with a key glued inside it is masked whole** — #110, found while verifying
+      #108. 3a takes the whole value after `bearer\s+` as one TOKEN, but it ran AFTER 1 (JWT) and 2
+      (AWS), and its group excludes `<` (inertness). A key that was only PART of a bearer value was
+      tagged alone and 3a could not claim the rest, so the text glued to it was SENT. Topology,
+      #57's class, not the key:
+      - `hdr Bearer AKIA…EXAMPLE.prod expired` → `hdr Bearer <TOKEN_1>.prod expired`, and `~prod`,
+        `-prod` and ASIA the same, on both paths;
+      - `_prod` and a lowercase letter after the key, on the template only, where the mangled key
+        has no closing `\b`;
+      - a JWT followed by `.` or `~`;
+      - `Bearer prod.AKIA….x`, which sent `.x`. `Bearer prod.AKIA…` sent nothing but split one
+        value into two tokens (`<TOKEN_2><TOKEN_1>`).
+
+      `residue()` read every leftover as clean. `sk-` was never affected, because 3a runs before
+      3b. v0.4.0 → v0.12.11, **thirty-seven tagged releases** (`git tag --contains 2da31be | wc -l`
+      → 37; v0.4.0's own anonymizer, run in a throwaway overlay, sends `.prod` and `~prod` on both
+      paths).
+
+      **The mechanism, measured on the cells and the full differential before any code.** Both
+      candidates close every cell and narrow nothing, because a bearer value holds no whitespace,
+      `:`, `@` or `,`, so no later rule ever spanned one, and the whole-value TOKEN covers the key's.
+      - **A, move 3a before 1 and 2.** It mints EVERY bearer value before 1 and 2 mint keys
+        elsewhere on the line, so a line with a bearer token and a JWT or AWS key elsewhere swaps
+        its placeholder numbers: `hdr Bearer abc123… key AKIA… used` goes from
+        `<TOKEN_2> … <TOKEN_1>` to `<TOKEN_1> … <TOKEN_2>`. Over the differential: 8 layout-only.
+      - **B, rule 3c, #57's remedy.** One rule before 1 and 2, built from `keyShapes` and
+        `glued` like 4d and 9e, that matches only a bearer value with a strict JWT or AWS key
+        glued inside it and masks the whole value as TOKEN. Absent everywhere else. Over the
+        differential: 2 layout-only, both the `prod.AKIA…` cell. B was taken: 0 narrowed and the
+        fewest byte changes outside the cells.
+
+      **The fix (`internal/anonymize/anonymize.go` only).**
+      - 3a's class is hoisted into `bearerChars`/`bearerChar`. 3a's source is byte-identical.
+      - `gluedBearer`: `\b(?i:bearer)\s+(` + `glued` over the unit `bearerChar` or `pipelinePH`
+        + `)`. The case-fold is scoped to the word, so a key's case is never folded. The "after"
+        class is the bearer class minus the key's `cont`, through `hostCharsBut`.
+      - It reads `keyShapes[:2]`, JWT and AWS. `glued` gains a `shapes` parameter; 4d and 9e pass
+        `keyShapes`.
+      - Detector 3c, `{tagToken, mustLongest(gluedBearer), 1, true, false}`, sits after 9e and
+        before 1. It is disjoint from 4d and 9e: their spans carry no whitespace, and a bearer
+        value carries none of their anchors.
+      - Every existing detector compiles byte-identically: source, tag, group, verify, fixpoint and
+        order dumped against main's under `New()` and an extra-suffix Mapper. Only 3c is new, at
+        index 2. `apply`, `residue`, `Restore` and the `detector` struct are unchanged.
+
+      **Decisions, each pinned by a test.**
+      1. **Mechanism B**, pinned by three mixed-line byte-identical rows A would renumber: a
+         bearer token beside an AWS key, `Bearer sk-….prod` beside an AWS key, and
+         `bearer akia….prod` beside an AWS key, which also pins that only the word is case-folded.
+      2. **Tag and Restore.** The whole bearer value is one TOKEN, and `Restore` gives it back
+         whole. The same key alone elsewhere on the line gets its own placeholder, as for #57's
+         userinfo. Pinned by a recurrence subtest on one Mapper.
+      3. **`residue`.** 3c is `verify:true`, as every credential rule. Three raw leftovers read
+         TOKEN, raw and templatized and the JWT form. Four old leftovers read clean:
+         `<TOKEN_1>.prod`, `<TOKEN_1>_prod`, `<TOKEN_1>~prod` and `<TOKEN_2><TOKEN_1>`.
+      4. **The audit table is corrected.** "1/2/3b → 3a harmless" holds only where the key IS the
+         whole value; the glued row is now **DEFECT (#110), FIXED**.
+
+      **The guard.** `TestGluedKeyRulesReadTheKeyDetectors` counted the readers of each key. It now
+      names them per key (JWT and AWS: 3c, 4d, 9e; `sk-`: 4d, 9e), so a fourth reader fails naming
+      itself, not by a count. The check that every reader runs before every key detector stays.
+
+      **Costs, pinned in `TestAcceptedOverMasking`.** A sentence dot right after a bearer key joins
+      the value: `auth Bearer AKIA…EXAMPLE. retry` → `auth Bearer <TOKEN_1> retry`. RFC 6750's
+      b64token admits `.`, and 3a already reads a non-key bearer token that way. A pays it too.
+
+      **No narrowing, shown differentially.** Every input the anonymize, llm and config tests feed
+      `Mask` and `residue`, on main and on the branch, plus their templatized forms: 2,814 inputs,
+      per-byte coverage compared under `New()` and an extra-suffix Mapper, with the same result
+      under both:
+      - 0 narrowed, 0 mixed, 0 error changes;
+      - 30 widened, every one a bearer value with a glued JWT or AWS key, the sentence dot
+        included;
+      - 2 layout-only, the `prod.AKIA…` cell raw and templatized;
+      - main's own 2,744 inputs: 3 widened, #108's bearer rows (`.prod` raw and templatized,
+        `_prod` templatized), and the rest unchanged.
+
+      **Frequency.** The 70,783 records (ten boots and ab37) were run raw and templatized, old
+      against new, under both Mappers: **0 changed, 0 error changes**, as predicted. No record
+      contains `bearer`.
+
+      **Tests.**
+      - `TestIssue110KeyGluedInsideABearerValue`, raw and through the real `pipeline.Templatize`:
+        - 14 closed rows, each with its exact output, every fragment main sent checked absent, and
+          a round trip: AWS with `.`, `_`, `~`, `-` and a letter after, ASIA, JWT with `.` and `~`,
+          `Authorization: Bearer`, lowercase and uppercase `bearer`, text before the key, text on
+          both sides, a JWT after "bearer" in prose;
+        - 12 byte-identical rows: `Bearer` followed by a whole key (AKIA, JWT, `sk-`),
+          `Bearer sk-….prod`, `Bearer` with no key, `Bearer x_AKIA…`, "Bearer" in a query string,
+          "bearer" as a userinfo, a JWT after "bearer" in prose and the three mixed rows;
+        - the recurrence subtest and the `residue` claims.
+      - Two completeness rows, two templatized rows (also run inside the logfmt wrapper), one
+        over-mask row and five outputs and old leftovers fed to `TestPlaceholdersAreInert`.
+      - #108's two bearer rows, "'_' after the key" and "'.' after the key", pinned #110's leak
+        itself in #108's byte-identical table. They moved here as closed rows and the comment there
+        says so. Every other #57 and #108 row is untouched.
+      - Red on main: 24 subtests plus the guard, all by assertion. No new identifier is named, so
+        the red commit compiles on main.
+
+      **Mutants, each with what it turned red.**
+      - (a) 3c removed, the mechanism off: 25. All 14 closed rows and the recurrence subtest,
+        the sentence-dot row, the guard, both completeness rows, both templatized rows and their
+        four logfmt forms.
+      - (b) 3c after 2, the rule after the key detectors: the same 25.
+      - (c) 3c also reading `sk-`: 2. The guard and the mixed `sk-` row.
+      - (d) `bearer` case-sensitive: 24. Every closed row spelled `Bearer`, `BEARER` or
+        `Authorization: Bearer`, the recurrence, sentence-dot, completeness, templatized and logfmt
+        rows, `TestEveryDetectorHasACompletenessRow` and the guard. The lowercase and prose rows
+        stay green, as they must.
+      - (e) `(?i)` over the whole pattern: 2. The guard and the mixed lowercase-`akia` row.
+      - (f) the leading-glue alternative dropped: 1, "text before the key".
+      - (g) the "after" class not excluding `cont`: 0, equivalent as predicted. The key's own `\b`
+        already ends it where its alphabet ends, so the value taken is the same.
+      - (h) 3c `verify:false`: 0, equivalent as predicted. 1 and 2 already mute any raw key on the
+        re-scan.
+      - (i) mechanism A instead: 4. The guard and the three mixed rows.
+
+      **The full suite** ran under `-race` on main and on the branch: 1,419 results, then 1,454.
+      **No existing result changed outcome.** Two left (the moved #108 rows) and 37 came in. The
+      new and touched tests pass under `-race -count=20`.
+
+      **Wire check.** One run per binary against a capturing endpoint (`--plain --llm-anonymize
+      --warmup-lines 0`). A `[FATAL] hdr Authorization: Bearer AKIAIOSFODNN7EXAMPLE.prod expired`
+      line, with #59's `postgres://user:p/ss@db` in its context as the open control.
+      - `.prod`: 2 before, 0 after. `AKIAIOSFODNN7EXAMPLE`: 0 in both.
+      - `p/ss` fires once in both, so the grep is not vacuous.
+
+      `internal/pipeline` does not appear in the diff. README: the Known-limitations entry goes, a
+      past-tense paragraph carries the shapes, span, costs and frequency, and the audit sentence
+      gains #110.
+
+      **Found on the way:** nothing new.
+
+      Seen, out of scope: #51, #59, #65's sweep. Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
@@ -3686,8 +3821,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 5 → 9a, 5 → 10 | `/Users/bob@corp.com/…` | nothing | **harmless**; the value is masked whole, as EMAIL |
       | 7/8 → 9a | `https://10.0.0.5:8080/x` | nothing | **harmless**; 9a is blocked but the whole authority WAS the address |
       | 6 → 10, 1/2/3b → 10 | `/home/550e8400-…/app.log` | nothing | **harmless**; blocking detector 10 costs a tag, never a value |
-      | 1/2/3b → 3a | `Bearer AKIAIOSFODNN7EXAMPLE` | nothing | **harmless**; already pinned by `TestPlaceholdersAreInert` |
-      | 1/2 → 3a | `Bearer AKIA…EXAMPLE.prod` | `.prod` | **DEFECT, filed #110**. A key glued to text inside the bearer value, not the key; 3b runs after 3a and is not affected |
+      | 1/2/3b → 3a | `Bearer AKIAIOSFODNN7EXAMPLE` | nothing | **harmless where the key IS the whole value**; already pinned by `TestPlaceholdersAreInert`. A key glued to text inside the value is the next row |
+      | 1/2 → 3a | `Bearer AKIA…EXAMPLE.prod` | `.prod` | **DEFECT (#110), FIXED**, by a rule run before the key detectors (3c) that masks the whole bearer value. The text glued to the key, not the key; 3b runs after 3a and was never affected |
       | 1/2/3b → 5 | `eyJ….eyJ….sig@example.com` | the domain | **theoretical**; nothing puts a JWT in an email local part |
       | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, FIXED** (#48) |
       | 6 → 9a | `https://api.550e8400-….acme.com/` | `.acme.com` | **DEFECT, FIXED** (#48) |
