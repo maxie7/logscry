@@ -2740,7 +2740,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         WHOLE.** `key AKIAIOSFODNN7EXAMPLE_prod used` and `key sk-…XYZ_prod used` reach the model
         unmasked, and `residue()` reads them as clean: the key's closing `\b` fails, and detectors 2
         and 3b match nothing. The template masks the key and sends `_prod`. Confirmed with a
-        throwaway test. No open issue covers it, so it is filed as ISSUE-TBD.
+        throwaway test. No open issue covers it, so it is filed as #108.
       - **9d misses the second of two adjacent fused list members** on the raw line, because its
         consumed trailing edge eats the shared comma:
         `mongodb://h1,10.0.0.5.nip.io,10.0.0.6.nip.io,host4/db` sends `.nip.io` and `host4`.
