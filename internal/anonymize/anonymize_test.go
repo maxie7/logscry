@@ -2128,7 +2128,7 @@ func TestIssue108KeyGluedToAWordCharacter(t *testing.T) {
 	// token, an email local part, a bare private-suffix host, a userinfo, a host label, a list member.
 	// Any rule that tagged the key before the rule owning the value would block that rule and send the
 	// rest; this one runs after all of them. The bearer rows' remainders, ".prod" on both paths and
-	// "_prod" on the template, are main's and are a remainder beside a masked key, not a key: ISSUE-TBD.
+	// "_prod" on the template, are main's and are a remainder beside a masked key, not a key: #110.
 	same := []struct{ name, in, want, tmpl string }{
 		{"key alone", "key " + aws + " used", "key <TOKEN_1> used", "key <TOKEN_1> used"},
 		{"aws key is the whole username", "s3://" + aws + ":secret@bucket",

@@ -1030,7 +1030,7 @@ entry with an empty message.
   pre-masked template. A JWT behind `Bearer` sends what follows a `.` or `~` after its
   signature. The fail-closed check reads the remainder as clean. Not affected: an `sk-` key
   behind `Bearer`, a bearer value with no key in it, and a key glued to text inside a URL, an
-  email or a host. In prose the glued text is sent beside the key by design. Filed as ISSUE-TBD.
+  email or a host. In prose the glued text is sent beside the key by design. Filed as #110.
 - **A quoted value containing an escaped quote templates badly on the plain-text path.** The
   `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
   as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left

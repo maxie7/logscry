@@ -2901,7 +2901,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         reads it clean. Main and the branch agree on every cell, so it predates #108 and is
         untouched by it. The audit table's "1/2/3b → 3a harmless" row is wrong for a glued key,
         and a row is added below it. Confirmed with a throwaway test. No open issue covers it, so
-        it is filed as ISSUE-TBD and named in README's Known limitations.
+        it is filed as #110 and named in README's Known limitations.
 
       Seen, out of scope: #51, #59, #65's sweep. Targets v0.12.11
 
@@ -3687,7 +3687,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 7/8 → 9a | `https://10.0.0.5:8080/x` | nothing | **harmless**; 9a is blocked but the whole authority WAS the address |
       | 6 → 10, 1/2/3b → 10 | `/home/550e8400-…/app.log` | nothing | **harmless**; blocking detector 10 costs a tag, never a value |
       | 1/2/3b → 3a | `Bearer AKIAIOSFODNN7EXAMPLE` | nothing | **harmless**; already pinned by `TestPlaceholdersAreInert` |
-      | 1/2 → 3a | `Bearer AKIA…EXAMPLE.prod` | `.prod` | **DEFECT, filed ISSUE-TBD**. A key glued to text inside the bearer value, not the key; 3b runs after 3a and is not affected |
+      | 1/2 → 3a | `Bearer AKIA…EXAMPLE.prod` | `.prod` | **DEFECT, filed #110**. A key glued to text inside the bearer value, not the key; 3b runs after 3a and is not affected |
       | 1/2/3b → 5 | `eyJ….eyJ….sig@example.com` | the domain | **theoretical**; nothing puts a JWT in an email local part |
       | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, FIXED** (#48) |
       | 6 → 9a | `https://api.550e8400-….acme.com/` | `.acme.com` | **DEFECT, FIXED** (#48) |
