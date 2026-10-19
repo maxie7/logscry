@@ -1037,13 +1037,6 @@ entry with an empty message.
   That is a gap in the anonymizer's own pattern (#49), filed rather than fixed here because the
   fix belongs to the same constant #42 is about. The two IPv6 patterns diverged in #40 and #41; #42
   decides whether they stay two.
-- **`--llm-anonymize` takes a closing quote into a home-directory username.** The username
-  rule stops at `/`, whitespace, `:`, `<` and `>`, but not at a quote or a bracket. So
-  `msg="cannot read /home/deploy2prod"` reaches the model as `…/home/<USER_1> …`, with the
-  closing quote inside the placeholder, and a JSON payload loses its `"}` the same way.
-  Nothing is disclosed and the payload round-trips exactly, but the model sees a broken
-  payload, and wherever its answer names `<USER_1>` the restored text carries the stray `"`
-  or `)`. Raw lines, JSON and logfmt templates are all affected. Filed as #90.
 - **A quoted value containing an escaped quote templates badly on the plain-text path.** The
   `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
   as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left

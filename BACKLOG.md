@@ -3040,6 +3040,128 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Seen, out of scope: #51, #59, #65's sweep. Targets v0.12.12
 
+- [x] **A home-dir username ends before a closing quote or bracket** — #90, found while building
+      #83. Detector 10's username class stopped at `/`, whitespace, `:`, `<` and `>`, and at nothing
+      a log writes AFTER a value. So a name at the end of a quoted or bracketed value took the closer
+      into its placeholder:
+      - `msg="cannot read /home/deploy2prod" module=x` → `…/home/<USER_1> module=x`;
+      - `{"path":"/home/bob"}` → `{"path":"/home/<USER_1>`;
+      - `open("/home/bob")` → `open("/home/<USER_1>`.
+
+      Nothing was disclosed and `Restore` round-tripped, but the model was sent a broken payload, and
+      an answer naming `<USER_1>` restored with the stray characters. Raw lines (trigger and context)
+      and the JSON and logfmt templates, which re-quote the message; on the text-path template only
+      the non-quote closers, since `strPat` folds a quoted string into `<STR>`. v0.4.0 → v0.12.12,
+      **thirty-eight tagged releases** (`git tag --contains 2da31be | wc -l` → 38; its class
+      `[^/<>\s:]+` already admitted every closer). The logfmt suite had pinned it as a skipped row
+      since #83.
+
+      **The fix (`internal/anonymize/anonymize.go` only).** The body keeps today's class, and the
+      name's LAST unit may not be a closer: `homeUser` is a run of `homeChar` that ends on a `homeEnd`,
+      either of them a pipeline placeholder. No trailing context; leftmost-longest makes the name the
+      longest such run, so a run of closers of any length stays outside. Every other detector compiles
+      byte-identically (source, tag, group, verify, fixpoint and order dumped against main's under
+      `New()` and an extra-suffix Mapper; only 10's source moved). `apply`, `residue`, `Restore` and
+      the `detector` struct are unchanged.
+
+      **Decisions, each pinned by a test.**
+      1. **The trailing set** is `"` `'` `` ` `` `)` `]` `}` `,` `;` `.` `\`. Quotes and the backtick
+         close a value in logfmt, JSON, `%q`, Python reprs and Markdown; brackets close a call, a list
+         or an object; a comma and a semicolon end a field or a clause; the dot ends a sentence, as 9d
+         keeps it outside an address. The backslash was added at step 0, measured rather than planned:
+         inside a quoted value it escapes the closing quote (`{"msg":"open(\"/home/bob\")"}`), and
+         without it the name ended on it and `<USER_1>` restored to `bob\`. Left out: `!` and `?`, which
+         no formatter writes after a value, and `-`, `_` and `$`, which are legal in a username.
+      2. **No narrowing but closers.** A closer INSIDE a name stays masked (`/home/o'brien/x`,
+         `/home/a)b/x`, `/Users/a,b/x`), and a leading one stays inside (`/home/'bob'` →
+         `/home/<USER_1>'`).
+      3. **Both paths:** raw, the JSON and logfmt templates, the text template for the closers it
+         keeps, and #43's tolerant end (`/home/maxie<NUM>"`, `(see /home/maxie<NUM>)`).
+      4. **Restore.** Every row round-trips, `<USER_1>` never restores to a name ending in a closer,
+         and a model answer naming it restores the name alone; the name bare elsewhere is the same
+         placeholder. `residue()` is unchanged in kind: a raw name before a closer still reads USER.
+
+      **Costs, pinned.** The rule has no trailing context, so a name whose LAST character is a closer
+      loses it before a `/` too (`/home/bob./x` → `/home/<USER_1>./x`), and a "name" made only of
+      closers is none (`/home/../etc`, `/home/./x`, left as they are). Only closers leave a
+      placeholder. Removing either cost needs a second rule, since one group cannot carry the `/`
+      context; the captures gate below decided it was not needed.
+
+      **No narrowing, shown differentially.** Every input the anonymize, llm and config tests feed
+      `Mask` and `residue`, on main and on the branch, plus their `Templatize` and `TemplatizeLine`
+      forms: 3,036 inputs, per-byte coverage under `New()` and an extra-suffix Mapper, the same result
+      under both:
+      - 48 narrowed, every byte in an allowed class: 86 bytes are trailing-set characters after the new
+        name's end and inside the old one, and 3 are an old name made only of closers that the new rule
+        does not match (`..` and `.`);
+      - 0 narrowed elsewhere, 0 widened, 0 mixed, 0 layout-only, 0 error changes;
+      - main's own 2,888 inputs all unchanged; the 48 are the new tests'.
+
+      **Frequency.** The 70,783 records (ten boots and ab37) were run raw and through `TemplatizeLine`,
+      old against new, under both Mappers. Predicted: 1 to 100 changed, mostly `"`, `'` and `.`, 0 in
+      "other", 0 in either cost cell, 0 error changes. Measured: **15 changed, every one a name before
+      `]`**, 0 other, 0 error changes. The count, the "other" bucket, the gate and the errors held; the
+      mix did not, it is all `]`. The gate: 0 records carry a closer-ended name before a `/`, and 0 a
+      name made only of closers.
+
+      **Tests.**
+      - `TestIssue90HomeDirClosingPunctuation`, raw and through the real `TemplatizeLine`:
+        - 23 closed rows: the issue's three lines, a JSON msg, one row per closer, an escaped quote on a
+          raw JSON and a raw logfmt line, runs of closers (`x=["/home/bob"]), y` raw, as a raw logfmt
+          line, and `(see [/home/bob]);.` through the logfmt template), the leading quote, both tolerant
+          ends, and a JSON escape glued to the name;
+        - each with its exact output, a round trip, the answer-side check and the new output re-masked
+          unchanged with a clean `residue()`;
+        - a raw-only row, `x="(see [/home/bob]);." y=1`, which is not logfmt (no level or message key),
+          so its template is `<STR>`;
+        - 10 byte-identical rows, the three cost rows, the answer-side and recurrence subtest, and the
+          `residue` claim.
+      - The logfmt suite's skipped `quote-edge/home-dir-last` runs again, as msg and as error, beside two
+        new quote-edge rows (a tolerant end, and the run `]);.` before the wrapper's quote).
+      - Two completeness rows (a closing quote, a sentence dot) and two templatized rows (a closing
+        paren, a tolerant end), which also run in the logfmt wrapper.
+      - Red on main: 42 subtests, all by assertion. Guard functions byte-identical.
+
+      **Mutants, each with what it turned red.**
+      - (a) closers dropped from the whole class: 6. The four closer-inside rows, the leading quote, the
+        glued JSON escape.
+      - (b) the trailing set without `"`: 24. Every `"` row, raw, JSON and logfmt, the answer side,
+        the raw-only run, every logfmt-suite row (the wrapper closes each with a quote) and the
+        closing-quote completeness row.
+      - (c) tolerance lost at the end: 10. The tolerant-end rows on every path, and the trailing-digit,
+        UUID and leading-quote rows, whose templates end on a pipeline placeholder.
+      - (d) `.` dropped: 10. The sentence-dot rows, the dot runs and all three cost rows.
+      - (e) each other closer dropped alone: `'` 2, backtick 1, `)` 16, `]` 8, `}` 5, `,` 3, `;` 5,
+        backslash 3 (the escaped-quote rows and the raw logfmt run). Each turns its own row red.
+      - (f) main's group restored: 40, every closed and cost row.
+      - (g) one closer only, read two ways. (g1) the name, then one optional closer inside it: 38. (g2)
+        exactly one trailing closer stripped (a throwaway second rule): 19, among them
+        `run_of_four_closers`, every other run row (raw logfmt, logfmt template, raw-only, the logfmt
+        suite's `closer-run`) and both escaped-quote rows: each ends on two closers or more.
+
+      **The full suite** ran under `-race` on main and on the branch: 1,454 results, then 1,505. **The only
+      changed outcomes are the two un-skipped rows, skip → pass**; none left, 51 came in. The new and
+      touched tests pass under `-race -count=20`.
+
+      **No wire check.** Nothing is disclosed before or after the fix, so there is no fragment to grep for
+      on the wire.
+
+      README: the Known-limitations entry goes.
+
+      **Found on the way:** nothing new.
+
+      Seen, out of scope:
+      - **The same shape in the host rules.** 9a's, 9c's and 9e's host run admits a trailing `.` and
+        `-`, so `see https://acme.com.` masks the sentence dot into `<HOST_1>`, and so do a list member
+        (`mongodb://h1,h2.acme.com.`) and a key-labelled host. Confirmed with a throwaway test. Restore
+        round-trips, so nothing is sent or lost, and no record of the 70,783 carries it (0 for each
+        rule). Not filed. 3a's trailing `.` is already pinned as #110's cost.
+      - **A JSON escape glued to a name.** `{"msg":"cannot read /home/bob\n"}` keeps `bob\n` as one name,
+        as on main: `n` is a name character. Pinned, no behaviour change, not filed.
+      - #59, #65's sweep, #51.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
