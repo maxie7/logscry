@@ -105,6 +105,9 @@ func TestTypeTags(t *testing.T) {
 		// #108: a key glued to a word character in prose is still a key. Before the fix this came back
 		// unchanged, the key in the clear; the exact output is pinned in TestIssue108KeyGluedToAWordCharacter.
 		{"key AKIAIOSFODNN7EXAMPLE_prod used", "<TOKEN_1>"},
+		// #51: an sk- key with a '-' or a '_' in its tail is a key. Before the fix this came back unchanged,
+		// the key in the clear; the exact output is pinned in TestIssue51SkKeyWithASeparatorInItsTail.
+		{"key " + skProjKey + " rejected", "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -152,6 +155,14 @@ func TestNoOverMasking(t *testing.T) {
 		"processed 4200 records in 12.5s",
 		"GET /orders 200 in 42ms",
 		"could not reach api.example.com", // bare PUBLIC host: accepted residual gap
+		// #51: an sk- key's alphabet is a kebab-case name's, so these stay by the witness, by \b, or by
+		// the floor (TestIssue51SkKeyWithASeparatorInItsTail).
+		"sk-learn-compatible-estimator",
+		"sk-worker-pool-7f9c",
+		"task-AbCdEfGhIjKlMnOpQr",
+		"Accept-Language: sk-SK,sk;q=0.9",
+		"sk-1 failed",
+		"region sk-2",
 	}
 	for _, s := range survive {
 		m := New()
@@ -528,6 +539,15 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"hdr Bearer <TOKEN_1>~prod expired",
 		"hdr Bearer <TOKEN_2><TOKEN_1>.x expired",
 		"hdr Bearer <TOKEN_1> expired",
+		// #51's new outputs fed back: our own tags beside the sk prefixes and in the cells that moved. The sk
+		// key reads a pipeline placeholder as evidence, never ours, so "sk-proj-", "sk-" and "sk<NUM>" before
+		// our tag give it nothing to match; and the residuals' leftovers read as clean.
+		"key sk-proj-<TOKEN_1> used",
+		"key sk<NUM><TOKEN_1> used",
+		"OPENAI_API_KEY=<TOKEN_1>",
+		"postgres://<TOKEN_1>:<TOKEN_2>@<HOST_1>/db",
+		"peer worker-<TOKEN_1>.<HOST_1> down",
+		"/home/<TOKEN_1>/x",
 	}
 	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
@@ -2095,8 +2115,10 @@ func TestIssue108KeyGluedToAWordCharacter(t *testing.T) {
 			"key <TOKEN_1>_prod used", "key <TOKEN_1>_prod used", []string{"IOSFODNN"}},
 		{"aws key, letter after (the issue's)", "key " + aws + "x",
 			"key <TOKEN_1>x", "key <TOKEN_1>x", []string{"IOSFODNN"}},
+		// Since #51 '_' and '-' are sk key characters, so the glue after an sk- key is part of it and the
+		// whole run is one token; an AWS key's alphabet still ends at '_', and its glue stays prose.
 		{"sk- key, '_' after (the issue's)", "key " + sk + "_prod used",
-			"key <TOKEN_1>_prod used", "key <TOKEN_1>_prod used", []string{"abcdefghij"}},
+			"key <TOKEN_1> used", "key <TOKEN_1> used", []string{"abcdefghij", "_prod"}},
 		{"asia key, '_' after", "key ASIAIOSFODNN7EXAMPLE_prod used",
 			"key <TOKEN_1>_prod used", "key <TOKEN_1>_prod used", []string{"IOSFODNN"}},
 		// Glue BEFORE the key, sent whole on both paths. For an AWS key a lowercase letter is glue too:
@@ -2112,8 +2134,8 @@ func TestIssue108KeyGluedToAWordCharacter(t *testing.T) {
 			"auth token_<TOKEN_1> rejected", "auth token_<TOKEN_1> rejected", []string{"dBjftJeZ", "eyJhbGci"}},
 		{"aws key, glued on both sides", "key x_" + aws + "_prod used",
 			"key x_<TOKEN_1>_prod used", "key x_<TOKEN_1>_prod used", []string{"IOSFODNN"}},
-		{"sk- key, glued on both sides", "key my_" + sk + "_prod used",
-			"key my_<TOKEN_1>_prod used", "key my_<TOKEN_1>_prod used", []string{"abcdefghij"}},
+		{"sk- key, glued on both sides (the '_' after is the key's since #51)", "key my_" + sk + "_prod used",
+			"key my_<TOKEN_1> used", "key my_<TOKEN_1> used", []string{"abcdefghij", "_prod"}},
 		{"end of text after '_'", "creds=prod_" + aws,
 			"creds=prod_<TOKEN_1>", "creds=prod_<TOKEN_1>", []string{"IOSFODNN"}},
 		{"start of text", aws + "_prod used", "<TOKEN_1>_prod used", "<TOKEN_1>_prod used", []string{"IOSFODNN"}},
@@ -2153,7 +2175,8 @@ func TestIssue108KeyGluedToAWordCharacter(t *testing.T) {
 	// What a key's grammar refuses: a letter or a digit before sk- or a JWT, and an uppercase letter or
 	// a digit before an AWS prefix, make a longer run that merely CONTAINS the prefix, which is no key.
 	// The template masks the digit-before rows by an accident of NUM: the digit becomes <NUM>, and \b
-	// holds after its '>'. sk-proj is #51's, a different grammar.
+	// holds after its '>'. An sk-proj key sat here at main's output, sent on both paths, until #51 closed
+	// it; it is TestIssue51SkKeyWithASeparatorInItsTail's now.
 	//
 	// And the shapes main masks WHOLE because the key detectors do not see a glued key there: a bearer
 	// token, an email local part, a bare private-suffix host, a userinfo, a host label, a list member.
@@ -2174,8 +2197,6 @@ func TestIssue108KeyGluedToAWordCharacter(t *testing.T) {
 		{"digit before an aws prefix", "key 7" + aws + " used", "key 7" + aws + " used", "key <NUM><TOKEN_1> used"},
 		{"letter before a jwt", "auth x" + jwt + " rejected", "auth x" + jwt + " rejected",
 			"auth xeyJhbGciOiJIUzI<NUM>NiJ<NUM>.eyJzdWIiOiIxIn<NUM>.dBjftJeZ<NUM>CVPmB<NUM>K<NUM>u rejected"},
-		{"sk-proj (#51)", "key sk-proj-abcdefghij0123456789 used",
-			"key sk-proj-abcdefghij0123456789 used", "key sk-proj-abcdefghij<NUM> used"},
 		{"bearer, '_' before the key", "hdr Bearer x_" + aws + " expired",
 			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
 		{"email, '_' before the key", "mail x_" + aws + "@example.com", "mail <EMAIL_1>", "mail <EMAIL_1>"},
@@ -2395,6 +2416,297 @@ func TestIssue110KeyGluedInsideABearerValue(t *testing.T) {
 	} {
 		if tag := New().residue(in); tag != "" {
 			t.Errorf("residue() sees the old leftover %q as %q; the claim in the comment above is wrong", in, tag)
+		}
+	}
+}
+
+// #51's invented keys, shared by its test and the tables. Each is written split at its vendor prefix so
+// that no source line carries a whole key-shaped literal for a secret scanner to match; the strings
+// are the same at run time.
+const (
+	skProjKey         = "sk-proj-" + "Rk4mQz8vLp2w_Xn6tYb9cHd3s-Jf7gKa5eTu1o"
+	skSvcacctKey      = "sk-svcacct-" + "Tq5wEr8yUi2oPa6sDf9gHj3kLz7xCv4b"
+	skAdminKey        = "sk-admin-" + "Mn8bVc6xZa4sDf2gHj0kLqWe5r"
+	skAntKey          = "sk-ant-" + "api03-" + "Xy7zWv5uTs3rQp1oNm9lKj_hGf-Ed2cBa8ZyQw4eRt6y-Ui9oPa1sDfAA"
+	skUnderscoreKey   = "sk-" + "AbCdEfGh_IjKlMnOpQrStUv"
+	skDigitFirstKey   = "sk-" + "7AbCdEfGhIjKlMnOpQrSt"
+	skDigitsInsideKey = "sk-" + "4Fh8KdLm2Qp9RsTv7Wx1Yz5"
+	skHexKey          = "sk-or-" + "v1-" + "3f9a2c7e1b8d4f60a5e9c2b7d1f8a3e6c4b9d2f7a1e8c5b3d6f9a2e7c1b4d8f0"
+)
+
+// TestIssue51SkKeyWithASeparatorInItsTail is the named regression for #51. Detector 3b wanted sixteen
+// unbroken letters and digits straight after "sk-", and every current key format puts a '-' or a '_' in
+// its tail before that: OpenAI's sk-proj-, sk-svcacct- and sk-admin-, Anthropic's sk-ant-api03-, and a
+// classic key with a '_' in it. Each was sent whole, raw and on the template, and residue() read the
+// line as clean. On the template a classic key whose tail starts with a digit was sent too: NUM takes
+// the '-' as a sign, "sk-7AbC..." becomes "sk<NUM>AbC...", and no "sk-" was left to anchor on.
+//
+// The tail is now a run of the key's alphabet, letters, digits, '-' and '_', carrying a witness: sixteen
+// unbroken letters and digits anywhere in it, or an uppercase letter with the whole tail sixteen long. A
+// kebab-case name that starts with a literal "sk-" word is the same alphabet with neither. On the template
+// a pipeline placeholder is the evidence, as it always was, and after "sk<NUM>" a letter of each case.
+//
+// A '-' or '_' at the very end is the key's; a closer is not. Text glued AFTER an sk- key by '-' or '_' is
+// the key's too, since it is the key's alphabet, which moves #108's sk rows. v0.4.0 onward.
+func TestIssue51SkKeyWithASeparatorInItsTail(t *testing.T) {
+	const (
+		proj    = skProjKey
+		svcacct = skSvcacctKey
+		admin   = skAdminKey
+		ant     = skAntKey
+		under   = skUnderscoreKey
+		digit   = skDigitFirstKey
+		digit2  = skDigitsInsideKey
+		hexv    = skHexKey
+	)
+	closed := []struct {
+		name, in, want, tmpl string
+		sent                 []string // what main sent on one path or both; none may survive
+	}{
+		// The issue's formats, in prose. The template is TemplatizeLine's, the real Template field.
+		{"sk-proj (the issue's)", "key " + proj + " rejected", "key <TOKEN_1> rejected", "key <TOKEN_1> rejected",
+			[]string{"sk-proj", "vLp", "gKa"}},
+		{"sk-svcacct", "key " + svcacct + " rejected", "key <TOKEN_1> rejected", "key <TOKEN_1> rejected",
+			[]string{"sk-svcacct", "wEr", "kLz"}},
+		{"sk-admin", "key " + admin + " rejected", "key <TOKEN_1> rejected", "key <TOKEN_1> rejected",
+			[]string{"sk-admin", "LqWe"}},
+		{"anthropic sk-ant-api03", "key " + ant + " rejected", "key <TOKEN_1> rejected", "key <TOKEN_1> rejected",
+			[]string{"sk-ant", "lKj_hGf", "sDfAA"}},
+		{"classic, '_' inside", "key " + under + " rejected", "key <TOKEN_1> rejected", "key <TOKEN_1> rejected",
+			[]string{"IjKlMn"}},
+		// The hex vendor form carries the sixteen-run after its prefix. On the template its body is already
+		// <HEX> and nothing of the key is left to send, so the template is main's.
+		{"hex body after a vendor prefix", "key " + hexv + " rejected", "key <TOKEN_1> rejected",
+			"key sk-or-v<NUM>-<HEX> rejected", []string{"3f9a2c7e"}},
+		// The two witnesses at their floors: sixteen unbroken after a separator, and an uppercase tail of
+		// exactly sixteen. One short of each is a must-stay below.
+		{"a sixteen-run after a separator", "key sk-x-" + "abcdefghijklmnop used", "key <TOKEN_1> used",
+			"key <TOKEN_1> used", []string{"abcdefghijklmnop"}},
+		{"an uppercase tail of sixteen", "key sk-" + "AbCd-EfGh_IjKlmn used", "key <TOKEN_1> used",
+			"key <TOKEN_1> used", []string{"EfGh"}},
+		// A classic key whose tail starts with a digit. The raw line always masked it; the template, where
+		// it is sk<NUM>, sent the rest of it.
+		{"digit-first classic (template)", "key " + digit + " rejected", "key <TOKEN_1> rejected",
+			"key <TOKEN_1> rejected", []string{"AbCdEf"}},
+		{"digit-first classic, digits inside (template)", "key " + digit2 + " rejected", "key <TOKEN_1> rejected",
+			"key <TOKEN_1> rejected", []string{"KdLm", "RsTv"}},
+		{"digit-first, lowercase sixteen-run (template)", "key sk-" + "7abcdefghijklmnopq rejected",
+			"key <TOKEN_1> rejected", "key <TOKEN_1> rejected", []string{"abcdefghijklmnop"}},
+		{"digit-first, logfmt msg", `level=error msg="key ` + digit + ` rejected" module=x`,
+			`level=error msg="key <TOKEN_1> rejected" module=x`, `level=error msg="key <TOKEN_1> rejected" module=x`,
+			[]string{"AbCdEf"}},
+		{"digit-first, json msg", `{"level":"error","msg":"key ` + digit + ` rejected"}`,
+			`{"level":"error","msg":"key <TOKEN_1> rejected"}`, `{"level":<STR>,"msg":"key <TOKEN_1> rejected"}`,
+			[]string{"AbCdEf"}},
+		// Environment variables, at the end of the text.
+		{"OPENAI_API_KEY (the issue's)", "OPENAI_API_KEY=" + proj, "OPENAI_API_KEY=<TOKEN_1>",
+			"OPENAI_API_KEY=<TOKEN_1>", []string{"vLp"}},
+		{"ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY=" + ant, "ANTHROPIC_API_KEY=<TOKEN_1>",
+			"ANTHROPIC_API_KEY=<TOKEN_1>", []string{"sDfAA"}},
+		// The structured wrappers: a logfmt msg and a JSON msg keep their text, re-quoted, and a JSON value
+		// is <STR> on the template.
+		{"logfmt msg", `level=error msg="key ` + proj + ` rejected" module=x`,
+			`level=error msg="key <TOKEN_1> rejected" module=x`, `level=error msg="key <TOKEN_1> rejected" module=x`,
+			[]string{"vLp"}},
+		{"json msg", `{"level":"error","msg":"key ` + proj + ` rejected"}`,
+			`{"level":"error","msg":"key <TOKEN_1> rejected"}`, `{"level":<STR>,"msg":"key <TOKEN_1> rejected"}`,
+			[]string{"vLp"}},
+		{"json msg, anthropic", `{"level":"error","msg":"key ` + ant + ` rejected"}`,
+			`{"level":"error","msg":"key <TOKEN_1> rejected"}`, `{"level":<STR>,"msg":"key <TOKEN_1> rejected"}`,
+			[]string{"sDfAA"}},
+		{"json value", `{"api_key":"` + proj + `"}`, `{"api_key":"<TOKEN_1>"}`, `{"api_key":<STR>}`, []string{"vLp"}},
+		// The edges: a closer stays outside the placeholder (#90's class), one row each.
+		{"sentence dot", "key " + proj + ". Retrying", "key <TOKEN_1>. Retrying", "key <TOKEN_1>. Retrying", []string{"vLp"}},
+		{"comma", "key " + proj + ", retrying", "key <TOKEN_1>, retrying", "key <TOKEN_1>, retrying", []string{"vLp"}},
+		{"double quote", `rejected "` + proj + `"`, `rejected "<TOKEN_1>"`, `rejected <STR>`, []string{"vLp"}},
+		{"single quote", "rejected '" + proj + "'", "rejected '<TOKEN_1>'", "rejected <STR>", []string{"vLp"}},
+		{"paren", "(" + proj + ")", "(<TOKEN_1>)", "(<TOKEN_1>)", []string{"vLp"}},
+		{"bracket", "[" + proj + "]", "[<TOKEN_1>]", "[<TOKEN_1>]", []string{"vLp"}},
+		{"brace", "{" + proj + "}", "{<TOKEN_1>}", "{<TOKEN_1>}", []string{"vLp"}},
+		{"colon", proj + ": rejected", "<TOKEN_1>: rejected", "<TOKEN_1>: rejected", []string{"vLp"}},
+		// ...and a '-' or a '_' at the very end is the key's: a base64url body can end on either.
+		{"trailing '-' is the key's", "key " + proj + "- used", "key <TOKEN_1> used", "key <TOKEN_1> used", []string{"vLp", "o-"}},
+		{"trailing '_' is the key's", "key " + proj + "_ used", "key <TOKEN_1> used", "key <TOKEN_1> used", []string{"vLp", "o_"}},
+		// A '_' after a lowercase classic key is the key's on the template too, where the placeholder in its
+		// first segment is the evidence and the run goes on across the separator.
+		{"lowercase classic, '_' after", "key sk-" + "abcdefghij0123456789xyz_prod used", "key <TOKEN_1> used",
+			"key <TOKEN_1> used", []string{"abcdefghij", "_prod"}},
+		// Rule 11 reads the same key: glued to '_' before it, the glue stays prose.
+		{"rule 11, '_' before", "key x_" + proj + " used", "key x_<TOKEN_1> used", "key x_<TOKEN_1> used", []string{"vLp"}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				m := New()
+				got := mustMask(t, m, p.in)
+				if got != p.want {
+					t.Errorf("an sk- key with a separator in its tail not masked:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+				for _, frag := range c.sent {
+					if strings.Contains(got, frag) {
+						t.Errorf("a fragment main sent survived: %q still in %q", frag, got)
+					}
+				}
+				if r := m.Restore(got); r != p.in {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", p.in, r)
+				}
+				// The new output is inert: masking it again changes nothing and the re-scan reads it clean.
+				if again := mustMask(t, New(), p.want); again != p.want {
+					t.Errorf("the masked output is not inert:\n out:   %q\n again: %q", p.want, again)
+				}
+				if tag := New().residue(p.want); tag != "" {
+					t.Errorf("residue() reads the masked output %q as %q", p.want, tag)
+				}
+			}
+		})
+	}
+
+	// Byte-identical with main, raw and templatized: the readers of skKey that already masked such a key
+	// whole, because the value around it is a rule's -- a userinfo (4d, and 4 before it), a host label
+	// (9e) and a bearer value (3a; 3c reads only JWT and AWS, TestGluedKeyRulesReadTheKeyDetectors).
+	same := []struct{ name, in, want, tmpl string }{
+		{"userinfo, '.' after the key (4d)", "s3://" + proj + ".prod@bucket", "s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>"},
+		{"userinfo with a password (4d)", "s3://" + proj + ".prod:secret@bucket", "s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>"},
+		{"host label (9e)", "https://" + proj + ".prod.acme.com/x", "https://<HOST_1>/x", "https://<HOST_1>/x"},
+		{"bearer key (3a)", "hdr Bearer " + proj + " expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"bearer key, '.' after (3a)", "hdr Bearer " + proj + ".prod expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+	}
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a shape outside #51 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// LAYOUT ONLY: masked on main and masked now, no byte unmasked, the placeholders arranged differently.
+	// A key the detectors now see is a key half, #46's design: in a userinfo the colon leaves the
+	// placeholder, and in a host list the key's member is minted first, #57's numbering for a classic key.
+	// A home directory, a host or a member that IS such a key is tagged TOKEN, not USER or HOST.
+	layout := []struct{ name, in, want, tmpl string }{
+		{"the #46 cell, the key is the username", "postgres://" + proj + ":password@localhost/db",
+			"postgres://<TOKEN_1>:<TOKEN_2>@<HOST_1>/db", "postgres://<TOKEN_1>:<TOKEN_2>@<HOST_1>/db"},
+		{"the #46 mirror, the key is the password", "postgres://appuser:" + proj + "@db",
+			"postgres://<TOKEN_2>:<TOKEN_1>@<HOST_1>", "postgres://<TOKEN_2>:<TOKEN_1>@<HOST_1>"},
+		{"list member, '.' after the key (9e)", "mongodb://h1," + proj + ".prod,host3/db",
+			"mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db", "mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db"},
+		{"a home directory that is a key", "/home/" + proj + "/x", "/home/<TOKEN_1>/x", "/home/<TOKEN_1>/x"},
+	}
+	for _, c := range layout {
+		t.Run("layout/"+c.name, func(t *testing.T) {
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				m := New()
+				if got := mustMask(t, m, p.in); got != p.want {
+					t.Errorf("layout moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				} else if r := m.Restore(got); r != p.in {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", p.in, r)
+				}
+			}
+		})
+	}
+
+	// THE RESIDUALS, pinned. A key the detectors now see blocks the rule that owned the value around it,
+	// the inertness invariant's wall, and the rest of that value is sent: an email's domain, and the
+	// labels of a bare private-suffix host before the key. Main masked both values whole, because 3b
+	// did not see the key. And on the template a lowercase body with no uppercase letter and its digits
+	// collapsed carries neither witness, so main's leak stays there; the raw line is closed.
+	residuals := []struct{ name, in, want, tmpl string }{
+		{"email local part", "mail " + proj + "@example.com", "mail <TOKEN_1>@example.com", "mail <TOKEN_1>@example.com"},
+		{"bare private host, '-' before the key", "peer worker-" + proj + ".corp.internal down",
+			"peer worker-<TOKEN_1>.<HOST_1> down", "peer worker-<TOKEN_1>.<HOST_1> down"},
+		{"lowercase body on the template", "key sk-proj-" + "abcdefghij0123456789 used",
+			"key <TOKEN_1> used", "key sk-proj-abcdefghij<NUM> used"},
+	}
+	for _, c := range residuals {
+		t.Run("residual/"+c.name, func(t *testing.T) {
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a pinned residual moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// THE COSTS on the template, pinned; the raw ones are TestAcceptedOverMasking's. A placeholder in the
+	// first segment is the evidence and the run goes on across separators, so a word after "sk-v<NUM>" is
+	// absorbed; and after "sk<NUM>" a letter of each case is a key. The raw line is unchanged in both.
+	costs := []struct{ name, in, tmpl string }{
+		{"a word after sk-v<NUM>", "sk-v2-worker-pool", "<TOKEN_1>"},
+		{"mixed case after sk<NUM>", "size sk-2-AbCd", "size <TOKEN_1>"},
+	}
+	for _, c := range costs {
+		t.Run("cost/"+c.name, func(t *testing.T) {
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			for _, p := range []struct{ in, want string }{{c.in, c.in}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a pinned cost moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// What stays, raw and templatized. A kebab-case name after a literal "sk-" word carries no witness; a
+	// word that merely ends in "sk" is refused by \b and rule 11's lead, not by the witness, so even a long
+	// mixed-case tail after one stays; and one short of each floor is no key. After "sk<NUM>" a short
+	// tail, or one of a single case, is a number with a word beside it.
+	for _, s := range []string{
+		"sk-learn-compatible-estimator",
+		"sk-worker-pool-7f9c",
+		"task-AbCdEfGhIjKlMnOpQr",
+		"ask-AbCdEfGhIjKlMnOpQr",
+		"disk-AbCdEfGhIjKlMnOpQr",
+		"Accept-Language: sk-SK,sk;q=0.9",
+		"sk-Ab_Cd",
+		"key sk-AbCd-EfGh_IjKlm used",
+		"key sk-x-abcdefghijklmno used",
+		"sk-1 failed",
+		"region sk-2",
+		"sk-2XL",
+	} {
+		tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: s}))
+		for _, in := range []string{s, tIn} {
+			if got := mustMask(t, New(), in); got != in {
+				t.Errorf("over-masked a name that is no key:\n in:  %q\n out: %q", in, got)
+			}
+		}
+	}
+
+	// The key in prose and in an environment variable is one value, under one placeholder, and an answer
+	// naming it restores the key alone.
+	t.Run("a key recurs under one placeholder", func(t *testing.T) {
+		m := New()
+		if got, want := mustMask(t, m, "key "+proj+" rejected"), "key <TOKEN_1> rejected"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		if got, want := mustMask(t, m, "OPENAI_API_KEY="+proj), "OPENAI_API_KEY=<TOKEN_1>"; got != want {
+			t.Errorf("recurrence: got %q, want %q", got, want)
+		}
+		if got := m.Restore("rotate <TOKEN_1>"); got != "rotate "+proj {
+			t.Errorf("Restore = %q, want the key alone", got)
+		}
+	})
+
+	// residue() reads the same rule, so a raw key of any format mutes the escalation; main read every one
+	// of these as clean.
+	for _, in := range []string{
+		"key " + proj + " rejected",
+		"key " + svcacct + " rejected",
+		"key " + admin + " rejected",
+		"key " + ant + " rejected",
+		"key " + under + " rejected",
+		"key " + hexv + " rejected",
+		"OPENAI_API_KEY=" + proj,
+		"key x_" + proj + " used",
+		"https://" + proj + ".prod.acme.com/x",
+	} {
+		if tag := New().residue(in); tag != tagToken {
+			t.Errorf("a raw sk- key does not mute: residue(%q) = %q, want %q", in, tag, tagToken)
 		}
 	}
 }
@@ -3271,7 +3583,8 @@ var completenessRows = []completenessRow{
 	{"aws-key/glued-underscore", "key ", "AKIAIOSFODNN7EXAMPLE", "_prod used"},
 	{"aws-key/glued-letter", "key id", "AKIAIOSFODNN7EXAMPLE", " used"},
 	{"aws-key/run", "key ", "AKIAIOSFODNN7EXAMPLEPROD", " used"},
-	{"sk-key/glued", "key my_", "sk-abcdefghij0123456789XYZ", "_prod used"},
+	// Since #51 the '_prod' after an sk- key is the key's: '_' is in its alphabet.
+	{"sk-key/glued", "key my_", "sk-" + "abcdefghij0123456789XYZ_prod", " used"},
 	{"jwt/glued", "auth token_", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u", " rejected"},
 	// #110. A key glued inside a bearer value: 1 or 2 tagged the key alone, and 3a could not claim the rest.
 	// The whole value is the secret, flush against the word on one side and a space on the other. After the
@@ -3290,6 +3603,16 @@ var completenessRows = []completenessRow{
 	// the same reason as the #48 rows.
 	{"home-dir/closing-quote", `cannot read "/home/`, "bob", `" twice`},
 	{"home-dir/sentence-dot", "cannot read /home/", "bob", ". Retrying"},
+	// #51. The current key formats carry '-' and '_' in the tail, and a closer after one stays outside the
+	// placeholder. After the canonical rows, for the same reason as the #48 rows.
+	{"sk-key/proj", "key ", skProjKey, " rejected"},
+	{"sk-key/svcacct", "key ", skSvcacctKey, " rejected"},
+	{"sk-key/anthropic", "key ", skAntKey, " rejected"},
+	{"sk-key/underscore-inside", "key ", skUnderscoreKey, " rejected"},
+	{"sk-key/hex-after-prefix", "key ", skHexKey, " rejected"},
+	{"sk-key/env-var-end", "OPENAI_API_KEY=", skProjKey, ""},
+	{"sk-key/closing-quote", `rejected "`, skProjKey, `" twice`},
+	{"sk-key/sentence-dot", "key ", skProjKey, ". Retrying"},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -3549,6 +3872,11 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// it cannot continue a key, so a sentence dot right after a key behind "Bearer" is glue: the value
 		// with its dot is one token, and the key alone elsewhere gets a placeholder of its own.
 		{"a sentence dot after a bearer key joins the value", "auth Bearer AKIAIOSFODNN7EXAMPLE. retry", "auth Bearer <TOKEN_1> retry"},
+		// #51's costs. An sk- tail is the key's alphabet with a witness, so a mixed-case identifier sixteen
+		// long after a literal "sk-" is a key, and so is a run of sixteen letters with the words after it.
+		// The second was a token on main too, with "-svc" left beside it.
+		{"a mixed-case name after sk- is a key", "deploy sk-" + "MyService-Deployment", "deploy <TOKEN_1>"},
+		{"a sixteen-letter word after sk- takes the words after it", "sk-internationalization-svc", "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -3712,9 +4040,10 @@ var templatizedRows = []templatizedRow{
 	{"url-host/list-member/glued-key", "dsn=mongodb://\x00h1\x00,\x00AKIAIOSFODNN7EXAMPLE.prod\x00,\x00host3\x00/db"},
 	// #108 through the composition. A '_' BEFORE a key defeats the key's \b on the template too, so these
 	// three were sent there as well as on the raw line. The '_'-after row is green on main, where the
-	// mangled form carries no closing \b, and is the control the raw line now agrees with.
+	// mangled form carries no closing \b, and is the control the raw line now agrees with. Since #51 the
+	// "_prod" after an sk- key is the key's, so the sk row's second mark moved past it.
 	{"aws-key/glued-underscore-before", "key x_\x00AKIAIOSFODNN7EXAMPLE\x00 used"},
-	{"sk-key/glued-underscore-before", "key my_\x00sk-abcdefghij0123456789XYZ\x00_prod used"},
+	{"sk-key/glued-underscore-before", "key my_\x00sk-" + "abcdefghij0123456789XYZ_prod\x00 used"},
 	{"jwt/glued-underscore-before", "auth token_\x00eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u\x00 rejected"},
 	{"aws-key/glued-underscore-after", "key \x00AKIAIOSFODNN7EXAMPLE\x00_prod used"},
 	// #110 through the composition. The key templatizes to AKIAIOSFODNN<NUM>EXAMPLE, which 2 reads with no
@@ -3733,6 +4062,20 @@ var templatizedRows = []templatizedRow{
 	{"aws-key", "creds \x00AKIAIOSFODNN7EXAMPLE\x00 denied"},
 	{"bearer-jwt", "hdr Bearer \x00eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u\x00 expired"},
 	{"sk-key", "key \x00sk-abcdefghij0123456789XYZ\x00 rejected"},
+	// #51 through the composition. Every digit in these keys is <NUM> on the template, which breaks both
+	// witnesses' runs, so the placeholder is the evidence, as for the classic key; and a classic key whose
+	// tail starts with a digit is sk<NUM>, the "-" taken as NUM's sign.
+	{"sk-key/proj", "key \x00" + skProjKey + "\x00 rejected"},
+	{"sk-key/svcacct", "key \x00" + skSvcacctKey + "\x00 rejected"},
+	{"sk-key/anthropic", "key \x00" + skAntKey + "\x00 rejected"},
+	{"sk-key/underscore-inside", "key \x00sk-" + "AbCd3fGh_IjKlMnOpQrStUv\x00 rejected"},
+	{"sk-key/digit-first", "key \x00" + skDigitFirstKey + "\x00 rejected"},
+	{"sk-key/digit-first/digits-inside", "key \x00" + skDigitsInsideKey + "\x00 rejected"},
+	{"sk-key/proj/env-var-end", "OPENAI_API_KEY=\x00" + skProjKey + "\x00"},
+	{"sk-key/proj/sentence-dot", "key \x00" + skProjKey + "\x00. Retrying"},
+	// The userinfo cell the key's cont is exact for: a lowercase key's mangled run must go on across the '_',
+	// or the key stops at it, 4d sees no glue, and the rest of the userinfo is left to the email detector.
+	{"url-credentials/glued-key/underscore/lowercase", "url=s3://\x00sk-" + "abcdefghij0123456789xyz_prod\x00@\x00bucket.example.com\x00/x"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
@@ -3818,6 +4161,8 @@ func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
 		{"quote-edge/home-dir-last/closer-run", "(see [/home/\x00bob\x00]);."},
 		{"quote-edge/url-host-last", "dial https://\x00db01.corp.internal\x00"},
 		{"quote-edge/sk-key-last", "rejected key \x00sk-abcdefghij0123456789XYZ\x00"},
+		{"quote-edge/sk-proj-last", "rejected key \x00" + skProjKey + "\x00"},
+		{"quote-edge/sk-digit-first-first", "\x00" + skDigitFirstKey + "\x00 rejected"},
 		{"quote-edge/aws-key-first", "\x00AKIAIOSFODNN7EXAMPLE\x00 denied"},
 	}
 	rows := append(append([]templatizedRow{}, templatizedRows...), quoteEdgeRows...)
@@ -4106,6 +4451,14 @@ func TestNoOverMaskingAfterTemplating(t *testing.T) {
 		"processed 4200 records in 12.5s",
 		"GET /orders 200 in 42ms",
 		"could not reach api.example.com", // bare PUBLIC host: accepted residual gap
+		// #51: sk-worker-pool<NUM>f<NUM>c carries a placeholder and no uppercase letter, and sk<NUM> with a
+		// short tail is a number beside a word.
+		"sk-learn-compatible-estimator",
+		"sk-worker-pool-7f9c",
+		"task-AbCdEfGhIjKlMnOpQr",
+		"Accept-Language: sk-SK,sk;q=0.9",
+		"sk-1 failed",
+		"region sk-2",
 	}
 	for _, s := range survive {
 		in, _ := pipeline.Templatize(s)
