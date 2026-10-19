@@ -60,6 +60,12 @@
 // still the key detectors', so #46's reason for running them first stands, and no struct, apply or
 // residue change was needed.
 //
+// #108 IS THE SAME RULE READ FROM THE OTHER END. A key glued to '_' or a letter is no key to 1, 2 or 3b,
+// whose \b fails beside a word character, so in prose it was sent whole. Every rule that owns a value
+// around such a key already masks the value whole, BECAUSE the key rules do not see the key; teaching
+// them to would block those rules and send the rest. So rule 11 runs LAST, reads only text no rule
+// claimed, and masks the key with the glue left as prose.
+//
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
 // Mask records nests; that inertness is what keeps a home path in a Go stack trace from tripping
@@ -228,6 +234,10 @@ func New(extraHostSuffixes ...string) *Mapper {
 // on its own -- #41's structural reason from the re-scan's side. What separates it from #41 is the
 // pattern's intent: 9a matched exactly what it was written for, and what it was written for was
 // smaller than the value. Closing it (9c) changes nothing about what residue() can see.
+//
+// #108 WIDENS WHAT residue() SEES by one class. A key glued to a word character matched no detector,
+// so the re-scan read it as clean for #55's reason -- no pattern to look with. Rule 11 is
+// verify-eligible, so a raw glued key that ever survives masking mutes.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -471,7 +481,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all eighteen rather than to the one detector known to need it, because
+// It is applied to all twenty-one rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -499,7 +509,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	suffixes := append(append([]string{}, defaultHostSuffixes...), extraHostSuffixes...)
 	bareHost := mustLongest(bareHostPattern(suffixes))
 
-	return []detector{
+	dets := []detector{
 		// 4d. A userinfo with a key GLUED inside one of its halves (#57). It runs HERE, ahead of the key
 		//     detectors, and the out-of-sequence number is 6's and 9d's convention: it is a credential
 		//     rule, and the audit table and the issues number those 4-4d.
@@ -957,6 +967,31 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     split the value and sent the tail — /home/deploy2prod leaked "prod" (#43).
 		{tagUser, mustLongest(`(?:/home/|/Users/)(` + tolerant(`[^/<>\s:]`) + `)`), 1, true, false},
 	}
+	// 11. A key glued to a word character (#108), one rule per key, in 1, 2 and 3b's order. Their \b
+	//     fails beside '_' or a letter, so until #108 such a key was no key at all on the raw line:
+	//     "key AKIA...EXAMPLE_prod used" was sent with the key in it and residue() read it as clean. On
+	//     the template the mangled form has no closing \b, so there the key was masked and "_prod" sent.
+	//
+	//     IT RUNS LAST, and that is the whole design. Teaching 1, 2 and 3b the new edges was rejected:
+	//     main masks a glued key WHOLE wherever a rule owns the value around it -- a bearer token (3a), an
+	//     email local part (5), a bare private-suffix host (9b), a userinfo (4), a host (9a, 9c) -- and it
+	//     does so only because the key rules do NOT see the key. A key tagged first blocks every one of
+	//     them, the inertness invariant's wall, and the rest of the value is sent: "Bearer AKIA..._prod"
+	//     would send "_prod", "x_AKIA...@example.com" the domain, "worker_AKIA....corp.internal" "worker".
+	//     That is the anti-correlation BACKLOG records for #51, a key rule that sees more blocking a rule
+	//     after it. Run after every rule, this one reads only text nothing claimed, so it can only add a
+	//     placeholder: every byte masked before is masked the same way, in the same layout.
+	//
+	//     There the text beside a key is PROSE, #57's decision: the key is the value and the glue stays,
+	//     "key <TOKEN_1>_prod used", "key x_<TOKEN_1> used". The character before the key is context, not
+	//     group, which a key rule could not do: RE2 has no lookbehind, and 1, 2 and 3b mask group 0.
+	//
+	//     verify:true, as every key rule: a raw glued key that ever survives masking mutes the escalation.
+	//     Its group is a raw key only, so it cannot fire on our own output.
+	for _, k := range keyShapes {
+		dets = append(dets, detector{tagToken, mustLongest(looseKey(k.loose, k.lead)), 1, true, false})
+	}
+	return dets
 }
 
 // pipelinePH matches a placeholder minted by the PIPELINE's template masker
@@ -1124,21 +1159,49 @@ const authorityTail = `(?:[^@/\s<>]|` + pipelinePH + `)*(?:[/\s>]|$)`
 // jwtChar is the base64url alphabet of a JWT segment.
 const jwtChar = `[A-Za-z0-9_-]`
 
+// The parts of a key: its prefix and the alphabet of the run after it, or for a JWT its three segments.
+// Each key below is built from them twice, with two different edges, so the two cannot drift.
+const (
+	awsPrefix = `(?:AKIA|ASIA)`
+	awsChar   = `[0-9A-Z]`
+	skPrefix  = `sk-`
+	skChar    = `[A-Za-z0-9]`
+)
+
+var jwtBody = `eyJ` + tolerant(jwtChar) + `\.eyJ` + tolerant(jwtChar) + `\.` + tolerant(jwtChar)
+
 // jwtKey, awsKey and skKey are what detectors 1, 2 and 3b match: "a key", in one definition. 4d and
 // 9e read the same three to find a key inside a larger value, so the rule that would tag a key and the
 // rule that must get to it first cannot disagree about what one is (TestGluedKeyRulesReadTheKeyDetectors).
+//
+// These are the STRICT keys: a \b on both edges, so a key standing alone in its value. That is the
+// notion 4d and 9e rely on -- a key that stands alone keeps its own tag -- and it is why a key glued to
+// a word character is not one of these (#108; see looseKey).
 var (
-	jwtKey = `\beyJ` + tolerant(jwtChar) + `\.eyJ` + tolerant(jwtChar) + `\.` + tolerant(jwtChar)
-	awsKey = `\b(?:AKIA|ASIA)(?:[0-9A-Z]{16}\b|` + mangled(`[0-9A-Z]`) + `)`
-	skKey  = `\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`
+	jwtKey = `\b` + jwtBody
+	awsKey = `\b` + awsPrefix + `(?:` + awsChar + `{16}\b|` + mangled(awsChar) + `)`
+	skKey  = `\b` + skPrefix + `(?:` + skChar + `{16,}\b|` + mangled(skChar) + `)`
 )
 
 // keyShapes pairs each key with the raw characters it could have continued with, as a class body.
 // A JWT's third segment runs on through '-' and '_', so neither is text beside a JWT.
-var keyShapes = []struct{ pat, cont string }{
-	{jwtKey, `A-Za-z0-9_-`},
-	{awsKey, `0-9A-Z`},
-	{skKey, `A-Za-z0-9`},
+//
+// loose and lead are rule 11's (#108). loose is the same key with no edge of its own: its run ends where
+// its alphabet does, which leftmost-longest gives without an assertion, and an AWS run longer than
+// sixteen is a key too, as its mangled form always was. lead is what may NOT sit before a loose key:
+// the key's own letters and digits, which would make a longer word that merely contains the prefix
+// (XAKIA..., task-..., xeyJ...). '_' and '-' are separators, so a JWT's lead is its alphabet without
+// them, and an AWS key's, being uppercase, leaves a lowercase letter as glue.
+var keyShapes = []struct{ pat, cont, loose, lead string }{
+	{jwtKey, `A-Za-z0-9_-`, jwtBody, `A-Za-z0-9`},
+	{awsKey, `0-9A-Z`, awsPrefix + `(?:` + awsChar + `{16,}|` + mangled(awsChar) + `)`, `0-9A-Z`},
+	{skKey, `A-Za-z0-9`, skPrefix + `(?:` + skChar + `{16,}|` + mangled(skChar) + `)`, `A-Za-z0-9`},
+}
+
+// looseKey is rule 11 for one key: the loose key, after the start of the text or a character outside
+// its lead. The character before is CONTEXT and the key is the group, so the glue stays where it was.
+func looseKey(loose, lead string) string {
+	return `(?:^|[^` + lead + `])(` + loose + `)`
 }
 
 // glued is a run of unit that contains a key with something beside it: one or more units before the

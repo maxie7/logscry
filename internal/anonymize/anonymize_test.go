@@ -101,6 +101,9 @@ func TestTypeTags(t *testing.T) {
 		// the name comes back <HOST_n>. Before the fix it came back <TOKEN_1> with the domain beside
 		// it in the clear; the exact output is pinned in TestIssue57PartlyRecognisedValue.
 		{"call https://AKIAIOSFODNN7EXAMPLE.prod.acme.com/x", "<HOST_1>"},
+		// #108: a key glued to a word character in prose is still a key. Before the fix this came back
+		// unchanged, the key in the clear; the exact output is pinned in TestIssue108KeyGluedToAWordCharacter.
+		{"key AKIAIOSFODNN7EXAMPLE_prod used", "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -506,6 +509,16 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"postgres://<HOST_2>@<HOST_1>/db",
 		"keys=a,<HOST_1>",
 		"mail ops@<HOST_1>",
+		// #108's new outputs fed back: our own <TOKEN_1> with the glue a key was masked out of, on either
+		// side, and two tags joined by it. The glued-key rules read a raw key after a character outside
+		// its alphabet, so a '_' or a letter beside our tag must give them nothing to start on.
+		"key <TOKEN_1>_prod used",
+		"key x_<TOKEN_1> used",
+		"key id<TOKEN_1> used",
+		"auth token_<TOKEN_1> rejected",
+		"creds=prod_<TOKEN_1>",
+		"<TOKEN_1>_<TOKEN_2>",
+		"southeast<TOKEN_1>",
 	}
 	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
@@ -2021,6 +2034,187 @@ func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
 	}
 }
 
+// TestIssue108KeyGluedToAWordCharacter is the named regression for #108. Detectors 1, 2 and 3b find a
+// key between two \b's, and '_' and letters are word characters, so a key glued to one was not a key at
+// all on the raw line: "key AKIA...EXAMPLE_prod used" and "key sk-..._prod used" went to the configured
+// model endpoint with THE KEY in them, and residue() returned "". On the Template field the mangled form
+// carries no closing \b, so there the key was masked and only "_prod" was sent: the two paths disagreed.
+// A '_' or a lowercase letter BEFORE the key was sent whole on both paths, and so was a JWT after a '_'.
+// v0.4.0 onward.
+//
+// Teaching 1, 2 and 3b the new edges was rejected, measured on paper and pinned below: a key those
+// detectors tag first blocks every rule after them, and main masks three shapes whole only because
+// they do NOT see the key -- a bearer token (3a), an email local part (5) and a bare private-suffix host
+// (9b). The fix runs LAST instead, after every rule that could own a value around the key, so it only
+// ever reads text no rule claimed, and there the text beside a key is prose (#57's decision): the key
+// is masked and the glue stays.
+func TestIssue108KeyGluedToAWordCharacter(t *testing.T) {
+	const (
+		aws = "AKIAIOSFODNN7EXAMPLE"
+		sk  = "sk-abcdefghij0123456789XYZ"
+		jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u"
+	)
+	closed := []struct {
+		name, in, want, tmpl string
+		sent                 []string // what main sent on one path or both; none may survive
+	}{
+		// The issue's three shapes. The template already masked the key and sent the glue, so the two
+		// paths agree now, on the template's output.
+		{"aws key, '_' after (the issue's)", "key " + aws + "_prod used",
+			"key <TOKEN_1>_prod used", "key <TOKEN_1>_prod used", []string{"IOSFODNN"}},
+		{"aws key, letter after (the issue's)", "key " + aws + "x",
+			"key <TOKEN_1>x", "key <TOKEN_1>x", []string{"IOSFODNN"}},
+		{"sk- key, '_' after (the issue's)", "key " + sk + "_prod used",
+			"key <TOKEN_1>_prod used", "key <TOKEN_1>_prod used", []string{"abcdefghij"}},
+		{"asia key, '_' after", "key ASIAIOSFODNN7EXAMPLE_prod used",
+			"key <TOKEN_1>_prod used", "key <TOKEN_1>_prod used", []string{"IOSFODNN"}},
+		// Glue BEFORE the key, sent whole on both paths. For an AWS key a lowercase letter is glue too:
+		// its alphabet is [0-9A-Z], so a lowercase letter cannot be part of its run. For sk- and a JWT
+		// only '_' is; a letter or a digit before them is a longer word (pinned below).
+		{"aws key, '_' before", "key x_" + aws + " used",
+			"key x_<TOKEN_1> used", "key x_<TOKEN_1> used", []string{"IOSFODNN"}},
+		{"aws key, lowercase before", "key id" + aws + " used",
+			"key id<TOKEN_1> used", "key id<TOKEN_1> used", []string{"IOSFODNN"}},
+		{"sk- key, '_' before", "key my_" + sk + " used",
+			"key my_<TOKEN_1> used", "key my_<TOKEN_1> used", []string{"abcdefghij"}},
+		{"jwt, '_' before", "auth token_" + jwt + " rejected",
+			"auth token_<TOKEN_1> rejected", "auth token_<TOKEN_1> rejected", []string{"dBjftJeZ", "eyJhbGci"}},
+		{"aws key, glued on both sides", "key x_" + aws + "_prod used",
+			"key x_<TOKEN_1>_prod used", "key x_<TOKEN_1>_prod used", []string{"IOSFODNN"}},
+		{"sk- key, glued on both sides", "key my_" + sk + "_prod used",
+			"key my_<TOKEN_1>_prod used", "key my_<TOKEN_1>_prod used", []string{"abcdefghij"}},
+		{"end of text after '_'", "creds=prod_" + aws,
+			"creds=prod_<TOKEN_1>", "creds=prod_<TOKEN_1>", []string{"IOSFODNN"}},
+		{"start of text", aws + "_prod used", "<TOKEN_1>_prod used", "<TOKEN_1>_prod used", []string{"IOSFODNN"}},
+		// A run that continues the key's alphabet past its length is masked whole: it starts with a key
+		// prefix and sixteen key characters, and masking a token beats sending a key. The template's
+		// mangled form was always unbounded, so this is the raw line coming to agree with it.
+		{"a longer run (decision 2)", "key AKIAIOSFODNN7EXAMPLEPROD used",
+			"key <TOKEN_1> used", "key <TOKEN_1> used", []string{"IOSFODNN", "PROD"}},
+		// The rule consumes one character of context before a key, so this row is the one that shows a
+		// second key after the first is not starved of it. Main's template masked the first key only.
+		{"two keys glued by one '_'", aws + "_AKIAIOSFODNN7EXAMPLF",
+			"<TOKEN_1>_<TOKEN_2>", "<TOKEN_1>_<TOKEN_2>", []string{"IOSFODNN"}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				m := New()
+				got := mustMask(t, m, p.in)
+				if got != p.want {
+					t.Errorf("a key glued to a word character not masked:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+				for _, frag := range c.sent {
+					if strings.Contains(got, frag) {
+						t.Errorf("a fragment main sent survived: %q still in %q", frag, got)
+					}
+				}
+				if r := m.Restore(got); r != p.in {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", p.in, r)
+				}
+			}
+		})
+	}
+
+	// Byte-identical with main, raw and templatized.
+	//
+	// What a key's grammar refuses: a letter or a digit before sk- or a JWT, and an uppercase letter or
+	// a digit before an AWS prefix, make a longer run that merely CONTAINS the prefix, which is no key.
+	// The template masks the digit-before rows by an accident of NUM: the digit becomes <NUM>, and \b
+	// holds after its '>'. sk-proj is #51's, a different grammar.
+	//
+	// And the shapes main masks WHOLE because the key detectors do not see a glued key there: a bearer
+	// token, an email local part, a bare private-suffix host, a userinfo, a host label, a list member.
+	// Any rule that tagged the key before the rule owning the value would block that rule and send the
+	// rest; this one runs after all of them. The bearer rows' remainders, ".prod" on both paths and
+	// "_prod" on the template, are main's and are a remainder beside a masked key, not a key: #110.
+	same := []struct{ name, in, want, tmpl string }{
+		{"key alone", "key " + aws + " used", "key <TOKEN_1> used", "key <TOKEN_1> used"},
+		{"aws key is the whole username", "s3://" + aws + ":secret@bucket",
+			"s3://<TOKEN_1>:<TOKEN_2>@<HOST_1>", "s<NUM>://<TOKEN_1>:<TOKEN_2>@<HOST_1>"},
+		{"bearer key", "hdr Bearer " + aws + " expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"jwt, '_' after (base64url)", "auth " + jwt + "_x rejected", "auth <TOKEN_1> rejected", "auth <TOKEN_1> rejected"},
+		{"a word that looks like sk- (task)", "task-abcdefghijklmnop0123", "task-abcdefghijklmnop0123", "task-abcdefghijklmnop<NUM>"},
+		{"a word that looks like sk- (ask)", "ask-abcdefghijklmnop0123", "ask-abcdefghijklmnop0123", "ask-abcdefghijklmnop<NUM>"},
+		{"digit before sk-", "key 2" + sk + " used", "key 2" + sk + " used", "key <NUM><TOKEN_1> used"},
+		{"uppercase before an aws prefix", "key X" + aws + " used", "key X" + aws + " used", "key XAKIAIOSFODNN<NUM>EXAMPLE used"},
+		{"digit before an aws prefix", "key 7" + aws + " used", "key 7" + aws + " used", "key <NUM><TOKEN_1> used"},
+		{"letter before a jwt", "auth x" + jwt + " rejected", "auth x" + jwt + " rejected",
+			"auth xeyJhbGciOiJIUzI<NUM>NiJ<NUM>.eyJzdWIiOiIxIn<NUM>.dBjftJeZ<NUM>CVPmB<NUM>K<NUM>u rejected"},
+		{"sk-proj (#51)", "key sk-proj-abcdefghij0123456789 used",
+			"key sk-proj-abcdefghij0123456789 used", "key sk-proj-abcdefghij<NUM> used"},
+		{"bearer, '_' after the key", "hdr Bearer " + aws + "_prod expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1>_prod expired"},
+		{"bearer, '.' after the key", "hdr Bearer " + aws + ".prod expired",
+			"hdr Bearer <TOKEN_1>.prod expired", "hdr Bearer <TOKEN_1>.prod expired"},
+		{"bearer, '_' before the key", "hdr Bearer x_" + aws + " expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"email, '_' before the key", "mail x_" + aws + "@example.com", "mail <EMAIL_1>", "mail <EMAIL_1>"},
+		{"email, '_' after the key", "mail " + aws + "_prod@example.com", "mail <EMAIL_1>", "mail <TOKEN_1><EMAIL_1>"},
+		{"bare private host, '_' before the key", "peer worker_" + aws + ".corp.internal down",
+			"peer <HOST_1> down", "peer <HOST_1> down"},
+		{"host label, '_' after the key", "https://" + aws + "_prod.acme.com/x", "https://<HOST_1>/x", "https://<HOST_1>/x"},
+		{"list member, '_' after the key", "mongodb://h1," + aws + "_prod,host3/db",
+			"mongodb://<HOST_1>,<HOST_2>,<HOST_3>/db", "mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db"},
+		{"userinfo, '_' after the key", "s3://" + aws + "_prod:secret@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>"},
+	}
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a shape outside #108 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// The key glued and the key alone are one value, under one placeholder.
+	t.Run("a glued key recurs under the key's placeholder", func(t *testing.T) {
+		m := New()
+		if got, want := mustMask(t, m, "key x_"+aws+" used"), "key x_<TOKEN_1> used"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		if got, want := mustMask(t, m, "creds "+aws+" denied"), "creds <TOKEN_1> denied"; got != want {
+			t.Errorf("recurrence: got %q, want %q", got, want)
+		}
+		if got := m.Restore("<TOKEN_1>"); got != aws {
+			t.Errorf("Restore(<TOKEN_1>) = %q, want the key alone", got)
+		}
+	})
+
+	// residue() reads the same rule, so a raw glued key ANYWHERE mutes the escalation -- in prose, in a
+	// query string, behind Bearer, in a userinfo -- and the old leftovers read as clean.
+	for _, in := range []string{
+		"key " + aws + "_prod used",
+		"key " + aws + "x",
+		"key " + sk + "_prod used",
+		"key x_" + aws + " used",
+		"key id" + aws + " used",
+		"auth token_" + jwt + " rejected",
+		"key x_" + aws + "_prod used",
+		"key AKIAIOSFODNN7EXAMPLEPROD used",
+		"https://x.com/q?k=" + aws + "_prod",
+		"hdr Bearer " + aws + "_prod expired",
+		"s3://" + aws + "_prod@bucket",
+	} {
+		if tag := New().residue(in); tag != tagToken {
+			t.Errorf("a raw glued key does not mute: residue(%q) = %q, want %q", in, tag, tagToken)
+		}
+	}
+	for _, in := range []string{
+		"key <TOKEN_1>_prod used",
+		"key x_<TOKEN_1> used",
+		"auth token_<TOKEN_1> rejected",
+	} {
+		if tag := New().residue(in); tag != "" {
+			t.Errorf("residue() sees the leftover %q as %q; the claim in the comment above is wrong", in, tag)
+		}
+	}
+}
+
 // TestIssue52SchemeAnchor is the named regression for #52. 9a and 9c find a URL by its scheme,
 // `\b[a-z][a-z0-9+.-]*://`, and that anchor is CONTEXT -- outside the group -- so #43, which made
 // every group tolerant of the pipeline's placeholders, never touched it. It failed two ways:
@@ -2730,6 +2924,16 @@ var completenessRows = []completenessRow{
 	{"url-host/glued-key", "call https://", "AKIAIOSFODNN7EXAMPLE.prod.acme.com", "/x"},
 	{"url-host/list-member/glued-key", "dsn=mongodb://" + phMark + "h1" + phMark + ",", "AKIAIOSFODNN7EXAMPLE.prod",
 		"," + phMark + "host3" + phMark + "/db"},
+	// #108. A key glued to a word character in prose: no detector saw it, and the key was sent. The key
+	// is the value and the glue is prose, so the text is flush against the key on the glued side -- an
+	// over-reach into the glue and a stop short of the key both fail here. One row per key and per side,
+	// a lowercase letter before an AWS key, and the run longer than a key. After the canonical rows, for
+	// the same reason as the #48 rows.
+	{"aws-key/glued-underscore", "key ", "AKIAIOSFODNN7EXAMPLE", "_prod used"},
+	{"aws-key/glued-letter", "key id", "AKIAIOSFODNN7EXAMPLE", " used"},
+	{"aws-key/run", "key ", "AKIAIOSFODNN7EXAMPLEPROD", " used"},
+	{"sk-key/glued", "key my_", "sk-abcdefghij0123456789XYZ", "_prod used"},
+	{"jwt/glued", "auth token_", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u", " rejected"},
 	// #52. A scheme with a digit in it: masked on the raw line, and the row exists for
 	// TestEveryDetectorsContextSurvivesTemplating, for which the '3' is a context digit -- the shape
 	// whose templatized form silenced 9a.
@@ -2986,6 +3190,12 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// it sent the domain, and "ops" is sent in both -- detector 5 cannot read a tag, as before.
 		{"a glued key after a comma reads as a host", "keys=a,AKIAIOSFODNN7EXAMPLE.prod", "keys=a,<HOST_1>"},
 		{"a glued key in an email domain reads as a host", "mail ops@AKIAIOSFODNN7EXAMPLE.prod.example.com", "mail ops@<HOST_1>"},
+		// #108's costs. A run that starts with an AWS prefix and continues the key's alphabet past twenty
+		// characters is a key, so an uppercase identifier of that shape is a token on the raw line, as it
+		// already was on the template wherever it carried a digit. And a lowercase letter before an AWS
+		// prefix is glue, so a word ending in one does not stop the run behind it from being a key.
+		{"an uppercase run that starts like an aws key is one", "region ASIAPACIFICDATACENTER01 up", "region <TOKEN_1> up"},
+		{"a lowercase word glued before an aws-prefixed run", "southeastASIAPACIFICDATACENTER01", "southeast<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -3147,6 +3357,13 @@ var templatizedRows = []templatizedRow{
 	{"url-credentials/glued-key/underscore", "url=s3://\x00sk-abcdefghij0123456789XYZ_prod\x00@\x00bucket.example.com\x00/x"},
 	{"url-host/glued-key", "call https://\x00AKIAIOSFODNN7EXAMPLE.prod.acme.com\x00/x"},
 	{"url-host/list-member/glued-key", "dsn=mongodb://\x00h1\x00,\x00AKIAIOSFODNN7EXAMPLE.prod\x00,\x00host3\x00/db"},
+	// #108 through the composition. A '_' BEFORE a key defeats the key's \b on the template too, so these
+	// three were sent there as well as on the raw line. The '_'-after row is green on main, where the
+	// mangled form carries no closing \b, and is the control the raw line now agrees with.
+	{"aws-key/glued-underscore-before", "key x_\x00AKIAIOSFODNN7EXAMPLE\x00 used"},
+	{"sk-key/glued-underscore-before", "key my_\x00sk-abcdefghij0123456789XYZ\x00_prod used"},
+	{"jwt/glued-underscore-before", "auth token_\x00eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u\x00 rejected"},
+	{"aws-key/glued-underscore-after", "key \x00AKIAIOSFODNN7EXAMPLE\x00_prod used"},
 	{"home-dir/middle-digit", "loaded from /home/\x00deploy2prod\x00/go/pkg/mod"},
 	{"home-dir/middle-digit-users", "path /Users/\x00jane7doe\x00/app.log missing"},
 	// The four widened at 2da31be, now held to completeness rather than to "a token appeared".

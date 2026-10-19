@@ -700,6 +700,28 @@ as a host even outside a URL (`keys=a,AKIA…EXAMPLE.prod`). A key as a label of
 private suffix (`worker-AKIA…EXAMPLE.corp.internal`) is not reached and still sends `worker-`; it is
 as theoretical as the key-label cell was. Measured over the same 70,783 records: nothing changed.
 
+**A key glued to `_` or a letter was sent whole before `v0.12.11`.** The JWT, AWS-key and
+`sk-` rules ended a key at a word boundary on both sides, and `_` and letters are word characters,
+so on the raw line a key glued to one was not seen at all: `key AKIA…EXAMPLE_prod used`,
+`key sk-…XYZ_prod used`, `key x_AKIA…EXAMPLE used`, `key idAKIA…EXAMPLE used` and `token_eyJ…`
+reached the model with the key itself in them, and the fail-closed check reported clean, because
+no rule it re-ran could see the key either. The pre-masked template masked a key with text glued
+*after* it and sent only the text, so the two paths disagreed; a key with text glued *before* it
+was sent on both. v0.4.0 → v0.12.10, thirty-six tagged releases. The fix is one more rule per key,
+run last, that ends a key where its own alphabet ends rather than at a word boundary: an AWS key
+at the first character outside `[0-9A-Z]`, an `sk-` key at the first outside `[A-Za-z0-9]`, a JWT
+where it always did. What is glued to the key stays prose beside its placeholder
+(`key <TOKEN_1>_prod used`), as for any key in prose, and the fail-closed check re-runs the new
+rule too, so a glued key that ever survived masking would mute the request. Running it last is
+what keeps everything else as it was: given the key first, the bearer, email and private-host rules
+would stop at its placeholder and send the glue, where they mask the whole value today. So a key
+alone, after `Bearer`, in an email, a URL or a host list masks exactly as before, and a word that
+only contains a prefix (`task-…`, `XAKIA…`) is still not a key. What it costs, pinned: an
+uppercase run that starts like an AWS key and is longer than one is masked whole
+(`region ASIAPACIFICDATACENTER01 up` → `region <TOKEN_1> up`), after a lowercase word too, as the
+template always masked it. Measured over the same 70,783 records: nothing changed. None carries an
+AWS or JWT prefix, and the 396 that contain `sk-` inside a word are untouched.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -714,7 +736,8 @@ a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found
 could not close then, #67, closed in `v0.12.6`, and a single-host leak, #66, closed in `v0.12.5`.
 Of the audit's own four, the half of #48 that ordering could not reach, #54, closed in
 `v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`; of #55's three, the
-partly-recognised half, #57, in `v0.12.10`.
+partly-recognised half, #57, in `v0.12.10`; and the glued key the work on it found unseen on
+the raw line, #108, in `v0.12.11`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -1000,6 +1023,14 @@ entry with an empty message.
   Nothing is disclosed and the payload round-trips exactly, but the model sees a broken
   payload, and wherever its answer names `<USER_1>` the restored text carries the stray `"`
   or `)`. Raw lines, JSON and logfmt templates are all affected. Filed as #90.
+- **`--llm-anonymize` sends the text glued after an AWS key or a JWT behind `Bearer`.** This
+  is a remainder beside a masked key, not the key: the key itself is masked.
+  `hdr Bearer AKIA…EXAMPLE.prod expired` reaches the model as `hdr Bearer <TOKEN_1>.prod expired`,
+  sending `.prod`. A `~` or `-` after an AWS key glues the same way, and so does a `_` on the
+  pre-masked template. A JWT behind `Bearer` sends what follows a `.` or `~` after its
+  signature. The fail-closed check reads the remainder as clean. Not affected: an `sk-` key
+  behind `Bearer`, a bearer value with no key in it, and a key glued to text inside a URL, an
+  email or a host. In prose the glued text is sent beside the key by design. Filed as #110.
 - **A quoted value containing an escaped quote templates badly on the plain-text path.** The
   `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
   as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left
