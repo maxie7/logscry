@@ -997,7 +997,16 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     awkward position is the one worth naming: a TRAILING digit was always harmless
 		//     (/home/maxie7 → /home/<USER_1><NUM> loses nothing), while a digit in the MIDDLE
 		//     split the value and sent the tail — /home/deploy2prod leaked "prod" (#43).
-		{tagUser, mustLongest(`(?:/home/|/Users/)(` + tolerant(`[^/<>\s:]`) + `)`), 1, true, false},
+		//
+		//     THE NAME ENDS BEFORE A TRAILING RUN OF CLOSERS (#90). The class stopped at nothing a log
+		//     writes AFTER a value, so a name at the end of a quoted or bracketed one took the closer with
+		//     it: msg="cannot read /home/bob" lost its quote into <USER_1>, {"path":"/home/bob"} its "}.
+		//     Nothing was disclosed, but the model was sent a broken payload and an answer naming <USER_1>
+		//     restored with the stray characters. The body keeps the class, so a closer INSIDE a name
+		//     (/home/o'brien/x) is still masked; only the last unit may not be one (see homeUser). What it
+		//     costs, pinned: a name whose last character is a closer loses it before a '/' too, and a
+		//     "name" made only of closers (/home/../etc) is none. Only closers leave a placeholder.
+		{tagUser, mustLongest(`(?:/home/|/Users/)(` + homeUser + `)`), 1, true, false},
 	}
 	// 11. A key glued to a word character (#108), one rule per key, in 1, 2 and 3b's order. Their \b
 	//     fails beside '_' or a letter, so until #108 such a key was no key at all on the raw line:
@@ -1310,6 +1319,21 @@ func hostCharsBut(class, cont string) string {
 	b.WriteString("]")
 	return b.String()
 }
+
+// homeChar is a home-dir username character as 10 reads it, and homeEnd one that may END the name: the same
+// class without the trailing set, the closers a log writes after a value -- quotes and the backtick, closing
+// brackets, a comma, a semicolon, a sentence dot, and the backslash that escapes a closing quote inside a
+// quoted value ("open \"/home/bob\""). '!', '?', '-', '_' and '$' stay name characters: no formatter writes
+// the first two after a value, and the last three are legal in a username ('$' ends a Samba machine account).
+const (
+	homeChar = `[^/<>\s:]`
+	homeEnd  = `[^/<>\s:"'` + "`" + `)\]},;.\\]`
+)
+
+// homeUser is 10's group: a run of homeChar that ends on a homeEnd, either of them a pipeline placeholder
+// too, so the name stays tolerant at its end (#43). Leftmost-longest makes it the longest such run, so a
+// closer inside the name is kept and a trailing run of them is left outside, however long.
+var homeUser = `(?:` + homeChar + `|` + pipelinePH + `)*(?:` + homeEnd + `|` + pipelinePH + `)`
 
 // tolerant builds a run of one or more units, where a unit is a character from class OR a
 // whole pipeline placeholder. For detectors with no length requirement, that is the entire
