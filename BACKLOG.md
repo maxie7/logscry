@@ -3311,12 +3311,12 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       builds one Mapper per escalation, capped by `--rate-limit`, and the default Mapper reuses the
       compiled chain.
 
-      README: the Known-limitations entry goes, and an ISSUE-TBD entry comes in (below).
+      README: the Known-limitations entry goes, and a #114 entry comes in (below).
 
       **Found on the way.** Stripe (`sk_live_`, `rk_live_`, `sk_test_`), GitHub (`ghp_`, `github_pat_`),
       Slack (`xoxb-`, `xoxp-`) and Google (`AIza…`) secrets match no detector and are sent whole, raw and
       on the template, on main and on the branch. Not #51's class: 3b reads `sk-` with a hyphen. Filed as
-      ISSUE-TBD and named in README's Known limitations.
+      #114 and named in README's Known limitations.
 
       Seen, out of scope:
       - **A bare `KEY=value`.** `OPENAI_API_KEY=<a value that is not an sk- key>` is sent; no rule reads
