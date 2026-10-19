@@ -677,6 +677,29 @@ suffix written with a dot, `.acme` or `acme.`, never matched (this README writes
 suffix is refused at startup, where it used to mask every dotted prefix. Measured over the same
 70,783 records: nothing changed.
 
+**A key with text beside it inside one value sent that text before `TODO-VERSION`.** The JWT,
+AWS-key and `sk-` rules run before every credential and host rule, so a key that was only *part* of
+a value was masked on its own and the rules after it could not step over its placeholder:
+`s3://AKIA…EXAMPLE.prod:secret@bucket` went out as `s3://<TOKEN_1>.prod:<TOKEN_2>@<HOST_1>`, sending
+`.prod`, and so did the colon-less form and a remainder before the key (`prod.AKIA…@bucket`) or in
+the password. A key as a hostname label sent the domain (`https://AKIA…EXAMPLE.prod.acme.com/x`),
+and as a later member of a host list (`mongodb://h1,AKIA…EXAMPLE.prod,host3/db`) it ended the list
+and sent `.prod` and `host3`. The pre-masked template leaked the same way, and on it alone an `sk-`
+key followed by `_` sent the `_` and what came after it. The fail-closed check reported clean every
+time. v0.4.0 → v0.12.9, thirty-five tagged releases; the list member since `v0.9.4`, before which no
+later member was masked at all. Running the credential rule first was never the answer, because a
+key that *is* a whole half must keep its own placeholder (#46). The fix is two more specific rules
+that run first, each matching only a key glued to other text inside one value: a userinfo with such
+a key is one credential placeholder, and a hostname with one is one host placeholder, as an address
+or a UUID inside a name is. A key that stands alone — a whole half, a whole list member, a whole
+host, after `Bearer`, in prose — is masked exactly as before, and so is a key glued to text in
+prose, which keeps its own placeholder with the text beside it. What it costs, pinned: such a
+userinfo no longer shows its colon, so the model is not told which half carried the key; a key
+inside a hostname is tagged as a host; and a key glued to text right after a comma or an `@` reads
+as a host even outside a URL (`keys=a,AKIA…EXAMPLE.prod`). A key as a label of a bare host on a
+private suffix (`worker-AKIA…EXAMPLE.corp.internal`) is not reached and still sends `worker-`; it is
+as theoretical as the key-label cell was. Measured over the same 70,783 records: nothing changed.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -690,7 +713,8 @@ the second of *those* (#58, closed in `v0.9.3`) found one of a kind none of the 
 a category for (#61, closed in `v0.9.4`); and the sweep that closed *that* found a class it
 could not close then, #67, closed in `v0.12.6`, and a single-host leak, #66, closed in `v0.12.5`.
 Of the audit's own four, the half of #48 that ordering could not reach, #54, closed in
-`v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`.
+`v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`; of #55's three, the
+partly-recognised half, #57, in `TODO-VERSION`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -721,16 +745,16 @@ Each time the audit's own count was right and its scope was narrower than the se
   userinfo production and found three more gaps in it, which are the three below: they share a
   family with #46 rather than with #55, because in each the grammar describes the value correctly
   and something else stops the rule reaching it.
-- **#57** — **a userinfo half that a detector recognised only in *part* leaves an
-  unreachable remainder.** `s3://AKIA…EXAMPLE.prod@bucket` sends `.prod`, and so does
-  `s3://AKIA…EXAMPLE.prod:secret@bucket` — so **#46's own fix does not cover it**, which makes
-  this an uncovered remainder of #46 rather than a leftover of #55. The tag minted mid-value
-  blocks every credential rule (all of their groups exclude `<`), and the remainder can lie on
-  *either side* of it, so unlike #46 this is not closed by adding two rules: no single pattern
-  reaches it. The candidate is structural — a second group or a second tag on the detector type.
-  The same key as a *later* member of a host list also ends the list there, because a member that
-  is a placeholder with text glued to it is neither a placeholder nor a host to the list rule:
-  `mongodb://h1,AKIA…EXAMPLE.prod,host3/db` sends `.prod` and `host3`.
+- ~~**#57** — a userinfo half that a detector recognised only in *part* leaves an
+  unreachable remainder.~~ **Closed in `TODO-VERSION`.** See the paragraph above.
+  `s3://AKIA…EXAMPLE.prod:secret@bucket` sent `.prod`, so **#46's own fix did not cover it**: an
+  uncovered remainder of #46 rather than a leftover of #55. The tag minted mid-value blocked every
+  credential rule, and the remainder could lie on either side of it, so no pattern run *after* the
+  key was tagged could reach it. The candidate was structural — a second group or a second tag on
+  the detector type — and what closed it was not: two rules that run *before* the key rules and
+  match only a key glued to other text inside one value, #54's remedy rather than a new struct. The
+  same key as a later member of a host list (`mongodb://h1,AKIA…EXAMPLE.prod,host3/db`), which sent
+  `.prod` and `host3`, is closed with it.
 - ~~**#58** — a raw `@` in a password truncates the mask and sends the real host.~~ **Closed in
   `v0.9.3`.** See the paragraph above. The candidate was not as small as the issue said:
   admitting `@` alone traded a host leak for a username-fragment leak on one shape, so the rule

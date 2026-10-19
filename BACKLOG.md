@@ -2561,6 +2561,193 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       change. The flag's help text and README's usage line say nothing about digits and stay.
       Seen, out of scope: #57, #59, #65's sweep. Targets v0.12.9
 
+- [x] **A key recognised inside a larger value masks the whole value** — #57, row 17 of the #55
+      sweep, with the later-member cell its comment moved from #54. Detectors 1, 2 and 3b (JWT,
+      AKIA, `sk-`) run before every credential and host rule, so a key that was only PART of a value
+      was tagged on its own, mid-value. Every later group excludes `<`, the inertness invariant, so
+      the remainder was sent:
+      - `s3://AKIA…EXAMPLE.prod:secret@bucket` → `s3://<TOKEN_1>.prod:<TOKEN_2>@<HOST_1>`, and the
+        colon-less and raw-`@` forms the same way;
+      - a remainder before the key (`prod.AKIA…@bucket`) or in the password (`user:AKIA….prod@`,
+        `user:AKIA…:extra@`, `user:pa:AKIA…@`);
+      - a key as a host label: `https://AKIA….prod.acme.com/x` sent the domain, as did
+        `https://api.AKIA….acme.com/x` and the same host behind `u:p@`;
+      - a key with text beside it as a list member: `mongodb://h1,AKIA….prod,host3/db` sent `.prod`
+        and `host3`, and as the first member it sent the rest of the list.
+
+      `Mask` returned nil and `residue()` returned `""`: the remainder is not a shape any detector
+      matches. v0.4.0 → v0.12.9, **thirty-five tagged releases** (`git tag --contains 2da31be | wc -l`
+      → 35); the list member since v0.9.4, before which no later member was masked at all.
+
+      **Where the grammar allows a glued remainder, measured per key.** AKIA and `sk-`: any non-word
+      userinfo or host character on either side. On the raw line a `_` or a letter defeats the key's
+      `\b`, so no key is seen and detector 4 masks the whole userinfo. On the Template field the
+      mangled form carries no closing `\b`, so a `_` or a lowercase letter after the key is glue
+      there too: `s3://sk-…XYZ_prod@b` sent `_prod` on the template only. JWT: `-` and `_` are
+      base64url and run on into the third segment; `.`, `~` and `!` are glue.
+
+      **The mechanism, compared on the cells before any code.**
+      - **A, the issue's candidate**: `group int` becomes a group list. It closes the userinfo cells
+        only with companion rules reading our tag as context, one per side per position. The host
+        cells need host rules with groups too, and the label stays split (`<TOKEN_1><HOST_1>`, the
+        HOST a partial name). It changes `apply`, `residue`, `completenessSecretFor` and every test
+        that reads `d.group`. Its one real gain is that `residue` would see the class.
+      - **B, #54's lesson**: rules more specific than the key detectors, run before them. It
+        closed every cell, raw and templatized, in a prototype measured before the plan, with no
+        contract change.
+      - **C**: a post-pass gluing our tag to its neighbours closes raw cells only, since on the
+        template the key is mangled, not our tag, and #54 rejected it for nesting and a numbering
+        gap. A key with a stricter boundary narrows: a key before a sentence dot would go unmasked.
+        The authority pre-pass stays rejected, since B does not fail.
+
+      **The fix (`internal/anonymize/anonymize.go` only) is B, as two rules.** Two are needed, not
+      one: the userinfo is a TOKEN and the host is a HOST, and a detector carries one tag. Both run
+      first, out of sequence, under 6's and 9d's numbering convention.
+      - **4d** is detector 4's group and `authorityTail`, matched only when a half carries a key
+        that is not the whole half. The halves split at the first `:`, as 4b/4c split them. Glued
+        means a unit before the key in its half, or directly after it a character the key could not
+        have continued with. That exclusion stops the mangled template form (`AKIAIOSFODNN<NUM>`
+        before `EXAMPLE`) reading as glued when the key is a whole half. TOKEN, `verify:true`.
+      - **9e** is one host run with a glued key in it, after one consumed `://`, `@` or `,`, with
+        no consumed right edge: leftmost-longest makes the run maximal anyway, and a consumed edge
+        would eat the comma the next member needs. HOST, `verify:false`.
+      - The three key patterns are hoisted into named values that 1, 2, 3b, 4d and 9e all read. Every
+        existing detector compiles byte-identically (compared source by source with main).
+      - `apply`, `residue`, `Restore`, `applyToFixpoint` and the `detector` struct are unchanged.
+
+      **Decisions.**
+      1. **Placement, pinned.** Both rules run before every key detector, and 4d before 9e, so a
+         userinfo is a TOKEN before a host rule can read it (`s3://user@AKIA….prod@bucket` →
+         `<TOKEN_1>@<HOST_1>`). `TestGluedKeyRulesReadTheKeyDetectors` holds both: each key
+         detector's source sits inside exactly one TOKEN rule and one HOST rule, both earlier.
+      2. **Tag and Restore.** The userinfo is one TOKEN and Restore gives it back whole. A key-label
+         host is HOST and the whole name is the value: containment, as for #48's UUID and #54's
+         address. TOKEN would tell the model a host is a credential, behind `u:p@` too. The fused
+         value recurs under one placeholder, and the key alone elsewhere keeps its own TOKEN.
+         **`residue`**: a raw glued userinfo mutes (4d); a raw key-label host, fused member or key
+         in prose mutes through detector 2, unchanged; the old leftovers still read as clean. All
+         pinned.
+      3. **9c's fixpoint and cap, untouched.** 9e masks every fused member in one pass before 9a
+         and 9c, so a fused member reaches 9c as a whole tag and the list re-anchors on it at no
+         cost in passes: `mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db`, 9d's layout. Two fused members
+         side by side each match. A termination shape alternates `AKIA%016d.prod` with names up to
+         65 members.
+
+      **Byte-identical with main, raw and templatized:** a key that is a whole half, member or host;
+      a key alone, behind `Bearer`, in a URL query; a JWT with a `-` tail; a `_` before the key; a
+      userinfo with no key; and a key glued to text in PROSE, `key AKIA….prod used` →
+      `key <TOKEN_1>.prod used`. Outside a userinfo or an authority, the text beside a key is not
+      part of a value this package protects.
+
+      **What it costs, pinned in `TestAcceptedOverMasking`.**
+      - A glued userinfo is one token, so the colon and "this half is a key" are inside it, #55's
+        traded-signal class.
+      - A key in a hostname is tagged HOST (`TestTypeTags`).
+      - 9e does not check that it is inside an authority, so a key glued to labels right after a
+        comma or an `@` in prose reads as a host: `keys=a,AKIA….prod` → `keys=a,<HOST_1>`, and
+        `mail ops@AKIA….prod.example.com` → `mail ops@<HOST_1>`, where main sent the domain.
+      - Inherited, not new: behind a password-less userinfo, a key-label host makes detector 4
+        decline (`authorityTail` admits no `<`), and 9a's fallback tags the username HOST, as on main.
+
+      **Known residual, pinned, not filed.** A key as a label of a BARE host on a private suffix:
+      `peer worker-AKIA….corp.internal down` → `peer worker-<TOKEN_1>.<HOST_1> down`, sending
+      `worker-`. Reaching it would mean reading 9b's configurable suffixes, and #105's rewritten
+      forms, in a rule that runs before the key detectors. It is as theoretical as #54's key-label
+      cell was.
+
+      **No narrowing, shown differentially.** Hooks in `Mask` and `residue`, carried by `-overlay`
+      copies of the source, collected every input the anonymize, llm and config tests feed, on main
+      and on the branch; each input's templatized form was added, for 2,629 distinct inputs. Main's
+      `anonymize.go` was overlaid as a sibling package, and the two were compared by per-byte coverage
+      rebuilt from `byToken`, under `New()` and an extra-suffix Mapper alike:
+      - **0 narrowed**, 0 mixed, 0 error changes;
+      - 1,786 unchanged;
+      - 205 widened, the new tests' inputs;
+      - 8 layout only: the delimiting `@` is now outside the placeholders, where the email rule had
+        swallowed `.prod@h1.acme.com` under EMAIL (#61's old row and the two templatized rows, each
+        also inside the logfmt wrapper);
+      - 623 the bitmap cannot rebuild, because the input already carries a literal placeholder;
+        every one masks byte-identically;
+      - 7 errored on both, the cap tests' inputs.
+
+      Restricted to the 2,364 inputs main's own tests feed: 1,747 unchanged, 10 widened (the five
+      moved cells, raw and templatized), 2 layout (#61's row), 598 unrebuildable and identical,
+      7 both-error, 0 narrowed.
+
+      **Frequency, measured.** The ten boot captures and the ab37 capture, 70,783 records, raw and
+      through `Templatize`, old against new, counts only. **Prediction, recorded in the plan before
+      the run:** 0 changed records, 0 error changes. **It held:** 0 and 0, and no record carries a
+      key shape at all, so there is no category to report. Nothing from the captures is in the repo.
+
+      **Tests.** Red first:
+      - `TestIssue57PartlyRecognisedValue`:
+        - 30 closed rows, exact outputs raw and through the real `Templatize`, every fragment main
+          sent absent, a round trip;
+        - 14 byte-identical rows and the pinned residual;
+        - the recurrence row and the `residue` claims.
+      - The two open #57 rows of the #55 test, the one in the #58 test and the two pinned key rows of
+        the #54 test moved in. So did #61's "#57-shaped first member", whose slot now holds a key
+        followed by an address, so member 1's adjacent-tags context stays covered.
+      - Five completeness rows, four templatized rows (each also run in the logfmt wrapper), three
+        over-mask rows, a `TestTypeTags` row, eight outputs fed to `TestPlaceholdersAreInert`, the
+        fixpoint shape, and `TestGluedKeyRulesReadTheKeyDetectors`, written without the new
+        identifiers so the red commit builds.
+
+      Main failed 52 subtests and two tests without subtests, all by assertion; the guards passed.
+      Main's own test file run against the new code fails exactly the six moved rows, plus
+      `TestEveryDetectorHasACompletenessRow`, which asks for rows for the two new rules.
+
+      **Flakiness and mutants.** Every new and touched test passes 20 of 20 runs under `-race`.
+      Twelve mutants each turn tests red:
+      - both rules off: 52 subtests, every closed, completeness, templatized, over-mask and fixpoint
+        row, plus the type-tag and shared-key tests;
+      - 4d after the key detectors: 24, every userinfo row and the shared-key test;
+      - 9e after the key detectors: 22, every host row, the fixpoint shape and the shared-key test;
+      - 9e before 4d: 18, every userinfo row whose glued key sits in the username, where 9e reads
+        the run after `://` or a raw `@` as a host, plus #61's row and the recurrence row;
+      - 9e's group admitting `/`: 10, every key-label row, raw, template and logfmt;
+      - 9e's group admitting `@`: the password-less row and the JWT `-` tail row;
+      - 4d's class admitting `/`: the URL-query row;
+      - 4d without the per-key exclusion: 18, every whole-half key row on the template, #52's
+        credential rows and the #46 templatized rows;
+      - 9e without it: 10, the whole-key rows on the template -- as a half, a member and a host,
+        where `AKIAIOSFODNN<NUM>` before `EXAMPLE` reads as glued -- the JWT `-` tail, #67's
+        templatized key row and #52's credential rows;
+      - 4d without its password branch: the four password-side rows and the password completeness
+        row;
+      - 9e without `,`: 11, every list-member row and the fixpoint shape;
+      - 9e consuming a right edge: the adjacent-members row.
+
+      **The full suite** ran under `-race` on main and on the branch: 1,300 results, then 1,364.
+      - **No existing result changed outcome.**
+      - Six left: the moved rows.
+      - 70 new results came in.
+
+      **Wire check.** One run per binary against a capturing endpoint (`--plain --llm-anonymize
+      --warmup-lines 0`). A `[FATAL]` line carried `s3://AKIA…EXAMPLE.prod:secret@bucket`, with
+      #59's `postgres://user:p/ss@db` in its context as the new open control, since `.prod` is now
+      closed.
+      - `.prod`: 2 before (the trigger line and the masked template), 0 after.
+      - `p/ss` fires once in both, so the grep is not vacuous.
+      - On the wire, the new trigger reads `url=s3://<TOKEN_1>@<HOST_1>`.
+
+      `internal/pipeline` does not appear in the diff. README: the #57 bullet is struck and marked
+      closed, the audit sentence gains #57, and a new past-tense paragraph carries the shapes, span,
+      costs, the residual and the frequency.
+
+      **Found on the way, not fixed.**
+      - **A key glued to `_` or a letter is not recognised at all on the raw line, and is SENT
+        WHOLE.** `key AKIAIOSFODNN7EXAMPLE_prod used` and `key sk-…XYZ_prod used` reach the model
+        unmasked, and `residue()` reads them as clean: the key's closing `\b` fails, and detectors 2
+        and 3b match nothing. The template masks the key and sends `_prod`. Confirmed with a
+        throwaway test. No open issue covers it, so it is filed as ISSUE-TBD.
+      - **9d misses the second of two adjacent fused list members** on the raw line, because its
+        consumed trailing edge eats the shared comma:
+        `mongodb://h1,10.0.0.5.nip.io,10.0.0.6.nip.io,host4/db` sends `.nip.io` and `host4`.
+        Confirmed with a throwaway test. It is an authority cell, offered as a comment on #65.
+
+      Seen, out of scope: #59, #65's sweep, #90, #51. Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
@@ -3143,7 +3330,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 7–10 | either or both halves pre-masked | masked by 4b/4c | #46, correct |
       | 11–14 | pct-encoded, sub-delims | masked | works; now tested |
       | 15–16 | multi-colon | masked, span unchanged | only the first colon was ever structural |
-      | 17 | a half recognised only in PART | `.prod` sent, residue clean | **OPEN — #57** |
+      | 17 | a half recognised only in PART | `.prod` sent, residue clean | **#57, now FIXED** |
       | 18 | raw `@` in a half | the TRUE HOST sent | **FIXED (#58)** |
       | 19 | raw `/` in a half | host and remainder sent | **OPEN — #59** |
       | 20–22 | no scheme; unexpressible shapes | — | computed, not run |
@@ -3349,6 +3536,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 6 → 9b | `worker-550e8400-….corp.internal` | `worker-` | **DEFECT, FIXED** (#48) |
       | 8 → 9a | `https://10.0.0.5.nip.io/x` | `.nip.io` | **DEFECT** (#54), **FIXED**. Same cause, DIFFERENT remedy: a more specific rule, not an order |
       | 8 → 9b | `worker-10.0.0.5.corp.internal` | `worker-` | **DEFECT** (#54), **FIXED**. New in the #48 sweep; not in the original table |
+      | 1/2/3b → 4, 4b, 4c | `s3://AKIA…EXAMPLE.prod:secret@bucket` | `.prod` | **DEFECT** (#57), **FIXED**. A key inside a half, not a half: a rule run before the key detectors |
+      | 1/2/3b → 9a, 9c | `mongodb://h1,AKIA…EXAMPLE.prod,host3/db` | `.prod`, `host3` | **DEFECT** (#57), **FIXED**, the same way; a bare private-suffix host is a pinned residual |
       | 7 → 8 | `::ffff:192.168.1.1` | `.168.1.1` | **DEFECT, filed #49** |
       **Detector 10 has no defects at all**, and that is a computed result rather than an
       untested area: every interferer that can reach a `/home/` username masks it entirely.
