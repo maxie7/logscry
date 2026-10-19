@@ -3162,6 +3162,169 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.13
 
+- [x] **An sk- key with '-' or '_' in its tail is masked, not sent whole** — #51, filed from the
+      #46 audit. Detector 3b wanted sixteen unbroken letters and digits straight after `sk-`, and
+      every current key format puts a `-` or a `_` in the tail before that:
+      - OpenAI's `sk-proj-…`, `sk-svcacct-…` and `sk-admin-…`;
+      - Anthropic's `sk-ant-api03-…` and `sk-ant-admin01-…`;
+      - a classic key with a `_` inside (`sk-AbCdEfGh_IjKl…`).
+
+      Each was sent whole, raw (trigger and context) and on the template, and `residue()` read the
+      line as clean: `key sk-proj-… rejected`, `OPENAI_API_KEY=sk-proj-…`. Only `Bearer sk-proj-…`
+      was masked, by 3a. On the template a classic key whose tail starts with a digit was sent too:
+      NUM takes the `-` as a sign, `sk-7AbC…` becomes `sk<NUM>AbC…`, and no `sk-` was left to anchor
+      on. v0.4.0 → v0.12.13, **thirty-nine tagged releases** (`git tag --contains 2da31be | wc -l` →
+      39).
+
+      **The fix (`internal/anonymize/anonymize.go` only).** The tail is a run of the key's alphabet,
+      letters, digits, `-` and `_`, carrying a WITNESS, because a kebab-case name that starts with a
+      literal `sk-` word is the same alphabet:
+      - sixteen unbroken letters and digits anywhere in it, the classic key's own run allowed after a
+        vendor prefix (`sk-or-v1-<hex>`);
+      - or an uppercase letter, with the whole tail sixteen long: a base62 or base64url body. Names on
+        k8s, Docker, PyPI and npm are lowercase by rule. RE2 has no intersection, so `withUpper` is
+        sixteen branches keyed on where the first uppercase letter falls.
+
+      On the template the pipeline breaks both runs and a placeholder is the evidence, as for
+      `mangled`: main's mangled form, then the rest of the run across separators, or a run holding a
+      placeholder and an uppercase letter (a placeholder alone is not enough once `-` is admitted:
+      `sk-worker-pool-7f9c` templatizes to `sk-worker-pool<NUM>f<NUM>c`). After `sk<NUM>` the witness is
+      a letter of each case or a sixteen-run, not a floor: the placeholder stands for an unknown count
+      of digits, and it is also every `sk-1`. No alternative carries a trailing assertion; each is
+      maximal over the alphabet, so a key ends where its alphabet does, and that alphabet is now the sk
+      key's `cont` in `keyShapes`, for 4d and 9e. Rule 11 reads the same `skLoose`. Every other
+      detector compiles byte-identically. `apply`, `residue`, `Restore`, the `detector` struct and
+      the order are unchanged.
+
+      **Decisions, each pinned by a test.**
+      1. **A generic tail with witnesses, no prefix list.** A prefix list goes stale, which is how #51
+         happened, and misses a random tail with `_` or `-` in it.
+      2. **No over-masking.** `sk-learn-compatible-estimator`, `sk-worker-pool-7f9c` (no witness),
+         `task-…`, `ask-…`, `disk-…` even with a long mixed-case tail (`\b` and rule 11's lead),
+         `Accept-Language: sk-SK`, `sk-Ab_Cd` and a fifteen-long uppercase tail (the floor), a fifteen-run
+         after a separator, and after `sk<NUM>`: `sk-1 failed`, `region sk-2`, `sk-2XL`. Raw and
+         templatized.
+      3. **Edges.** `.` `,` `"` `'` `)` `]` `}` `:` stay outside the placeholder, one row each plus a JSON
+         value: #90's class is not reintroduced. **A `-` or `_` at the very end is the key's**: a
+         base64url body can end on either, and no formatter writes them as a closer. So text glued
+         after an sk- key by either is the key's too, and #108's `key sk-…XYZ_prod used` becomes
+         `key <TOKEN_1> used`. Glue before the key is still prose (`key x_<TOKEN_1> used`).
+      4. **The mangled form is widened**, and the templatized, logfmt (msg and error) and quote-edge
+         suites gain sk-proj, svcacct, Anthropic, `_`-inside, digit-first, env-var and sentence-dot rows;
+         #51's test runs a JSON msg and a logfmt msg through the real `TemplatizeLine`.
+      5. **One row per reader of `skKey`.**
+         - 4d `s3://sk-proj-….prod@bucket`, 9e host label, and 3a `Bearer sk-proj-…` and `Bearer
+           sk-proj-….prod` are byte-identical with main. 3c still reads only JWT and AWS.
+         - Rule 11's `key x_sk-proj-… used` is closed.
+         - **Layout only:** the #46 cell `postgres://sk-proj-…:password@localhost/db` was
+           `<TOKEN_1>@<HOST_1>` and is `<TOKEN_1>:<TOKEN_2>@<HOST_1>`, #46's design for a key half (no
+           secret byte unmasked; only the `:` leaves the placeholder). So is its mirror, and the 9e list
+           member is `<HOST_2>,<HOST_1>,<HOST_3>`, #57's numbering for a classic key. A home directory
+           that is such a key is `<TOKEN_1>`, not `<USER_1>`.
+      6. **Restore and residue.** Every row round-trips, its output re-masks unchanged with a clean
+         `residue()`, and a raw key of each format now reads TOKEN. The key in prose and in
+         `OPENAI_API_KEY=` is one placeholder.
+
+      **Residuals, pinned** (the two narrowing cells chosen at planning). A key the detectors now see
+      blocks the rule that owned the value around it, the anti-correlation the audit recorded:
+      `mail sk-proj-…@example.com` → `mail <TOKEN_1>@example.com` (main: `<EMAIL_1>`), and
+      `peer worker-sk-proj-….corp.internal down` → `peer worker-<TOKEN_1>.<HOST_1> down` (main:
+      `<HOST_1>`). And on the template a lowercase body with its digits collapsed carries neither
+      witness: `key sk-proj-abcdefghij<NUM> used` is sent, as on main; the raw line is closed.
+
+      **Costs, pinned.** A mixed-case identifier sixteen long after a literal `sk-` is a key
+      (`deploy sk-MyService-Deployment` → `deploy <TOKEN_1>`), and a run of sixteen letters takes the
+      words after it (`sk-internationalization-svc` → `<TOKEN_1>`; main left `-svc` beside it). On the
+      template a word after `sk-v<NUM>` is absorbed (`sk-v2-worker-pool`), and mixed case after `sk<NUM>`
+      is a key (`size sk-2-AbCd`); the raw line is unchanged in both.
+
+      **The differential.** Every input the anonymize, llm and config tests feed `Mask` (recorded),
+      every string literal in those tests (main's and the branch's), and their `Templatize` and
+      `TemplatizeLine` forms: 9,354 form-inputs, per-byte coverage under `New()` and an extra-suffix
+      Mapper, the same result under both:
+      - 9,117 unchanged, 0 mixed, 0 error changes;
+      - 197 widened, every run classified: 128 runs are the new sk- key shapes, 34 the `sk<NUM>`
+        digit-first form (3 of them the `sk-2-AbCd` cost), 19 `_`/`-` glue after a key joining it, 7 the
+        template's first form running on through a `_`, 9 the two raw costs and the `sk-v<NUM>` one;
+      - 16 narrowed: the two pinned residual cells (8) and the `:` of the #46 cell and its mirror (8);
+      - 4 tag-only (the home directory) and 4 layout-only (the 9e member);
+      - 16 that the harness cannot align (fail-closed errors, and inputs carrying our own placeholder
+        syntax), identical on both sides.
+
+      **Frequency.** The 70,783 records (ten boots and ab37; 310 have a non-string MESSAGE) raw,
+      through `Templatize` and through `TemplatizeLine`, old against new, under both Mappers. Predicted
+      per witness: 0 changed by the sixteen-run, 0 by the uppercase witness, 0 by the `sk<NUM>` form, a
+      handful of standalone `\bsk-` records at most, 0 error changes. Measured: **0 changed** under each
+      witness and both Mappers, 0 error changes, and **0 records with a standalone `\bsk-`** (the 396 with
+      `sk-` have it inside a word) and 0 with an `sk<NUM>` on either template. The three small laptop and
+      home captures (1,643 records) agree: 0 changed. The over-masking cost is measured at zero on this
+      corpus, not assumed.
+
+      **Wire check.** A capturing endpoint, `--plain --llm-anonymize --warmup-lines 0`, v0.12.13 built
+      from 1bd653f against the branch, with an sk-proj line, an `OPENAI_API_KEY=sk-proj-…` line, an
+      `sk-ant-api03-…` line, a digit-first classic key and `postgres://user:p/ss@db` in the context. Key
+      fragments in the request bodies on v0.12.13: 7 for each sk-proj fragment, 3 for each Anthropic
+      one, and 1 for the digit-first key (its `sk<NUM>` template field); **0** for every one on the
+      branch. `p/ss` is sent by both, the open #59 control.
+
+      **Tests.**
+      - `TestIssue51SkKeyWithASeparatorInItsTail`, raw and through the real `TemplatizeLine`: 31 closed
+        rows (each format, both witnesses at their floors, the digit-first form raw, logfmt and JSON,
+        env vars, JSON and logfmt wrappers, one row per closer, a trailing `-` and `_`, lowercase glue
+        after, rule 11), each with its exact output, the fragments main sent checked absent, a round
+        trip, and the output re-masked unchanged with a clean `residue()`; 5 byte-identical reader rows,
+        4 layout rows, 3 residuals, 2 template costs, 12 must-stays raw and templatized, recurrence, and
+        the `residue` claims.
+      - New rows in the completeness (8), templatized (9), quote-edge (2), type-tag, inert (6) and both
+        over-masking tables, and two raw costs in `TestAcceptedOverMasking`.
+      - Changed rows, each with a comment: #108's two `_`-after sk rows, completeness `sk-key/glued` and
+        templatized `sk-key/glued-underscore-before` (the `_prod` is the key's), and #108's `sk-proj` same
+        row, which moved into #51's test.
+      - Red on main: every closed, layout, residual and cost row, by assertion. Guard functions
+        byte-identical. The full suite under `-race`: 1,505 results on main, 1,588 on the branch, 0
+        failing on either; no existing test changed outcome. New and touched tests pass under
+        `-race -count=20`.
+
+      **Mutants, each with what it turned red.**
+      - (a) the unbroken-run class restored: 72 subtests, `TestTypeTags` and
+        `TestNoDetectorGroupLandsOnOurOwnOutput`.
+      - (b) `_` dropped: 57, among them both #108 rows and every Anthropic and `_`-inside row.
+      - (c) `-` dropped: 60, every vendor-prefix row and both raw costs.
+      - (d1) the uppercase floor lowered to 2: `sk-SK` in both over-masking tests, `sk-Ab_Cd`, the
+        fifteen-long tail, `sk-2XL` and the `sk-2-AbCd` cost row.
+      - (d2) the run witness lowered to 4: `sk-learn-compatible-estimator`, `sk-worker-pool-7f9c` (raw and
+        template), the fifteen-run, the fifteen-long tail, the lowercase residual and both template
+        costs.
+      - (e) the mangled form left unwidened: 59, among them #57's two sk rows.
+      - (f) no witness (any sixteen of the alphabet): #51's must-stays and both over-masking tests.
+      - (g) the run witness dropped: 7, the hex vendor rows, every lowercase sixteen-run and the
+        sixteen-letter cost.
+      - (h) sk `cont` left alphanumeric: 2, the #46 layout rows (4d then takes the value whole again).
+      - (i) the template's first form not run across separators: 5, the lowercase `_prod` rows and the
+        userinfo `url=s3://sk-…xyz_prod@…` row, whose template went to `<TOKEN_1><EMAIL_1>`.
+      - (j) the `sk<NUM>` form dropped: 14, every digit-first row.
+      - (k) its witness dropped: `sk-1 failed`, `region sk-2`, `sk-2XL`. (k2) one case allowed: `sk-2XL`.
+
+      **Cost in time.** Matching is unchanged (every detector timed over a whole boot's records, main
+      against branch, within noise; `Mask` on a typical payload within noise). Compiling is not: `New()`
+      with extra host suffixes, which recompiles the chain, went from about 2.0 ms to 4.9 ms. Production
+      builds one Mapper per escalation, capped by `--rate-limit`, and the default Mapper reuses the
+      compiled chain.
+
+      README: the Known-limitations entry goes, and an ISSUE-TBD entry comes in (below).
+
+      **Found on the way.** Stripe (`sk_live_`, `rk_live_`, `sk_test_`), GitHub (`ghp_`, `github_pat_`),
+      Slack (`xoxb-`, `xoxp-`) and Google (`AIza…`) secrets match no detector and are sent whole, raw and
+      on the template, on main and on the branch. Not #51's class: 3b reads `sk-` with a hyphen. Filed as
+      ISSUE-TBD and named in README's Known limitations.
+
+      Seen, out of scope:
+      - **A bare `KEY=value`.** `OPENAI_API_KEY=<a value that is not an sk- key>` is sent; no rule reads
+        the variable name. Confirmed with a throwaway test, reported, not filed.
+      - #59, #49, #42, #65's sweep, #91, #92.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
@@ -3964,7 +4127,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       `sk-proj-…`, the current OpenAI key format, which detector 3b does not match at all
       (**#51**) and which is anti-correlated with #46 — a key 3b cannot see cannot block
       detector 4, so fixing 3b alone would INTRODUCE this leak for those keys, and #51 must not
-      land before this does; and detector 9a's scheme anchor (**#52**), which #43 left
+      land before this does (Done with #51, in TODO-VERSION.);
+      and detector 9a's scheme anchor (**#52**), which #43 left
       non-tolerant while widening the host group beside it, so `s3://` templatizes to
       `s<NUM>://` and the host goes unmasked on the `Template` field. That last one was found in
       the #46 wire capture rather than by a test, and the lesson generalises: **a detector's
