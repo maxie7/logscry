@@ -97,6 +97,10 @@ func TestTypeTags(t *testing.T) {
 		// "ss" behind the first '@' tagged as a host and the real host in the clear. Contains
 		// cannot tell those apart, so the exact output is pinned in TestIssue58RawAtInUserinfo.
 		{"dsn=postgres://user:p@ss@db", "<TOKEN_1>"},
+		// #57: an access key that is a LABEL of a hostname is part of the host, as #48's UUID is, so
+		// the name comes back <HOST_n>. Before the fix it came back <TOKEN_1> with the domain beside
+		// it in the clear; the exact output is pinned in TestIssue57PartlyRecognisedValue.
+		{"call https://AKIAIOSFODNN7EXAMPLE.prod.acme.com/x", "<HOST_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -491,6 +495,17 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"<HOST_1><NUM> up",
 		"reach <HOST_1>. retrying",
 		`time=<STR> level=error msg="peer <HOST_1> down"`,
+		// #57's OLD outputs fed back: our own <TOKEN_1> glued to the remainder main sent, in a userinfo,
+		// a list member and a host label. The glued-key rules read a RAW key only, never our tag. And
+		// the new outputs, among them the two costs, a key after a comma and in an email domain.
+		"s3://<TOKEN_1>.prod@<HOST_1>",
+		"s3://<TOKEN_1>.prod:<TOKEN_2>@<HOST_1>",
+		"mongodb://<HOST_1>,<TOKEN_1>.prod,<HOST_2>/db",
+		"https://<TOKEN_1>.prod.acme.com/x",
+		"s3://<TOKEN_1>@<HOST_1>",
+		"postgres://<HOST_2>@<HOST_1>/db",
+		"keys=a,<HOST_1>",
+		"mail ops@<HOST_1>",
 	}
 	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
@@ -729,15 +744,8 @@ func TestIssue55PasswordlessUserinfo(t *testing.T) {
 	// to update the docs that call it open. One run therefore shows both what this fix reaches and
 	// what it does not.
 	open := []struct{ name, in, leak string }{
-		// A detector recognised only PART of the half, so a tag sits mid-value and every credential
-		// group — all of which must exclude '<' — is blocked. The remainder can lie on EITHER side
-		// of the tag, so unlike #46 this is not covered by adding two rules: no single pattern
-		// reaches it. #57.
-		{"partly-recognised half (#57)", "s3://AKIAIOSFODNN7EXAMPLE.prod@bucket", ".prod"},
-		// The same shape WITH a colon, which is the half that matters: #46's own fix does not cover
-		// it either, so this is an uncovered remainder of #46 rather than a leftover of #55.
-		{"partly-recognised half, with colon (#57)",
-			"s3://AKIAIOSFODNN7EXAMPLE.prod:secret@bucket", ".prod"},
+		// A half only PARTLY recognised by an earlier detector sat here as #57, with and without a
+		// colon, until it was closed; it is TestIssue57PartlyRecognisedValue now.
 		// A raw '@' in the password sat here as #58 until it was closed; it is
 		// TestIssue58RawAtInUserinfo now, with the '/' case below kept as its control.
 		// A raw '/' in the password. net/url ERRORS on this one, so unlike the '@' case there is no
@@ -850,12 +858,8 @@ func TestIssue58RawAtInUserinfo(t *testing.T) {
 		// the userinfo at '?' and '#' would reopen "postgres://user:p?ss@db", fully masked today.
 		// All three are #59's class -- no reliable parse -- and #59's remedy, whatever it is.
 		{"raw '/' in the password (#59)", "postgres://user:p/ss@db", "p/ss"},
-		// #57 with a raw '@' behind the tag. Reading to the last '@' puts the HOST tag on the real
-		// host now, so what remains is the partly-recognised half's remainder (".prod@x") and
-		// nothing else -- before, ".prod" went out AND the host did, with the "x" mis-tagged as
-		// the host. Still #57; not closed here, and the assertion is on the part that leaks in
-		// both states.
-		{"partly-recognised half, raw '@' (#57)", "s3://AKIAIOSFODNN7EXAMPLE.prod@x@bucket", ".prod"},
+		// #57 with a raw '@' behind the tag sat here until it was closed; it is
+		// TestIssue57PartlyRecognisedValue now.
 		// The second host of a replica set sat here as #61 until it was closed; it is
 		// TestIssue61MultiHostAuthority now, with the open cells of ITS sweep pinned there.
 	}
@@ -942,8 +946,10 @@ func TestIssue61MultiHostAuthority(t *testing.T) {
 			"mongodb://<TOKEN_1>@<HOST_1>:27017,<HOST_2>:27017/db", []string{"host1", "host2"}},
 		// THE FIRST MEMBER'S TAG SET, derived by walking the chain rather than sampled. Before 9c
 		// runs, a tag can land on member 1 from 7 and 8 (an address literal, bracketed or not), from
-		// 9a (the ordinary case), from 1/2/3b only when a host literally IS a key, and from 5 only
-		// through #57's shape, where two tags sit adjacent with no comma between. 3a is impossible
+		// 9a (the ordinary case), from 1/2/3b only when a host literally IS a key, from 9d and 9e (an
+		// address or a key fused with labels), and adjacent to another when a key is directly
+		// followed by an address literal. 5 reached member 1 only through #57's shape until #57 was
+		// closed; that userinfo is 4d's now and comes back one token. 3a is impossible
 		// (it needs whitespace, and none can precede member 1 inside an authority); 4 mints on the
 		// userinfo, never on a member; 9b, 6 and 10 run after 9c. The context therefore admits one
 		// or more adjacent tags of ours, a bracketed one (ours, or the pipeline's <IP> on the
@@ -959,8 +965,8 @@ func TestIssue61MultiHostAuthority(t *testing.T) {
 			"mongodb://<IP_1>,<HOST_1>/db", []string{"host2"}},
 		{"key-shaped first member (theoretical)", "mongodb://AKIAIOSFODNN7EXAMPLE,host2/db",
 			"mongodb://<TOKEN_1>,<HOST_1>/db", []string{"host2"}},
-		{"#57-shaped first member: adjacent tags", "s3://AKIAIOSFODNN7EXAMPLE.prod@h1.acme.com,host2/db",
-			"s3://<TOKEN_1><EMAIL_1>,<HOST_1>/db", []string{"host2"}},
+		{"adjacent tags first: a key, then an address (theoretical)", "mongodb://sk-abcdefghij0123456789XYZ::1,host2/db",
+			"mongodb://<TOKEN_1><IP_1>,<HOST_1>/db", []string{"host2"}},
 		// A UUID label as a later member. 9c runs before 6, so the member is a host run to it; after
 		// 6 it would have been <HOST_1>,<UUID_1>.acme.com/db (measured) -- #48's leak, one member in.
 		{"uuid-label member", "mongodb://host1," + uuid + ".acme.com/db",
@@ -1279,6 +1285,14 @@ func TestHostListFixpoint(t *testing.T) {
 		{"address-label names between names", func(i int) string {
 			if i%2 == 0 {
 				return "10.0.0." + strconv.Itoa(i) + ".nip.io"
+			}
+			return name(i)
+		}, ","},
+		// #57: a member with a key glued inside it is 9e's before 9c runs, so it reaches 9c as a whole
+		// tag, costs no pass, and the list re-anchors on it as it does on 9d's.
+		{"key-fused names between names", func(i int) string {
+			if i%2 == 0 {
+				return fmt.Sprintf("AKIA%016d.prod", i)
 			}
 			return name(i)
 		}, ","},
@@ -1695,25 +1709,8 @@ func TestIssue54IPv4LabelInHostname(t *testing.T) {
 		t.Errorf("a partial octet moved: %q", got)
 	}
 
-	// Pinned, not targeted: the class's other inner tag. A host label that literally IS an access key
-	// is the sweep's "theoretical" cell, and the same key as a later list member is #57's shape. Both
-	// keep main's output; they are here so a change to either shows up as a diff.
-	pinned := []struct{ name, in, want, tmpl string }{
-		{"key-shaped host label (theoretical)", "https://AKIAIOSFODNN7EXAMPLE.prod.acme.com/x",
-			"https://<TOKEN_1>.prod.acme.com/x", "https://<TOKEN_1>.prod.acme.com/x"},
-		{"key-shaped later member (#57)", "mongodb://h1,AKIAIOSFODNN7EXAMPLE.prod,host3/db",
-			"mongodb://<HOST_1>,<TOKEN_1>.prod,host3/db", "mongodb://<HOST_1>,<TOKEN_1>.prod,host<NUM>/db"},
-	}
-	for _, c := range pinned {
-		t.Run(c.name, func(t *testing.T) {
-			tIn, _ := pipeline.Templatize(c.in)
-			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
-				if got := mustMask(t, New(), p.in); got != p.want {
-					t.Errorf("a pinned shape moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
-				}
-			}
-		})
-	}
+	// The class's other inner tag, a key as a host label or a list member, sat here pinned at main's
+	// output until #57 closed it; it is TestIssue57PartlyRecognisedValue now.
 
 	// The name is ONE value: it recurs under one placeholder across the request, as a list member
 	// and in a URL, and the address on its own is a different value with its own tag.
@@ -1742,6 +1739,285 @@ func TestIssue54IPv4LabelInHostname(t *testing.T) {
 	}
 	if tag := New().residue("https://10.0.0.5.nip.io/x"); tag != tagIP {
 		t.Errorf("a raw address inside a name no longer mutes: residue = %q, want %q", tag, tagIP)
+	}
+}
+
+// TestIssue57PartlyRecognisedValue is the named regression for #57. Detectors 1, 2 and 3b run before
+// every credential and host rule, so a key that is only PART of a value -- a userinfo half, a host
+// list member, a hostname label -- was tagged on its own, mid-value. Every later group excludes '<',
+// the inertness invariant, so no rule could reach the remainder, and it went to the configured model
+// endpoint: s3://AKIA...EXAMPLE.prod:secret@bucket sent ".prod", and as a later list member the
+// mixed member ended 9c's list and sent every member after it. Mask returned nil and residue()
+// returned "": the remainder is not a shape any detector matches. v0.4.0 onward; the list member
+// since v0.9.4, before which no later member was masked at all.
+//
+// #46's own fix did not cover it. 4b and 4c take the half the other half's key left behind; here
+// the key and its remainder are ONE half, and the remainder may lie on either side of the tag.
+//
+// Moving 1, 2 and 3b later was rejected for #46 and stays rejected: a key that IS a half must keep
+// its own tag. The fix is #54's lesson, a MORE SPECIFIC rule rather than an order: 4d matches only
+// a userinfo with a key glued inside a half, 9e only a hostname with a key glued inside it, and both
+// run before the key detectors, so a key that stands alone in its value is still theirs.
+func TestIssue57PartlyRecognisedValue(t *testing.T) {
+	const (
+		aws = "AKIAIOSFODNN7EXAMPLE"
+		sk  = "sk-abcdefghij0123456789XYZ"
+		jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u"
+	)
+	closed := []struct {
+		name, in, want, tmpl string
+		sent                 []string // what main sent on one path or both; none may survive
+	}{
+		// The issue's shapes and the colon-less form, and #58's raw '@' behind the tag. The whole
+		// userinfo is one TOKEN: a key glued to other text cannot be a half on its own, so the value
+		// is detector 4's, read before 2 can tag the key.
+		{"aws key, colon-less (#55's open row)", "s3://" + aws + ".prod@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{".prod", "IOSFODNN"}},
+		{"aws key, with a colon (#55's open row)", "s3://" + aws + ".prod:secret@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{".prod", "secret"}},
+		{"aws key, raw '@' behind it (#58's open row)", "s3://" + aws + ".prod@x@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{".prod", "@x"}},
+		// The remainder BEFORE the key, and the password side, where the multi-colon and the
+		// left-hand remainder were each sent while 4c took the username.
+		{"remainder before the key", "s3://prod." + aws + "@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{"prod."}},
+		{"remainder before the key, with a colon", "s3://prod." + aws + ":secret@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{"prod.", "secret"}},
+		{"password side, after the key", "s3://user:" + aws + ".prod@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{".prod", "user"}},
+		{"password side, before the key", "s3://user:prod." + aws + "@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{"prod.", "user"}},
+		{"password side, a colon after the key", "s3://user:" + aws + ":extra@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{":extra"}},
+		{"password side, a colon before the key", "s3://user:pa:" + aws + "@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{"pa:"}},
+		// 4d runs before 9e: a raw '@' in front of a glued key is the userinfo's, not a host's.
+		{"raw '@' in front of the key", "s3://user@" + aws + ".prod@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{".prod", "user@"}},
+		// sk-. Its glue is any non-word character; on the template the mangled form carries no \b,
+		// so a '_' is glue there too, and that row is the one path main sent it on.
+		{"sk- key, colon-less", "s3://" + sk + ".prod@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{".prod"}},
+		{"sk- key, with a colon", "s3://" + sk + ".prod:secret@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{".prod", "secret"}},
+		{"sk- key, hyphen after", "s3://" + sk + "-prod@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{"-prod"}},
+		{"sk- key, remainder before", "s3://prod." + sk + "@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{"prod."}},
+		{"sk- key, underscore after (template only)", "s3://" + sk + "_prod@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{"_prod"}},
+		// A JWT. '-' and '_' after it are base64url, absorbed into its third segment (pinned below);
+		// a '.' or a '~' is not.
+		{"jwt, dot after", "s3://" + jwt + ".prod@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{".prod"}},
+		{"jwt, dot after, with a colon", "s3://" + jwt + ".prod:secret@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{".prod", "secret"}},
+		{"jwt, tilde after", "s3://" + jwt + "~prod@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{"~prod"}},
+		{"jwt, remainder before", "s3://prod." + jwt + "@bucket",
+			"s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>", []string{"prod."}},
+		// #61's "#57-shaped first member", where the email rule put a tag beside the key's and two
+		// tags sat adjacent. The userinfo is one token now and the host list is ordinary.
+		{"glued key before a host list (#61's row)", "s3://" + aws + ".prod@h1.acme.com,host2/db",
+			"s3://<TOKEN_1>@<HOST_1>,<HOST_2>/db", "s<NUM>://<TOKEN_1>@<HOST_1>,<HOST_2>/db",
+			[]string{".prod", "h1.acme.com", "host2"}},
+		// The comment's cell, moved from #54: a key glued inside a LATER list member ended 9c's list.
+		// The fused member is one HOST, minted by 9e before 9a, so it numbers first -- 9d's layout.
+		{"later member, aws key (the comment's cell)", "mongodb://h1," + aws + ".prod,host3/db",
+			"mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db", "mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db",
+			[]string{".prod", "host3", "h1,"}},
+		{"later member, sk- key", "mongodb://h1," + sk + ".prod,host3/db",
+			"mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db", "mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db",
+			[]string{".prod", "host3"}},
+		{"later member, jwt", "mongodb://h1," + jwt + ".prod,host3/db",
+			"mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db", "mongodb://<HOST_2>,<HOST_1>,<HOST_3>/db",
+			[]string{".prod", "host3"}},
+		{"first member", "mongodb://" + aws + ".prod,host2/db",
+			"mongodb://<HOST_1>,<HOST_2>/db", "mongodb://<HOST_1>,<HOST_2>/db", []string{".prod", "host2"}},
+		// Two fused members side by side: 9e consumes nothing after its group, so the comma between
+		// them is the second one's context, and each is its own match in one pass.
+		{"two fused members adjacent", "mongodb://h1," + aws + ".a,AKIAIOSFODNN7EXAMPLF.b,host4/db",
+			"mongodb://<HOST_3>,<HOST_1>,<HOST_2>,<HOST_4>/db", "mongodb://<HOST_3>,<HOST_1>,<HOST_2>,<HOST_4>/db",
+			[]string{".a,", ".b,", "host4"}},
+		// The host-label cell, #54's "theoretical" one: a key as a label sent the domain. HOST, and the
+		// whole name is the value -- containment, as for #48's UUID and #54's address.
+		{"host label, first", "https://" + aws + ".prod.acme.com/x",
+			"https://<HOST_1>/x", "https://<HOST_1>/x", []string{"acme.com", ".prod"}},
+		{"host label, middle", "https://api." + aws + ".acme.com/x",
+			"https://<HOST_1>/x", "https://<HOST_1>/x", []string{"acme.com", "api."}},
+		{"host label, with a port", "https://" + aws + ".prod.acme.com:8443/x",
+			"https://<HOST_1>:8443/x", "https://<HOST_1>:<NUM>/x", []string{"acme.com"}},
+		// A credential in front of a key-labelled host. 9e's HOST tag makes 4 decline (authorityTail
+		// admits no '<'), so 4b and 4c take the halves as two tokens -- main's layout here too.
+		{"host label behind a credential", "postgres://u:p@" + aws + ".prod.acme.com/db",
+			"postgres://<TOKEN_2>:<TOKEN_1>@<HOST_1>/db", "postgres://<TOKEN_2>:<TOKEN_1>@<HOST_1>/db",
+			[]string{"acme.com", "u:p"}},
+		// The same without a password: no 4b/4c to fall back on, so 9a's fallback tags the username
+		// HOST, exactly as it did on main. Inherited, not new; nothing is sent.
+		{"host label behind a password-less userinfo", "postgres://appuser@" + aws + ".prod.acme.com/db",
+			"postgres://<HOST_2>@<HOST_1>/db", "postgres://<HOST_2>@<HOST_1>/db", []string{"acme.com", "appuser"}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				m := New()
+				got := mustMask(t, m, p.in)
+				if got != p.want {
+					t.Errorf("a key inside a larger value not masked with it:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+				for _, frag := range c.sent {
+					if strings.Contains(got, frag) {
+						t.Errorf("a fragment main sent survived: %q still in %q", frag, got)
+					}
+				}
+				if r := m.Restore(got); r != p.in {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", p.in, r)
+				}
+			}
+		})
+	}
+
+	// Byte-identical with main, raw and templatized. A key that IS a whole half keeps its own tag --
+	// that is what #46 ran the key rules first for, and the per-key exclusion after the key is what
+	// keeps the mangled template form (AKIAIOSFODNN<NUM> before EXAMPLE) from reading as glued. A key
+	// alone, behind Bearer, as a whole member or a whole host; a userinfo with no key; a JWT whose
+	// '-' tail is base64url; a '_' before a key, which defeats \b so no key is seen and 4 masks the
+	// whole userinfo; and a key glued to text in PROSE, whose remainder is not part of a value this
+	// package protects -- outside a userinfo or an authority the text beside a key is prose.
+	same := []struct{ name, in, want, tmpl string }{
+		{"aws key is the whole username", "s3://" + aws + ":secret@bucket",
+			"s3://<TOKEN_1>:<TOKEN_2>@<HOST_1>", "s<NUM>://<TOKEN_1>:<TOKEN_2>@<HOST_1>"},
+		{"aws key is the whole password", "s3://myaccount:" + aws + "@bucket",
+			"s3://<TOKEN_2>:<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_2>:<TOKEN_1>@<HOST_1>"},
+		{"sk- key is the whole username", "postgres://sk-livekeyabcdefghij0123456789XYZ:hunter2@db",
+			"postgres://<TOKEN_1>:<TOKEN_2>@<HOST_1>", "postgres://<TOKEN_1>:<TOKEN_2>@<HOST_1>"},
+		{"jwt is the whole username", "postgres://" + jwt + ":hunter2@redis",
+			"postgres://<TOKEN_1>:<TOKEN_2>@<HOST_1>", "postgres://<TOKEN_1>:<TOKEN_2>@<HOST_1>"},
+		{"jwt with a hyphen tail", "s3://" + jwt + "-prod@bucket", "s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>"},
+		{"underscore before the key", "s3://x_" + aws + ".prod@bucket", "s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>"},
+		{"no key", "postgres://u:p@db.acme.com/prod", "postgres://<TOKEN_1>@<HOST_1>/prod", "postgres://<TOKEN_1>@<HOST_1>/prod"},
+		{"key alone in prose", "key " + aws + " used", "key <TOKEN_1> used", "key <TOKEN_1> used"},
+		{"key glued to text in prose", "key " + aws + ".prod used", "key <TOKEN_1>.prod used", "key <TOKEN_1>.prod used"},
+		{"bearer key", "hdr Bearer " + aws + " expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"key is a whole member (#67)", "mongodb://h1," + aws + ",host3/db",
+			"mongodb://<HOST_1>,<TOKEN_1>,<HOST_2>/db", "mongodb://<HOST_1>,<TOKEN_1>,<HOST_2>/db"},
+		{"key is the whole host", "https://" + aws + "/x", "https://<TOKEN_1>/x", "https://<TOKEN_1>/x"},
+		{"key is the whole host, with a port", "https://" + aws + ":8443/x", "https://<TOKEN_1>:8443/x", "https://<TOKEN_1>:<NUM>/x"},
+		{"key in a url query", "https://x.com/q?k=" + aws + ".prod@b",
+			"https://<HOST_1>/q?k=<TOKEN_1>.prod@b", "https://<HOST_1>/q?k=<TOKEN_1>.prod@b"},
+	}
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a shape outside #57 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// Pinned, not targeted: a key as a label of a BARE host on a private suffix. 9b masks the suffix
+	// and the label before the key is sent. 9e reads a host only after "://", '@' or ',', and reaching
+	// a bare name would mean reading 9b's configurable suffixes in a rule that runs before 1, 2 and
+	// 3b. Theoretical, as #54's key-label cell was; kept so a change to it shows up as a diff.
+	t.Run("key label of a bare private-suffix host (residual)", func(t *testing.T) {
+		const in, want = "peer worker-" + aws + ".corp.internal down", "peer worker-<TOKEN_1>.<HOST_1> down"
+		tIn, _ := pipeline.Templatize(in)
+		for _, p := range []string{in, tIn} {
+			if got := mustMask(t, New(), p); got != want {
+				t.Errorf("a pinned shape moved:\n in:   %q\n got:  %q\n want: %q", p, got, want)
+			}
+		}
+	})
+
+	// The fused value is ONE value: it recurs under one placeholder across the request, and the key
+	// on its own is a different value with its own token.
+	t.Run("the fused value recurs under one placeholder", func(t *testing.T) {
+		m := New()
+		mustMask(t, m, "mongodb://h1,"+aws+".prod,host3/db")
+		for _, c := range []struct{ in, want string }{
+			{"dial https://" + aws + ".prod/x failed", "dial https://<HOST_1>/x failed"},
+			{"key " + aws + " used", "key <TOKEN_1> used"},
+		} {
+			if got := mustMask(t, m, c.in); got != c.want {
+				t.Errorf("recurrence:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+		}
+		if got := m.Restore("<HOST_1>"); got != aws+".prod" {
+			t.Errorf("Restore(<HOST_1>) = %q, want the whole member", got)
+		}
+		u := New()
+		mustMask(t, u, "s3://"+aws+".prod:secret@bucket")
+		if got := u.Restore("<TOKEN_1>"); got != aws+".prod:secret" {
+			t.Errorf("Restore(<TOKEN_1>) = %q, want the whole userinfo", got)
+		}
+	})
+
+	// residue() needs no change, and these say why. A key left raw ANYWHERE still mutes the
+	// escalation -- in a userinfo by 4d, as a host label or member by detector 2, in prose by 2 --
+	// and the old leftovers still read as clean, so the fix lives in the chain.
+	for _, in := range []string{
+		"s3://" + aws + ".prod@bucket",
+		"mongodb://h1," + aws + ".prod,host3/db",
+		"https://" + aws + ".prod.acme.com/x",
+		"key " + aws + " used",
+	} {
+		if tag := New().residue(in); tag != tagToken {
+			t.Errorf("a raw key no longer mutes: residue(%q) = %q, want %q", in, tag, tagToken)
+		}
+	}
+	for _, in := range []string{
+		"s3://<TOKEN_1>.prod@<HOST_1>",
+		"s3://<TOKEN_1>.prod:<TOKEN_2>@<HOST_1>",
+		"mongodb://<HOST_1>,<TOKEN_1>.prod,host3/db",
+	} {
+		if tag := New().residue(in); tag != "" {
+			t.Errorf("residue() sees the old leftover %q as %q; the claim in the comment above is wrong", in, tag)
+		}
+	}
+}
+
+// TestGluedKeyRulesReadTheKeyDetectors holds 4d and 9e to the key detectors' own patterns, and to
+// their place in the chain. "A key" is one definition: each of 1, 2 and 3b -- the three TOKEN rules
+// with group 0 -- has its source inside exactly two other rules, a TOKEN rule and a HOST rule, and
+// both run before every key detector, because a key the key detectors tagged first is a key no
+// rule can see inside a larger value any more (#57). Two copies of a pattern are how #52 was missed.
+func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
+	for _, dets := range [][]detector{baseDetectors, buildDetectors([]string{"example"})} {
+		var keys []int
+		for i, d := range dets {
+			if d.tag == tagToken && d.group == 0 {
+				keys = append(keys, i)
+			}
+		}
+		if len(keys) != 3 {
+			t.Fatalf("want three key detectors (1, 2, 3b), found %d", len(keys))
+		}
+		for _, k := range keys {
+			src := dets[k].re.String()
+			var readers []int
+			for i, d := range dets {
+				if i != k && strings.Contains(d.re.String(), src) {
+					readers = append(readers, i)
+				}
+			}
+			if len(readers) != 2 {
+				t.Errorf("key detector %d is read by %d rules, want 2 (4d and 9e):\n pattern: %s", k, len(readers), src)
+				continue
+			}
+			tags := map[string]bool{}
+			for _, r := range readers {
+				tags[dets[r].tag] = true
+				if r > keys[0] {
+					t.Errorf("rule %d (%s) reads key detector %d but runs after detector %d: the key would already be a tag", r, dets[r].tag, k, keys[0])
+				}
+			}
+			if !tags[tagToken] || !tags[tagHost] {
+				t.Errorf("key detector %d is read by %v, want one TOKEN rule and one HOST rule", k, tags)
+			}
+		}
 	}
 }
 
@@ -2442,6 +2718,18 @@ var completenessRows = []completenessRow{
 	{"url-host/ipv4-label", "call https://", "10.0.0.5.nip.io", "/x"},
 	{"url-host/ipv4-label/label-2", "call https://", "api.10.0.0.5.nip.io", ":8443/x"},
 	{"bare-host/ipv4-label", "peer ", "worker-10.0.0.5.corp.internal", " down"},
+	// #57. A key glued inside a larger value: detectors 1, 2 and 3b tagged the key alone and every
+	// later rule was blocked behind the tag. The userinfo rows are 4d's, one per side the remainder can
+	// lie on, and the password side; the host rows are 9e's, a label and a later member. After the
+	// canonical rows, for the same reason as the #48 rows.
+	{"url-credentials/glued-key", "dsn=s3://", "AKIAIOSFODNN7EXAMPLE.prod", "@" + phMark + "bucket" + phMark + "/x"},
+	{"url-credentials/glued-key/before", "dsn=s3://", "prod.sk-abcdefghij0123456789XYZ:secret",
+		"@" + phMark + "bucket" + phMark + "/x"},
+	{"url-credentials/glued-key/password", "dsn=s3://",
+		"user:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u.prod", "@" + phMark + "bucket" + phMark + "/x"},
+	{"url-host/glued-key", "call https://", "AKIAIOSFODNN7EXAMPLE.prod.acme.com", "/x"},
+	{"url-host/list-member/glued-key", "dsn=mongodb://" + phMark + "h1" + phMark + ",", "AKIAIOSFODNN7EXAMPLE.prod",
+		"," + phMark + "host3" + phMark + "/db"},
 	// #52. A scheme with a digit in it: masked on the raw line, and the row exists for
 	// TestEveryDetectorsContextSurvivesTemplating, for which the '3' is a context digit -- the shape
 	// whose templatized form silenced 9a.
@@ -2688,6 +2976,16 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// only shape that changed when this rule ran over one laptop's journal (70,783 records): ten
 		// records, raw and templatized alike, all of them names like this one.
 		{"reverse-dns name", "PTR 5.0.0.10.in-addr.arpa", "PTR <HOST_1>"},
+		// #57's costs. A userinfo with a key glued inside a half is ONE token now, so the colon and
+		// the "this half is a key" signal are inside it -- #55's traded-signal class again, and only
+		// where a key is glued; a key that is a whole half keeps its own tag. Main sent ".prod" here.
+		{"a glued key absorbs the userinfo's halves", "s3://AKIAIOSFODNN7EXAMPLE.prod:secret@bucket", "s3://<TOKEN_1>@<HOST_1>"},
+		// 9e reads a host after "://", '@' or ',' and does not check that it is in an authority, so
+		// a key glued to labels in those two positions in prose reads as a host: the model is told
+		// "a host" where the line carried a key. Main sent ".prod" beside <TOKEN_1>; in the address
+		// it sent the domain, and "ops" is sent in both -- detector 5 cannot read a tag, as before.
+		{"a glued key after a comma reads as a host", "keys=a,AKIAIOSFODNN7EXAMPLE.prod", "keys=a,<HOST_1>"},
+		{"a glued key in an email domain reads as a host", "mail ops@AKIAIOSFODNN7EXAMPLE.prod.example.com", "mail ops@<HOST_1>"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -2842,6 +3140,13 @@ var templatizedRows = []templatizedRow{
 	{"url-host/digit-scheme/credential",
 		"url=s3://\x00AKIAIOSFODNN7EXAMPLE\x00:\x00secret\x00@\x00bucket.example.com\x00/x"},
 	{"url-host/list-rest/digit-scheme", "dsn=s3://\x00h1.acme.com\x00,\x00h2.acme.com\x00/x"},
+	// #57 through the composition. The key templatizes to AKIAIOSFODNN<NUM>EXAMPLE, which detector 2
+	// reads in its mangled form -- so main tagged it mid-value on this path too. The '_' row is green
+	// on the raw line, where no key is seen and 4 masks the userinfo, and was sent on this path only.
+	{"url-credentials/glued-key", "url=s3://\x00AKIAIOSFODNN7EXAMPLE.prod\x00@\x00bucket.example.com\x00/x"},
+	{"url-credentials/glued-key/underscore", "url=s3://\x00sk-abcdefghij0123456789XYZ_prod\x00@\x00bucket.example.com\x00/x"},
+	{"url-host/glued-key", "call https://\x00AKIAIOSFODNN7EXAMPLE.prod.acme.com\x00/x"},
+	{"url-host/list-member/glued-key", "dsn=mongodb://\x00h1\x00,\x00AKIAIOSFODNN7EXAMPLE.prod\x00,\x00host3\x00/db"},
 	{"home-dir/middle-digit", "loaded from /home/\x00deploy2prod\x00/go/pkg/mod"},
 	{"home-dir/middle-digit-users", "path /Users/\x00jane7doe\x00/app.log missing"},
 	// The four widened at 2da31be, now held to completeness rather than to "a token appeared".

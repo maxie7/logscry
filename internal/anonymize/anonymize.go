@@ -52,6 +52,14 @@
 // raw cells but not the Template field, where the address is the pipeline's <IP>, and would have
 // put a target group on our own output. 9d is that glue read on raw text one step earlier.
 //
+// #57 WAS CLOSED THE SAME WAY, and it is the case the issue said no pattern could reach. A key that is
+// only PART of a value -- a userinfo half, a host-list member, a hostname label -- was tagged by 1, 2
+// or 3b on its own, and the remainder could lie on either side of the tag, so no rule run AFTER them
+// could cover it. Two rules run BEFORE them instead, 4d and 9e, each matching only a key glued to
+// other text inside one value, and masking the value whole. A key that stands alone in its value is
+// still the key detectors', so #46's reason for running them first stands, and no struct, apply or
+// residue change was needed.
+//
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
 // Mask records nests; that inertness is what keeps a home path in a Go stack trace from tripping
@@ -209,8 +217,10 @@ func New(extraHostSuffixes ...string) *Mapper {
 // DETECTOR DESCRIBED — a userinfo with no password — so the re-scan could not have caught it
 // however hard it looked, there being no pattern to look with. Closing it makes the class
 // verify-eligible for the first time: a password-less userinfo that ever survives masking now
-// mutes the escalation instead of being sent. What stays invisible is the remainder of a half
-// only PARTLY recognised by an earlier detector, for exactly #46's reason; that is #57.
+// mutes the escalation instead of being sent. What stayed invisible was the remainder of a half
+// only PARTLY recognised by an earlier detector, for exactly #46's reason; that was #57, and it is
+// closed in the chain rather than here: 4d is verify-eligible, so a glued userinfo that ever survives
+// masking mutes, and the old leftover is a shape the re-scan still reads as clean but no longer meets.
 //
 // #61 IS NOT A NARROWING EITHER, and it adds no proviso to the note above because the re-scan was
 // never in a position to see it: the host detectors are verify:false, and had they been eligible
@@ -461,7 +471,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all sixteen rather than to the one detector known to need it, because
+// It is applied to all eighteen rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -474,7 +484,9 @@ var defaultHostSuffixes = []string{
 // since #58, because its group is followed by context (authorityTail) and a class that admits
 // '@' could in principle end the group at any of several '@'s. It cannot: the tail admits no
 // '@' and must reach a terminator, so exactly one '@' -- the last before the authority ends --
-// lets the whole pattern match, and the group's end is forced there.
+// lets the whole pattern match, and the group's end is forced there. 4d carries the same group and
+// the same tail, so the same argument holds; 9e's group ends its pattern, so its longest match is its
+// longest group.
 func mustLongest(pat string) *regexp.Regexp {
 	re := regexp.MustCompile(pat)
 	re.Longest()
@@ -488,16 +500,61 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	bareHost := mustLongest(bareHostPattern(suffixes))
 
 	return []detector{
+		// 4d. A userinfo with a key GLUED inside one of its halves (#57). It runs HERE, ahead of the key
+		//     detectors, and the out-of-sequence number is 6's and 9d's convention: it is a credential
+		//     rule, and the audit table and the issues number those 4-4d.
+		//
+		//     Until #57, 1, 2 and 3b tagged a key that was only PART of a half on its own, and every
+		//     credential group excludes '<', so the remainder was sent:
+		//     s3://AKIA...EXAMPLE.prod:secret@bucket went out as s3://<TOKEN_1>.prod:<TOKEN_2>@<HOST_1>.
+		//     4b and 4c could not reach it -- their half is the one the OTHER half's key left behind,
+		//     and here the key and its remainder are one half, with the remainder on either side of the
+		//     tag. Running 4 before the key detectors was rejected for #46 and that stands: a key that
+		//     IS a half keeps its own tag. THIS IS NOT A REORDERING, it is #54's remedy: a rule more
+		//     specific than the key detectors on exactly the span they share, a key with text beside it
+		//     inside a half, and absent wherever a key stands alone in its half.
+		//
+		//     THE GROUP IS DETECTOR 4'S, the whole userinfo up to the delimiting '@', with authorityTail
+		//     behind it. A key glued to other text cannot be a half on its own, so what #46 ran the key
+		//     rules first to keep -- "this half is a key" -- was never there to keep, and the value goes
+		//     to the rule that owns it. The halves are split at the first ':', as 4b and 4c split them,
+		//     and a key is "glued" when its half carries a unit before it or a character after it that
+		//     the key could not have continued with (see glued). The key is the key detectors' own
+		//     pattern, \b and all, so a key 2 would not match is not one here either.
+		//
+		//     verify:true, as every credential rule: a glued userinfo that ever survives masking mutes
+		//     the escalation. Its group reads a RAW key only, so it cannot fire on our own output.
+		{tagToken, mustLongest(gluedUserinfo), 1, true, false},
+		// 9e. A hostname with a key GLUED inside it (#57), the host-side twin of 4d: a key as a label
+		//     (https://AKIA...EXAMPLE.prod.acme.com/x sent the domain), or a host-list member with text
+		//     beside the key (mongodb://h1,AKIA...EXAMPLE.prod,host3/db sent ".prod" and ended 9c's list,
+		//     sending host3). HOST, and the whole name is the value: containment, as for #48's UUID and
+		//     #54's address -- what is protected is the domain, and the key is a label of it.
+		//
+		//     Its context is one "://", '@' or ',' directly before the name, and nothing after it:
+		//     leftmost-longest makes the run maximal without a right edge, and a consumed one would eat
+		//     the comma the next member needs, so two fused members side by side would not both match.
+		//     It does not check that the name is in an authority, and the cost is pinned in
+		//     TestAcceptedOverMasking: a key glued to labels after a comma or an '@' in prose is a host.
+		//     A BARE name on a private suffix is not reached; that would mean reading 9b's configurable
+		//     suffixes in a rule that runs before the key detectors (pinned as a residual).
+		//
+		//     It runs after 4d, so a glued userinfo is a TOKEN before this rule can read any of it as a
+		//     host, and before 9a and 9c, so a fused member reaches 9c as a whole tag and the list
+		//     re-anchors on it at no cost to the pass cap. A tag behind the '@' makes detector 4 decline,
+		//     as authorityTail requires; 4b and 4c then take the halves, or 9a's fallback tags a
+		//     password-less username HOST -- both main's output for that shape.
+		//
+		//     verify:false, as every host rule: a raw key it ever misses is still detector 2's.
+		{tagHost, mustLongest(gluedHost), 1, false, false},
 		// 1. JWT — three base64url segments; the header always starts "eyJ".
-		{tagToken, mustLongest(
-			`\beyJ` + tolerant(jwtChar) + `\.eyJ` + tolerant(jwtChar) + `\.` + tolerant(jwtChar)), 0, true, false},
+		{tagToken, mustLongest(jwtKey), 0, true, false},
 		// 2. AWS access-key id — a fixed, distinctive prefix and exactly 16 more characters.
-		{tagToken, mustLongest(
-			`\b(?:AKIA|ASIA)(?:[0-9A-Z]{16}\b|` + mangled(`[0-9A-Z]`) + `)`), 0, true, false},
+		{tagToken, mustLongest(awsKey), 0, true, false},
 		// 3a. Bearer token — mask the credential, not the word "Bearer".
 		{tagToken, mustLongest(`(?i)\bbearer\s+(` + tolerant(`[A-Za-z0-9._~+/=-]`) + `)`), 1, true, false},
 		// 3b. sk- style API keys (OpenAI and friends).
-		{tagToken, mustLongest(`\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`), 0, true, false},
+		{tagToken, mustLongest(skKey), 0, true, false},
 		// 4. Credentials embedded in a URL / connection string: scheme://userinfo@host.
 		//    Runs before host and email so "@host" survives for the host detector and a userinfo
 		//    is not misread as an email address. Placeholder-tolerant: the pipeline turns hunter2
@@ -581,7 +638,8 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    '<' and '>' stay excluded. That is the inertness invariant rather than a detail: it
 		//    is what keeps this group off our own output, and it is also the wall that a half only
 		//    PARTLY recognised by an earlier detector runs into, where the remainder may lie on
-		//    either side of the minted tag and no single pattern reaches it. Open; #57. It is also
+		//    either side of the minted tag and no pattern run after the tag reaches it. That was
+		//    #57, and 4d, run before the key detectors, is its remedy. It is also
 		//    what makes the tail's "decline" work: a group that cannot start on or enter a tag has
 		//    nowhere else to go once the tail refuses.
 		{tagToken, mustLongest(`://(` + tolerant(`[^/\s<>]`) + `)@` + authorityTail), 1, true, false},
@@ -619,7 +677,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     LAST '@' as detector 4's does. They carry no authorityTail, and the reason is what a
 		//     tag after a raw '@' in THEIR half would mean: the other half is already a tag by
 		//     construction, so a second tag inside this one is a half an earlier detector
-		//     recognised only in part -- #57, the shape no pattern reaches, rather than #58.
+		//     recognised only in part -- #57's shape rather than #58's, and 4d's since #57.
 		//
 		//     THEY ARE ALSO WHY THE #55 MERGE STOPS AT THREE RULES, and the reason is the struct
 		//     rather than effort. Detector 4 could absorb the colon-less case because the two
@@ -629,9 +687,9 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     positions -- `group int` becoming a group list with a "first that captured"
 		//     convention, plus matching changes in apply, residue, completenessSecretFor and
 		//     TestNoDetectorGroupLandsOnOurOwnOutput. So three rules is merged as far as the
-		//     struct allows, not nearly merged. The same wall is what makes a PARTLY recognised
-		//     half uncoverable by any pattern at all (#57): there the remainder can lie on
-		//     either side of the tag, so it is not two rules, it is none.
+		//     struct allows, not nearly merged. The same wall made a PARTLY recognised half
+		//     uncoverable by any pattern run after the tag (#57): there the remainder can lie on
+		//     either side of it. Run before the tag exists, one rule covers it, and that is 4d.
 		{tagToken, mustLongest(
 			`://(?:[^:/\s<>]|` + pipelinePH + `|` + ourPH + `)*:(` +
 				tolerant(`[^/\s<>]`) + `)@`), 1, true, false},
@@ -715,7 +773,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     after a sentence dot, a word before the address, a version with a pre-release tag
 		//     (1.2.3.4-beta, which 8 already read as an address). Each was <IP_1> beside text in the
 		//     clear; now it is one HOST. The other inner tag of this class, an access key as a host
-		//     label, is the sweep's "theoretical" cell and #57's shape in a list; neither is reached.
+		//     label or with text beside it in a list member, is 9e's since #57.
 		//
 		//     verify:false, as every host rule: a raw address it ever misses is still 8's on the re-scan.
 		{tagHost, mustLongest(ipv4LabelHost), 1, false, false},
@@ -731,10 +789,10 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     this is the fourth rule that reads a userinfo, and if it stopped at the first '@'
 		//     while the credential rules read to the last, the package would parse one string two
 		//     ways. It is the one userinfo run that admits '<' and '>' on purpose -- it steps over
-		//     the tag the credential rules minted -- and that is unchanged. Where it shows is only
-		//     the shapes every credential rule declined, which are #57's: there the HOST tag now
-		//     lands on the real host and what leaks is the partly-recognised half's remainder,
-		//     where before both leaked.
+		//     the tag the credential rules minted -- and that is unchanged. Where it showed was only
+		//     the shapes every credential rule declined, which were #57's: there the HOST tag
+		//     landed on the real host and what leaked was the partly-recognised half's remainder.
+		//     4d takes that userinfo whole now, before a key tag can exist inside it.
 		//     THE GROUP IS ONE HOST, and since #61 that is a statement about this rule rather than
 		//     about the value. A multi-host authority -- host[:port](,host[:port])*, which MongoDB,
 		//     MySQL, libpq and Sentinel all write -- is masked by this rule up to the first port colon
@@ -800,9 +858,11 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//       member 1, context:        a raw host run or a taggedMember. Derived by walking the chain:
 		//                                 before 9c runs a tag can land on member 1 from 7 and 8 (an
 		//                                 address literal), from 9a, from 1/2/3b only when a host literally
-		//                                 IS a key, and from 5 only through #57's shape, where two tags sit
-		//                                 adjacent. 3a needs whitespace, 4 mints on the userinfo, 9b/6/10
-		//                                 run later. The raw branch is unreachable in the chain -- 9a has
+		//                                 IS a key, from 9d and 9e (an address or a key fused with labels),
+		//                                 and two tags adjacent when a key is directly followed by an
+		//                                 address literal. 5 reached it only through #57's shape until 4d
+		//                                 took that userinfo. 3a needs whitespace, 4 mints on the
+		//                                 userinfo, 9b/6/10 run later. The raw branch is unreachable in the chain -- 9a has
 		//                                 already taken every raw first member this anchor can reach, and
 		//                                 declines only on '<' and '[', where the raw branch cannot start
 		//                                 either -- and exists for the single-detector probes
@@ -838,11 +898,10 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     ports between members hidden inside one placeholder, is gone: every port is visible now,
 		//     and a member that recurs elsewhere in the request gets the same placeholder there.
 		//
-		//     WHAT IT DOES NOT REACH is a MIXED member, a tag with raw text glued to it: #57's partly
-		//     recognised key (AKIA...EXAMPLE.prod as a later member, <TOKEN_1>.prod by the time this rule
-		//     runs). That is neither a tag nor a host run, so the list ends there as it did before #67.
-		//     #54's address inside a hostname was the other such member until 9d, which runs first and
-		//     hands this rule the whole name as one tag.
+		//     WHAT IT DOES NOT REACH is a MIXED member, a tag with raw text glued to it, which is neither a
+		//     tag nor a host run, so the list ends there. Two rules once produced one, and each now runs
+		//     first and hands this rule the whole name as one tag: 9d for #54's address inside a hostname,
+		//     and 9e for #57's key with text beside it (AKIA...EXAMPLE.prod, <TOKEN_1>.prod on main).
 		//
 		//     verify:false, for the same reason 9a and 9b are: a missed list member must not mute an
 		//     otherwise-safe escalation.
@@ -1064,6 +1123,78 @@ const authorityTail = `(?:[^@/\s<>]|` + pipelinePH + `)*(?:[/\s>]|$)`
 
 // jwtChar is the base64url alphabet of a JWT segment.
 const jwtChar = `[A-Za-z0-9_-]`
+
+// jwtKey, awsKey and skKey are what detectors 1, 2 and 3b match: "a key", in one definition. 4d and
+// 9e read the same three to find a key inside a larger value, so the rule that would tag a key and the
+// rule that must get to it first cannot disagree about what one is (TestGluedKeyRulesReadTheKeyDetectors).
+var (
+	jwtKey = `\beyJ` + tolerant(jwtChar) + `\.eyJ` + tolerant(jwtChar) + `\.` + tolerant(jwtChar)
+	awsKey = `\b(?:AKIA|ASIA)(?:[0-9A-Z]{16}\b|` + mangled(`[0-9A-Z]`) + `)`
+	skKey  = `\bsk-(?:[A-Za-z0-9]{16,}\b|` + mangled(`[A-Za-z0-9]`) + `)`
+)
+
+// keyShapes pairs each key with the raw characters it could have continued with, as a class body.
+// A JWT's third segment runs on through '-' and '_', so neither is text beside a JWT.
+var keyShapes = []struct{ pat, cont string }{
+	{jwtKey, `A-Za-z0-9_-`},
+	{awsKey, `0-9A-Z`},
+	{skKey, `A-Za-z0-9`},
+}
+
+// glued is a run of unit that contains a key with something beside it: one or more units before the
+// key, or directly after it a raw character from after(cont), which must be a character of the run
+// that the key could not have continued with.
+//
+// That exclusion is what makes "beside" mean beside the WHOLE key. On the Template field a key takes
+// its mangled form, which carries no closing \b, so AKIAIOSFODNN<NUM> alone is a key to the pattern,
+// and without it AKIAIOSFODNN<NUM>EXAMPLE -- a key that is a whole half -- would read as one glued to
+// "EXAMPLE". A unit before the key needs no such care: the key starts at its \b, where its detector
+// would start too.
+func glued(unit string, after func(cont string) string) string {
+	right := make([]string, len(keyShapes))
+	keys := make([]string, len(keyShapes))
+	for i, k := range keyShapes {
+		right[i] = k.pat + after(k.cont)
+		keys[i] = k.pat
+	}
+	return `(?:` + unit + `*(?:` + strings.Join(right, "|") + `)` + unit + `*|` +
+		unit + `+(?:` + strings.Join(keys, "|") + `)` + unit + `*)`
+}
+
+// gluedUserinfo is 4d: detector 4's group, matched only when a half carries a glued key. The username
+// runs to the first ':' and the password from there to the delimiting '@', as 4b and 4c read them, so
+// a ':' after a key ends a username but is text beside a key in a password.
+var gluedUserinfo = func() string {
+	user := `(?:[^:/\s<>]|` + pipelinePH + `)`
+	pass := `(?:[^/\s<>]|` + pipelinePH + `)`
+	inUser := glued(user, func(cont string) string { return `[^:/\s<>` + cont + `]` })
+	inPass := glued(pass, func(cont string) string { return `[^/\s<>` + cont + `]` })
+	return `://(` + inUser + `(?::` + pass + `*)?|` + user + `*:` + inPass + `)@` + authorityTail
+}()
+
+// gluedHost is 9e: a host run with a glued key inside it, after one "://", '@' or ','. The host class
+// is a positive one, so the characters a key could not have continued with are listed rather than
+// excluded (hostCharsBut).
+var gluedHost = func() string {
+	const hostChars = `A-Za-z0-9_.-`
+	unit := `(?:[` + hostChars + `]|` + pipelinePH + `)`
+	return `(?:://|@|,)(` + glued(unit, func(cont string) string { return hostCharsBut(hostChars, cont) }) + `)`
+}()
+
+// hostCharsBut is the class of printable ASCII characters in class and not in cont, each written as
+// an escape so that '-', '.' and ']' mean themselves.
+func hostCharsBut(class, cont string) string {
+	in, out := regexp.MustCompile(`^[`+class+`]$`), regexp.MustCompile(`^[`+cont+`]$`)
+	var b strings.Builder
+	b.WriteString("[")
+	for c := '!'; c <= '~'; c++ {
+		if in.MatchString(string(c)) && !out.MatchString(string(c)) {
+			fmt.Fprintf(&b, `\x%02x`, c)
+		}
+	}
+	b.WriteString("]")
+	return b.String()
+}
 
 // tolerant builds a run of one or more units, where a unit is a character from class OR a
 // whole pipeline placeholder. For detectors with no length requirement, that is the entire
