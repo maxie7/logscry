@@ -2748,6 +2748,163 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Seen, out of scope: #59, #65's sweep, #90, #51. Targets v0.12.10
 
+- [x] **A key glued to `_` or a letter is masked, not sent whole** — #108, found while verifying
+      #57. Detectors 1, 2 and 3b (JWT, AWS, `sk-`) end a key with `\b` on both edges, and `_` and
+      letters are word characters, so a key glued to one matched nothing on the raw line and was
+      SENT WHOLE:
+      - `key AKIAIOSFODNN7EXAMPLE_prod used`, `key AKIA…EXAMPLEx`, `key ASIA…_prod used` and
+        `key sk-…XYZ_prod used`, the key with text glued after it;
+      - `key x_AKIA… used`, `key idAKIA… used`, `my_sk-…` and `token_eyJ…`, the key with text
+        glued before it, and both sides at once;
+      - two keys glued by one `_`.
+
+      `Mask` returned nil and `residue()` returned `""`: the re-scan runs the same detectors, so it
+      had no pattern to look with, #55's reason. On the Template field the mangled form has no
+      closing `\b`, so a key with text glued AFTER it was masked there and only the text was sent;
+      text glued BEFORE it leaked on both paths, and so did the second of two glued keys.
+      v0.4.0 → v0.12.10, **thirty-six tagged releases** (`git tag --contains 2da31be | wc -l` →
+      36).
+
+      **The mechanism, compared on the cells before any code.**
+      - **A, move the edges inside 1, 2 and 3b.** It narrows main in three shapes, each masked whole
+        today only BECAUSE the key detectors do not see the key. Tagged first, the key blocks every
+        later group at our `<`, the anti-correlation recorded for #51:
+        - `hdr Bearer AKIA…_prod` → `Bearer <TOKEN_1>_prod` (2 runs before 3a);
+        - `x_AKIA…@example.com` → `x<TOKEN_1>@example.com`, the audit table's theoretical
+          "1/2/3b → 5" cell reached from a shape main masks;
+        - `worker_AKIA….corp.internal` → `worker<TOKEN_1>.<HOST_1>`.
+
+        RE2 also has no lookbehind and those detectors must keep group 0
+        (`TestGluedKeyRulesReadTheKeyDetectors` finds them by it), so a leading glue character
+        could only be consumed into the token.
+      - **B, rule 11**: one more detector per key, appended AFTER detector 10. Each one is
+        `(?:^|[^<lead>])(<loose key>)`, group 1, TOKEN, `verify:true`. It runs after every rule that
+        could own a value around a key, so it only reads raw text no rule claimed. No earlier
+        rule's input changes and rule 11 only adds placeholders, so nothing narrows and nothing
+        moves BY CONSTRUCTION. B was taken.
+
+      **The fix (`internal/anonymize/anonymize.go` only).**
+      - A key's parts are hoisted into named values: `awsPrefix`, `awsChar`, `skPrefix`, `skChar`,
+        `jwtBody`. `jwtKey`, `awsKey` and `skKey` are rebuilt from them, so a key is one grammar read
+        with two edge policies that cannot drift. **Strict** (`\b` on both edges) is a key that
+        stands alone in its value: 1, 2, 3b, 4d and 9e. **Loose** is a key glued to a word
+        character in text nothing else claimed: rule 11.
+      - `keyShapes` gains `loose` and `lead` beside `pat` and `cont`. A key's own alphabet ends
+        it, and rule 11 has no trailing assertion: leftmost-longest makes the run maximal.
+      - Every existing detector compiles byte-identically. Its source, tag, group, verify, fixpoint
+        and order were dumped and compared with main's under `New()` and an extra-suffix Mapper:
+        only the three rule-11 detectors are new. `apply`, `residue`, `Restore` and the `detector`
+        struct are unchanged.
+
+      **Decisions, each pinned by a test.**
+      1. **Boundaries from each key's own grammar, on both edges.**
+         - AWS: the run is `[0-9A-Z]`, so lowercase, `_` and punctuation end it. Before the prefix,
+           anything outside `[0-9A-Z]` is glue: `_` and lowercase are, while `XAKIA…` and `7AKIA…`
+           are a longer run and not a key. Unchanged on the raw line; the template masks `7AKIA…`
+           by a NUM accident (`<NUM>AKIA…`), as on main.
+         - `sk-`: `_` is glue, a letter or digit is not, so `task-…`, `ask-…` and `2sk-…` stay
+           unmasked. `sk-proj-…` (#51) is unchanged.
+         - JWT: `-` and `_` continue the third segment as before. Before `eyJ`, only `_` is glue,
+           so `xeyJ…` stays.
+         - The lead classes come from one rule: a key's own letters and digits make a longer run,
+           and `_` and `-` are separators.
+      2. **A run longer than a key is masked whole.** `AKIAIOSFODNN7EXAMPLEPROD` → `<TOKEN_1>`.
+         Loose AWS is `{16,}`, so the raw line now agrees with the template, whose mangled form
+         was always unbounded. This is in rule 11 only: in strict detector 2 it would hit the
+         email narrowing above.
+      3. **`residue` sees exactly what the detectors see.** Rule 11 is verify-eligible:
+         - 11 strings carrying a raw glued key read TOKEN, in prose, a query string, behind
+           `Bearer` and in a userinfo;
+         - the old leftovers read clean (`key <TOKEN_1>_prod used`).
+
+         So an escalation carrying such a key would mute.
+      4. **4d and 9e: `cont` and `pat` do not change.** Every #57 row is byte-identical and
+         `TestGluedKeyRulesReadTheKeyDetectors` stays green: rule 11 has group 1, and its source
+         does not contain the strict source.
+      5. **The prose remainder stays prose.** `key <TOKEN_1>_prod used` and `key x_<TOKEN_1> used`,
+         on both paths.
+
+      **What it costs, pinned in `TestAcceptedOverMasking`.** `region ASIAPACIFICDATACENTER01 up`
+      → `region <TOKEN_1> up`, and a lowercase word glued before such a run,
+      `southeastASIAPACIFICDATACENTER01` → `southeast<TOKEN_1>`. The template already masked the
+      first one on main.
+
+      **No narrowing, shown differentially.** The inputs are every string the anonymize, llm and
+      config tests feed `Mask` and `residue`, on main and on the branch, plus each one's
+      templatized form: 2,744 distinct inputs. Main's `anonymize.go` was overlaid as a sibling
+      package, and per-byte coverage was rebuilt from `byToken` under `New()` and an extra-suffix
+      Mapper (`k8s`, `acme1`, `eu-1`, `v1.2`, `deadbeef`, `2corp`). Both Mappers gave the same
+      result:
+      - 0 narrowed, 0 mixed, 0 layout-only, 0 error changes;
+      - 32 widened, every one a glued-key input of the new tests;
+      - main's own 2,624 inputs all unchanged.
+
+      **Frequency.** The 70,783 records (ten boots and ab37) were run raw and templatized, old
+      against new, under both Mappers: **0 changed, 0 error changes**, as predicted. No record
+      carries an AWS or JWT prefix, and the 396 with `sk-` inside a word are untouched.
+
+      **Tests.**
+      - `TestIssue108KeyGluedToAWordCharacter`, raw and through the real `pipeline.Templatize`:
+        - 14 closed rows, with every fragment main sent checked absent and a round trip;
+        - 20 byte-identical rows: the must-stays above, the three narrowing shapes, a bearer key
+          with `_` before it and with `_` or `.` after it, a key as a host label, a list member and
+          in a userinfo;
+        - a recurrence subtest and the `residue` claims.
+      - Five completeness rows, four templatized rows (three leading `_`, one control), two
+        over-mask rows, one `TestTypeTags` row and seven new outputs fed to
+        `TestPlaceholdersAreInert`.
+      - Red on main: 31 subtests plus 2 tests without subtests, all by assertion, with the guards
+        byte-identical and green.
+
+      **Mutants, each with what it turned red.**
+      - (a) `\b` kept on rule 11's trailing edge: 12. Eight #108 rows, completeness
+        `aws-key/glued-underscore` and `sk-key/glued`, `TestNoDetectorGroupLandsOnOurOwnOutput`,
+        `TestTypeTags`.
+      - (b) letters admitted before `sk-`: 2, `task` and `ask`.
+      - (c) the decision-2 run refused, capped at 16: 4. Both over-mask rows, the longer-run row,
+        completeness `aws-key/run`.
+      - (d) rule 11 `verify:false`, so residue reads the old patterns: the `residue` claims.
+      - (e) rule 11 at 1, 2 and 3b's position: 10. The eight narrowing rows (bearer `_` before and
+        after, email `_` before and after, bare private host, host label, list member,
+        userinfo), and #57's "sk- key, underscore after (template only)" and "underscore before
+        the key".
+      - (f) AWS lead refusing lowercase: 4. The lowercase-before row, completeness
+        `aws-key/glued-letter`, the lowercase over-mask row, `TestNoDetectorGroupLandsOnOurOwnOutput`.
+      - (g) no leading context: 6. `ask`, `task`, a digit before AWS and before `sk-`, a letter
+        before a JWT, an uppercase letter before AWS.
+      - (h) JWT lead equal to `cont`, refusing `_`: 6. The JWT `_`-before row and its completeness,
+        templatized and both logfmt rows, `TestNoDetectorGroupLandsOnOurOwnOutput`.
+      - (i) a drifted AWS prefix without ASIA: 3. The ASIA row and both over-mask rows.
+      - (j) trailing context consumed: the two-keys row.
+
+      **The full suite** ran under `-race` on main and on the branch: 1,374 results, then 1,429.
+      **No existing result changed outcome** and none left; 55 came in. Main's test file passes
+      against the new code. The new and touched tests pass under `-race -count=20`.
+
+      **Wire check.** One run per binary against a capturing endpoint (`--plain --llm-anonymize
+      --warmup-lines 0`). A `[FATAL] key AKIAIOSFODNN7EXAMPLE_prod used` line, with #59's
+      `postgres://user:p/ss@db` in its context as the open control.
+      - `AKIAIOSFODNN7EXAMPLE`: 1 before (the trigger line), 0 after. Both fields now read
+        `key <TOKEN_1>_prod used`.
+      - `p/ss` fires once in both, so the grep is not vacuous.
+
+      `internal/pipeline` does not appear in the diff. README: a new past-tense paragraph carries
+      the shapes, span, costs and frequency, and the audit sentence gains #108. #108 had no
+      Known-limitations entry to remove.
+
+      **Found on the way, not fixed.**
+      - **A REMAINDER glued after a masked AWS key or JWT behind `Bearer` is sent.** It is
+        topology, #57's class, not the key: the key is masked. 1 and 2 run before 3a and tag only
+        the key, so `hdr Bearer AKIA…EXAMPLE.prod expired` → `hdr Bearer <TOKEN_1>.prod expired`
+        on both paths. `~` and `-` glue the same way, and `_` does on the template. A JWT sends
+        what follows `.` or `~`. `sk-` is not affected, because 3a runs before 3b. `residue()`
+        reads it clean. Main and the branch agree on every cell, so it predates #108 and is
+        untouched by it. The audit table's "1/2/3b → 3a harmless" row is wrong for a glued key,
+        and a row is added below it. Confirmed with a throwaway test. No open issue covers it, so
+        it is filed as ISSUE-TBD and named in README's Known limitations.
+
+      Seen, out of scope: #51, #59, #65's sweep. Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
@@ -3530,6 +3687,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 7/8 → 9a | `https://10.0.0.5:8080/x` | nothing | **harmless**; 9a is blocked but the whole authority WAS the address |
       | 6 → 10, 1/2/3b → 10 | `/home/550e8400-…/app.log` | nothing | **harmless**; blocking detector 10 costs a tag, never a value |
       | 1/2/3b → 3a | `Bearer AKIAIOSFODNN7EXAMPLE` | nothing | **harmless**; already pinned by `TestPlaceholdersAreInert` |
+      | 1/2 → 3a | `Bearer AKIA…EXAMPLE.prod` | `.prod` | **DEFECT, filed ISSUE-TBD**. A key glued to text inside the bearer value, not the key; 3b runs after 3a and is not affected |
       | 1/2/3b → 5 | `eyJ….eyJ….sig@example.com` | the domain | **theoretical**; nothing puts a JWT in an email local part |
       | 6 → 9a | `https://550e8400-….blob.core.windows.net/x` | the whole domain | **DEFECT, FIXED** (#48) |
       | 6 → 9a | `https://api.550e8400-….acme.com/` | `.acme.com` | **DEFECT, FIXED** (#48) |
