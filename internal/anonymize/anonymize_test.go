@@ -2399,6 +2399,161 @@ func TestIssue110KeyGluedInsideABearerValue(t *testing.T) {
 	}
 }
 
+// TestIssue90HomeDirClosingPunctuation is the named regression for #90. Detector 10's username class
+// stopped at '/', whitespace, ':', '<' and '>', and at nothing a log writes AFTER a value, so a username at
+// the end of a quoted or bracketed value took the closer into its placeholder: msg="cannot read
+// /home/deploy2prod" went out as ".../home/<USER_1> module=x", {"path":"/home/bob"} lost its "}, and
+// open("/home/bob") its "). Nothing was disclosed -- Restore round-tripped -- but the model was sent a
+// broken payload, and an answer naming <USER_1> restored with the stray characters. Raw lines and the JSON
+// and logfmt templates alike, which re-quote the message.
+//
+// The class stays for the body, so a closer INSIDE a name is still masked; only the name's LAST unit may
+// not be one of the trailing set, " ' ` ) ] } , ; . and '\'. The backslash is there because inside a quoted
+// value it escapes the closing quote ("open \"/home/bob\""). What may leave a placeholder is a trailing
+// closer and nothing else.
+func TestIssue90HomeDirClosingPunctuation(t *testing.T) {
+	const trailing = "\"'`)]},;.\\"
+	closed := []struct{ name, in, want, tmpl string }{
+		// The issue's three lines. The template is TemplatizeLine's, the real Template field: a logfmt msg
+		// and a JSON msg keep their text, re-quoted; a text-path quoted string is <STR>.
+		{"logfmt msg (the issue's)", `level=error msg="cannot read /home/deploy2prod" module=x`,
+			`level=error msg="cannot read /home/<USER_1>" module=x`, `level=error msg="cannot read /home/<USER_1>" module=x`},
+		{"json value (the issue's)", `{"path":"/home/bob"}`, `{"path":"/home/<USER_1>"}`, `{"path":<STR>}`},
+		{"call (the issue's)", `open("/home/bob")`, `open("/home/<USER_1>")`, `open(<STR>)`},
+		{"json msg", `{"level":"error","msg":"cannot read /home/bob"}`,
+			`{"level":"error","msg":"cannot read /home/<USER_1>"}`, `{"level":<STR>,"msg":"cannot read /home/<USER_1>"}`},
+		// One row per closer.
+		{"double quote, /Users/", `/Users/jane"`, `/Users/<USER_1>"`, `/Users/<USER_1>"`},
+		{"single quote", `['/home/bob']`, `['/home/<USER_1>']`, `[<STR>]`},
+		{"backtick", "`/home/bob` missing", "`/home/<USER_1>` missing", "`/home/<USER_1>` missing"},
+		{"paren", `(see /home/bob)`, `(see /home/<USER_1>)`, `(see /home/<USER_1>)`},
+		{"bracket", `list [/home/bob]`, `list [/home/<USER_1>]`, `list [/home/<USER_1>]`},
+		{"brace", `{dir: /home/bob}`, `{dir: /home/<USER_1>}`, `{dir: /home/<USER_1>}`},
+		{"comma", `x=/home/bob, y`, `x=/home/<USER_1>, y`, `x=/home/<USER_1>, y`},
+		{"semicolon", `/home/bob;`, `/home/<USER_1>;`, `/home/<USER_1>;`},
+		{"sentence dot", `cannot read /home/bob.`, `cannot read /home/<USER_1>.`, `cannot read /home/<USER_1>.`},
+		// The backslash: an escaped closing quote inside a quoted value, on a raw JSON and a raw logfmt line.
+		{"escaped quote, raw json", `{"msg":"open(\"/home/bob\")"}`, `{"msg":"open(\"/home/<USER_1>\")"}`, `{"msg":"open(<STR>)"}`},
+		{"escaped quote, raw logfmt", `level=error msg="open \"/home/bob\": denied" module=x`,
+			`level=error msg="open \"/home/<USER_1>\": denied" module=x`, `level=error msg="open <STR>: denied" module=x`},
+		// A run of mixed closers leaves whole, not one character of it.
+		{"dot then quote", `cannot read /home/bob."`, `cannot read /home/<USER_1>."`, `cannot read /home/<USER_1>."`},
+		{"run of four closers", `x=["/home/bob"]), y`, `x=["/home/<USER_1>"]), y`, `x=[<STR>]), y`},
+		{"run of closers, raw logfmt", `level=error msg="x=[\"/home/bob\"]), y" module=x`,
+			`level=error msg="x=[\"/home/<USER_1>\"]), y" module=x`, `level=error msg="x=[<STR>]), y" module=x`},
+		{"run of closers, logfmt template", `level=error msg="(see [/home/bob]);." module=x`,
+			`level=error msg="(see [/home/<USER_1>]);." module=x`, `level=error msg="(see [/home/<USER_1>]);." module=x`},
+		// A leading closer is inside the name and stays there; only the trailing one leaves.
+		{"leading quote stays inside", `/home/'bob'`, `/home/<USER_1>'`, `/home/<USER_1>`},
+		// #43's tolerant form: a pipeline placeholder may end the name, and a closer after it still leaves.
+		{"tolerant end, text template", `(see /home/maxie7)`, `(see /home/<USER_1>)`, `(see /home/<USER_1>)`},
+		{"tolerant end, logfmt template", `level=error msg="cannot read /home/maxie7" module=x`,
+			`level=error msg="cannot read /home/<USER_1>" module=x`, `level=error msg="cannot read /home/<USER_1>" module=x`},
+		// A JSON escape glued to the name: 'n' is a body character, so "bob\n" stays one name, as on main;
+		// only the "} after it leaves. The template decodes the escape, and the newline ends the name there.
+		{"json escape glued to the name", `{"msg":"cannot read /home/bob\n"}`,
+			`{"msg":"cannot read /home/<USER_1>"}`, `{"msg":"cannot read /home/<USER_1>"}`},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				m := New()
+				got := mustMask(t, m, p.in)
+				if got != p.want {
+					t.Errorf("a closer after a home-dir username not left outside it:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+				if r := m.Restore(got); r != p.in {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", p.in, r)
+				}
+				// The answer side: what <USER_1> restores to never ends in a closer.
+				if name := m.Restore("<USER_1>"); name != "<USER_1>" && strings.TrimRight(name, trailing) != name {
+					t.Errorf("<USER_1> restores to %q, which ends in a closer", name)
+				}
+				// The new output is inert: masking it again changes nothing and the re-scan reads it clean.
+				if again := mustMask(t, New(), p.want); again != p.want {
+					t.Errorf("the masked output is not inert:\n out:   %q\n again: %q", p.want, again)
+				}
+				if tag := New().residue(p.want); tag != "" {
+					t.Errorf("residue() reads the masked output %q as %q", p.want, tag)
+				}
+			}
+		})
+	}
+
+	// Raw only: x= and y= carry no level or message key, so the line is not logfmt and its template is
+	// "x=<STR> y=<NUM>", with no name left in it.
+	t.Run("run of closers in a quoted non-logfmt value (raw only)", func(t *testing.T) {
+		const in, want = `x="(see [/home/bob]);." y=1`, `x="(see [/home/<USER_1>]);." y=1`
+		m := New()
+		if got := mustMask(t, m, in); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		if got := m.Restore("<USER_1>"); got != "bob" {
+			t.Errorf("Restore(<USER_1>) = %q, want %q", got, "bob")
+		}
+	})
+
+	// Byte-identical with main, raw and templatized. A closer INSIDE a name is part of it -- the body class
+	// is unchanged -- and so is everything that already ended the name.
+	same := []struct{ name, in, want, tmpl string }{
+		{"quote inside, then a path", `/home/o'brien/x`, `/home/<USER_1>/x`, `/home/<USER_1>/x`},
+		{"paren inside, then a path", `/home/a)b/x`, `/home/<USER_1>/x`, `/home/<USER_1>/x`},
+		{"comma inside, /Users/", `/Users/a,b/x`, `/Users/<USER_1>/x`, `/Users/<USER_1>/x`},
+		{"quote inside, end of text", `/home/o'brien`, `/home/<USER_1>`, `/home/<USER_1>`},
+		{"a path after the name", `loaded from /home/maxie/go/pkg/mod`, `loaded from /home/<USER_1>/go/pkg/mod`, `loaded from /home/<USER_1>/go/pkg/mod`},
+		{"trailing digit", `/home/maxie7`, `/home/<USER_1>`, `/home/<USER_1>`},
+		{"a uuid home dir", `/home/550e8400-e29b-41d4-a716-446655440000/app.log`, `/home/<UUID_1>/app.log`, `/home/<USER_1>/app.log`},
+		{"colon after", `/home/bob:`, `/home/<USER_1>:`, `/home/<USER_1>:`},
+		{"angle bracket after", `/home/bob>`, `/home/<USER_1>>`, `/home/<USER_1>>`},
+		{"end of text", `see /home/bob`, `see /home/<USER_1>`, `see /home/<USER_1>`},
+	}
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a shape outside #90 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// THE COSTS, pinned. A name whose LAST character is a closer loses it even before a '/', since the rule
+	// has no trailing context; and a "name" made only of closers is none, so it is left as it is. Only
+	// closers leave a placeholder in either.
+	costs := []struct{ name, in, want string }{
+		{"a name ending in a dot, then a path", `/home/bob./x`, `/home/<USER_1>./x`},
+		{"dot-dot", `/home/../etc`, `/home/../etc`},
+		{"dot", `/home/./x`, `/home/./x`},
+	}
+	for _, c := range costs {
+		t.Run("cost/"+c.name, func(t *testing.T) {
+			if got := mustMask(t, New(), c.in); got != c.want {
+				t.Errorf("a pinned cost moved:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	// The answer side, and recurrence. A model answer naming <USER_1> restores to the name alone, and the
+	// same name bare elsewhere in the request is the same placeholder.
+	t.Run("an answer restores the name alone", func(t *testing.T) {
+		m := New()
+		mustMask(t, m, `level=error msg="cannot read /home/bob" module=x`)
+		if got, want := m.Restore("check permissions on /home/<USER_1>"), "check permissions on /home/bob"; got != want {
+			t.Errorf("Restore = %q, want %q", got, want)
+		}
+		if got, want := mustMask(t, m, "cd /home/bob"), "cd /home/<USER_1>"; got != want {
+			t.Errorf("recurrence: got %q, want %q", got, want)
+		}
+	})
+
+	// residue() is unchanged in kind: a raw name before a closer is still a USER value, and mutes.
+	if tag := New().residue(`cannot read /home/bob"`); tag != tagUser {
+		t.Errorf("a raw name before a closer does not mute: residue = %q, want %q", tag, tagUser)
+	}
+}
+
 // TestIssue52SchemeAnchor is the named regression for #52. 9a and 9c find a URL by its scheme,
 // `\b[a-z][a-z0-9+.-]*://`, and that anchor is CONTEXT -- outside the group -- so #43, which made
 // every group tolerant of the pipeline's placeholders, never touched it. It failed two ways:
@@ -3130,6 +3285,11 @@ var completenessRows = []completenessRow{
 	{"home-dir", "loaded from /home/", "maxie", "/go/pkg/mod"},
 	// The home-dir rule's second literal, so the context check proves it digit-free as well.
 	{"home-dir/users", "path /Users/", "jane", "/app.log"},
+	// #90. A closer after the name is the value's wrapper or the sentence's, not the name's, so it stays outside
+	// the placeholder: flush against the name, a closing quote and a sentence dot. After the canonical rows, for
+	// the same reason as the #48 rows.
+	{"home-dir/closing-quote", `cannot read "/home/`, "bob", `" twice`},
+	{"home-dir/sentence-dot", "cannot read /home/", "bob", ". Retrying"},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -3563,6 +3723,11 @@ var templatizedRows = []templatizedRow{
 	{"bearer/glued-jwt", "hdr Bearer \x00eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u.prod\x00 expired"},
 	{"home-dir/middle-digit", "loaded from /home/\x00deploy2prod\x00/go/pkg/mod"},
 	{"home-dir/middle-digit-users", "path /Users/\x00jane7doe\x00/app.log missing"},
+	// #90 through the composition: a closer after the name, which the text template keeps (a quote it folds into
+	// <STR>). The second row ends the name on its digit, so the pipeline placeholder is the name's last unit and
+	// the closer after it must still stay outside.
+	{"home-dir/closing-paren", "(see /home/\x00deploy2prod\x00)"},
+	{"home-dir/tolerant-end", "(see /home/\x00maxie7\x00)"},
 	// The four widened at 2da31be, now held to completeness rather than to "a token appeared".
 	{"jwt", "auth \x00eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u\x00 rejected"},
 	{"aws-key", "creds \x00AKIAIOSFODNN7EXAMPLE\x00 denied"},
@@ -3642,17 +3807,15 @@ func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
 	// templatized row has: each of these puts the secret against the closing or the
 	// opening quote.
 	//
-	// home-dir-last is skipped, not dropped. The home-dir detector's username class admits
-	// '"', so the closing quote goes into <USER_N>. That over-masks rather than discloses —
-	// nothing leaks and Restore round-trips — and it predates this branch: a raw line, a JSON
-	// template and `open("/home/bob")` do the same. Filed as #90; the fix turns it on.
-	skip := map[string]string{
-		"quote-edge/home-dir-last": "the home-dir detector takes a closing quote into the username (#90)",
-	}
+	// home-dir-last sat skipped here until #90: the username class admitted '"', so the
+	// closing quote went into <USER_N>. The two rows after it end the name on a pipeline
+	// placeholder, and on a run of closers before the wrapper's own quote.
 	quoteEdgeRows := []templatizedRow{
 		{"quote-edge/email-last", "login refused for \x00ops7@corp.example.com\x00"},
 		{"quote-edge/email-first", "\x00ops7@corp.example.com\x00 refused"},
 		{"quote-edge/home-dir-last", "cannot read /home/\x00deploy2prod\x00"},
+		{"quote-edge/home-dir-last/tolerant-end", "cannot read /home/\x00maxie7\x00"},
+		{"quote-edge/home-dir-last/closer-run", "(see [/home/\x00bob\x00]);."},
 		{"quote-edge/url-host-last", "dial https://\x00db01.corp.internal\x00"},
 		{"quote-edge/sk-key-last", "rejected key \x00sk-abcdefghij0123456789XYZ\x00"},
 		{"quote-edge/aws-key-first", "\x00AKIAIOSFODNN7EXAMPLE\x00 denied"},
@@ -3661,9 +3824,6 @@ func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
 	for _, f := range fields {
 		for _, r := range rows {
 			t.Run(f.name+"/"+r.name, func(t *testing.T) {
-				if why, ok := skip[r.name]; ok {
-					t.Skip(why)
-				}
 				payload := payloadOf(r.text)
 				if strconv.Quote(payload) != `"`+payload+`"` {
 					t.Fatalf("premise broken: %q needs escaping inside a quoted value", payload)
