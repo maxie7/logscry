@@ -66,6 +66,11 @@
 // them to would block those rules and send the rest. So rule 11 runs LAST, reads only text no rule
 // claimed, and masks the key with the glue left as prose.
 //
+// #110 IS #57'S RULE FOR A BEARER VALUE. 1 and 2 run before 3a, so a key that was only part of a bearer
+// value was tagged alone and the text glued to it was sent. 3c runs before them and masks such a value
+// whole; moving 3a ahead of them would have closed the same cells and renumbered every line that carries
+// a bearer token and a key elsewhere.
+//
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
 // Mask records nests; that inertness is what keeps a home path in a Go stack trace from tripping
@@ -238,6 +243,9 @@ func New(extraHostSuffixes ...string) *Mapper {
 // #108 WIDENS WHAT residue() SEES by one class. A key glued to a word character matched no detector,
 // so the re-scan read it as clean for #55's reason -- no pattern to look with. Rule 11 is
 // verify-eligible, so a raw glued key that ever survives masking mutes.
+//
+// #110 changes nothing here. Its leftover, "Bearer <TOKEN_1>.prod", is a shape the re-scan reads as clean,
+// and it no longer meets it; a raw key left in a bearer value was always 1's or 2's, and mutes.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -481,7 +489,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all twenty-one rather than to the one detector known to need it, because
+// It is applied to all twenty-two rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -557,12 +565,36 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//
 		//     verify:false, as every host rule: a raw key it ever misses is still detector 2's.
 		{tagHost, mustLongest(gluedHost), 1, false, false},
+		// 3c. A bearer value with a key GLUED inside it (#110), 3a's value read before 1 and 2 can tag the key
+		//     in it. The out-of-sequence number is 4d's and 9e's convention: it is a bearer rule.
+		//
+		//     Until #110, 1 or 2 tagged a JWT or an AWS key that was only PART of a bearer value, and 3a's
+		//     group excludes '<', so it could not claim what was left: "Bearer AKIA...EXAMPLE.prod" went out
+		//     as "Bearer <TOKEN_1>.prod", and on the template, where the mangled key has no closing \b, so did
+		//     "_prod" and a lowercase letter. sk- was never affected, because 3b runs after 3a.
+		//
+		//     THIS IS NOT A REORDERING, and the reorder was measured. Running 3a before 1 and 2 closes the same
+		//     cells, but it mints EVERY bearer value first, so a line with a bearer token and a key elsewhere
+		//     swaps its placeholder numbers. This rule matches only a bearer value carrying a glued key, the
+		//     span 3a and the key rules share, and is absent everywhere else: a key that IS the whole value is
+		//     still 1's or 2's, and every other bearer value is still 3a's.
+		//
+		//     THE GROUP IS 3a'S, the whole bearer value. A key glued to other text there is part of one
+		//     credential, and the value is the secret, as #57 decided for a userinfo. Glued means a unit of
+		//     the value before the key, or after it a character the key could not have continued with (see
+		//     glued). The key is 1's and 2's own pattern, \b and all, so where 2 sees no key -- "x_AKIA..." --
+		//     3a still takes the value whole, as before.
+		//
+		//     It runs after 4d and 9e and is disjoint from both: their spans carry no whitespace, and a bearer
+		//     value carries none of their anchors. verify:true, as every credential rule; a raw key left in a
+		//     bearer value is still 1's or 2's on the re-scan.
+		{tagToken, mustLongest(gluedBearer), 1, true, false},
 		// 1. JWT — three base64url segments; the header always starts "eyJ".
 		{tagToken, mustLongest(jwtKey), 0, true, false},
 		// 2. AWS access-key id — a fixed, distinctive prefix and exactly 16 more characters.
 		{tagToken, mustLongest(awsKey), 0, true, false},
 		// 3a. Bearer token — mask the credential, not the word "Bearer".
-		{tagToken, mustLongest(`(?i)\bbearer\s+(` + tolerant(`[A-Za-z0-9._~+/=-]`) + `)`), 1, true, false},
+		{tagToken, mustLongest(`(?i)\bbearer\s+(` + tolerant(bearerChar) + `)`), 1, true, false},
 		// 3b. sk- style API keys (OpenAI and friends).
 		{tagToken, mustLongest(skKey), 0, true, false},
 		// 4. Credentials embedded in a URL / connection string: scheme://userinfo@host.
@@ -1192,11 +1224,14 @@ var (
 // the key's own letters and digits, which would make a longer word that merely contains the prefix
 // (XAKIA..., task-..., xeyJ...). '_' and '-' are separators, so a JWT's lead is its alphabet without
 // them, and an AWS key's, being uppercase, leaves a lowercase letter as glue.
-var keyShapes = []struct{ pat, cont, loose, lead string }{
+var keyShapes = []keyShape{
 	{jwtKey, `A-Za-z0-9_-`, jwtBody, `A-Za-z0-9`},
 	{awsKey, `0-9A-Z`, awsPrefix + `(?:` + awsChar + `{16,}|` + mangled(awsChar) + `)`, `0-9A-Z`},
 	{skKey, `A-Za-z0-9`, skPrefix + `(?:` + skChar + `{16,}|` + mangled(skChar) + `)`, `A-Za-z0-9`},
 }
+
+// keyShape is one key as keyShapes lists it.
+type keyShape struct{ pat, cont, loose, lead string }
 
 // looseKey is rule 11 for one key: the loose key, after the start of the text or a character outside
 // its lead. The character before is CONTEXT and the key is the group, so the glue stays where it was.
@@ -1204,19 +1239,19 @@ func looseKey(loose, lead string) string {
 	return `(?:^|[^` + lead + `])(` + loose + `)`
 }
 
-// glued is a run of unit that contains a key with something beside it: one or more units before the
-// key, or directly after it a raw character from after(cont), which must be a character of the run
-// that the key could not have continued with.
+// glued is a run of unit that contains one of shapes' keys with something beside it: one or more units
+// before the key, or directly after it a raw character from after(cont), which must be a character of
+// the run that the key could not have continued with.
 //
 // That exclusion is what makes "beside" mean beside the WHOLE key. On the Template field a key takes
 // its mangled form, which carries no closing \b, so AKIAIOSFODNN<NUM> alone is a key to the pattern,
 // and without it AKIAIOSFODNN<NUM>EXAMPLE -- a key that is a whole half -- would read as one glued to
 // "EXAMPLE". A unit before the key needs no such care: the key starts at its \b, where its detector
 // would start too.
-func glued(unit string, after func(cont string) string) string {
-	right := make([]string, len(keyShapes))
-	keys := make([]string, len(keyShapes))
-	for i, k := range keyShapes {
+func glued(shapes []keyShape, unit string, after func(cont string) string) string {
+	right := make([]string, len(shapes))
+	keys := make([]string, len(shapes))
+	for i, k := range shapes {
 		right[i] = k.pat + after(k.cont)
 		keys[i] = k.pat
 	}
@@ -1230,8 +1265,8 @@ func glued(unit string, after func(cont string) string) string {
 var gluedUserinfo = func() string {
 	user := `(?:[^:/\s<>]|` + pipelinePH + `)`
 	pass := `(?:[^/\s<>]|` + pipelinePH + `)`
-	inUser := glued(user, func(cont string) string { return `[^:/\s<>` + cont + `]` })
-	inPass := glued(pass, func(cont string) string { return `[^/\s<>` + cont + `]` })
+	inUser := glued(keyShapes, user, func(cont string) string { return `[^:/\s<>` + cont + `]` })
+	inPass := glued(keyShapes, pass, func(cont string) string { return `[^/\s<>` + cont + `]` })
 	return `://(` + inUser + `(?::` + pass + `*)?|` + user + `*:` + inPass + `)@` + authorityTail
 }()
 
@@ -1241,11 +1276,28 @@ var gluedUserinfo = func() string {
 var gluedHost = func() string {
 	const hostChars = `A-Za-z0-9_.-`
 	unit := `(?:[` + hostChars + `]|` + pipelinePH + `)`
-	return `(?:://|@|,)(` + glued(unit, func(cont string) string { return hostCharsBut(hostChars, cont) }) + `)`
+	return `(?:://|@|,)(` + glued(keyShapes, unit, func(cont string) string { return hostCharsBut(hostChars, cont) }) + `)`
+}()
+
+// bearerChars is the alphabet of a bearer value as 3a reads it, RFC 6750's b64token, and bearerChar its
+// class. One definition, read by 3a and 3c, so the value 3c takes whole is the value 3a would have.
+const (
+	bearerChars = `A-Za-z0-9._~+/=-`
+	bearerChar  = `[` + bearerChars + `]`
+)
+
+// gluedBearer is 3c: a bearer value with a JWT or an AWS key glued inside it, after the word "bearer"
+// and whitespace, as 3a finds one. Only the word is case-folded, so a key's case means what it does to
+// 1 and 2. It reads keyShapes' first two keys only, 1's and 2's, the key detectors that run before 3a;
+// 3b runs after it, so a bearer value with an sk- key inside it has always been 3a's whole.
+var gluedBearer = func() string {
+	unit := `(?:` + bearerChar + `|` + pipelinePH + `)`
+	return `\b(?i:bearer)\s+(` + glued(keyShapes[:2], unit, func(cont string) string { return hostCharsBut(bearerChars, cont) }) + `)`
 }()
 
 // hostCharsBut is the class of printable ASCII characters in class and not in cont, each written as
-// an escape so that '-', '.' and ']' mean themselves.
+// an escape so that '-', '.' and ']' mean themselves. 9e reads it over the host class, 3c over the
+// bearer class.
 func hostCharsBut(class, cont string) string {
 	in, out := regexp.MustCompile(`^[`+class+`]$`), regexp.MustCompile(`^[`+cont+`]$`)
 	var b strings.Builder

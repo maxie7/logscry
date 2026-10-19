@@ -722,6 +722,26 @@ uppercase run that starts like an AWS key and is longer than one is masked whole
 template always masked it. Measured over the same 70,783 records: nothing changed. None carries an
 AWS or JWT prefix, and the 396 that contain `sk-` inside a word are untouched.
 
+**Text glued to a key behind `Bearer` was sent before `v0.12.12`.** The bearer rule masks the
+whole value after `Bearer` as one token, but it ran after the JWT and AWS-key rules, and a
+placeholder stops it. So a key that was only part of a bearer value was masked alone and the text
+glued to it was sent: `hdr Bearer AKIA…EXAMPLE.prod expired` reached the model as
+`hdr Bearer <TOKEN_1>.prod expired`. A `~` or `-` glued the same way on both paths, and a `_` or a
+lowercase letter did on the pre-masked template. A JWT sent what followed a `.` or `~` after its
+signature, and a key with text on both sides sent the text after it. The fail-closed check read
+the remainder as clean. An `sk-` key was never affected, because the bearer rule runs before it.
+v0.4.0 → v0.12.11, thirty-seven tagged releases. The fix is one more rule, run before the key
+rules, that matches only a bearer value with a JWT or an AWS key glued inside it and masks the
+whole value as one token: `hdr Bearer <TOKEN_1> expired`, on both paths and in any case of
+`Bearer`. Moving the bearer rule ahead of the key rules would have closed the same cells, but it
+would also have renumbered the placeholders on every line that carries a bearer token and a key
+elsewhere. The new rule is absent everywhere else, so a key that is the whole bearer value, an
+`sk-` key, a bearer value with no key and every other line mask exactly as before. The same key
+alone elsewhere on the line keeps its own placeholder. What it costs, pinned: a sentence dot right
+after a bearer key joins the value (`auth Bearer AKIA…EXAMPLE. retry` →
+`auth Bearer <TOKEN_1> retry`), as the bearer rule already reads a dot in any other bearer token.
+Measured over the same 70,783 records: nothing changed. None contains `bearer`.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -737,7 +757,8 @@ could not close then, #67, closed in `v0.12.6`, and a single-host leak, #66, clo
 Of the audit's own four, the half of #48 that ordering could not reach, #54, closed in
 `v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`; of #55's three, the
 partly-recognised half, #57, in `v0.12.10`; and the glued key the work on it found unseen on
-the raw line, #108, in `v0.12.11`.
+the raw line, #108, in `v0.12.11`; and the bearer remainder the work on *that* found, #110,
+in `v0.12.12`.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -1023,14 +1044,6 @@ entry with an empty message.
   Nothing is disclosed and the payload round-trips exactly, but the model sees a broken
   payload, and wherever its answer names `<USER_1>` the restored text carries the stray `"`
   or `)`. Raw lines, JSON and logfmt templates are all affected. Filed as #90.
-- **`--llm-anonymize` sends the text glued after an AWS key or a JWT behind `Bearer`.** This
-  is a remainder beside a masked key, not the key: the key itself is masked.
-  `hdr Bearer AKIA…EXAMPLE.prod expired` reaches the model as `hdr Bearer <TOKEN_1>.prod expired`,
-  sending `.prod`. A `~` or `-` after an AWS key glues the same way, and so does a `_` on the
-  pre-masked template. A JWT behind `Bearer` sends what follows a `.` or `~` after its
-  signature. The fail-closed check reads the remainder as clean. Not affected: an `sk-` key
-  behind `Bearer`, a bearer value with no key in it, and a key glued to text inside a URL, an
-  email or a host. In prose the glued text is sent beside the key by design. Filed as #110.
 - **A quoted value containing an escaped quote templates badly on the plain-text path.** The
   `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
   as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left

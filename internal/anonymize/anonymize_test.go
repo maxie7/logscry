@@ -5,6 +5,7 @@ package anonymize
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -519,6 +520,14 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"creds=prod_<TOKEN_1>",
 		"<TOKEN_1>_<TOKEN_2>",
 		"southeast<TOKEN_1>",
+		// #110's OLD outputs fed back: our own <TOKEN_1> behind "Bearer" with the remainder main sent, and
+		// the prefix 3a took as a token of its own. The bearer rule reads a RAW key inside the value, so a
+		// value that starts on our tag, or carries one, gives it nothing to match. And the new output.
+		"hdr Bearer <TOKEN_1>.prod expired",
+		"hdr Bearer <TOKEN_1>_prod expired",
+		"hdr Bearer <TOKEN_1>~prod expired",
+		"hdr Bearer <TOKEN_2><TOKEN_1>.x expired",
+		"hdr Bearer <TOKEN_1> expired",
 	}
 	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
@@ -1992,13 +2001,36 @@ func TestIssue57PartlyRecognisedValue(t *testing.T) {
 	}
 }
 
-// TestGluedKeyRulesReadTheKeyDetectors holds 4d and 9e to the key detectors' own patterns, and to
-// their place in the chain. "A key" is one definition: each of 1, 2 and 3b -- the three TOKEN rules
-// with group 0 -- has its source inside exactly two other rules, a TOKEN rule and a HOST rule, and
-// both run before every key detector, because a key the key detectors tagged first is a key no
-// rule can see inside a larger value any more (#57). Two copies of a pattern are how #52 was missed.
+// TestGluedKeyRulesReadTheKeyDetectors holds the glued-key rules to the key detectors' own patterns,
+// and to their place in the chain. "A key" is one definition: the source of each of 1, 2 and 3b -- the
+// three TOKEN rules with group 0 -- sits inside exactly the rules named for it below, and every one of
+// them runs before every key detector, because a key the key detectors tagged first is a key no rule can
+// see inside a larger value any more (#57). Two copies of a pattern are how #52 was missed.
+//
+// The readers are NAMED rather than counted, so a new one fails naming itself. 4d (a userinfo) and 9e (a
+// host) read all three keys. 3c (a bearer value, #110) reads JWT's and AWS's only: 3b runs after 3a, so
+// a bearer value with an sk- key inside it has always been 3a's whole.
 func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
+	want := map[string][]string{
+		jwtKey: {"3c", "4d", "9e"},
+		awsKey: {"3c", "4d", "9e"},
+		skKey:  {"4d", "9e"},
+	}
+	keyName := map[string]string{jwtKey: "JWT", awsKey: "AWS", skKey: "sk-"}
 	for _, dets := range [][]detector{baseDetectors, buildDetectors([]string{"example"})} {
+		name := func(i int) string {
+			d := dets[i]
+			src := d.re.String()
+			switch {
+			case d.tag == tagToken && src == gluedUserinfo:
+				return "4d"
+			case d.tag == tagHost && src == gluedHost:
+				return "9e"
+			case d.tag == tagToken && strings.HasPrefix(src, `\b(?i:bearer)\s+(`):
+				return "3c"
+			}
+			return fmt.Sprintf("detector %d (%s)", i, d.tag)
+		}
 		var keys []int
 		for i, d := range dets {
 			if d.tag == tagToken && d.group == 0 {
@@ -2010,25 +2042,24 @@ func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
 		}
 		for _, k := range keys {
 			src := dets[k].re.String()
-			var readers []int
-			for i, d := range dets {
-				if i != k && strings.Contains(d.re.String(), src) {
-					readers = append(readers, i)
-				}
-			}
-			if len(readers) != 2 {
-				t.Errorf("key detector %d is read by %d rules, want 2 (4d and 9e):\n pattern: %s", k, len(readers), src)
+			key, ok := keyName[src]
+			if !ok {
+				t.Errorf("key detector %d is none of jwtKey, awsKey and skKey:\n pattern: %s", k, src)
 				continue
 			}
-			tags := map[string]bool{}
-			for _, r := range readers {
-				tags[dets[r].tag] = true
-				if r > keys[0] {
-					t.Errorf("rule %d (%s) reads key detector %d but runs after detector %d: the key would already be a tag", r, dets[r].tag, k, keys[0])
+			var readers []string
+			for i, d := range dets {
+				if i == k || !strings.Contains(d.re.String(), src) {
+					continue
+				}
+				readers = append(readers, name(i))
+				if i > keys[0] {
+					t.Errorf("%s reads the %s key but runs after detector %d: the key would already be a tag", name(i), key, keys[0])
 				}
 			}
-			if !tags[tagToken] || !tags[tagHost] {
-				t.Errorf("key detector %d is read by %v, want one TOKEN rule and one HOST rule", k, tags)
+			sort.Strings(readers)
+			if strings.Join(readers, ",") != strings.Join(want[src], ",") {
+				t.Errorf("the %s key is read by %v, want %v", key, readers, want[src])
 			}
 		}
 	}
@@ -2127,8 +2158,9 @@ func TestIssue108KeyGluedToAWordCharacter(t *testing.T) {
 	// And the shapes main masks WHOLE because the key detectors do not see a glued key there: a bearer
 	// token, an email local part, a bare private-suffix host, a userinfo, a host label, a list member.
 	// Any rule that tagged the key before the rule owning the value would block that rule and send the
-	// rest; this one runs after all of them. The bearer rows' remainders, ".prod" on both paths and
-	// "_prod" on the template, are main's and are a remainder beside a masked key, not a key: #110.
+	// rest; this one runs after all of them. Two bearer rows sat here at main's output, ".prod" sent on
+	// both paths and "_prod" on the template, a remainder beside a masked key rather than a key, until #110
+	// closed them; they are TestIssue110KeyGluedInsideABearerValue's now.
 	same := []struct{ name, in, want, tmpl string }{
 		{"key alone", "key " + aws + " used", "key <TOKEN_1> used", "key <TOKEN_1> used"},
 		{"aws key is the whole username", "s3://" + aws + ":secret@bucket",
@@ -2144,10 +2176,6 @@ func TestIssue108KeyGluedToAWordCharacter(t *testing.T) {
 			"auth xeyJhbGciOiJIUzI<NUM>NiJ<NUM>.eyJzdWIiOiIxIn<NUM>.dBjftJeZ<NUM>CVPmB<NUM>K<NUM>u rejected"},
 		{"sk-proj (#51)", "key sk-proj-abcdefghij0123456789 used",
 			"key sk-proj-abcdefghij0123456789 used", "key sk-proj-abcdefghij<NUM> used"},
-		{"bearer, '_' after the key", "hdr Bearer " + aws + "_prod expired",
-			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1>_prod expired"},
-		{"bearer, '.' after the key", "hdr Bearer " + aws + ".prod expired",
-			"hdr Bearer <TOKEN_1>.prod expired", "hdr Bearer <TOKEN_1>.prod expired"},
 		{"bearer, '_' before the key", "hdr Bearer x_" + aws + " expired",
 			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
 		{"email, '_' before the key", "mail x_" + aws + "@example.com", "mail <EMAIL_1>", "mail <EMAIL_1>"},
@@ -2211,6 +2239,162 @@ func TestIssue108KeyGluedToAWordCharacter(t *testing.T) {
 	} {
 		if tag := New().residue(in); tag != "" {
 			t.Errorf("residue() sees the leftover %q as %q; the claim in the comment above is wrong", in, tag)
+		}
+	}
+}
+
+// TestIssue110KeyGluedInsideABearerValue is the named regression for #110, a remainder beside a masked
+// key -- #57's class, not the key itself. 3a masks the whole value after "bearer" as one TOKEN, but it
+// runs AFTER 1 (JWT) and 2 (AWS), so a key that was only PART of a bearer value was tagged on its own,
+// and 3a's group, which excludes '<', could not claim what was left: "hdr Bearer AKIA...EXAMPLE.prod
+// expired" sent ".prod" on both paths, and on the template, where the mangled key has no closing \b, a
+// '_' or a lowercase letter after it was sent too. sk- was never affected: 3b runs after 3a. residue()
+// read every leftover as clean. v0.4.0 onward.
+//
+// Running 3a before 1 and 2 closes the same cells and was rejected, measured: it mints every bearer
+// value first, so a line with a bearer token and a key elsewhere swaps its placeholder numbers (the
+// mixed rows below). The fix is #57's remedy, a MORE SPECIFIC rule run before the key detectors: 3c
+// matches only a bearer value with a key glued inside it, and masks the value whole.
+func TestIssue110KeyGluedInsideABearerValue(t *testing.T) {
+	const (
+		aws = "AKIAIOSFODNN7EXAMPLE"
+		sk  = "sk-abcdefghij0123456789XYZ"
+		jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u"
+	)
+	closed := []struct {
+		name, in, want, tmpl string
+		sent                 []string // what main sent on one path or both; none may survive
+	}{
+		// Text glued after an AWS key, sent on both paths. The two rows #108 pinned at main's output are
+		// the first two here.
+		{"aws key, '.' after", "hdr Bearer " + aws + ".prod expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", []string{".prod"}},
+		{"aws key, '_' after (template only)", "hdr Bearer " + aws + "_prod expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", []string{"_prod"}},
+		{"aws key, '~' after", "hdr Bearer " + aws + "~prod expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", []string{"~prod"}},
+		{"aws key, '-' after", "hdr Bearer " + aws + "-prod expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", []string{"-prod"}},
+		{"asia key, '.' after", "hdr Bearer ASIAIOSFODNN7EXAMPLE.prod expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", []string{".prod"}},
+		// A lowercase letter cannot continue an AWS key, so on the template, where the mangled key has no
+		// closing \b, it was glue and was sent. On the raw line 2 saw no key and 3a took the value whole.
+		{"aws key, letter after (template only)", "hdr Bearer " + aws + "xyz expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", []string{"xyz"}},
+		// A JWT: '-' and '_' are base64url and run on into its third segment; '.' and '~' are glue.
+		{"jwt, '.' after", "hdr Bearer " + jwt + ".prod expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", []string{".prod"}},
+		{"jwt, '~' after", "hdr Bearer " + jwt + "~prod expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", []string{"~prod"}},
+		// The word, as 3a reads it: after a header name, and in any case.
+		{"authorization header", "hdr Authorization: Bearer " + aws + ".prod expired",
+			"hdr Authorization: Bearer <TOKEN_1> expired", "hdr Authorization: Bearer <TOKEN_1> expired", []string{".prod"}},
+		{"lowercase bearer", "hdr bearer " + aws + ".prod expired",
+			"hdr bearer <TOKEN_1> expired", "hdr bearer <TOKEN_1> expired", []string{".prod"}},
+		{"uppercase bearer", "hdr BEARER " + aws + ".prod expired",
+			"hdr BEARER <TOKEN_1> expired", "hdr BEARER <TOKEN_1> expired", []string{".prod"}},
+		// Text glued BEFORE the key. On its own main sent nothing here -- 3a took "prod." as a token of its
+		// own beside the key's, <TOKEN_2><TOKEN_1> -- so this row is layout; with text after the key as
+		// well, that text was sent.
+		{"text before the key", "hdr Bearer prod." + aws + " expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", nil},
+		{"text on both sides", "hdr Bearer prod." + aws + ".x expired",
+			"hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired", []string{".x"}},
+		// 3a reads "bearer" in prose as well, and so does 3c.
+		{"jwt after bearer in prose", "the bearer " + jwt + ".prod was rejected",
+			"the bearer <TOKEN_1> was rejected", "the bearer <TOKEN_1> was rejected", []string{".prod"}},
+	}
+	for _, c := range closed {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				m := New()
+				got := mustMask(t, m, p.in)
+				if got != p.want {
+					t.Errorf("a bearer value with a key glued inside it not masked whole:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+				for _, frag := range c.sent {
+					if strings.Contains(got, frag) {
+						t.Errorf("a fragment main sent survived: %q still in %q", frag, got)
+					}
+				}
+				if r := m.Restore(got); r != p.in {
+					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", p.in, r)
+				}
+			}
+		})
+	}
+
+	// Byte-identical with main, raw and templatized. A key that IS the whole bearer value is still 1's or
+	// 2's; an sk- key, glued or not, is still 3a's whole; a bearer value with no key, or one where 2 sees no
+	// key ('_' before it), is 3a's. "Bearer" without whitespace after it is no bearer value to 3a or 3c --
+	// in a query string, as a username -- and #52's "Bearer https://..." is pinned in its own test.
+	//
+	// The mixed rows are what decided the mechanism: a bearer value beside a key elsewhere on the line.
+	// Running 3a before 1 and 2 would mint the bearer value first and swap the numbers in each. The last
+	// one also holds the case-fold to the word: a lowercase "akia..." is no key to 2, so it is 3a's.
+	same := []struct{ name, in, want, tmpl string }{
+		{"aws key is the whole value", "hdr Bearer " + aws + " expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"jwt is the whole value", "hdr Bearer " + jwt + " expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"sk- key is the whole value", "hdr Bearer " + sk + " expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"sk- key, '.' after", "hdr Bearer " + sk + ".prod expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"no key", "hdr Bearer abc123DEF456ghi789JKL expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"'_' before the key", "hdr Bearer x_" + aws + " expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"in a query string", "GET /x?h=Bearer+" + aws + ".prod", "GET /x?h=Bearer+<TOKEN_1>.prod", "GET /x?h=Bearer+<TOKEN_1>.prod"},
+		{"as a username", "s3://bearer:" + aws + ".prod@bucket", "s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>"},
+		{"jwt after bearer in prose", "the bearer " + jwt + " was rejected", "the bearer <TOKEN_1> was rejected", "the bearer <TOKEN_1> was rejected"},
+		{"mixed: a bearer token, a key elsewhere", "hdr Bearer abc123DEF456ghi789JKL key " + aws + " used",
+			"hdr Bearer <TOKEN_2> key <TOKEN_1> used", "hdr Bearer <TOKEN_2> key <TOKEN_1> used"},
+		{"mixed: a glued sk- bearer value, a key elsewhere", "key " + aws + " used, hdr Bearer " + sk + ".prod",
+			"key <TOKEN_1> used, hdr Bearer <TOKEN_2>", "key <TOKEN_1> used, hdr Bearer <TOKEN_2>"},
+		{"mixed: a lowercase akia bearer value, a key elsewhere", "key " + aws + " used, hdr bearer akiaiosfodnn7example.prod",
+			"key <TOKEN_1> used, hdr bearer <TOKEN_2>", "key <TOKEN_1> used, hdr bearer <TOKEN_2>"},
+	}
+	for _, c := range same {
+		t.Run(c.name, func(t *testing.T) {
+			tIn, _ := pipeline.Templatize(c.in)
+			for _, p := range []struct{ in, want string }{{c.in, c.want}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a shape outside #110 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// The bearer value is ONE value: Restore gives it back whole, and the key on its own elsewhere is a
+	// different value with its own token, as for #57's userinfo.
+	t.Run("the bearer value is one value", func(t *testing.T) {
+		m := New()
+		if got, want := mustMask(t, m, "hdr Bearer "+aws+".prod expired"), "hdr Bearer <TOKEN_1> expired"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		if got, want := mustMask(t, m, "key "+aws+" used"), "key <TOKEN_2> used"; got != want {
+			t.Errorf("the key alone: got %q, want %q", got, want)
+		}
+		if got := m.Restore("<TOKEN_1>"); got != aws+".prod" {
+			t.Errorf("Restore(<TOKEN_1>) = %q, want the whole bearer value", got)
+		}
+	})
+
+	// residue(): a raw key left in a bearer value mutes, raw and in its template form, and the old
+	// leftovers read as clean, so the fix lives in the chain.
+	for _, in := range []string{
+		"hdr Bearer " + aws + ".prod expired",
+		"hdr Bearer AKIAIOSFODNN<NUM>EXAMPLE_prod expired",
+		"hdr Bearer " + jwt + "~prod expired",
+	} {
+		if tag := New().residue(in); tag != tagToken {
+			t.Errorf("a raw key in a bearer value does not mute: residue(%q) = %q, want %q", in, tag, tagToken)
+		}
+	}
+	for _, in := range []string{
+		"hdr Bearer <TOKEN_1>.prod expired",
+		"hdr Bearer <TOKEN_1>_prod expired",
+		"hdr Bearer <TOKEN_1>~prod expired",
+		"hdr Bearer <TOKEN_2><TOKEN_1>.x expired",
+	} {
+		if tag := New().residue(in); tag != "" {
+			t.Errorf("residue() sees the old leftover %q as %q; the claim in the comment above is wrong", in, tag)
 		}
 	}
 }
@@ -2934,6 +3118,11 @@ var completenessRows = []completenessRow{
 	{"aws-key/run", "key ", "AKIAIOSFODNN7EXAMPLEPROD", " used"},
 	{"sk-key/glued", "key my_", "sk-abcdefghij0123456789XYZ", "_prod used"},
 	{"jwt/glued", "auth token_", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u", " rejected"},
+	// #110. A key glued inside a bearer value: 1 or 2 tagged the key alone, and 3a could not claim the rest.
+	// The whole value is the secret, flush against the word on one side and a space on the other. After the
+	// canonical rows, for the same reason as the #48 rows.
+	{"bearer/glued-key", "hdr Bearer ", "AKIAIOSFODNN7EXAMPLE.prod", " expired"},
+	{"bearer/glued-jwt", "hdr Bearer ", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u~prod", " expired"},
 	// #52. A scheme with a digit in it: masked on the raw line, and the row exists for
 	// TestEveryDetectorsContextSurvivesTemplating, for which the '3' is a context digit -- the shape
 	// whose templatized form silenced 9a.
@@ -3196,6 +3385,10 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// prefix is glue, so a word ending in one does not stop the run behind it from being a key.
 		{"an uppercase run that starts like an aws key is one", "region ASIAPACIFICDATACENTER01 up", "region <TOKEN_1> up"},
 		{"a lowercase word glued before an aws-prefixed run", "southeastASIAPACIFICDATACENTER01", "southeast<TOKEN_1>"},
+		// #110's cost. A '.' is a bearer character (RFC 6750's b64token, and 3a has always read it so), and
+		// it cannot continue a key, so a sentence dot right after a key behind "Bearer" is glue: the value
+		// with its dot is one token, and the key alone elsewhere gets a placeholder of its own.
+		{"a sentence dot after a bearer key joins the value", "auth Bearer AKIAIOSFODNN7EXAMPLE. retry", "auth Bearer <TOKEN_1> retry"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -3364,6 +3557,10 @@ var templatizedRows = []templatizedRow{
 	{"sk-key/glued-underscore-before", "key my_\x00sk-abcdefghij0123456789XYZ\x00_prod used"},
 	{"jwt/glued-underscore-before", "auth token_\x00eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u\x00 rejected"},
 	{"aws-key/glued-underscore-after", "key \x00AKIAIOSFODNN7EXAMPLE\x00_prod used"},
+	// #110 through the composition. The key templatizes to AKIAIOSFODNN<NUM>EXAMPLE, which 2 reads with no
+	// closing \b, so a '_' after it was glue on this path and was sent; a '.' was sent on both.
+	{"bearer/glued-key", "hdr Bearer \x00AKIAIOSFODNN7EXAMPLE_prod\x00 expired"},
+	{"bearer/glued-jwt", "hdr Bearer \x00eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27u.prod\x00 expired"},
 	{"home-dir/middle-digit", "loaded from /home/\x00deploy2prod\x00/go/pkg/mod"},
 	{"home-dir/middle-digit-users", "path /Users/\x00jane7doe\x00/app.log missing"},
 	// The four widened at 2da31be, now held to completeness rather than to "a token appeared".
