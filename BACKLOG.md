@@ -3316,7 +3316,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Found on the way.** Stripe (`sk_live_`, `rk_live_`, `sk_test_`), GitHub (`ghp_`, `github_pat_`),
       Slack (`xoxb-`, `xoxp-`) and Google (`AIza…`) secrets match no detector and are sent whole, raw and
       on the template, on main and on the branch. Not #51's class: 3b reads `sk-` with a hyphen. Filed as
-      #114 and named in README's Known limitations (Done with #114, in TODO-VERSION.).
+      #114 and named in README's Known limitations (Done with #114, in v0.12.15.).
 
       Seen, out of scope:
       - **A bare `KEY=value`.** `OPENAI_API_KEY=<a value that is not an sk- key>` is sent; no rule reads
@@ -3497,7 +3497,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       sent). A bare `KEY=value`, #59, #49, #42, #65's sweep, #91, #92 and `internal/pipeline` were not
       touched.
 
-      Targets TODO-VERSION
+      Targets v0.12.15
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
