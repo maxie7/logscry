@@ -785,7 +785,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       line at the entry's priority. Every captured boot holds exactly one (kernel, priority
       3). Confirmed by a throwaway test that feeds the same entry through both paths (live 2
       lines, replay 1); it is in README "Known limitations" (Done with #87, in
-      TODO-VERSION.). It does not touch this measurement: both legs of every A/B are replays,
+      v0.12.16.). It does not touch this measurement: both legs of every A/B are replays,
       and the ab37 capture holds none.
       RDI §6 updated. Targets v0.11.0
 
@@ -3550,7 +3550,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       README: the Known-limitations entry goes, and so does the sentence in the replay section
       that pointed to it.
 
-      Targets TODO-VERSION
+      Targets v0.12.16
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
