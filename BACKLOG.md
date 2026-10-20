@@ -1624,7 +1624,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         reaches EOF before the `die`, `stop` later finds no entry. The context stays
         registered on `Lines`' until exit. A throwaway test measured about 116 bytes retained
         per such run, freed when the parent was cancelled. It is there since v0.1.0, and the
-        moved code keeps it. Filed as #98.
+        moved code keeps it. Filed as #98 (Done with #98, in v0.12.17.).
       - **An events-stream error hangs `Lines` instead of returning.** It waits for its
         followers without cancelling them. A throwaway test against the fake daemon ended
         the events stream with a follower attached:
@@ -1780,7 +1780,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         `cli.Close` closes only idle connections. A throwaway test against a fake daemon
         whose list answers 500 confirmed it in 3 of 3 runs: still open 2 s after Lines
         returned, closed on cancel. It has no functional effect, and needs an events request
-        that succeeds beside a list that fails. Filed under #98, which now covers both.
+        that succeeds beside a list that fails. Filed under #98, which now covers both
+        (Done with #98, in v0.12.17.).
       - **The TUI status bar shows only the newest error**, so a later one hides the Docker
         error. That is by design.
 
@@ -3551,6 +3552,50 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       that pointed to it.
 
       Targets v0.12.16
+
+- [x] **A Docker follower's context, and a failed list's events subscription, are released** —
+      #98, found while fixing #85 and extended while fixing #97. Two retentions, neither with a
+      functional effect:
+      - Each follower runs under `context.WithCancel` on `Lines`' context, and its cancel func was
+        held only in the follower's entry. One whose log stream ends before its `die` (the
+        container stops, the daemon ends the stream, the `die` arrives a moment later) deletes its
+        own entry, so the later `stop` found nothing and the cancel func was never called. The
+        child stayed registered until the source ended: about 116 bytes per such run, growing with
+        restarts. There since v0.1.0.
+      - `Lines` subscribed to events and listed containers on the caller's ctx. When the list
+        failed, it returned `docker: list: …`, but the events goroutine and its HTTP connection
+        stayed open until the run's ctx ended, since `cli.Close` closes only idle connections.
+
+      **Fix.** The follower goroutine cancels its own context once `follow` returns, however the
+      follower ended. A `stop` that lands before the entry is removed cancels again, a no-op. The
+      mark hand-off, the restart path and `stop` are unchanged, and a successor's context is its
+      own child of the set's, so it is untouched. `Events` and `ContainerList` now run under
+      `lctx`, which `Lines` cancels on every return, so a list error closes the events request
+      with it. The shutdown and events-error paths keep their behaviour: `lctx` is cancelled only
+      by the caller's ctx, by the events-error branch after it has received the error, or by the
+      return itself, so no cancellation of `lctx` can come first and read as `docker: events`.
+      `internal/ingest/docker.go` only.
+
+      **Tests.**
+      - `TestFollowerSetReleasesEveryFollowersContext`, through the fake follow function: after
+        the follower exits, the context it was handed is cancelled, while the set's own is still
+        live. It covers a follower that ends on its own and a successor that ends on its own (both
+        red on main by assertion), and a stopped follower as the control.
+      - `TestDockerListErrorClosesTheEventsSubscription`, against the fake daemon with its list
+        answering 500: `Lines` returns the list error, and the events request closes on the server
+        side without the caller's ctx being cancelled. Red on main by assertion (still open 2 s
+        after `Lines` returned). The fake daemon gains a failing list and a signal for an events
+        stream the client hung up on.
+      - Reverting either half alone turns only its own test red. `ContainerList` under `lctx` is
+        not pinned by a test of its own; it returns before `Lines` goes on either way.
+      - The full suite under `-race`: 2,005 passing and 1 skipped on main, 2,010 and 1 on the
+        branch, 0 failing on either; no existing test changed outcome. The new tests, and every
+        Docker and follower-set test, pass under `-race -count=20`.
+
+      No Docker captures exist, so there is nothing to replay. README: no change; it does not
+      document either retention.
+
+      Targets v0.12.17
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and

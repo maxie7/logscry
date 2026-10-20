@@ -76,8 +76,10 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 	}
 	defer cli.Close()
 
-	// The followers' parent. Lines cancels it on an events error, so that waiting for them
-	// ends; the caller's ctx would stop them only at shutdown.
+	// The followers' parent, and the events subscription's and the list's. Lines cancels it
+	// on an events error, so that waiting for the followers ends, and on every return, so
+	// that a list error does not leave the events request open until the caller's ctx
+	// ends (#98): cli.Close closes only idle connections.
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -95,12 +97,12 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 	ef.Add("type", string(events.ContainerEventType))
 	ef.Add("event", string(events.ActionStart))
 	ef.Add("event", string(events.ActionDie))
-	msgs, errs := cli.Events(ctx, events.ListOptions{Filters: ef})
+	msgs, errs := cli.Events(lctx, events.ListOptions{Filters: ef})
 
 	// Attach to already-running matching containers.
 	lf := filters.NewArgs()
 	lf.Add("status", "running")
-	list, err := cli.ContainerList(ctx, container.ListOptions{Filters: lf})
+	list, err := cli.ContainerList(lctx, container.ListOptions{Filters: lf})
 	if err != nil {
 		return fmt.Errorf("docker: list: %w", err)
 	}
@@ -198,6 +200,10 @@ func (s *followerSet) launchLocked(id, name string) {
 		// a later start of the same id can re-attach. IDs are unique, so there is no reuse
 		// race.
 		m := s.follow(fctx, id, name, prev)
+		// Released here, however the follower ended. One whose stream ended before its die
+		// is never stopped, and its context would stay registered on s.ctx until the source
+		// ends (#98). A stop that lands before the entry is removed cancels again, a no-op.
+		cancel()
 		// The mark is stored in the same critical section that removes the follower, so
 		// start sees either a running follower or its final mark — and a successor
 		// launched here reads that mark. Its wg.Add comes before this goroutine's Done,

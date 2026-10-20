@@ -223,3 +223,54 @@ func TestFollowerSetUsesTheStartName(t *testing.T) {
 	next.release <- markAt(6)
 	waitReturns(t, s)
 }
+
+// TestFollowerSetReleasesEveryFollowersContext is #98: a follower's context is released
+// however the follower ends. One whose stream ends before its die is never stopped, so
+// only the follower itself can release it; otherwise it stays registered on the set's
+// context until the source ends. The set's own context is still live at the end, so it
+// is not shutdown that cancels these.
+func TestFollowerSetReleasesEveryFollowersContext(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		run  func(t *testing.T, s *followerSet, ff *fakeFollows) *followCall
+	}{
+		{"ends on its own", func(t *testing.T, s *followerSet, ff *fakeFollows) *followCall {
+			s.start("c1", "app")
+			c := ff.next(t)
+			c.release <- markAt(5)
+			return c
+		}},
+		{"stopped", func(t *testing.T, s *followerSet, ff *fakeFollows) *followCall {
+			s.start("c1", "app")
+			c := ff.next(t)
+			s.stop("c1")
+			c.release <- markAt(5)
+			return c
+		}},
+		{"successor ends on its own", func(t *testing.T, s *followerSet, ff *fakeFollows) *followCall {
+			s.start("c1", "app")
+			old := ff.next(t)
+			s.stop("c1")
+			s.start("c1", "app")
+			old.release <- markAt(5)
+			next := ff.next(t)
+			next.release <- markAt(6)
+			return next
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ff := newFakeFollows()
+			s := newFollowerSet(ctx, ff.follow)
+			c := tt.run(t, s, ff)
+			waitReturns(t, s)
+			if c.ctx.Err() == nil {
+				t.Error("the follower has exited and its context is still live")
+			}
+			if ctx.Err() != nil {
+				t.Fatal("the set's context was cancelled; the test needs it live")
+			}
+		})
+	}
+}
