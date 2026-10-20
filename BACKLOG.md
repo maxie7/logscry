@@ -1183,7 +1183,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         dump. So do dumps that begin at the goroutine header, as `debug.Stack()` written on
         its own does. Measured on real Go 1.26 output: a system panic splits 87 lines into
         13 events, or 22 with the tabs stripped, and a SIGQUIT dump 116 lines into 38 or
-        49. No capture contains one. It is in README "Known limitations". Targets v0.12.1
+        49. No capture contains one. It is in README "Known limitations". (Done with #94, in
+        TODO-VERSION.) Targets v0.12.1
 
 - [x] **A partial match is a leak, not a near miss** — #41, the disclosure defect in the one
       package whose job is preventing disclosure. `--llm-anonymize` sent part of every
@@ -3596,6 +3597,112 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       document either retention.
 
       Targets v0.12.17
+
+- [x] **Every dump the Go runtime writes is one event** — #94, found while fixing #89. Since
+      Go 1.23, `GOTRACEBACK=system` and `crash`, and every SIGQUIT dump, write each goroutine
+      header as `goroutine 1 gp=0x… m=0 mp=0x… [running]:`. The coalescer split such a dump at
+      every goroutine, and each piece became its own "novel" template. It also split a dump that
+      begins at the goroutine header, as `debug.Stack()` written on its own does.
+
+      **Why it split.** The issue named three causes. The runtime source showed two more for
+      SIGQUIT:
+      - the header cue was `^goroutine \d+ \[`, which the `gp=` form does not match;
+      - a dump starting at the header opened no block, so its first un-indented call line
+        (`runtime/debug.Stack()`) started a new event, since `goFrameRe` is gated on an active
+        block;
+      - with the indentation stripped, assembly frames (`asm_amd64.s:1771 +0x1 fp=…`) matched
+        nothing, since the frame cue was `.go`-only;
+      - the `PC=0x… m=0 sigcode=0` line written after `SIGQUIT: quit` matched nothing;
+      - neither did the register dump at the end (`rax    0xca` … `gs     0x0`, 21 lines on
+        amd64).
+
+      **The cues.** All of them are in `coalesce.go`.
+      - **Goroutine header**, both forms: `goroutine N`, then only `key=value` fields, then the
+        bracketed state, and the line ends at `]:`. It continues a dump and opens one
+        (`traceStartRe`).
+      - **Assembly frame**: the `.go` frame's whole-line shape with a `.s` file, and the ` +0x`
+        offset required. Assembly is never inlined, so a real asm frame always prints one, and a
+        bare `boot.s:12` is not a frame.
+      - **Signal PC line**: `PC=0x… m=N sigcode=N`, optionally ` addr=0x…`. It is ungated. The
+        signal's name line (`SIGQUIT: quit`) is a plain header that this line folds into, which
+        makes the block active. No regex reads `SIGQUIT` text, so prose that mentions it opens
+        nothing.
+      - **Register line**: `name<spaces>0xHEX` and nothing else. It is gated on an active block,
+        like `goFrameRe`, because the shape is too generic to stand alone.
+      - Openers: `panic:` and `fatal error:` already existed. The goroutine header is the only
+        new one.
+
+      **A behaviour change.** The header cue used to be open-ended. It now ends at `]:`, so a
+      bracketed line such as `goroutine 5 [worker] started` no longer folds into a dump before
+      it. In the ten boots and ab37 (70,783 lines), 0 lines match the old open-ended cue, so
+      nothing in them moves.
+
+      **Not changed.** Two dumps that each *start* at a goroutine header, such as two
+      `debug.Stack()` writes inside the group timeout, still fold into one. They cannot be told
+      apart from one dump with two goroutines, and the header continued a block on main too.
+      This is not pinned by a test.
+
+      **`GOTRACEBACK=crash` is one event, like `system`.** After the dump, the runtime re-raises
+      SIGABRT with the default handler, which prints nothing. The plan expected a second
+      `SIGABRT: abort` dump, and the real output showed there isn't one.
+
+      **Fixtures.** `internal/pipeline/testdata/godump/{system,crash,sigquit,stack}.txt` are the
+      stderr of a real Go 1.26.4 binary. It is the existing `goroutineDump` program: an
+      index-out-of-range panic beside one parked worker goroutine, the same worker plus a SIGQUIT
+      the program sends itself, and `debug.Stack()` written alone. The build path is replaced
+      with `/build/app`, GOROOT with `/usr/local/go`, and every address with a deterministic
+      fake of the same width. The `GOTRACEBACK=all` row is the existing inline `goroutineDump`.
+
+      | dump | lines | events on main, tabbed / stripped | on the branch |
+      |---|---|---|---|
+      | panic, `GOTRACEBACK=all` | 13 | 1 / 1 | 1 / 1 |
+      | panic, `GOTRACEBACK=system` | 97 | 15 / 25 | 1 / 1 |
+      | panic, `GOTRACEBACK=crash` | 97 | 15 / 25 | 1 / 1 |
+      | SIGQUIT | 120 | 38 / 48 | 1 / 1 |
+      | `debug.Stack()` written alone | 5 | 2 / 2 | 1 / 1 |
+
+      The fixture program has one more goroutine than the issue's dumps (87 → 13 / 22 and
+      116 → 38 / 49), hence the different counts.
+
+      **Tests.** Red first.
+      - `TestGoDumpsFoldIntoOneEvent`: each dump above, tabbed and stripped, is one event holding
+        every line. So does a system panic followed by a SIGQUIT dump, which is two events.
+      - `TestGoDumpCueShapes`: each cue line by line, on an idle header and in an active block.
+      - `TestNotPartOfAGoDump` covers lines that stay their own event:
+        - `goroutine 5 started`, after a dump and as a header followed by `retry(3) scheduled`;
+        - the bracketed `goroutine 5 [worker] started`;
+        - SIGQUIT in prose;
+        - a bare `/src/boot.s:12` and lines ending in `.s:12`;
+        - two `GOTRACEBACK=all` panics back to back, tabbed and stripped;
+        - an `ERROR:` line and #89's slog line, after each fixture, tabbed and stripped.
+
+        All of these pass on main except the bracketed row, which is the behaviour change.
+      - Mutants, each applied alone:
+        - header cue reverted: system, crash, SIGQUIT, back-to-back, the `gp=` shape rows and
+          the bracketed rows go red;
+        - header dropped from `traceStartRe`: `debug.Stack()` ×2;
+        - `.s` cue removed: the stripped system, crash, SIGQUIT and back-to-back rows, and the
+          `.s` shape rows;
+        - header cue loosened to `^goroutine \d+\b`: both `goroutine 5 started` rows and the
+          bracketed rows;
+        - PC cue removed: SIGQUIT ×2, back-to-back ×2 and the PC shape rows;
+        - register cue removed: SIGQUIT ×2, back-to-back ×2 and the register shape rows;
+        - `]:$` dropped: the bracketed rows.
+      - The full suite under `-race`: 2,010 passing and 1 skipped on main, 2,078 and 1 on the
+        branch. No existing test changed outcome. The new tests pass under `-race -count=20`.
+
+      **Captures, predicted first.** The prediction: +0 events, +0 templates, +0 escalations on
+      the ten journald boots and ab37, with exports byte-identical. No goroutine header of either
+      form appears in them. The new cues are whole-line runtime shapes, and the register cue
+      only applies inside a block. **It held.** Main and branch match on all 11 at the default
+      200 ms timeout on the source clock: 58,405 events from 70,783 lines and 60 escalations, and
+      distinct templates match capture by capture. All 11 exports are byte-identical. No capture
+      line matches any of the new cues.
+
+      README: the #94 Known-limitations entry goes, and the grouping paragraph names the `.s`
+      frame.
+
+      Targets TODO-VERSION
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
