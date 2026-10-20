@@ -498,7 +498,8 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       - #71: export times carry the local zone (`Z` against `+09:00` for one instant).
         Fixed, in Fixes below.
       - #70: the live export's drop count reaches the user only at exit, as queue
-        messages labelled records (a 2× overstatement), with exit status 0.
+        messages labelled records (a 2× overstatement), with exit status 0. (Done with #70,
+        in TODO-VERSION.)
       - #73: `--record` for sources without their own clock.
 
       **What this unblocks, stated and not built:**
@@ -1690,6 +1691,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
          one error per source plus the two notices, so no sender blocks. **The exit status
          stays 0**: a source's outcome, a watched app's crash included, is reported, not
          exit-coded. What the exit status should mean is the question #70 also raises.
+         (Done with #70, in TODO-VERSION.)
       3. **Shutdown is unchanged.** On Ctrl-C nothing is reported. `Run` returns only after
          every source has. A pending re-attach (#85) is not launched once the source is
          ending, by the same check that stops it at shutdown. The marks are untouched.
@@ -1774,7 +1776,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       Seen and left alone, out of scope:
       - **#98 is unchanged.** A follower's context is now a child of Lines' own. It is freed
         when the Docker source ends, but it still accumulates during the run.
-      - **#70 is unchanged**, and the exit status stays 0 there too.
+      - **#70 is unchanged**, and the exit status stays 0 there too. (Done with #70, in
+        TODO-VERSION.)
       - **A Docker list error leaves the events subscription open until exit.** Lines
         subscribes to events before listing. When the list fails, it returns, but the events
         goroutine and its connection stay until the run's ctx is cancelled, because
@@ -3703,6 +3706,158 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       frame.
 
       Targets v0.12.18
+
+- [x] **Lost export records are counted, announced, exit-coded and recorded** — #70, found
+      while working on #35. The live export writer loses a record rather than stall ingestion
+      when its 1024-slot queue is full. The only report was one stderr line at exit. It counted
+      queue messages (two per record) but said "record(s)", the run exited 0, and the file gave
+      no sign that it was incomplete. The issue measured 3,061 records lost, reported as
+      "6102 record(s) dropped". Making the live writer blocking stays out of scope (RDI §3), and
+      replay's blocking writer is unchanged.
+
+      **Found while reading, and fixed here: a record could mix the halves of two
+      escalations.** The writer joined a flag and its resolution by template hash only. When one
+      half was dropped, its partner still went in, waited unmatched, and was joined to the
+      *next* escalation of the same template. The file then held one record with one
+      escalation's `count_at_flag` and another's explanation, and nothing in it could tell. This
+      is a correctness fix, not just a counting one.
+      `TestDroppedFlagNeverPairsWithALaterEscalation` and
+      `TestDroppedResolutionNeverPairsWithALaterEscalation` show it on main, one test per
+      dropped half: the second escalation's record carries `count_at_flag 2` with the first
+      answer's `explanation.at`, and `count_at_flag 1` with the second's.
+
+      **Decisions.**
+      1. **Records, not messages, and the pairing.** `send` gives each pair a sequence number
+         under a mutex. It records which half arrived first and whether it was queued, in
+         `pairs`, one entry per template. The arrival rules:
+         - the first half of a pair takes a new number; if the queue is full, the record is
+           lost at that moment, once;
+         - the other half of a lost pair is dropped on arrival, **even with room in the
+           queue**, so no orphan half reaches the writer;
+         - the other half of a queued pair takes the same number; if *it* is the half that
+           can't be queued, the record is lost then, and its first half is already in the
+           writer;
+         - a half from the same side as the waiting one starts a new pair, as the newer flag
+           replaced the older on main.
+
+         The writer joins only halves with equal numbers. A waiting half with a different
+         number is stale and is discarded when the next half for that template arrives. So
+         the first half of a record whose resolution was lost is never written, and never
+         joins a later one. `Dropped()` keeps its name and counts records.
+
+         **`pairs` stays bounded.** A flag gets exactly one resolution on every path but one:
+         - dry-run resolves it at once (`WouldEscalate`);
+         - a full LLM queue resolves it at once as failed;
+         - a queued request gets exactly one terminal answer from the pool, explained or
+           unavailable, an anonymization failure included; partial answers are not
+           resolutions;
+         - a cache hit makes no flag.
+
+         The one exception is an answer still pending when the run ends. Its entry is left
+         behind until exit, at most one per template, and the next escalation of that template
+         replaces it. `TestALeftBehindHalfIsReplaced` pins this: 100 templates flagged three
+         times unanswered hold 100 entries, and one answered escalation each leaves none, with
+         every record the new one.
+      2. **Shown live, through the existing mechanisms.**
+         - `--plain`: the output loop checks `Dropped()` once per iteration. The first time it
+           moves, one stderr line: `logscry: export: records are being lost — the export file
+           is not keeping up; the total is reported at exit`. A loss follows a flag, which an
+           event to this loop always follows, or a resolution this loop makes itself.
+         - TUI: `Options.ExportLost` is read on every snapshot, and snapshots come on a ticker,
+           so an idle stream still sees it. The first move adds a background notice. A status
+           field ` · export lost N` in the protected counters segment shows the running count
+           and is hidden at 0.
+         - At exit: `export: N record(s) lost — the export file could not keep up`.
+      3. **Exit status 1 when records were lost, in `--plain` and the TUI.** The codes in use
+         were 0 (the run finished, source errors and Ctrl-C included, per #97) and 1 (`run`
+         returned an error: a bad flag or config, `-h`, an unopenable `--export`, no log
+         source, a TUI failure). A loss is now one of the reasons for 1, through the same path.
+         `closeExport` returns it, and a deferred assignment in `run` makes it the error when
+         `run` has none of its own. Otherwise it is printed beside that error, and the status
+         is 1 either way. The TUI exits 1 too, because the TUI is chosen automatically at a
+         terminal. Were the status renderer-specific, the same `logscry --export f -- ./app`
+         would leave the same incomplete file and exit 1 in CI but 0 at a terminal. A write
+         error with nothing lost is still printed and not exit-coded. README gains an
+         "Exit status" section.
+      4. **The file describes itself.** When N > 0 its last line is
+         `{"kind":"export_incomplete","records_lost":N,"at":"<RFC3339 UTC>"}`.
+         - `records_lost` names its unit because a unit confusion was the bug, like
+           `count_at_flag`.
+         - `at` places the marker among other runs' records in an appended file.
+         - It is a kind of its own, not a zero-filled anomaly that a count would include.
+         - It is written only when N > 0, so a complete file is byte-identical to main's.
+
+         The readers of export files in the repo are the export, pipeline, cmd and replay
+         tests and README's jq examples. The tests never see it, because they run without loss
+         or through the blocking writer. Both jq examples (`select(.kind == "anomaly")` and
+         `select(.explanation.state == "explained")`) skip it, and a plain line count includes
+         it, which README says.
+
+      **Close is bounded on the live writer, by progress and not by time.** The writer bumps a
+      counter after every message it handles and every write it attempts. Close gives up after
+      10 s in which the counter did not move. That is about 1000× a healthy fsync, and above
+      the few-second ext4 writeback stalls, so a slow but moving disk drains fully and a stuck
+      one costs 10 s at exit instead of a hang.
+      - On giving up, the records still queued are counted lost. The record being written is
+        not counted. The writer writes nothing more, so a record counted lost cannot appear
+        later.
+      - The trailer is skipped. stderr says the export is incomplete, how many records were
+        still queued, and that the trailing record could not be written. The exit status is 1.
+      - If the drain completes, the trailer has its own 2 s bound.
+      - Replay's blocking writer keeps its unbounded drain, which is #35's no-drop promise.
+      - A writer stuck *inside* a write can leave a last line cut short, with no newline and no
+        one to roll it back. One stuck in fsync leaves it whole but unsynced. README says to
+        discard a final line that doesn't parse after an incomplete export.
+
+      **Tests.** Red first, failing on main by assertion. Inert hooks let them compile there:
+      the `stall` and `trailerWait` fields, `export.NewWriter` (the one exported constructor
+      over a sink, used by `cmd`'s tests through the `openLiveExport` var), the `tuiOptions`
+      helper and `tui.Options.ExportLost`.
+      - `internal/export`:
+        - `TestLostCountsRecords`: written plus lost is the 3,000 records sent. On main, 513 +
+          4,974 = 5,487.
+        - The two mixed-halves tests above.
+        - `TestTrailerRecordsTheLoss`: exactly three keys, `records_lost == Dropped()`, `at` in
+          UTC within the test's window.
+        - `TestCloseGivesUpOnAStalledDisk`: hangs on main.
+        - `TestTrailerWriteIsBounded`.
+        - Guards that pass on main: `TestCompleteFileIsUnchanged` (byte-identical),
+          `TestCloseDrainsASlowButMovingDisk` (300 records at 2 ms each against a 200 ms
+          bound) and `TestBlockingCloseStillWaits`.
+        - `TestALeftBehindHalfIsReplaced`, added with the fix because it reads the new
+          bookkeeping.
+      - `internal/tui`: `TestExportLossNotice` (once), `TestExportLostStatusField` (hidden at
+        0, kept at width 80 beside a long source list), and the guard
+        `TestNoExportNoLossField`.
+      - `cmd/logscry`:
+        - `TestPlainExportLossEndToEnd`: 2,000 distinct FATALs in dry-run onto a stalled disk.
+          The live line appears once; `run` returns the record count; the file's last line is
+          the trailer with that count; records plus lost is every escalation.
+        - The guard `TestPlainNoExportLoss`: no line, `run` returns nil, records only.
+        - `TestTUIOptionsCarryExportLoss`.
+      - The full suite under `-race`: 2,078 passing and 1 skipped on main, 2,094 and 1 on the
+        branch. No existing test changed outcome. The new tests pass under `-race -count=20`.
+
+      **The issue's measurement, repeated.** A distinct FATAL every 5 s over 6 virtual hours
+      (4,320 lines), default config, `pipeline.Run` on the source clock in dry-run, writing
+      through the live writer to an ext4 file. Three runs on each side:
+
+      | | escalations | records in the file | lost, as reported | file + lost |
+      |---|---|---|---|---|
+      | main | 3,609 | 569 / 577 / 564 | 6,076 / 6,048 / 6,072 (messages) | ≠ 3,609 |
+      | branch | 3,609 | 578 / 571 / 575 | 3,031 / 3,038 / 3,034 (records) | 3,609 in all three |
+
+      On the branch the live count, the exit-time count and the trailer's `records_lost` agree
+      in every run, and Close returns no error.
+
+      Seen and left alone, out of scope: a second Ctrl-C during a slow exit is swallowed by
+      `signal.NotifyContext`, so it does not cut the 10 s bound short.
+
+      README: the #70 Known-limitations entry goes. The Export section documents the live line,
+      the notice, the status field, the `export_incomplete` kind, the bounded exit and the
+      partial last line, and a new "Exit status" section lists 0 and 1.
+
+      Targets TODO-VERSION
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
