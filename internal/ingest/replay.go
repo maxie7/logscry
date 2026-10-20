@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 
 // ReplaySource plays back a recorded `journalctl -o json` capture (--replay, issue #35).
 //
-// It is the journald source reading a file instead of a subprocess: the same mapLines loop,
+// It is the journald source reading a file instead of a subprocess: mapLines' own loop,
 // the same decode, so PRIORITY becomes the level (#24), error-class priorities are tagged
 // stderr, and each line is named for its unit — a replay that bypassed decode would be
 // replaying a different program. What it adds is the one thing a file has that a live
@@ -72,7 +73,7 @@ func (s *ReplaySource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 	var readErr error
 	go func() {
 		defer close(decoded)
-		readErr = mapLines(readCtx, f, s.Name(), model.Stdout, decoded, replayDecode)
+		readErr = replayLines(readCtx, f, s.Name(), decoded)
 	}()
 	// stop ends the reader and waits for it, so the file is not closed underneath it.
 	stop := func() {
@@ -87,9 +88,6 @@ func (s *ReplaySource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 		wall0, cap0 time.Time // where pacing measures from
 	)
 	for ll := range decoded {
-		if ll.Raw == "" {
-			continue // not a journal entry; journalctl never writes one
-		}
 		if first {
 			if ll.Time.IsZero() {
 				stop()
@@ -122,6 +120,33 @@ func (s *ReplaySource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 	}
 	if ctx.Err() != nil {
 		return nil // a clean stop, as for every other source
+	}
+	return readErr
+}
+
+// replayLines is mapLines(ctx, r, source, model.Stdout, out, replayDecode) with one
+// difference: a blank line in the file is skipped before it is decoded. A blank line is not
+// a journal entry, since journalctl never writes one. An entry whose MESSAGE is empty IS
+// one, and the live source emits it as an empty line at its priority (#87); skipping after
+// decode could not tell the two apart. That needs a dropped line, which mapLines' transform
+// cannot express, so the read/emit loop is mapLines' own, written out, as readDockerStream's is.
+func replayLines(ctx context.Context, r io.Reader, source string, out chan<- model.LogLine) error {
+	interim := make(chan model.LogLine)
+	var readErr error
+	go func() {
+		defer close(interim)
+		readErr = readLines(ctx, r, source, model.Stdout, interim)
+	}()
+	for ll := range interim {
+		if ll.Raw == "" {
+			continue
+		}
+		ll = replayDecode(ll)
+		select {
+		case out <- ll:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return readErr
 }
