@@ -1184,7 +1184,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         its own does. Measured on real Go 1.26 output: a system panic splits 87 lines into
         13 events, or 22 with the tabs stripped, and a SIGQUIT dump 116 lines into 38 or
         49. No capture contains one. It is in README "Known limitations". (Done with #94, in
-        TODO-VERSION.) Targets v0.12.1
+        v0.12.18.) Targets v0.12.1
 
 - [x] **A partial match is a leak, not a near miss** — #41, the disclosure defect in the one
       package whose job is preventing disclosure. `--llm-anonymize` sent part of every
@@ -3702,7 +3702,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       README: the #94 Known-limitations entry goes, and the grouping paragraph names the `.s`
       frame.
 
-      Targets TODO-VERSION
+      Targets v0.12.18
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
