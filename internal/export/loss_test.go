@@ -401,3 +401,55 @@ func TestTrailerWriteIsBounded(t *testing.T) {
 		t.Error("nothing was lost, so there was no trailing record to wait for")
 	}
 }
+
+// pending is how many templates send is holding a half-record for.
+func pending(w *Writer) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.pairs)
+}
+
+// TestALeftBehindHalfIsReplaced: a flag whose answer never comes — a run that ended with it
+// outstanding — leaves an entry behind, one per template at most, and the next escalation of
+// that template replaces it. The bookkeeping stays bounded by the number of templates, and the
+// old flag is never written.
+func TestALeftBehindHalfIsReplaced(t *testing.T) {
+	sink := &chunkSink{}
+	w := newWriter(sink, 0)
+	const templates = 100
+	t2 := time.Date(2026, 8, 29, 11, 0, 2, 0, time.UTC)
+	for round := range 3 {
+		for i := range templates {
+			f := flagFor(fmt.Sprintf("t%03d", i))
+			f.Count = 1
+			w.Flag(f) // answered never
+		}
+		if got := pending(w); got != templates {
+			t.Fatalf("round %d: %d entries held for %d templates", round, got, templates)
+		}
+	}
+	for i := range templates {
+		h := fmt.Sprintf("t%03d", i)
+		f := flagFor(h)
+		f.Count = 2
+		ex := doneFor(h)
+		ex.At = t2
+		w.Flag(f)
+		w.Resolve(ex)
+	}
+	if got := pending(w); got != 0 {
+		t.Errorf("%d entries held after every template's latest escalation was answered", got)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recs := decodeLines(t, sink.contents())
+	if len(recs) != templates {
+		t.Fatalf("%d records, want one per template", len(recs))
+	}
+	for _, r := range recs {
+		if r["count_at_flag"] != float64(2) || r["explanation"].(map[string]any)["at"] != t2.Format(time.RFC3339) {
+			t.Errorf("a record joins a left-behind flag: %v", r)
+		}
+	}
+}

@@ -261,6 +261,11 @@ func (m Model) viewStatus() string {
 		counters += " · supp " + formatCount(n)
 	}
 	counters += m.llmCounters()
+	// Records lost on the way to the --export file, once there are any: like the suppressed
+	// count, the number that says the tool is missing things rather than quiet.
+	if n := m.exportLost; n > 0 {
+		counters += " · export lost " + formatCount(int(n))
+	}
 	// Part of the protected segment, not the elastic source list: a notice that raw logs
 	// are leaving the machine must not be the first thing a narrow terminal drops.
 	if h := m.opts.RemoteWarnHost; h != "" {

@@ -37,7 +37,8 @@ type Options struct {
 	// one place a TUI user would learn their logs are leaving the machine.
 	RemoteWarnHost string
 	// ExportLost reports how many export records have been lost so far; nil when there is no
-	// --export file.
+	// --export file. Read on every snapshot: the status bar carries the count, and its first
+	// move raises a notice, because a TUI user would otherwise learn of it only after quitting.
 	ExportLost func() uint64
 }
 

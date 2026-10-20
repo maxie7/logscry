@@ -62,7 +62,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, args []string) error {
+func run(ctx context.Context, args []string) (err error) {
 	cfg, err := config.Load(args)
 	if err != nil {
 		return err
@@ -80,7 +80,19 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer closeExport(exp)
+	// Records lost on the way to the file make the run fail, in --plain and the TUI alike: the
+	// status describes the file the run leaves, and the renderer is chosen by whether stdout is
+	// a terminal, so the same command must not exit 0 by hand and 1 in CI (#70). An error of
+	// the run's own is the one returned; the loss is then printed beside it.
+	defer func() {
+		if lost := closeExport(exp); lost != nil {
+			if err == nil {
+				err = lost
+			} else {
+				fmt.Fprintln(os.Stderr, "logscry:", lost)
+			}
+		}
+	}()
 
 	sources, stdinOnly := sources(cfg)
 	replay, _ := sources[0].(*ingest.ReplaySource) // nil unless --replay: it is then the only source
@@ -189,18 +201,21 @@ func openExport(cfg config.Config) (*export.Writer, error) {
 	return w, nil
 }
 
-// closeExport drains and closes the export file, reporting anything it has to admit to.
+// closeExport drains and closes the export file, reporting anything it has to admit to: a
+// write error on stderr, and records lost as the error it returns, which is what makes the
+// run exit non-zero.
 //
-// Both messages go to stderr rather than being swallowed: a tool whose whole job is to not
-// miss anomalies must say so when it has missed one on the way to disk, and a file the
-// consumer is about to parse deserves to be described honestly.
-func closeExport(w *export.Writer) {
+// Neither is swallowed: a tool whose whole job is to not miss anomalies must say so when it
+// has missed one on the way to disk, and a file the consumer is about to parse deserves to be
+// described honestly.
+func closeExport(w *export.Writer) error {
 	if err := w.Close(); err != nil {
 		fmt.Fprintln(os.Stderr, "logscry: export:", err)
 	}
 	if n := w.Dropped(); n > 0 {
-		fmt.Fprintf(os.Stderr, "logscry: export: %d record(s) dropped — the export file could not keep up\n", n)
+		return fmt.Errorf("export: %d record(s) lost — the export file could not keep up", n)
 	}
+	return nil
 }
 
 // startLLM builds the LLM stage: the escalation channel the scorer emits on, and the
@@ -317,15 +332,19 @@ func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, 
 	return term.Run(ctx, snaps, errs, tuiOptions(cfg, escalations != nil, exp))
 }
 
-// tuiOptions is what the TUI is told about this run.
+// tuiOptions is what the TUI is told about this run, including how to read the export's
+// running count of lost records.
 func tuiOptions(cfg config.Config, explain bool, exp *export.Writer) tui.Options {
-	_ = exp
-	return tui.Options{
+	o := tui.Options{
 		ExplainDryRun:  cfg.ExplainDryRun,
 		Explain:        explain,
 		DockerTail:     cfg.Docker.Tail,
 		RemoteWarnHost: remoteWarnHost(cfg),
 	}
+	if exp != nil {
+		o.ExportLost = exp.Dropped
+	}
+	return o
 }
 
 // remoteWarnHost returns the host logscry is about to stream raw logs to, or "" when there
@@ -392,7 +411,16 @@ func runPlainAt(ctx context.Context, lines <-chan model.LogLine, errs <-chan err
 func printPlain(ctx context.Context, events <-chan pipeline.Event, errs <-chan error,
 	explanations <-chan model.Explanation, exp *export.Writer, dryRun bool,
 ) error {
+	announced := false
 	for events != nil || explanations != nil {
+		// A record lost on the way to the export file is said at once, not only at exit. Each
+		// loss comes from a flag, which an event to this loop follows, or from the Resolve this
+		// loop makes itself, so the check runs right after every loss.
+		if !announced && exp.Dropped() > 0 {
+			announced = true
+			fmt.Fprintln(os.Stderr, "logscry: export: records are being lost — the export file is not keeping up; "+
+				"the total is reported at exit")
+		}
 		select {
 		case <-ctx.Done():
 			return nil
