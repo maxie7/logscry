@@ -81,5 +81,5 @@ Please do not report these privately:
   not close", including the shapes that section names inline as not reached. They are public
   issues already, so add a comment to the issue instead.
 - **Public hostnames in prose.** The README leaves them unmasked deliberately.
-- **A secret format no detector targets.** Ask for it in a public enhancement request; #116 is
+- **A secret format no detector targets.** Ask for it in a public enhancement request; [#116](https://github.com/maxie7/logscry/issues/116) is
   the model for one.
