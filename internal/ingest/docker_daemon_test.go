@@ -74,24 +74,27 @@ type fakeDaemon struct {
 	stopLen int           // len(log) at the last stop: what a stopped stream may still send
 	changed chan struct{} // closed and replaced on every change to log or gen
 
-	reqs      chan url.Values // one per logs request, sent once its history is snapshotted
-	gone      chan struct{}   // one per follow stream the client hung up on
-	events    chan events.Message
-	eventsEnd chan struct{} // closed by endEvents: the events stream ends, logs go on
+	reqs       chan url.Values // one per logs request, sent once its history is snapshotted
+	gone       chan struct{}   // one per follow stream the client hung up on
+	events     chan events.Message
+	eventsEnd  chan struct{} // closed by endEvents: the events stream ends, logs go on
+	eventsGone chan struct{} // one per events stream the client hung up on
+	listFails  bool          // set by failList: /containers/json answers 500
 }
 
 func newFakeDaemon(t *testing.T, name string, tty bool, history ...fakeEntry) *fakeDaemon {
 	t.Helper()
 	d := &fakeDaemon{
-		t:         t,
-		name:      name,
-		tty:       tty,
-		log:       history,
-		changed:   make(chan struct{}),
-		reqs:      make(chan url.Values, 16),
-		gone:      make(chan struct{}, 16),
-		events:    make(chan events.Message, 64),
-		eventsEnd: make(chan struct{}),
+		t:          t,
+		name:       name,
+		tty:        tty,
+		log:        history,
+		changed:    make(chan struct{}),
+		reqs:       make(chan url.Values, 16),
+		gone:       make(chan struct{}, 16),
+		events:     make(chan events.Message, 64),
+		eventsEnd:  make(chan struct{}),
+		eventsGone: make(chan struct{}, 16),
 	}
 	srv := httptest.NewServer(http.HandlerFunc(d.serve))
 	t.Cleanup(srv.Close)
@@ -113,6 +116,15 @@ func (d *fakeDaemon) serve(w http.ResponseWriter, r *http.Request) {
 	case "/events":
 		d.serveEvents(w, r)
 	case "/containers/json":
+		d.mu.Lock()
+		fails := d.listFails
+		d.mu.Unlock()
+		if fails {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"message": "list unavailable"})
+			return
+		}
 		writeJSON(w, []map[string]any{{"Id": fakeID, "Names": []string{"/" + d.name}}})
 	case "/containers/" + fakeID + "/json":
 		writeJSON(w, map[string]any{"Id": fakeID, "Name": "/" + d.name, "Config": map[string]any{"Tty": d.tty}})
@@ -136,6 +148,7 @@ func (d *fakeDaemon) serveEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
+			d.eventsGone <- struct{}{}
 			return
 		case <-d.eventsEnd:
 			return
@@ -255,6 +268,13 @@ func (d *fakeDaemon) event(action events.Action) {
 		Action: action,
 		Actor:  events.Actor{ID: fakeID, Attributes: map[string]string{"name": d.name}},
 	}
+}
+
+// failList makes the container list fail with a 500 while the events stream works.
+func (d *fakeDaemon) failList() {
+	d.mu.Lock()
+	d.listFails = true
+	d.mu.Unlock()
 }
 
 // endEvents ends the events stream while every log stream stays open, as a proxy that
@@ -661,5 +681,29 @@ func TestDockerEventsErrorEndsTheSource(t *testing.T) {
 			d.logs(out(at(100), "after the end"))
 			time.Sleep(100 * time.Millisecond)
 		})
+	}
+}
+
+// TestDockerListErrorClosesTheEventsSubscription is #98's second half: Lines subscribes to
+// events before it lists, and the list fails. Lines returns the list error, and the events
+// request it opened must close with it rather than stay open until the run's ctx ends:
+// cli.Close closes only idle connections. The caller's ctx is not cancelled here.
+func TestDockerListErrorClosesTheEventsSubscription(t *testing.T) {
+	d := newFakeDaemon(t, "ab-list", false)
+	d.failList()
+	f := startFollow(t, NewDockerSource(DockerSelector{NameRegex: "^ab-list$"}))
+
+	select {
+	case err := <-f.done:
+		if err == nil || !strings.Contains(err.Error(), "docker: list") {
+			t.Fatalf("Lines = %v, want the docker: list error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lines had not returned 2s after the list failed")
+	}
+	select {
+	case <-d.eventsGone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the events request was still open 2s after Lines returned")
 	}
 }
