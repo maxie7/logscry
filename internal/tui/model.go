@@ -59,6 +59,8 @@ type Model struct {
 	paused bool
 	ended  bool
 	errs   []string
+	// exportLost is the export's count of lost records as of the last snapshot.
+	exportLost uint64
 
 	// The cards pane's selection is keyed by template hash, never by index. Escalations
 	// arrive at the TOP of this list, so an index would silently slide the selection onto
@@ -160,6 +162,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case snapshotMsg:
+		m.readExportLoss()
 		if !m.paused {
 			m.snap = pipeline.Snapshot(msg)
 			m.refresh()
@@ -172,14 +175,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case errMsg:
 		if msg.err != nil {
-			m.errs = append(m.errs, msg.err.Error())
-			if len(m.errs) > maxErrors {
-				m.errs = m.errs[len(m.errs)-maxErrors:]
-			}
+			m.notice(msg.err.Error())
 		}
 		return m, waitForError(m.errCh)
 	}
 	return m, nil
+}
+
+// notice adds a background notice to the bounded list the status bar shows the newest of.
+func (m *Model) notice(s string) {
+	m.errs = append(m.errs, s)
+	if len(m.errs) > maxErrors {
+		m.errs = m.errs[len(m.errs)-maxErrors:]
+	}
+}
+
+// readExportLoss takes the export's count of lost records, and raises a notice the first time
+// it moves. It runs on every snapshot, paused or not: pause freezes the panes, not the news
+// that the file is losing anomalies.
+func (m *Model) readExportLoss() {
+	if m.opts.ExportLost == nil {
+		return
+	}
+	n := m.opts.ExportLost()
+	if n > 0 && m.exportLost == 0 {
+		m.notice("export: records are being lost — the export file is not keeping up")
+	}
+	m.exportLost = n
 }
 
 // handleKey routes one keystroke. Every scroll key goes to the FOCUSED pane and nowhere

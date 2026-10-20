@@ -45,6 +45,8 @@ const (
 	KindAnomaly = "anomaly"
 	// KindWouldEscalate is a flagged event from a run with no LLM stage attached.
 	KindWouldEscalate = "would_escalate"
+	// KindIncomplete is the last line of a live run that lost records (see Incomplete).
+	KindIncomplete = "export_incomplete"
 )
 
 // Explanation states, as they appear in the file. ExplainPending has no spelling here on
@@ -60,6 +62,16 @@ const (
 // a disk — it exists so that a stalled filesystem cannot reach back and stall ingestion,
 // not because a backlog is expected.
 const queueCap = 1024
+
+// How long a live writer's Close waits on a disk that has stopped (see Close). The stall is
+// measured as time with NO progress, so a slow disk that keeps completing records is never cut
+// off: ten seconds is about a thousand healthy fsyncs, and above the few-second stalls ext4
+// writeback is known for. The trailing record gets less, because it is written straight after
+// a drain that just proved the disk was moving, and it is one short line.
+const (
+	defaultStall       = 10 * time.Second
+	defaultTrailerWait = 2 * time.Second
+)
 
 // Flag is an anomaly's state at the instant it was flagged: the moment the scorer decided
 // this template had crossed the threshold. It is one half of a record; the other half is
@@ -113,6 +125,18 @@ type Explanation struct {
 	At    time.Time `json:"at"`
 }
 
+// Incomplete is the line a live writer appends on Close when it lost records, so that the file
+// says it is incomplete to a consumer holding nothing else. It is its own kind rather than a
+// zero-filled Record: an empty anomaly that a count of anomalies would include is worse than a
+// line every `select(.kind == …)` already skips. The count is of RECORDS, the unit the rest of
+// the file is in (#70); At is when the run closed, in UTC like every time in the file, which
+// places the line among the runs appended to one file.
+type Incomplete struct {
+	Kind        string    `json:"kind"`
+	RecordsLost uint64    `json:"records_lost"`
+	At          time.Time `json:"at"`
+}
+
 // resolution is the terminal half of a record: how one flag ended. It is built on the
 // caller's goroutine (the mapping is pure) so the writer goroutine only ever joins and
 // writes.
@@ -122,11 +146,29 @@ type resolution struct {
 	explanation Explanation
 }
 
-// msg is one item in the channel: a flag, or the resolution of one.
+// msg is one item in the channel: a flag, or the resolution of one. seq names the record it
+// is half of: both halves of one record carry the same seq, and no other message does.
 type msg struct {
 	flag   Flag
 	res    resolution
 	isFlag bool
+	seq    uint64
+}
+
+// hash is the template the message is about.
+func (m msg) hash() string {
+	if m.isFlag {
+		return m.flag.Hash
+	}
+	return m.res.hash
+}
+
+// pairState is what send knows about the record a template has in flight: the seq it was
+// given, which half has gone through send, and whether that half was dropped.
+type pairState struct {
+	seq    uint64
+	isFlag bool
+	lost   bool
 }
 
 // sink is the file as the writer goroutine uses it. *os.File satisfies it; the interface
@@ -149,21 +191,57 @@ type Writer struct {
 	quit     chan struct{}
 	finished chan struct{}
 	closing  sync.Once
-	// dropped counts records that never reached the writer goroutine because the channel
-	// was full. Atomic because both the pipeline goroutine and the --plain consumer send;
-	// read once, after the goroutine has finished.
+	// dropped counts RECORDS lost on the way to the file: a record is lost once, when either
+	// of its halves cannot be queued, or when Close gives up with it still queued. Atomic
+	// because the pipeline goroutine and the --plain consumer both send, and a renderer reads
+	// it while the run is live.
 	dropped atomic.Uint64
 	// block makes send wait for room instead of dropping. Set only by OpenBlocking, before
 	// any send, and never changed afterwards.
 	block bool
+	// stall and trailerWait bound Close on a live writer whose disk has stopped; see Close.
+	// Set before any send, like block.
+	stall       time.Duration
+	trailerWait time.Duration
+
+	// mu guards pairs and seq, send's account of each record's two halves. A flag and its
+	// resolution arrive on different goroutines, so classifying a half and queueing it must be
+	// one step. The live send never waits while holding it; the blocking one (replay) has a
+	// single sender, the pipeline goroutine, so nothing waits behind it.
+	//
+	// pairs is keyed by template hash, so it holds at most one entry per template. An entry
+	// lives from a record's first half to its second. While a run is live every flag gets
+	// exactly one resolution: on the spot in a dry run, at once as "unavailable" when the LLM
+	// queue is full, and otherwise the pool's one terminal answer, explained or failed (a
+	// failed anonymization is a failure). So an entry is left behind only by a run that ends
+	// with an answer outstanding, and the next half of the same side for that template
+	// replaces it.
+	mu    sync.Mutex
+	pairs map[string]pairState
+	seq   uint64
+	// queued counts records whose two halves both went into the queue, which the writer
+	// goroutine will therefore start writing unless Close gives up first.
+	queued atomic.Uint64
+	// progress moves each time the writer goroutine handles a message or finishes a write.
+	// It is how Close tells a slow disk from a stopped one.
+	progress atomic.Uint64
+	// drained is closed once the writer has drained the queue at Close, and trailerDone once
+	// it has written the trailing record, or found there was none to write.
+	drained     chan struct{}
+	trailerDone chan struct{}
+	// gate guards started and gaveUp, so that Close giving up and the writer starting a
+	// record cannot interleave: a record is either started, and may land, or counted lost.
+	gate    sync.Mutex
+	started uint64 // records the writer goroutine has started to write
+	gaveUp  bool   // Close stopped waiting: write nothing more
 
 	// Owned by the writer goroutine — do not touch from anywhere else.
 	f       sink
-	offset  int64                 // file offset of the end of the last COMPLETE record
-	flags   map[string]Flag       // flagged, awaiting a resolution
-	orphans map[string]resolution // resolved, awaiting its flag (see run)
-	err     error                 // first write error; read after <-finished
-	broken  bool                  // a partial line could not be rolled back: stop writing
+	offset  int64          // file offset of the end of the last COMPLETE record
+	flags   map[string]msg // flagged, awaiting a resolution
+	orphans map[string]msg // resolved, awaiting its flag (see run)
+	err     error          // first write error; read after <-finished
+	broken  bool           // a partial line could not be rolled back: stop writing
 }
 
 // Open opens path for appending and starts the writer goroutine. An existing file is added
@@ -201,17 +279,29 @@ func OpenBlocking(path string) (*Writer, error) {
 	return w, nil
 }
 
+// NewWriter is a live writer over s, a file whose last complete record ends at offset. It is
+// Open with the file supplied, so that a test outside this package can put a disk that stalls
+// under the real writer; s needs Write, Truncate, Sync and Close, as *os.File has them.
+func NewWriter(s sink, offset int64) *Writer {
+	return newWriter(s, offset)
+}
+
 // newWriter is Open's testable half: it takes the sink and the offset of the last complete
 // record already in it.
 func newWriter(f sink, offset int64) *Writer {
 	w := &Writer{
-		in:       make(chan msg, queueCap),
-		quit:     make(chan struct{}),
-		finished: make(chan struct{}),
-		f:        f,
-		offset:   offset,
-		flags:    make(map[string]Flag),
-		orphans:  make(map[string]resolution),
+		in:          make(chan msg, queueCap),
+		quit:        make(chan struct{}),
+		finished:    make(chan struct{}),
+		drained:     make(chan struct{}),
+		trailerDone: make(chan struct{}),
+		stall:       defaultStall,
+		trailerWait: defaultTrailerWait,
+		pairs:       make(map[string]pairState),
+		f:           f,
+		offset:      offset,
+		flags:       make(map[string]msg),
+		orphans:     make(map[string]msg),
 	}
 	go w.run()
 	return w
@@ -263,9 +353,10 @@ func (w *Writer) WouldEscalate(hash string, at time.Time) {
 	}})
 }
 
-// Dropped reports how many records never reached the writer goroutine because the channel
-// was full. It is meant to be surfaced: a tool whose job is to not miss anomalies must not
-// quietly miss them on the way to disk.
+// Dropped reports how many RECORDS have been lost on the way to the file: dropped because the
+// queue was full, or still queued when Close gave up on a stalled disk. It is meant to be
+// surfaced, while the run is live and at its end: a tool whose job is to not miss anomalies
+// must not quietly miss them on the way to disk. Safe to call at any time.
 func (w *Writer) Dropped() uint64 {
 	if w == nil {
 		return 0
@@ -273,8 +364,18 @@ func (w *Writer) Dropped() uint64 {
 	return w.dropped.Load()
 }
 
-// Close drains what has already been queued, syncs, and closes the file. It returns the
-// first write error of the run, if any.
+// Close drains what has already been queued, writes the trailing Incomplete record if any
+// record was lost, syncs, and closes the file. It returns the first write error of the run,
+// if any.
+//
+// A LIVE writer's Close is bounded, because a disk that has stopped would otherwise hang the
+// exit with it. It gives up once the writer has made no progress for the stall (default 10 s),
+// which a slow disk that keeps completing records never trips. Giving up counts every record
+// still queued as lost, stops the writer writing anything more, and skips the trailing record
+// on a disk that is not moving. The record being written at that moment is not counted: it
+// may yet land, whole or cut short. The trailing record has a bound of its own (default 2 s),
+// measured from the end of the drain. A BLOCKING writer (replay) waits however long the disk
+// takes, because its promise is that it never drops (#35).
 //
 // Note what it does NOT do: close the message channel. A pipeline goroutine can outlive the
 // run that Closed this writer (Ctrl-C cancels the context and main returns while it is
@@ -285,11 +386,88 @@ func (w *Writer) Close() error {
 		return nil
 	}
 	w.closing.Do(func() { close(w.quit) })
+	if !w.block {
+		if err := w.await(); err != nil {
+			return err // the writer goroutine is stuck, so w.err is still its to write
+		}
+	}
 	<-w.finished
 	return w.err // the writer goroutine is done; <-finished orders its last write before this read
 }
 
-// send hands a message to the writer goroutine, DROPPING it if the channel is full.
+// await waits for the writer goroutine to finish, and gives up on a disk that has stopped:
+// no progress for w.stall, or no trailing record within w.trailerWait of the drain.
+func (w *Writer) await() error {
+	tick := time.NewTicker(max(w.stall/10, time.Millisecond))
+	defer tick.Stop()
+	last, since := w.progress.Load(), time.Now()
+	drained, trailerDone := w.drained, w.trailerDone
+	var trailerTimeout <-chan time.Time
+	for {
+		select {
+		case <-w.finished:
+			return nil
+		case <-drained:
+			drained = nil
+			trailer := time.NewTimer(w.trailerWait)
+			defer trailer.Stop()
+			trailerTimeout = trailer.C
+		case <-trailerDone:
+			trailerDone, trailerTimeout = nil, nil
+			last, since = w.progress.Load(), time.Now()
+		case <-trailerTimeout:
+			w.giveUp()
+			return fmt.Errorf("incomplete: the trailing %s record could not be written within %s",
+				KindIncomplete, w.trailerWait)
+		case now := <-tick.C:
+			if p := w.progress.Load(); p != last {
+				last, since = p, now
+				continue
+			}
+			if trailerTimeout != nil || now.Sub(since) < w.stall {
+				continue
+			}
+			return w.stalled(w.giveUp())
+		}
+	}
+}
+
+// giveUp stops the writer writing anything more and counts every record still queued as lost.
+// It returns how many that was.
+func (w *Writer) giveUp() uint64 {
+	w.gate.Lock()
+	defer w.gate.Unlock()
+	w.gaveUp = true
+	queued := w.queued.Load()
+	if queued <= w.started {
+		return 0
+	}
+	abandoned := queued - w.started
+	w.dropped.Add(abandoned)
+	return abandoned
+}
+
+// stalled is what Close reports when it gave up on a disk that made no progress.
+func (w *Writer) stalled(abandoned uint64) error {
+	msg := fmt.Sprintf("the export file accepted no write for %s; gave up", w.stall)
+	if abandoned > 0 {
+		msg += fmt.Sprintf(" with %d record(s) still queued", abandoned)
+	}
+	if w.dropped.Load() > 0 {
+		msg = "incomplete: " + msg + fmt.Sprintf("; the trailing %s record could not be written", KindIncomplete)
+	}
+	return errors.New(msg)
+}
+
+// send hands one half of a record to the writer goroutine, DROPPING it if the channel is
+// full, and counts what that costs in records.
+//
+// A record is lost once, when its first half is dropped, and its other half is then dropped
+// on arrival even if there is room for it. Queueing that half is how a lost record used to
+// corrupt another one: it waited in the writer, unmatched, and was joined to the NEXT
+// escalation of the same template — one escalation's flag with another's explanation. When it
+// is the second half that cannot be queued, the record is lost then; its first half is already
+// in the writer, where its seq keeps it from joining anything else.
 //
 // The default case is the point: the loudest caller is the pipeline goroutine that owns the
 // template map, and a blocking send would let a slow disk stall ingestion. It is the same
@@ -300,18 +478,51 @@ func (w *Writer) Close() error {
 // writer has been told to stop, nothing will read the queue again, and a sender waiting on
 // it would wait forever. That send is counted as a drop, which it is.
 func (w *Writer) send(m msg) {
-	if w.block {
-		select {
-		case w.in <- m:
-		case <-w.quit:
+	hash := m.hash()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if p, ok := w.pairs[hash]; ok && p.isFlag != m.isFlag {
+		// The second half of the record in flight for this template.
+		delete(w.pairs, hash)
+		if p.lost {
+			return // the record is already counted lost; its other half must not be written
+		}
+		m.seq = p.seq
+		if w.enqueue(m) {
+			w.queued.Add(1)
+		} else {
 			w.dropped.Add(1)
 		}
 		return
 	}
+	// A first half. One of the same side still in flight for this template is replaced, as
+	// the writer has always replaced it: the newer half is the one a resolution will answer.
+	w.seq++
+	m.seq = w.seq
+	queued := w.enqueue(m)
+	if !queued {
+		w.dropped.Add(1)
+	}
+	w.pairs[hash] = pairState{seq: m.seq, isFlag: m.isFlag, lost: !queued}
+}
+
+// enqueue puts m on the channel, or reports that it could not: the channel was full, or, for a
+// blocking writer, Close came first.
+func (w *Writer) enqueue(m msg) bool {
+	if w.block {
+		select {
+		case w.in <- m:
+			return true
+		case <-w.quit:
+			return false
+		}
+	}
 	select {
 	case w.in <- m:
+		return true
 	default:
-		w.dropped.Add(1)
+		return false
 	}
 }
 
@@ -331,7 +542,11 @@ func (w *Writer) run() {
 				case m := <-w.in:
 					w.handle(m)
 				default:
+					close(w.drained)
+					w.writeTrailer()
+					close(w.trailerDone)
 					w.closeFile()
+					w.progress.Add(1)
 					return
 				}
 			}
@@ -347,31 +562,65 @@ func (w *Writer) run() {
 // is still in flight. Joining on whichever half arrives second removes the assumption
 // entirely.
 //
-// Both maps hold only unmatched halves, so they are bounded by the escalations in flight.
-// A flag left unmatched at shutdown is simply never written, which is correct: it never
-// reached a terminal state.
+// The halves join only when they carry the same seq, i.e. belong to one record. A waiting half
+// with another seq is stale — its partner was dropped (see send) — and gives way.
+//
+// Both maps hold only unmatched halves, one per template at most. A flag left unmatched at
+// shutdown is simply never written, which is correct: it never reached a terminal state.
 func (w *Writer) handle(m msg) {
-	if m.isFlag {
-		if res, ok := w.orphans[m.flag.Hash]; ok {
-			delete(w.orphans, m.flag.Hash)
-			w.write(record(m.flag, res))
-			return
-		}
-		w.flags[m.flag.Hash] = m.flag
-		return
+	defer w.progress.Add(1)
+	hash := m.hash()
+	waiting, other := w.orphans, w.flags
+	if !m.isFlag {
+		waiting, other = w.flags, w.orphans
 	}
-	if f, ok := w.flags[m.res.hash]; ok {
+	if p, ok := waiting[hash]; ok {
 		// Deleting is what makes a second terminal explanation for the same hash write
 		// nothing. The next line for this template needs a new flag, i.e. a new escalation.
-		delete(w.flags, m.res.hash)
-		w.write(record(f, m.res))
-		return
+		delete(waiting, hash)
+		if p.seq == m.seq {
+			if m.isFlag {
+				w.writeRecord(record(m.flag, p.res))
+			} else {
+				w.writeRecord(record(p.flag, m.res))
+			}
+			return
+		}
 	}
-	w.orphans[m.res.hash] = m.res
+	other[hash] = m
 }
 
-// write appends one record, or leaves the file exactly as it found it.
-func (w *Writer) write(r Record) {
+// writeRecord writes one joined record, unless Close has given up on the disk, in which case
+// the record was counted lost and must not appear.
+func (w *Writer) writeRecord(r Record) {
+	w.gate.Lock()
+	if w.gaveUp {
+		w.gate.Unlock()
+		return
+	}
+	w.started++
+	w.gate.Unlock()
+	w.write(r)
+}
+
+// writeTrailer appends the Incomplete record when records were lost and Close has not given up.
+func (w *Writer) writeTrailer() {
+	n := w.dropped.Load()
+	if n == 0 {
+		return
+	}
+	w.gate.Lock()
+	gaveUp := w.gaveUp
+	w.gate.Unlock()
+	if gaveUp {
+		return
+	}
+	w.write(Incomplete{Kind: KindIncomplete, RecordsLost: n, At: time.Now().UTC()})
+}
+
+// write appends one line, or leaves the file exactly as it found it.
+func (w *Writer) write(r any) {
+	defer w.progress.Add(1)
 	if w.broken {
 		return
 	}
@@ -513,7 +762,7 @@ func explanationOf(ex model.Explanation) Explanation {
 // as "connection refused to \u003cIP\u003e" — valid JSON, but it would silently break the
 // greps this file exists to serve, including the one that checks that an anonymization
 // placeholder never leaked into it.
-func encode(r Record) ([]byte, error) {
+func encode(r any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)

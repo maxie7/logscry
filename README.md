@@ -867,11 +867,12 @@ otherwise.
 
 #### Schema
 
-Every key is always present (no `omitempty`), so a consumer can index without checking.
+Every key of a kind is always present (no `omitempty`), so a consumer can index without
+checking. A record of an anomaly has these keys:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `kind` | string | `anomaly`, or `would_escalate` in `--explain-dry-run` |
+| `kind` | string | `anomaly`, or `would_escalate` in `--explain-dry-run` (`export_incomplete` is below) |
 | `template_hash` | string | The dedup key: the template's signature hash |
 | `pattern` | string | The masked signature, e.g. `connection refused to <IP>:<NUM>` |
 | `level` | string | Level of the line that fired, `""` if none was detected |
@@ -911,6 +912,53 @@ is what lets the whole file go into a ticket or a CI artifact without auditing i
 mid-flight leaves a file whose every line still parses. If a write fails part-way the
 partial bytes are rolled back and that one record is lost rather than the file's validity;
 logscry says so on stderr on the way out.
+
+#### When the file cannot keep up
+
+A live run never waits for the export file: ingestion matters more. The writer has a queue
+of its own, and when a disk stalls for long enough to fill it (tens of minutes at the
+default rate limit), the records that do not fit are lost. Replay is the exception: it
+waits for the disk and loses nothing. Losing a record is never silent:
+
+- **While the run is live.** With `--plain`, one line on stderr the first time it happens:
+  `logscry: export: records are being lost — the export file is not keeping up; the total
+  is reported at exit`. In the TUI, the same news as a background notice, and a status-bar
+  field ` · export lost N` with the running count (absent while nothing is lost).
+- **At exit.** `logscry: export: N record(s) lost — the export file could not keep up`, and
+  the exit status is 1 (see [Exit status](#exit-status)), in `--plain` and the TUI alike.
+- **In the file.** The last line says how many records the file is missing:
+
+  ```json
+  {"kind":"export_incomplete","records_lost":412,"at":"2026-08-29T15:00:04Z"}
+  ```
+
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `kind` | string | `export_incomplete` |
+  | `records_lost` | number | Records this run lost; the same number as the exit-time line |
+  | `at` | string | RFC3339 in UTC (`…Z`); when the run wrote it, which places it among the records of other runs appended to the same file |
+
+  It is written only when a record was lost, so a complete file holds its records and
+  nothing else, byte for byte what it held before this kind existed. `select(.kind == "anomaly")` and `select(.explanation.state == "explained")`
+  skip it; a plain line count (`wc -l`) includes it.
+
+A count of lost records is a count of whole records. A record is an anomaly and its
+explanation: when one is lost, so is the other, and a record never pairs the flag of one
+escalation with the explanation of another.
+
+**Exit is bounded when the disk is stuck.** At exit a live run drains its queue to the file
+for as long as the file keeps accepting writes, however slowly. It gives up only when the
+file has accepted nothing for **10 s**. The records still queued then are counted as lost,
+the trailing record is not written, and stderr says so: `logscry: export: incomplete — the
+export file accepted no write for 10s; gave up with N record(s) still queued; the trailing
+export_incomplete record could not be written`. When the drain finishes but the trailing
+record itself takes more than 2 s, stderr says that it could not be written. Replay waits
+as long as it takes.
+
+**After an incomplete export, discard a final line that doesn't parse.** When logscry gives
+up, the record it was writing at that moment may be missing, complete, or cut short: a disk
+stuck part-way through a write leaves a last line without its newline, which no one is left
+to roll back. Every line before it is whole.
 
 ### Replay (`--replay <file>`)
 
@@ -979,6 +1027,16 @@ recorded journal with the same binary and flags gave the live run's export recor
 kind, template, count at flag and reasons. That is one escalation on one host, so it is
 evidence, not a proof. The bundled fixture (`internal/ingest/testdata/replay/basic.jsonl`)
 is still synthetic.
+
+### Exit status
+
+| Status | When |
+|---|---|
+| `0` | The run finished: its sources ended, or it was stopped with Ctrl-C or `SIGTERM`. A source that failed along the way (`-- ./app` exiting non-zero, a broken Docker events stream) is reported on stderr or in the status bar, not in the status. |
+| `1` | logscry could not run as asked (a bad flag or config file, `-h`, no log source, an export file it could not open, a TUI that failed), **or** the export lost records (see [When the file cannot keep up](#when-the-file-cannot-keep-up)). |
+
+The status is the same in `--plain` and the TUI: it describes the run and the file, not the
+renderer, so a job checking it sees an incomplete export whichever way the output went.
 
 ## Known limitations (v1)
 
@@ -1050,12 +1108,6 @@ is still synthetic.
   it to follow Docker again, which reads each container's `--docker-tail` lines again on first
   attach. A plausible trigger is a remote `DOCKER_HOST` behind a proxy or SSH tunnel that
   closes the idle events connection. Reconnecting is filed as #100.
-- **Export drops are reported only at exit, and overstated.** In a live run the export
-  writer drops a record rather than stall ingestion when its queue is full, which needs a
-  disk stalled for tens of minutes at the default rate limit. The only report is one
-  stderr line when logscry exits, the exit status is still 0, and the count is of queue
-  messages (two per record), so it can overstate the records lost by up to 2×. Filed
-  as #70. Replay does not drop.
 - **`--docker-tail` defaults to 100 lines** of history per container on first attach. An
   event further back than that won't appear until it recurs — use `--docker-tail all` for
   the full backlog. A restarted container is not read from its tail again: logscry resumes
