@@ -1,0 +1,83 @@
+name: Bug report
+description: Something logscry does that it should not, or does not do that it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you paste anything:** this issue is public.
+
+        - Do not paste real log lines, hostnames, IP addresses, paths or secrets. Reproduce the bug with **synthetic lines**: invented values of the same shape.
+        - If the bug is that `--llm-anonymize` may have let a value reach the model, **do not file it here.** Report it privately through the [security advisory form](https://github.com/maxie7/logscry/security/advisories/new), as [SECURITY.md](https://github.com/maxie7/logscry/blob/main/SECURITY.md) describes.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `logscry --version`.
+      placeholder: logscry v0.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source
+      description: Where the lines came from. Pick every source the run used.
+      multiple: true
+      options:
+        - stdin
+        - subprocess (logscry -- ./app)
+        - docker
+        - journald
+        - replay
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command line
+      description: The full command line, every flag included. If you use `--config`, add the relevant keys. Replace real hostnames and paths with invented ones.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: anonymize
+    attributes:
+      label: Was --llm-anonymize on?
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: LLM backend
+      options:
+        - local (Ollama or another endpoint on the same machine)
+        - remote (an endpoint off this machine)
+        - dry-run (--explain-dry-run, no model)
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected logscry to do.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What it did instead. Paste output with real values replaced.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Synthetic lines that reproduce it, and how you fed them in.
+      render: text
+    validations:
+      required: false
