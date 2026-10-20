@@ -3410,7 +3410,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       app token's secret segment is already `<HEX>`, so nothing of it is left and the template is main's
       (`xoxp<NUM><NUM><NUM>-<HEX>`). But with a word character glued right after an `xoxp-…` key, the
       hex segment has no `\b` to end on, NUM takes its digits, and the template sends its letters a–f,
-      as main does. Not widened here; reported with the out-of-scope formats below.
+      as main does. Not widened here; filed with the formats below as #116.
 
       **Costs, pinned.** Raw: a camelCase identifier at least as long as a raw floor after a vendor
       prefix is a key (`sk_test_` and a 31-letter camelCase test name → `<TOKEN_1>`). Template:
@@ -3490,12 +3490,19 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       README: the Known-limitations entry goes.
 
-      Seen, out of scope (throwaway test, invented values): AWS secret access keys, Twilio `SK…`/`AC…`,
-      SendGrid `SG.…`, npm `npm_…`, GitLab `glpat-…`, Hugging Face `hf_…`, Shopify `shpat_…`, PyPI
-      `pypi-…`, and Slack incoming-webhook (`hooks.slack.com/services/T…/B…/…`) and Discord webhook URLs
-      are all sent on the raw line (for the webhooks the host is masked and the secret path segment
-      sent). A bare `KEY=value`, #59, #49, #42, #65's sweep, #91, #92 and `internal/pipeline` were not
-      touched.
+      **Found on the way.** Other vendors' secrets match no detector either, confirmed with a throwaway
+      test and invented values, on main and on the branch: AWS secret access keys, Twilio `SK…`/`AC…`,
+      SendGrid `SG.…`, npm `npm_…`, GitLab `glpat-…`, Hugging Face `hf_…`, Shopify `shpat_…` and PyPI
+      `pypi-…` are sent whole on the raw line and minus their digits on the template (a Hugging Face
+      token has none to lose; a Twilio `AC…` SID is `<HEX>` there). In a Slack incoming-webhook URL
+      (`hooks.slack.com/services/T…/B…/…`) or a Discord webhook URL the host is masked and the secret
+      path segment is sent. Not #114's class as a whole: the AWS secret has no prefix, only a variable
+      name or a neighbouring key id to know it by, and a webhook's secret is in the URL path, which no
+      rule reads. Filed as #116 with the `xoxp-…_prod` template residual above, and named in README's
+      Known limitations.
+
+      Seen, out of scope: a bare `KEY=value`, #59, #49, #42, #65's sweep, #91, #92 and
+      `internal/pipeline` were not touched.
 
       Targets v0.12.15
 
