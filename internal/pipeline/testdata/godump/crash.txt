@@ -1,0 +1,97 @@
+panic: runtime error: index out of range [3] with length 3
+
+goroutine 1 gp=0xc00000000048 m=0 mp=0xc00090 [running]:
+panic({0xc000d8?, 0xc00000000120?})
+	/usr/local/go/src/runtime/panic.go:879 +0x16f fp=0xc00000000168 sp=0xc000000001b0 pc=0xc001f8
+runtime.panicBounds64(0xc00240, 0xc00000000288)
+	/usr/local/go/src/runtime/panic.go:236 +0xf7 fp=0xc000000002d0 sp=0xc00000000168 pc=0xc00318
+runtime.panicBounds()
+	/usr/local/go/src/runtime/asm_amd64.s:2129 +0x68 fp=0xc00000000360 sp=0xc000000002d0 pc=0xc003a8
+main.lookup(...)
+	/build/app/main.go:14
+main.main()
+	/build/app/main.go:23 +0x19f fp=0xc000000003f0 sp=0xc00000000360 pc=0xc00240
+runtime.main()
+	/usr/local/go/src/runtime/proc.go:290 +0x2d5 fp=0xc00000000438 sp=0xc000000003f0 pc=0xc00480
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0xc000000004c8 sp=0xc00000000438 pc=0xc00510
+
+goroutine 2 gp=0xc00000000558 m=nil [force gc (idle)]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0xc000000005a0 sp=0xc000000005e8 pc=0xc00630
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.forcegchelper()
+	/usr/local/go/src/runtime/proc.go:375 +0xb3 fp=0xc00000000678 sp=0xc000000005a0 pc=0xc006c0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0xc00000000708 sp=0xc00000000678 pc=0xc00510
+created by runtime.init.7 in goroutine 1
+	/usr/local/go/src/runtime/proc.go:363 +0x1a
+
+goroutine 3 gp=0xc00000000750 m=nil [GC sweep wait]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0xc00000000798 sp=0xc000000007e0 pc=0xc00630
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.bgsweep(0xc00000000828)
+	/usr/local/go/src/runtime/mgcsweep.go:279 +0x94 fp=0xc00000000870 sp=0xc00000000798 pc=0xc008b8
+runtime.gcenable.gowrap1()
+	/usr/local/go/src/runtime/mgc.go:214 +0x17 fp=0xc00000000900 sp=0xc00000000870 pc=0xc00948
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0xc00000000990 sp=0xc00000000900 pc=0xc00510
+created by runtime.gcenable in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:214 +0x66
+
+goroutine 4 gp=0xc000000009d8 m=nil [GC scavenge wait]:
+runtime.gopark(0xc00000000828?, 0xc00a20?, 0x1?, 0x0?, 0xc000000009d8?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0xc00000000a68 sp=0xc00000000ab0 pc=0xc00630
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.(*scavengerState).park(0xc00af8)
+	/usr/local/go/src/runtime/mgcscavenge.go:425 +0x49 fp=0xc00000000b40 sp=0xc00000000a68 pc=0xc00b88
+runtime.bgscavenge(0xc00000000828)
+	/usr/local/go/src/runtime/mgcscavenge.go:653 +0x3c fp=0xc00000000bd0 sp=0xc00000000b40 pc=0xc00c18
+runtime.gcenable.gowrap2()
+	/usr/local/go/src/runtime/mgc.go:215 +0x17 fp=0xc00000000c60 sp=0xc00000000bd0 pc=0xc00ca8
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0xc00000000cf0 sp=0xc00000000c60 pc=0xc00510
+created by runtime.gcenable in goroutine 1
+	/usr/local/go/src/runtime/mgc.go:215 +0xa5
+
+goroutine 5 gp=0xc00000000d38 m=nil [GOMAXPROCS updater (idle)]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0xc00000000d80 sp=0xc00000000dc8 pc=0xc00630
+runtime.goparkunlock(...)
+	/usr/local/go/src/runtime/proc.go:468
+runtime.updateMaxProcsGoroutine()
+	/usr/local/go/src/runtime/proc.go:7095 +0xe7 fp=0xc00000000e10 sp=0xc00000000d80 pc=0xc00e58
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0xc00000000ea0 sp=0xc00000000e10 pc=0xc00510
+created by runtime.defaultGOMAXPROCSUpdateEnable in goroutine 1
+	/usr/local/go/src/runtime/proc.go:7083 +0x37
+
+goroutine 6 gp=0xc00000000ee8 m=nil [finalizer wait]:
+runtime.gopark(0xc00f30?, 0x0?, 0x0?, 0x0?, 0xc00000000f78?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0xc00000000fc0 sp=0xc00000001008 pc=0xc00630
+runtime.runFinalizers()
+	/usr/local/go/src/runtime/mfinal.go:210 +0x107 fp=0xc00000001050 sp=0xc00000000fc0 pc=0xc01098
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0xc000000010e0 sp=0xc00000001050 pc=0xc00510
+created by runtime.createfing in goroutine 1
+	/usr/local/go/src/runtime/mfinal.go:172 +0x3d
+
+goroutine 7 gp=0xc00000001128 m=nil [chan receive]:
+runtime.gopark(0x0?, 0x0?, 0x0?, 0x0?, 0x0?)
+	/usr/local/go/src/runtime/proc.go:462 +0xce fp=0xc00000001170 sp=0xc000000011b8 pc=0xc00630
+runtime.chanrecv(0xc00000001200, 0x0, 0x1)
+	/usr/local/go/src/runtime/chan.go:667 +0x4ae fp=0xc00000001248 sp=0xc00000001170 pc=0xc01290
+runtime.chanrecv1(0x0?, 0x0?)
+	/usr/local/go/src/runtime/chan.go:509 +0x12 fp=0xc000000012d8 sp=0xc00000001248 pc=0xc01320
+main.(*Pool).worker(...)
+	/build/app/main.go:12
+main.main.gowrap1()
+	/build/app/main.go:18 +0x1c fp=0xc00000001368 sp=0xc000000012d8 pc=0xc013b0
+runtime.goexit({})
+	/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0xc000000013f8 sp=0xc00000001368 pc=0xc00510
+created by main.main in goroutine 1
+	/build/app/main.go:18 +0x98
