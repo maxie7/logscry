@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -137,6 +138,76 @@ func TestReplayCountsUntimedAndBackwards(t *testing.T) {
 	}
 	if src.Untimed() != 2 || src.Backwards() != 1 {
 		t.Errorf("Untimed()=%d Backwards()=%d, want 2 and 1", src.Untimed(), src.Backwards())
+	}
+}
+
+// TestReplayMatchesLiveJournald: the same capture, fed to the live source through a
+// stand-in journalctl and replayed from the file, gives the same lines. That includes an
+// entry whose MESSAGE is empty: live emits it as an empty line at its priority (here 3, so
+// ERROR on stderr), and a replay that dropped it would score one line fewer than the run
+// it recorded.
+func TestReplayMatchesLiveJournald(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	path := writeCapture(t,
+		`{"MESSAGE":"link is up","PRIORITY":"6","SYSLOG_IDENTIFIER":"kernel","__REALTIME_TIMESTAMP":"1788000001000000"}`,
+		`{"MESSAGE":"","PRIORITY":"3","SYSLOG_IDENTIFIER":"kernel","__REALTIME_TIMESTAMP":"1788000001500000"}`,
+		`{"MESSAGE":"cache almost full","PRIORITY":"4","_SYSTEMD_UNIT":"a.service","__REALTIME_TIMESTAMP":"1788000002000000"}`,
+	)
+
+	script := filepath.Join(t.TempDir(), "journalctl")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec cat '"+path+"'\n"), 0o700); err != nil {
+		t.Fatalf("write stand-in: %v", err)
+	}
+	live := NewJournaldSource(nil, 7)
+	live.path = script
+	out := make(chan model.LogLine, 64)
+	if err := live.Lines(context.Background(), out); err != nil {
+		t.Fatalf("live: %v", err)
+	}
+	close(out)
+	var want []model.LogLine
+	for l := range out {
+		want = append(want, l)
+	}
+
+	got, err := replayAll(t, NewReplaySource(path, 0))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("replay gave %d lines, live %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		g, w := got[i], want[i]
+		if g.Raw != w.Raw || g.Level != w.Level || g.Stream != w.Stream || g.Source != w.Source ||
+			!g.Time.Equal(w.Time) {
+			t.Errorf("line %d: replay %+v, live %+v", i, g, w)
+		}
+	}
+	empty := got[1]
+	if empty.Raw != "" || empty.Level != "ERROR" || empty.Stream != model.Stderr ||
+		empty.Source != "journald:kernel" {
+		t.Errorf("empty-message entry = %+v, want an empty ERROR line on stderr from journald:kernel", empty)
+	}
+}
+
+// TestReplaySkipsBlankCaptureLines: a blank line in the file, with or without a carriage
+// return, is not a journal entry, since journalctl never writes one, and replays as nothing.
+func TestReplaySkipsBlankCaptureLines(t *testing.T) {
+	path := writeCapture(t,
+		`{"MESSAGE":"one","PRIORITY":"6","_SYSTEMD_UNIT":"a.service","__REALTIME_TIMESTAMP":"1788000001000000"}`,
+		``,
+		"\r",
+		`{"MESSAGE":"two","PRIORITY":"6","_SYSTEMD_UNIT":"a.service","__REALTIME_TIMESTAMP":"1788000002000000"}`,
+	)
+	got, err := replayAll(t, NewReplaySource(path, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Raw != "one" || got[1].Raw != "two" {
+		t.Fatalf("replayed %+v, want the two entries and nothing for the blank lines", got)
 	}
 }
 

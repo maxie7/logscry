@@ -784,8 +784,9 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       whose MESSAGE is empty, after decode, while a live `--journald` run emits it as an empty
       line at the entry's priority. Every captured boot holds exactly one (kernel, priority
       3). Confirmed by a throwaway test that feeds the same entry through both paths (live 2
-      lines, replay 1); it is in README "Known limitations". It does not touch this
-      measurement: both legs of every A/B are replays, and the ab37 capture holds none.
+      lines, replay 1); it is in README "Known limitations" (Done with #87, in
+      v0.12.16.). It does not touch this measurement: both legs of every A/B are replays,
+      and the ab37 capture holds none.
       RDI §6 updated. Targets v0.11.0
 
 - [x] **A card is a TEMPLATE, and its numbers are live** — #34, found by dogfooding, and a
@@ -3505,6 +3506,51 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       `internal/pipeline` were not touched.
 
       Targets v0.12.15
+
+- [x] **Replay keeps a journal entry whose message is empty, as a live run does** — #87, found
+      on the way in #37. `ReplaySource.Lines` skipped a line whose `Raw` was empty ("not a journal
+      entry; journalctl never writes one"), but the check ran after `replayDecode`. It dropped two
+      things it could not tell apart: a blank line in the capture file, the skip it meant, and a real
+      entry with `MESSAGE` `""`, which a live `--journald` run emits as an empty line at its priority
+      (priority 3: an empty `ERROR` line on stderr). Replay promises the live run's answer (#35), and
+      every captured boot holds exactly one such entry (kernel, priority 3), so a replay scored one
+      line fewer than the run it recorded.
+
+      **Fix.** The skip runs on the raw capture line, before decode. `mapLines`' transform cannot drop
+      a line, so its read/emit loop is written out in `replay.go` as `replayLines`, as
+      `readDockerStream`'s is. With `model.Stdout` and `replayDecode` substituted, `mapLines`' body
+      and `replayLines`' differ by the skip alone (checked by diff), so the goroutine, the
+      cancellation and the error return are `mapLines`' own. `\r\n` alone is still a blank line; a
+      whitespace-only line is decoded and emitted, as before. The live path, `decode`, `mapLines` and
+      `readLines` are untouched.
+
+      Both paths dropping the line was considered and rejected. The pipeline never drops an empty
+      line, and the coalescer reads a blank line as a continuation of an open group (Go's blank line
+      between `panic:` and the goroutine dump), so dropping blanks live would change coalesced
+      templates.
+
+      **Tests.**
+      - `TestReplayMatchesLiveJournald`: the same capture, through the live source with a stand-in
+        `journalctl` and through `ReplaySource`, gives the same lines (raw, level, stream, source and
+        time); the empty entry comes out as an empty `ERROR` line on stderr from `journald:kernel`.
+        Red on main by assertion (2 lines, live 3).
+      - `TestReplaySkipsBlankCaptureLines`: a blank line, and one holding only `\r`, replay as
+        nothing. It passes on main and on the branch.
+      - The full suite under `-race`: 2,003 passing and 1 skipped on main, 2,005 and 1 on the branch,
+        0 failing on either; no existing test changed outcome. The new tests pass under
+        `-race -count=20`.
+
+      **Captures.** The ten journald boots replayed at max speed through the pipeline with default
+      settings, main against the branch. Predicted before the run: one more line per boot and no change
+      in escalations, since the entry sits about a second into each capture and the replay clock is the
+      capture's, so warmup still mutes novelty and stderr + `ERROR` is 0.90, under the threshold. Both
+      held on every boot: 63,007 → 63,017 lines (+1 each; each boot now emits one line per entry in
+      its file), 59 → 59 escalations (+0 each).
+
+      README: the Known-limitations entry goes, and so does the sentence in the replay section
+      that pointed to it.
+
+      Targets v0.12.16
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
