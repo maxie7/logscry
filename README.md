@@ -777,9 +777,13 @@ Each time the audit's own count was right and its scope was narrower than the se
   ordering argument rules out.
 - **#49** — an IPv4-mapped IPv6 address masks only as far as its first octet:
   `::ffff:192.168.1.1` sends `.168.1.1`.
-- **#114** — Stripe (`sk_live_…`, `rk_live_…`, `sk_test_…`), GitHub (`ghp_…`,
-  `github_pat_…`), Slack (`xoxb-…`, `xoxp-…`) and Google (`AIza…`) secrets match no detector and
-  are sent whole.
+- **#116** — AWS secret access keys, Twilio (`SK…`, `AC…`), SendGrid (`SG.…`), npm (`npm_…`),
+  GitLab (`glpat-…`), Hugging Face (`hf_…`), Shopify (`shpat_…`) and PyPI (`pypi-…`) tokens match
+  no detector and are sent whole on the raw line; on the template only their digits are lost. In a
+  Slack incoming-webhook or Discord webhook URL the host is masked and the secret path segment is
+  sent. And a Slack user token (`xoxp-…`) with a word character glued right after it is masked on
+  the raw line but sends its secret segment's letters on the template. Not affected: the Stripe,
+  GitHub, Slack and Google formats #114 covers, in every other placement.
 - ~~**#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
   pre-masked template.~~ **Closed in `v0.12.8`.** See the paragraph above. `s3://…@bucket`
   sent `bucket`. It was not an interference defect but a tolerance gap left over from #43, listed
