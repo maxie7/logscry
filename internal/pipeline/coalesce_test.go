@@ -5,6 +5,9 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -382,13 +385,6 @@ var goroutineDump = []string{
 // TestCoalesceGoFrameLines: anchoring the frame cue (#89) leaves real Go frames folding as
 // they did, and is what keeps a log line out of a trace.
 func TestCoalesceGoFrameLines(t *testing.T) {
-	stripped := func(lines []string) []string {
-		out := make([]string, len(lines))
-		for i, l := range lines {
-			out[i] = strings.TrimLeft(l, " \t")
-		}
-		return out
-	}
 	one := func(t *testing.T, lines []string) model.LogLine {
 		t.Helper()
 		got := drive(t, time.Second, lines...)
@@ -439,4 +435,210 @@ func TestCoalesceGoFrameLines(t *testing.T) {
 			t.Errorf("Level = %q, want the text path's %q", line.Level, wantLevel)
 		}
 	})
+}
+
+// stripped returns lines with their leading indentation removed, as a producer or shipper
+// that strips it would deliver them.
+func stripped(lines []string) []string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = strings.TrimLeft(l, " \t")
+	}
+	return out
+}
+
+// godump reads a Go runtime dump from testdata/godump, one string per physical line. Each
+// file is the stderr of a real Go 1.26 binary (an index-out-of-range panic beside one parked
+// worker goroutine, or that worker and a SIGQUIT the program sends itself, or debug.Stack()
+// written on its own), with the build and GOROOT paths and every address replaced.
+func godump(t *testing.T, name string) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "godump", name+".txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+}
+
+// heads renders each event's first line, for a failure message about a dump that fragmented
+// into dozens of events.
+func heads(events []model.LogLine) string {
+	var b strings.Builder
+	for i, ev := range events {
+		first, _, _ := strings.Cut(ev.Raw, "\n")
+		fmt.Fprintf(&b, "  [%d] %d lines, %q\n", i, strings.Count(ev.Raw, "\n")+1, first)
+	}
+	return b.String()
+}
+
+// TestGoDumpsFoldIntoOneEvent is #94: every dump the Go runtime writes folds into one event,
+// with its indentation and with it stripped. Since Go 1.23 GOTRACEBACK=system and crash, and
+// every SIGQUIT dump, write each goroutine header as "goroutine 1 gp=0x… m=0 mp=0x… [running]:".
+// A SIGQUIT dump adds a "PC=… m=… sigcode=…" line and a register dump, a stripped dump has
+// assembly frames ("asm_amd64.s:1771 +0x1"), and debug.Stack() begins at the goroutine header.
+// The coalescer recognized none of these, so each such dump arrived as many events.
+func TestGoDumpsFoldIntoOneEvent(t *testing.T) {
+	dumps := []struct {
+		name  string
+		lines func(*testing.T) []string
+	}{
+		{"panic, GOTRACEBACK=all", func(*testing.T) []string { return goroutineDump }},
+		{"panic, GOTRACEBACK=system", func(t *testing.T) []string { return godump(t, "system") }},
+		// crash writes what system does: the SIGABRT it raises after the dump goes to the
+		// default handler, which prints nothing.
+		{"panic, GOTRACEBACK=crash", func(t *testing.T) []string { return godump(t, "crash") }},
+		{"SIGQUIT", func(t *testing.T) []string { return godump(t, "sigquit") }},
+		{"debug.Stack() written alone", func(t *testing.T) []string { return godump(t, "stack") }},
+	}
+	for _, d := range dumps {
+		t.Run(d.name, func(t *testing.T) {
+			for _, form := range []string{"tabbed", "tabs stripped"} {
+				t.Run(form, func(t *testing.T) {
+					lines := d.lines(t)
+					if form == "tabs stripped" {
+						lines = stripped(lines)
+					}
+					got := drive(t, time.Second, lines...)
+					if len(got) != 1 {
+						t.Fatalf("%d lines arrived as %d events, want 1 (the dump fragmented):\n%s", len(lines), len(got), heads(got))
+					}
+					if got[0].Raw != strings.Join(lines, "\n") {
+						t.Errorf("the folded event is not the dump, line for line:\n%s", heads(got))
+					}
+				})
+			}
+		})
+	}
+
+	// The dump a signal writes starts a new event: two dumps back to back stay two.
+	t.Run("system panic, then a SIGQUIT dump", func(t *testing.T) {
+		for _, form := range []string{"tabbed", "tabs stripped"} {
+			t.Run(form, func(t *testing.T) {
+				first, second := godump(t, "system"), godump(t, "sigquit")
+				if form == "tabs stripped" {
+					first, second = stripped(first), stripped(second)
+				}
+				got := drive(t, time.Second, slices.Concat(first, second)...)
+				if len(got) != 2 || got[0].Raw != strings.Join(first, "\n") || got[1].Raw != strings.Join(second, "\n") {
+					t.Fatalf("got %d events, want the panic dump then the SIGQUIT dump:\n%s", len(got), heads(got))
+				}
+			})
+		}
+	})
+}
+
+// TestGoDumpCueShapes pins the Go dump cues line by line, on an idle header and inside an
+// active block. The goroutine header, an assembly frame and the signal PC line continue an
+// event at any time; a register line only once a block is in progress.
+func TestGoDumpCueShapes(t *testing.T) {
+	tests := []struct {
+		raw          string
+		idle, active bool
+	}{
+		{"goroutine 1 gp=0xc000002380 m=0 mp=0x5a1b20 [running]:", true, true},
+		{"goroutine 2 gp=0xc000002e00 m=nil [force gc (idle)]:", true, true},
+		{"goroutine 7 [chan receive, 2 minutes, locked to thread]:", true, true},
+		{"/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1 fp=0xc000067fe8 sp=0xc000067fe0 pc=0x47da81", true, true},
+		{"/usr/local/go/src/runtime/asm_amd64.s:1771 +0x1", true, true},
+		{"PC=0x46f4c1 m=0 sigcode=0", true, true},
+		{"PC=0x46f4c1 m=3 sigcode=1 addr=0x0", true, true},
+		{"rax    0xca", false, true},
+		{"r8     0x0", false, true},
+		{"rflags 0x212", false, true},
+
+		{"goroutine 5 started", false, false},
+		{"goroutine 5 [worker] started", false, false},
+		{"received SIGQUIT, shutting down", false, false},
+		{"SIGQUIT: quit", false, false},
+		{"SIGQUIT: quit requested", false, false},
+		{"/src/boot.s:12", false, false},
+		{"nasm failed at /src/boot.s:12", false, false},
+		{"assembling /src/boot.s:12", false, false},
+		{"PC=0x46f4c1", false, false},
+		{"rax    0xca and more", false, false},
+		{"cache: 0x1f", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			if got := isContinuation(&pending{}, tt.raw); got != tt.idle {
+				t.Errorf("isContinuation(idle header, %q) = %v, want %v", tt.raw, got, tt.idle)
+			}
+			if got := isContinuation(&pending{active: true}, tt.raw); got != tt.active {
+				t.Errorf("isContinuation(active block, %q) = %v, want %v", tt.raw, got, tt.active)
+			}
+		})
+	}
+}
+
+// TestNotPartOfAGoDump is the other half of #94: a line that is not part of a Go dump stays its
+// own event, after a finished dump or on its own.
+func TestNotPartOfAGoDump(t *testing.T) {
+	slog := `time=2026-07-13T12:00:00.000+02:00 level=ERROR source=main.go:31 msg="restarting"`
+	tests := []struct {
+		name  string
+		lines []string
+		want  []string // the events, each one physical line except a whole dump
+	}{
+		{"goroutine prose after a dump",
+			slices.Concat(goroutineDump, []string{"goroutine 5 started"}),
+			[]string{strings.Join(goroutineDump, "\n"), "goroutine 5 started"}},
+		{"goroutine prose opens no block",
+			[]string{"goroutine 5 started", "retry(3) scheduled"},
+			[]string{"goroutine 5 started", "retry(3) scheduled"}},
+		{"bracketed goroutine prose after a dump",
+			slices.Concat(goroutineDump, []string{"goroutine 5 [worker] started"}),
+			[]string{strings.Join(goroutineDump, "\n"), "goroutine 5 [worker] started"}},
+		{"SIGQUIT in prose after a dump",
+			slices.Concat(goroutineDump, []string{"received SIGQUIT, shutting down"}),
+			[]string{strings.Join(goroutineDump, "\n"), "received SIGQUIT, shutting down"}},
+		{"SIGQUIT in prose opens no block",
+			[]string{"SIGQUIT: quit requested", "shutdown(ctx) begun"},
+			[]string{"SIGQUIT: quit requested", "shutdown(ctx) begun"}},
+		{"a bare .s position after a call line",
+			[]string{"main.main()", "/src/boot.s:12"},
+			[]string{"main.main()", "/src/boot.s:12"}},
+		{"a line ending in .s:N after a dump",
+			slices.Concat(goroutineDump, []string{"nasm failed at /src/boot.s:12"}),
+			[]string{strings.Join(goroutineDump, "\n"), "nasm failed at /src/boot.s:12"}},
+		{"a .s position in prose after a dump",
+			slices.Concat(goroutineDump, []string{"assembling /src/boot.s:12"}),
+			[]string{strings.Join(goroutineDump, "\n"), "assembling /src/boot.s:12"}},
+		{"two panics back to back",
+			slices.Concat(goroutineDump, goroutineDump),
+			[]string{strings.Join(goroutineDump, "\n"), strings.Join(goroutineDump, "\n")}},
+		{"two panics back to back, tabs stripped",
+			slices.Concat(stripped(goroutineDump), stripped(goroutineDump)),
+			[]string{strings.Join(stripped(goroutineDump), "\n"), strings.Join(stripped(goroutineDump), "\n")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := drive(t, time.Second, tt.lines...)
+			raws := make([]string, len(got))
+			for i, ev := range got {
+				raws[i] = ev.Raw
+			}
+			if !slices.Equal(raws, tt.want) {
+				t.Fatalf("got %d events, want %d:\n%s", len(got), len(tt.want), heads(got))
+			}
+		})
+	}
+
+	// A log line right after each of the new dumps stays its own event. The dump in front of it
+	// is not what this checks (TestGoDumpsFoldIntoOneEvent is), so only the last event is.
+	for _, name := range []string{"system", "crash", "sigquit", "stack"} {
+		for _, line := range []string{"ERROR: db connection failed", slog} {
+			for _, form := range []string{"tabbed", "tabs stripped"} {
+				t.Run(fmt.Sprintf("%s after the %s dump, %s", line, name, form), func(t *testing.T) {
+					lines := godump(t, name)
+					if form == "tabs stripped" {
+						lines = stripped(lines)
+					}
+					got := drive(t, time.Second, append(lines, line)...)
+					if last := got[len(got)-1].Raw; last != line {
+						t.Fatalf("the last event is not the log line on its own:\n%s", heads(got))
+					}
+				})
+			}
+		}
+	}
 }

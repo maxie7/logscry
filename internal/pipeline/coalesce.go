@@ -31,6 +31,14 @@ const (
 	maxCoalesceBytes = 64 << 10
 )
 
+// goroutineHeader is the header the Go runtime writes above each goroutine in a dump:
+// "goroutine 1 [running]:", or since Go 1.23, under GOTRACEBACK=system or crash and in every
+// SIGQUIT dump, "goroutine 1 gp=0x… m=0 mp=0x… [running]:". Only key=value fields may come
+// between the ID and the bracketed state, and the line ends at "]:", so "goroutine 5 started"
+// and "goroutine 5 [worker] started" are prose (#94). It both continues a dump and opens one:
+// debug.Stack() written on its own begins here.
+const goroutineHeader = `^goroutine \d+(?: [a-z]+=\w+)* \[.*\]:\s*$`
+
 // continuationRe matches stack-frame / dump markers at any indentation. These are the
 // explicit language cues that attach a line to the event in progress even when it is
 // not indented. Kept broad across Python, Java, and Go rather than tied to one format.
@@ -40,26 +48,36 @@ const (
 // nothing else. A line that merely cites a position is a log line — slog's
 // source=server.go:99, logrus's file="main.go:42", log's Lshortfile "main.go:42: …" — and an
 // unanchored cue folded each into the line before it (#89). The path holds no "=", so a
-// bare source=x.go:N is not one either.
+// bare source=x.go:N is not one either. An assembly frame ("asm_amd64.s:1771 +0x1") is the
+// same line with a .s file, and always carries its offset, since assembly is never inlined; so
+// a bare "boot.s:12" is not one.
+//
+// A fatal signal's dump (SIGQUIT: quit) has no regex of its own: its first line is a plain
+// header, and the "PC=0x… m=0 sigcode=0" line the runtime writes straight after it is the cue
+// that folds into it and makes the block active (#94).
 var continuationRe = regexp.MustCompile(strings.Join([]string{
 	`^\s*File ".*", line \d+`,   // Python:  File "app.py", line 10, in <module>
 	`^\s*at\s+[\w$.]+\(`,        // Java:    at com.foo.Bar.baz(Bar.java:1)
 	`^\s*Caused by:`,            // Java:    Caused by: ...
 	`^\s*Suppressed:`,           // Java:    Suppressed: ...
 	`^\s*\.\.\.\s+\d+\s+more\b`, // Java:    ... 3 more
-	`^goroutine \d+ \[`,         // Go:      goroutine 1 [running]:
+	goroutineHeader,             // Go:      goroutine 1 gp=0x… m=0 mp=0x… [running]:
 	`^\s*created by \S`,         // Go:      created by main.main
 	`^\s*\[signal\b`,            // Go:      [signal SIGSEGV: segmentation violation ...]
 	`^\s*[^\s=]+\.go:\d+(?: \+0x[0-9a-f]+)?(?: fp=0x[0-9a-f]+ sp=0x[0-9a-f]+ pc=0x[0-9a-f]+)?\s*$`, // Go: /app/main.go:42 +0x1d
+	`^\s*[^\s=]+\.s:\d+ \+0x[0-9a-f]+(?: fp=0x[0-9a-f]+ sp=0x[0-9a-f]+ pc=0x[0-9a-f]+)?\s*$`,       // Go: …/asm_amd64.s:1771 +0x1
+	`^PC=0x[0-9a-f]+ m=\d+ sigcode=\d+(?: addr=0x[0-9a-f]+)?\s*$`,                                  // Go: PC=0x46f4c1 m=0 sigcode=0
 }, "|"))
 
 // traceStartRe recognizes a header that itself opens a multi-line block, so the lines
 // after it are kept even before the first indented continuation confirms the block —
-// notably Go's "[signal ...]" and blank line between "panic:" and the goroutine dump.
+// notably Go's "[signal ...]" and blank line between "panic:" and the goroutine dump, and
+// the un-indented call line under a goroutine header that starts a dump.
 var traceStartRe = regexp.MustCompile(strings.Join([]string{
 	`^Traceback \(most recent call last\):`, // Python
 	`^\s*panic:`,                            // Go
 	`^fatal error:`,                         // Go runtime
+	goroutineHeader,                         // Go runtime, debug.Stack()
 	`Exception in thread `,                  // Java
 }, "|"))
 
@@ -76,6 +94,10 @@ var excSummaryRe = regexp.MustCompile(
 // goFrameRe matches an un-indented Go call frame ("main.doStuff(...)"), also only
 // consulted once a block is active.
 var goFrameRe = regexp.MustCompile(`^[\w$./]+\(`)
+
+// goRegisterRe matches one line of the register dump that ends a Go fatal-signal dump
+// ("rax    0xca", "rflags 0x212"), also only consulted once a block is active.
+var goRegisterRe = regexp.MustCompile(`^[a-z][a-z0-9]{1,6} +0x[0-9a-f]+\s*$`)
 
 // streamKey identifies the logical stream a line belongs to. Continuations only ever
 // attach to a buffer of the SAME source and stream, so a stack trace on one container's
@@ -327,9 +349,10 @@ func CoalesceSourceTime(ctx context.Context, in <-chan model.LogLine, out chan<-
 //  1. Indentation — a leading space or tab with non-blank content. The primary
 //     cross-language frame signal (Python code/File lines, Java "\tat", Go "\t/path").
 //  2. An explicit frame marker at any indent (see continuationRe).
-//  3. Only once p.active: a blank separator, an un-indented exception summary, or a Go
-//     call frame. Gating these on an active block is what keeps ordinary prefix-less
-//     log lines from being swallowed, so an unrelated burst stays one event per line.
+//  3. Only once p.active: a blank separator, an un-indented exception summary, a Go
+//     call frame, or a Go register line. Gating these on an active block is what keeps
+//     ordinary prefix-less log lines from being swallowed, so an unrelated burst stays one
+//     event per line.
 func isContinuation(p *pending, raw string) bool {
 	if len(raw) > 0 && (raw[0] == ' ' || raw[0] == '\t') && strings.TrimSpace(raw) != "" {
 		return true
@@ -341,7 +364,7 @@ func isContinuation(p *pending, raw string) bool {
 		if strings.TrimSpace(raw) == "" {
 			return true
 		}
-		if excSummaryRe.MatchString(raw) || goFrameRe.MatchString(raw) {
+		if excSummaryRe.MatchString(raw) || goFrameRe.MatchString(raw) || goRegisterRe.MatchString(raw) {
 			return true
 		}
 	}
