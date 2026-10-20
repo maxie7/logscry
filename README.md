@@ -978,8 +978,7 @@ on a real laptop for three hours, with a live `--journald` run beside it. Replay
 recorded journal with the same binary and flags gave the live run's export record exactly:
 kind, template, count at flag and reasons. That is one escalation on one host, so it is
 evidence, not a proof. The bundled fixture (`internal/ingest/testdata/replay/basic.jsonl`)
-is still synthetic. One known divergence is listed under Known limitations: a journal
-entry with an empty message.
+is still synthetic.
 
 ## Known limitations (v1)
 
@@ -1014,14 +1013,6 @@ entry with an empty message.
   one-line fix. There is no cursor: `-f` picks up from roughly now, so an event
   further back won't appear until it recurs. Record with `journalctl -o json` and use
   [`--replay`](#replay---replay-file) to score history.
-- **Replay drops a journal entry whose message is empty, and a live run does not.** A live
-  `--journald` run emits such an entry as an empty line, at the entry's priority (an empty
-  kernel message at priority 3 becomes an empty `ERROR` line on stderr). `--replay` skips it,
-  so a replay can score one line fewer than the live run it recorded. That is enough to
-  differ by one escalation if the empty line would have escalated. Every boot of the laptop
-  measured for #37 logged exactly one: kernel, priority 3. Confirmed by a test that feeds
-  the same entry through both paths, not observed as a changed escalation. Filed as
-  #87.
 - **Three IPv6 shapes are deliberately not masked in the pipeline's `<IP>` template mask.**
   The template mask requires a boundary before the match and at least two hex groups, because
   without that a C++ scope resolution operator reads as an address — `CNSSCertStore::CNSSCertStore` used to template as
