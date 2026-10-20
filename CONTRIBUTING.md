@@ -11,6 +11,15 @@ that way are the most welcome.
 - **Standard library first.** Add a dependency only when the RDI calls for it.
 - **Match the surrounding code** — its naming, comment density, and idiom.
 
+## Issues and pull requests
+
+Bug reports and feature requests have issue forms that ask for what a report needs: for a bug,
+the version, the source, the full command line and the anonymizer setting. Reproduce a bug with
+synthetic lines, never real logs. Blank issues stay open for anything else. A security problem,
+an anonymizer leak above all, goes through the private form described in
+[`SECURITY.md`](SECURITY.md), never an issue. The pull request template is one comment, the rule
+for closing keywords: `Closes #N` once, for the issue the PR closes, and every other number bare.
+
 ## Before you open a PR
 
 Run the full verify loop from a clean tree; all of it must be green:

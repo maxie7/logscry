@@ -840,6 +840,9 @@ value is smaller than the value, and not unknown data.
 Treat this as a way to lower exposure to a remote provider, and do not send logs you cannot
 afford to send.
 
+A value that reaches the model although this section says it is masked is a vulnerability:
+report it privately, as [SECURITY.md](SECURITY.md) describes, not in a public issue.
+
 ### Export (`--export <path>`)
 
 Everything above puts anomalies on a screen. `--export anomalies.jsonl` puts them in a
@@ -1118,6 +1121,12 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `deepseek-r1`) can spend the whole default budget on its chain of thought and return
   empty content with `finish_reason: length`. Prefer a plain instruct model such as
   `gemma2:2b`, or raise the cap (see [Configuration](#configuration)).
+
+## Security
+
+Report a vulnerability privately, never in a public issue: above all, a value that reaches the
+model although `--llm-anonymize` is documented to mask it. [SECURITY.md](SECURITY.md) says how,
+what is in scope, and what to leave out of the report.
 
 ## License
 
