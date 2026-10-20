@@ -1624,7 +1624,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         reaches EOF before the `die`, `stop` later finds no entry. The context stays
         registered on `Lines`' until exit. A throwaway test measured about 116 bytes retained
         per such run, freed when the parent was cancelled. It is there since v0.1.0, and the
-        moved code keeps it. Filed as #98 (Done with #98, in TODO-VERSION.).
+        moved code keeps it. Filed as #98 (Done with #98, in v0.12.17.).
       - **An events-stream error hangs `Lines` instead of returning.** It waits for its
         followers without cancelling them. A throwaway test against the fake daemon ended
         the events stream with a follower attached:
@@ -1781,7 +1781,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         whose list answers 500 confirmed it in 3 of 3 runs: still open 2 s after Lines
         returned, closed on cancel. It has no functional effect, and needs an events request
         that succeeds beside a list that fails. Filed under #98, which now covers both
-        (Done with #98, in TODO-VERSION.).
+        (Done with #98, in v0.12.17.).
       - **The TUI status bar shows only the newest error**, so a later one hides the Docker
         error. That is by design.
 
@@ -3595,7 +3595,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       No Docker captures exist, so there is nothing to replay. README: no change; it does not
       document either retention.
 
-      Targets TODO-VERSION
+      Targets v0.12.17
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
