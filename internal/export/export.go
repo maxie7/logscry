@@ -156,6 +156,10 @@ type Writer struct {
 	// block makes send wait for room instead of dropping. Set only by OpenBlocking, before
 	// any send, and never changed afterwards.
 	block bool
+	// stall and trailerWait bound Close on a live writer whose disk has stopped; see Close.
+	// Set before any send, like block.
+	stall       time.Duration
+	trailerWait time.Duration
 
 	// Owned by the writer goroutine — do not touch from anywhere else.
 	f       sink
@@ -199,6 +203,13 @@ func OpenBlocking(path string) (*Writer, error) {
 	}
 	w.block = true
 	return w, nil
+}
+
+// NewWriter is a live writer over s, a file whose last complete record ends at offset. It is
+// Open with the file supplied, so that a test outside this package can put a disk that stalls
+// under the real writer; s needs Write, Truncate, Sync and Close, as *os.File has them.
+func NewWriter(s sink, offset int64) *Writer {
+	return newWriter(s, offset)
 }
 
 // newWriter is Open's testable half: it takes the sink and the offset of the last complete

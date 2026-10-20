@@ -36,6 +36,9 @@ type Options struct {
 	// stderr line printed before the alternate screen starts would be wiped unseen — the
 	// one place a TUI user would learn their logs are leaving the machine.
 	RemoteWarnHost string
+	// ExportLost reports how many export records have been lost so far; nil when there is no
+	// --export file.
+	ExportLost func() uint64
 }
 
 // StdinIsTerminal reports whether stdin is an interactive terminal rather than a pipe

@@ -166,13 +166,17 @@ func replayNotice(r *ingest.ReplaySource) error {
 		"each was replayed at the capture's current time", r.Untimed(), r.Backwards())
 }
 
+// openLiveExport opens a live run's export file. A variable so that a test can put a disk that
+// stalls under the real writer (see export.NewWriter).
+var openLiveExport = export.Open
+
 // openExport opens the JSONL export file, or returns nil when --export was not given. A nil
 // *export.Writer is inert, so "disabled" needs no further branching anywhere.
 func openExport(cfg config.Config) (*export.Writer, error) {
 	if cfg.Export == "" {
 		return nil, nil
 	}
-	open := export.Open
+	open := openLiveExport
 	if cfg.Replay != "" {
 		// A replay has no real-time contract and its export is the artifact that gets
 		// diffed, so a slow disk must cost time, never records (see export.OpenBlocking).
@@ -310,12 +314,18 @@ func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, 
 		Export:       exp,
 		SourceTime:   cfg.Replay != "",
 	})
-	return term.Run(ctx, snaps, errs, tui.Options{
+	return term.Run(ctx, snaps, errs, tuiOptions(cfg, escalations != nil, exp))
+}
+
+// tuiOptions is what the TUI is told about this run.
+func tuiOptions(cfg config.Config, explain bool, exp *export.Writer) tui.Options {
+	_ = exp
+	return tui.Options{
 		ExplainDryRun:  cfg.ExplainDryRun,
-		Explain:        escalations != nil,
+		Explain:        explain,
 		DockerTail:     cfg.Docker.Tail,
 		RemoteWarnHost: remoteWarnHost(cfg),
-	})
+	}
 }
 
 // remoteWarnHost returns the host logscry is about to stream raw logs to, or "" when there
