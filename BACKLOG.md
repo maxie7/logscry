@@ -145,6 +145,33 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
       model spends the whole budget on its chain of thought and returns EMPTY content with
       `finish_reason: length`. The error now names the flag, but the default 300 is too low for such
       models and the README should say so (rides along with the M6 README task)
+- [x] **Community health files** — #123. The community profile listed four missing items; three
+      are added.
+      - `SECURITY.md`. The latest release is supported, and fixes ship as patch releases.
+        Reports go through GitHub private vulnerability reporting, with a synthetic
+        reproduction and never real logs or credentials. Best effort: no SLA, no bounty.
+        The scope is grounded in what the README promises:
+        - in: a documented-masked value reaching the model endpoint, a partial mask included;
+          a request despite `--explain-dry-run` or a failed mask; a release artifact that
+          fails attestation or its checksum; a crafted line that crashes, hangs or executes;
+        - out: real values in the TUI and the export; unmasked lines to a local model or with
+          masking off; gaps the README already names.
+
+        Until this, an anonymizer leak could only be reported in public, which disclosed it.
+      - `.github/ISSUE_TEMPLATE/`: a bug form (version, source, command line, anonymizer
+        setting, backend kind, expected and actual, and a warning against real log lines), a
+        feature form, and `config.yml` keeping blank issues with a link to the advisory form.
+      - `.github/pull_request_template.md`: one HTML comment with the closing-keyword rule,
+        which #61's reopening came from.
+      - README and CONTRIBUTING point at all three.
+
+      Left out, with reasons:
+      - **Code of conduct:** a single-maintainer project has no community spaces of its own
+        to moderate yet.
+      - **Accessibility statement:** not until there is real content to state for a TUI.
+
+      Private vulnerability reporting has to be enabled in the repository settings
+      (Settings → Security); without it the advisory link 404s.
 
 ## Epic M8 — Export & persistence  `[v0.6.0]`
 - [x] `--export <path>`: JSONL dump of flagged anomalies. Until this, an anomaly was pixels — a TUI card
