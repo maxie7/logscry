@@ -777,9 +777,6 @@ Each time the audit's own count was right and its scope was narrower than the se
   ordering argument rules out.
 - **#49** — an IPv4-mapped IPv6 address masks only as far as its first octet:
   `::ffff:192.168.1.1` sends `.168.1.1`.
-- **#114** — Stripe (`sk_live_…`, `rk_live_…`, `sk_test_…`), GitHub (`ghp_…`,
-  `github_pat_…`), Slack (`xoxb-…`, `xoxp-…`) and Google (`AIza…`) secrets match no detector and
-  are sent whole.
 - ~~**#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
   pre-masked template.~~ **Closed in `v0.12.8`.** See the paragraph above. `s3://…@bucket`
   sent `bucket`. It was not an interference defect but a tolerance gap left over from #43, listed

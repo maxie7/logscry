@@ -3316,7 +3316,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Found on the way.** Stripe (`sk_live_`, `rk_live_`, `sk_test_`), GitHub (`ghp_`, `github_pat_`),
       Slack (`xoxb-`, `xoxp-`) and Google (`AIza…`) secrets match no detector and are sent whole, raw and
       on the template, on main and on the branch. Not #51's class: 3b reads `sk-` with a hyphen. Filed as
-      #114 and named in README's Known limitations.
+      #114 and named in README's Known limitations (Done with #114, in TODO-VERSION.).
 
       Seen, out of scope:
       - **A bare `KEY=value`.** `OPENAI_API_KEY=<a value that is not an sk- key>` is sent; no rule reads
@@ -3324,6 +3324,180 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       - #59, #49, #42, #65's sweep, #91, #92.
 
       Targets v0.12.14
+
+- [x] **Stripe, GitHub, Slack and Google secrets are masked, not sent whole** — #114, found on the
+      way to #51. No detector had a vendor format's shape (3b reads `sk-` with a hyphen only), so each
+      of these was sent whole, raw (trigger and context) and on the template, and `residue()` read the
+      line as clean:
+      - Stripe `sk_live_…`, `sk_test_…`, `rk_live_…`, `rk_test_…` and the webhook signing secret
+        `whsec_…`;
+      - GitHub `ghp_…`, `gho_…`, `ghu_…`, `ghs_…`, `ghr_…` and the fine-grained `github_pat_…`;
+      - Slack `xoxb-…`, `xoxp-…`, `xoxa-…`, `xoxr-…`, `xoxs-…` and the app-level `xapp-…`;
+      - Google `AIza…`.
+
+      The leak was confined to text no rule claims: prose, a URL query value (`…/geocode/json?…&key=AIza…`,
+      the commonest real placement of a Google key), a JSON value, an env var. Every rule that owns a
+      value around such a key already masked it whole on main, because their classes admit the key's
+      alphabet: a userinfo half (4), a host or a list member (9a, 9c), a bare private host (9b), an email
+      local part (5), a home directory (10), a bearer value (3a). v0.4.0 → v0.12.14, **forty tagged
+      releases** (`git tag --contains 2da31be | wc -l` → 40).
+
+      **The fix (`internal/anonymize/anonymize.go` only).** Rule 12 is one verify-eligible TOKEN rule
+      per format family, appended after rule 11 through `looseKey` (the character before the prefix is
+      context, outside `A-Za-z0-9`). Each raw body is the format's alphabet from its shortest published
+      length up, with no upper bound and no trailing assertion, so a key ends where its alphabet does:
+
+      | Family | Prefix | Raw body | Template floor |
+      |---|---|---|---|
+      | Stripe | `sk_`/`rk_` × `live_`/`test_` | 24+ base62 (test and legacy keys are 24; current ones ~99) | 8 units |
+      | | `whsec_` | 32+ base62 (the Stripe CLI's is 64 hex) | 8 units |
+      | GitHub classic | `ghp_` `gho_` `ghu_` `ghs_` `ghr_` | 36+ base62 (30 random + a 6-character checksum) | 12 units |
+      | GitHub fine-grained | `github_pat_` | 82+ of base62 and `_` (published 22 `_` 59; the split is not relied on) | 24 units |
+      | Slack | `xoxb-` `xoxp-` `xoxa-` `xoxr-` `xoxs-` `xapp-` | a digit first, then `-`-separated segments carrying an unbroken run of 16 | after `<NUM>`, a letter of each case or a 16-run |
+      | Google | `AIza` | 35+ base64url (published: exactly 35) | 12 units |
+
+      On the template every digit run is `<NUM>`, and a pipeline placeholder is the evidence, as in
+      `mangled`, over a floor in UNITS (a class character or a whole placeholder): `mangledFloor` is two
+      branches that never match fewer than n units and match every placeholder-carrying run of 2n−2 or
+      more. The floors are measured, not guessed: over 200,000 random bodies per format the fewest units
+      left were 14 (Stripe 24), 22 (`whsec_` base62), 13 (`whsec_` hex), 27 (`ghp_`), 69 (`github_pat_`)
+      and 25 (`AIza`), and every one of those templates was masked whole against the compiled rules,
+      raw too. Slack's leading `-` and first numeric segment become one `<NUM>` (NUM takes the `-` as a
+      sign), so after `xoxb<NUM>` the witness is #51's `sk<NUM>` one, factored into `caseOrRun`;
+      `skDigitFirst` compiles byte-identically. Where I am unsure of a length (Slack per-type segments,
+      the fine-grained split, a future longer Stripe key), the floor is the shortest published form and
+      the run is unbounded above.
+
+      **Decisions, each pinned by a test.**
+      1. **Run last, one rule per family.** At 3b's slot a vendor rule would mint first and block the
+         value rules above at our `<`, #46's and #51's anti-correlation: the email domain and the
+         labels before a bare host's key label would be sent, and #46's cell would change layout. Run
+         after rule 11 it reads only text no rule claimed, so every rule before it sees main's input,
+         main's chain is a byte-identical prefix (a source/tag/group/verify dump of both chains), and
+         nothing can narrow. Per family rather than combined, so the completeness, templatized and
+         context guards hold for each format, not for one row of a combined rule; GitHub is two
+         families because its alphabets and floors differ.
+      2. **No over-masking**, raw and templatized, and what keeps each: the floor (`sk_test_helper`,
+         `sk_live_mode`, `whsec_rotated`, `ghp_cache_dir`, `AIzaTest`, one short of each raw floor in
+         letters); the alphabet (`sk_test_create_customer_with_card_1`, where `_` ends the body); the
+         template floor (`sk_test_run42`, `whsec_v2_rotation`, `ghp_v2`, `AIza_test_1`,
+         `github_pat_rotation_policy_v2_enabled`, short digit-bearing tails); the Slack witness
+         (`xoxb token missing`, `the xoxb- prefix`, `set xoxb-1 retries`, a kebab-case date-and-words
+         name after `xoxb-`, and a 24-letter word after `xoxb-`, which only the digit-first rule keeps); and the lead
+         (`disk_test_…`, `ask_live_…`, `xghp_…`, `mygithub_pat_…`, `bAIza…`, a letter before `xoxb-…`).
+      3. **Edges, as #57 and #108 decided them.** `.` `,` `"` `'` `)` `]` `}` `:` stay outside the
+         placeholder, one row per closer per family. Glue BEFORE the prefix (`_` `-` `=` `:`) is prose:
+         `token_<TOKEN_1>`. AFTER the key the format's alphabet decides: `_prod` and `-prod` stay prose
+         after a Stripe or `ghp_` key; `_` is the key's for `github_pat_` and Google, `-` for Slack and
+         Google.
+      4. **The template.** Every family's prose, env var, logfmt and JSON msg, JSON value (`<STR>`) and
+         query-value placements are closed through the real `TemplatizeLine`, and each family has a
+         templatized, a logfmt (msg and error) and a quote-edge row.
+      5. **Readers: none.** The shapes are not keyShapes. That list exists so that 4d, 9e and 3c can see
+         a key inside a larger value before a strict detector tags it; no strict detector tags a vendor
+         key, so 4, 9a and 9c already take such a value whole. Joining it would duplicate them, run them
+         earlier and compile each shape about eight times. `TestGluedKeyRulesReadTheKeyDetectors` now
+         holds each family to exactly one detector, a verify-eligible TOKEN rule with group 1 among the
+         chain's last, one per family, whose shape no other detector carries. One byte-identical row per
+         would-be reader and per family: 4d's position `s3://<key>.prod@bucket`, 9e's host label and
+         list member, 3c's `Bearer <key>.prod`, the email, the bare private host, the home directory and
+         #46's cell `postgres://<key>:password@localhost/db` → `postgres://<TOKEN_1>@<HOST_1>/db`.
+      6. **Restore and residue.** Every closed row round-trips; its output re-masks unchanged with a
+         clean `residue()`; no key body survives; a raw key of each format now reads TOKEN where main
+         read `""`; the key in prose and in its env var is one placeholder.
+
+      **Residuals, pinned.** The raw line is closed in every placement. On the template a Slack user or
+      app token's secret segment is already `<HEX>`, so nothing of it is left and the template is main's
+      (`xoxp<NUM><NUM><NUM>-<HEX>`). But with a word character glued right after an `xoxp-…` key, the
+      hex segment has no `\b` to end on, NUM takes its digits, and the template sends its letters a–f,
+      as main does. Not widened here; reported with the out-of-scope formats below.
+
+      **Costs, pinned.** Raw: a camelCase identifier at least as long as a raw floor after a vendor
+      prefix is a key (`sk_test_` and a 31-letter camelCase test name → `<TOKEN_1>`). Template:
+      a tail between the template floor and the raw floor that carries a digit is a key there
+      (`sk_test_Abc123defghij`, `whsec_Abc123defghij`, `ghp_` + 17, `github_pat_` + 27, `AIza` + 30), and
+      so is mixed case after `xoxb<NUM>` (`size xoxb-12-Ab`); the raw line is unchanged in each.
+
+      **The differential.** Every input any package's tests feed `Mask` (recorded through an overlay
+      hook; 2,118 distinct, 1,409 of them from main's own tests) and every string literal in the
+      repository's tests (5,013), raw, through `Templatize` and through `TemplatizeLine`, per-byte
+      coverage under `New()` and the extra-suffix Mapper (`k8s acme1 eu-1 v1.2 deadbeef 2corp`):
+      - main's own inputs: 6,920 cells, **all identical** (24 fail closed on both sides);
+      - the literals: 28,454 cells, all identical (every vendor value in the tests is split at its prefix);
+      - the branch's inputs: 9,778 cells, 8,262 identical, **1,492 widened, 0 narrowed, 0 layout-only,
+        0 error changes**. Every widened run starts at a vendor prefix and is classified: 422 runs a test
+        key raw, 10 a key with the glue its alphabet takes, 1,012 a test key templated, 42 the pinned
+        template costs, 6 the pinned raw cost.
+      - main's test file run against the branch's code fails only `TestEveryDetectorHasACompletenessRow`,
+        naming the five new detectors.
+
+      **Frequency.** The 70,783 records (ten boots and ab37) and the three small laptop and home
+      captures (1,643), each record's MESSAGE and its whole JSON line, raw, through `Templatize` and
+      through `TemplatizeLine`, old against new, under both Mappers. Predicted before the run: 0 changed,
+      0 error changes, 0 records with a standalone vendor prefix. Measured: **0 changed** in 217,058
+      cells (54,090 message and 155,120 line cells; 3,348 and 4,500 in the small captures), so 0 per
+      family and per rule, 0 error changes, and **0 records with a vendor prefix anywhere**. The
+      prediction held; the over-masking cost is measured at zero on this corpus, not assumed.
+
+      **Wire check.** A capturing endpoint, `--plain --llm-anonymize --warmup 0 --warmup-lines 0`,
+      v0.12.14 built from 9feb036 against the branch, one `[FATAL]` line per family (Stripe `sk_live_…`
+      in prose, `whsec_…`, `ghp_…`, `github_pat_…`, `xoxb-…`, `xoxp-…`, and a Google key as the geocode
+      query value) and `postgres://user:p/ss@db` as the open #59 control. Eight requests each. Key
+      fragments in the request bodies on v0.12.14: every family's raw fragment sent (8, 7, 6, 5, 4, 3 and
+      2 times, the context ring carrying each line into the later requests) and every template fragment
+      once (`xoxp-…`'s template is `<HEX>` on both); **0** for every one on the branch. `p/ss` is sent
+      twice by both.
+
+      **Tests.**
+      - `TestIssue114VendorSecretFormats`, raw and through the real `TemplatizeLine`, over ten keys (three
+        Stripe, three GitHub, three Slack, one Google): 20 closed contexts per key (prose, env var, logfmt
+        and JSON msg, JSON value, the Google, Stripe and GitHub query values, four glue-before rows, one
+        row per closer), each with its exact output, the fragments main sent checked absent, a round trip
+        and the output re-masked unchanged with a clean `residue()`; 14 glue-after rows; 11
+        byte-identical reader rows per key; 3 residuals; 7 template costs; 37 must-stays; recurrence and
+        `residue()` per key.
+      - New rows in the completeness (17), templatized (13), quote-edge (5), type-tag (5), inert (11) and
+        both over-masking tables, and a raw cost in `TestAcceptedOverMasking`. No existing row changed.
+      - Red on main: 8 tests by assertion (every closed, glue-after, cost, residual and recurrence row);
+        no reader row and no must-stay fails there. Guard functions byte-identical; the test commit is
+        additions only. The full suite under `-race`: 1,591 passing and 1 skipped on main, 2,003 and 1 on
+        the branch, 0 failing on either; no existing test changed outcome. New and touched tests pass
+        under `-race -count=20`.
+
+      **Mutants, each with what it turned red** (38, all killed).
+      - Prefix dropped: `rk_`, the test mode, `whsec_`, `ghs_`, `github_pat_`, `xoxp`, `xapp` and `AIza`,
+        each its family's closed rows and recurrence; `github_pat_` and `AIza` also the reader guard and
+        `TestEveryDetectorHasACompletenessRow`.
+      - Raw floor lowered (Stripe 24→6, `whsec_` 32→7, `ghp_` 36→5, `github_pat_` 82→20, Google 35→4,
+        Slack's run 16→4): the must-stays and the over-masking tests.
+      - Template floor n→1, per family: the short digit-bearing must-stays (`sk_test_run42`,
+        `whsec_v2_rotation`, `ghp_v2`, `github_pat_…_v2_enabled`, `AIza_test_1`).
+      - Template form dropped, per family: the templatized, logfmt and closed template rows, and
+        `TestEveryUncollapsedDetectorHasATemplatizedRow` for `ghp_`, `github_pat_`, Google and Slack.
+      - Slack: digit-first dropped (the 24-letter word after `xoxb-`), the raw witness dropped (the
+        kebab-case must-stays), the template witness dropped (`xoxb<NUM>` rows and the inert list).
+      - The lead admitting letters, per family: `disk_test_…` and `ask_live_…`, `xghp_…`, `mygithub_pat_…`,
+        `bAIza…`, and a letter before `xoxb-…`.
+      - Rule 12 not appended: every #114 row and the reader guard. `verify:false`: the reader guard and the
+        `residue()` rows. Rule 12 at 3b's slot: the reader guard and the byte-identical reader rows.
+        The shapes added to keyShapes: the same. One combined rule: the reader guard.
+
+      **Cost in time.** Main against the branch, medians of eight runs: `buildDetectors(nil)` 4.86 →
+      5.60 ms (×1.15), `New()` with extra host suffixes 4.97 → 5.74 ms (×1.16), and `Mask` over a
+      typical seven-line payload (trigger, template, five context lines) with a fresh Mapper 0.86 →
+      1.04 ms (×1.21), five more scans per string. Production builds one Mapper per escalation, capped by
+      `--rate-limit`, and the default Mapper reuses the compiled chain.
+
+      README: the Known-limitations entry goes.
+
+      Seen, out of scope (throwaway test, invented values): AWS secret access keys, Twilio `SK…`/`AC…`,
+      SendGrid `SG.…`, npm `npm_…`, GitLab `glpat-…`, Hugging Face `hf_…`, Shopify `shpat_…`, PyPI
+      `pypi-…`, and Slack incoming-webhook (`hooks.slack.com/services/T…/B…/…`) and Discord webhook URLs
+      are all sent on the raw line (for the webhooks the host is masked and the secret path segment
+      sent). A bare `KEY=value`, #59, #49, #42, #65's sweep, #91, #92 and `internal/pipeline` were not
+      touched.
+
+      Targets TODO-VERSION
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
