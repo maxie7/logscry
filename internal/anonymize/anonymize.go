@@ -78,6 +78,12 @@
 // What that costs a reader: text glued after an sk- key by '_' or '-' is the key's, since it is the key's
 // alphabet, and a userinfo half or a host-list member that is such a key is now a key half.
 //
+// #114 IS A RULE AT THE END, NOT A READER. Stripe, GitHub, Slack and Google secrets matched no detector
+// and were sent whole, raw and on the template, with residue() reading the line as clean. Each format
+// family is now one verify-eligible rule run after rule 11 (rule 12, see vendorKeys). Every rule that
+// owns a value around such a key already masked it whole, so a rule run last reads only the text none of
+// them claims -- prose, a query value, a JSON value, an env var -- and changes nothing they mask.
+//
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
 // Mask records nests; that inertness is what keeps a home path in a Go stack trace from tripping
@@ -253,6 +259,9 @@ func New(extraHostSuffixes ...string) *Mapper {
 //
 // #110 changes nothing here. Its leftover, "Bearer <TOKEN_1>.prod", is a shape the re-scan reads as clean,
 // and it no longer meets it; a raw key left in a bearer value was always 1's or 2's, and mutes.
+//
+// #114 WIDENS WHAT residue() SEES by the vendor formats, for #108's reason: rule 12 is verify-eligible,
+// so a raw Stripe, GitHub, Slack or Google secret that ever survives masking mutes.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -451,8 +460,8 @@ func (m *Mapper) residue(s string) string {
 	return ""
 }
 
-// The placeholder type tags. TOKEN covers every secret shape (JWT, AWS key, Bearer/sk-,
-// embedded credentials): the card and the model care that it is a secret, not which kind.
+// The placeholder type tags. TOKEN covers every secret shape (JWT, AWS key, Bearer/sk-, a vendor
+// key, embedded credentials): the card and the model care that it is a secret, not which kind.
 const (
 	tagIP    = "IP"
 	tagEmail = "EMAIL"
@@ -496,7 +505,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all twenty-two rather than to the one detector known to need it, because
+// It is applied to all twenty-seven rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -1040,6 +1049,31 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	for _, k := range keyShapes {
 		dets = append(dets, detector{tagToken, mustLongest(looseKey(k.loose, k.lead)), 1, true, false})
 	}
+	// 12. A vendor key (#114): Stripe, GitHub classic and fine-grained, Slack and Google, one rule per
+	//     format family in vendorKeys' order. None was any detector's shape, so each was sent whole, raw
+	//     and on the template, and residue() read the line as clean.
+	//
+	//     IT RUNS LAST, after rule 11, and the argument is #108's. A vendor key no strict detector tags is
+	//     masked whole by every rule that owns a value around it -- a userinfo half (4), a host or a list
+	//     member (9a, 9c), a bare private host (9b), an email local part (5), a home directory (10), a
+	//     bearer value (3a) -- because their classes admit the key's alphabet. A key rule run at 3b's slot
+	//     would tag it first and block each of them at our '<', the anti-correlation #51 paid twice: the
+	//     domain of "mail <key>@example.com" and the labels before a bare host's key label would be sent.
+	//     Run last, it reads only text no rule claimed, so every rule before it sees main's input and only
+	//     placeholders are added. After rule 11 rather than before, so main's whole chain is a prefix.
+	//
+	//     There the text beside a key is prose, #57's decision: glue BEFORE the prefix stays outside
+	//     ("token_<TOKEN_1>"), and after it the format's alphabet decides, so a '_' after a github_pat_ or
+	//     Google key, and a '-' after a Slack or Google one, are the key's, while a closer never is.
+	//
+	//     One rule per format family rather than one for all, so each family has its own canonical
+	//     completeness and templatized rows; GitHub is two, because its formats differ in alphabet and floor.
+	//
+	//     verify:true, as every key rule: a raw vendor key that ever survives masking mutes the escalation.
+	//     Its group is raw text and the pipeline's placeholders only, so it cannot fire on our own output.
+	for _, k := range vendorKeys {
+		dets = append(dets, detector{tagToken, mustLongest(looseKey(k.loose, k.lead)), 1, true, false})
+	}
 	return dets
 }
 
@@ -1258,10 +1292,14 @@ var skBody = func() string {
 // the raw tail's, a letter of each case -- a base62 body carries both, while "sk-1 failed", "region sk-2"
 // and a size like "sk-2XL" carry at most one -- or sixteen unbroken letters and digits. A digit-first hex
 // body needs neither: HEX runs before NUM and keeps the "sk-" (sk-<HEX>).
-var skDigitFirst = func() string {
-	unit := `(?:` + skRun + `|` + pipelinePH + `)`
-	return unit + `*(?:[A-Z]` + unit + `*[a-z]|[a-z]` + unit + `*[A-Z]|` + skChar + `{16})` + unit + `*`
-}()
+var skDigitFirst = caseOrRun(`(?:`+skRun+`|`+pipelinePH+`)`, skChar)
+
+// caseOrRun is a run of unit carrying a letter of each case or sixteen unbroken characters of char:
+// skDigitFirst's witness after a placeholder that stands for an unknown count of digits, and Slack's
+// after its own (see slackKey).
+func caseOrRun(unit, char string) string {
+	return unit + `*(?:[A-Z]` + unit + `*[a-z]|[a-z]` + unit + `*[A-Z]|` + char + `{16})` + unit + `*`
+}
 
 // skLoose is the sk key with no edge of its own, rule 11's; skKey adds the leading \b.
 var skLoose = `(?:` + skPrefix + skBody + `|sk<NUM>` + skDigitFirst + `)`
@@ -1317,6 +1355,82 @@ var keyShapes = []keyShape{
 
 // keyShape is one key as keyShapes lists it.
 type keyShape struct{ pat, cont, loose, lead string }
+
+// vendorKeys are rule 12's keys (#114), one per format family: a vendor's prefix, then a body over the
+// format's own alphabet with no edge of its own, so a key ends where its alphabet does, as rule 11's do.
+// lead is what may not sit before the prefix, as for rule 11: a letter or a digit there makes a longer
+// word that merely contains the prefix (disk_test_..., bAIza...), and '_', '-' and punctuation are glue.
+//
+// They are NOT keyShapes, and that is the point of the list. keyShapes exists so that 4d, 9e and 3c can
+// see a key inside a larger value before a strict detector tags it there; no strict detector tags a vendor
+// key, so the rules that own a value around one -- 4, 9a, 9c, 9b, 5, 10, 3a -- already mask it whole,
+// and only text none of them claims is left for rule 12.
+var vendorKeys = []vendorKey{
+	{stripeKey, `A-Za-z0-9`},
+	{githubKey, `A-Za-z0-9`},
+	{githubPAT, `A-Za-z0-9`},
+	{slackKey, `A-Za-z0-9`},
+	{googleKey, `A-Za-z0-9`},
+}
+
+// vendorKey is one key as vendorKeys lists it.
+type vendorKey struct{ loose, lead string }
+
+// The vendor formats, each from its published structure. A raw body's floor is the shortest published
+// length, with no upper bound: a vendor that lengthens its keys still matches, and a longer run of the
+// alphabet is masked whole, as rule 11's AWS run is. On the Template field the pipeline turns each digit
+// run into <NUM> and a placeholder is the evidence, as in mangled, with a floor in units (mangledFloor),
+// so a short identifier with a digit in it stays.
+//
+//   - Stripe: sk_ and rk_ (secret and restricted) in live or test mode, 24 base62 characters for a test or
+//     legacy key and up to about 99 for a current one; whsec_ (a webhook signing secret) with 32, or 64
+//     hex from the Stripe CLI. pk_ is a publishable key, public by design, and is not read.
+//   - GitHub classic: ghp_, gho_, ghu_, ghs_, ghr_ and 36 base62 characters, the last six a checksum.
+//   - GitHub fine-grained: github_pat_ and 82 characters, '_' among them (22, '_', 59). The split is not
+//     relied on; the floor is over the alphabet.
+//   - Slack: xoxb-, xoxp-, xoxa-, xoxr-, xoxs- and xapp-, a body of '-'-separated segments that starts
+//     with a numeric one and carries a secret segment of at least sixteen (24 base62 for a bot, 32 hex
+//     for a user, 64 hex for an app token; the IDs are at most thirteen digits). '-' is in the alphabet,
+//     so a kebab-case word after a literal "xoxb-" is the same alphabet, and the witness is #51's run.
+//   - Google: AIza and exactly 35 base64url characters.
+//
+// The template floors are measured, not guessed: over 200,000 simulated bodies per format the fewest
+// units left on the Template field were 13 for a hex whsec_, 14 for a 24-character sk_, 27 for ghp_, 69
+// for github_pat_ and 25 for AIza, and every one of those templates matched whole. Each floor sits far
+// enough below its minimum that mangledFloor's two branches meet it (see there), and far enough above
+// a short identifier with a digit in it ("ghp_v2", "AIza_test_1") that one stays.
+var (
+	stripeKey = `(?:(?:sk|rk)_(?:live|test)_(?:` + vendorAlnum + `{24,}|` + mangledFloor(vendorAlnum, 8) + `)` +
+		`|whsec_(?:` + vendorAlnum + `{32,}|` + mangledFloor(vendorAlnum, 8) + `))`
+	githubKey = `gh[pousr]_(?:` + vendorAlnum + `{36,}|` + mangledFloor(vendorAlnum, 12) + `)`
+	githubPAT = `github_pat_(?:[A-Za-z0-9_]{82,}|` + mangledFloor(`[A-Za-z0-9_]`, 24) + `)`
+	googleKey = `AIza(?:[A-Za-z0-9_-]{35,}|` + mangledFloor(`[A-Za-z0-9_-]`, 12) + `)`
+)
+
+// vendorAlnum is the base62 alphabet of the Stripe and GitHub classic bodies.
+const vendorAlnum = `[A-Za-z0-9]`
+
+// slackKey is the Slack family. On the raw line the body starts with a digit and carries an unbroken run
+// of sixteen; a team or user ID is never that long, and a kebab-case word after "xoxb-" has neither.
+//
+// On the Template field the leading '-' and the first numeric segment are one <NUM> -- NUM takes a '-'
+// before a digit as its sign -- so "xoxb-123...-456...-AbC..." arrives as "xoxb<NUM><NUM>-AbC...", and the
+// witness is caseOrRun's, as after sk<NUM>: the placeholder stands for any count of digits, and it is also
+// every "xoxb-1". A user or app token's hex segment arrives as <HEX>, with no secret byte left in the
+// template, so that template is main's.
+var slackKey = `(?:xox[abprs]|xapp)(?:-[0-9][A-Za-z0-9-]*` + vendorAlnum + `{16}[A-Za-z0-9-]*|<NUM>` +
+	caseOrRun(`(?:[A-Za-z0-9-]|`+pipelinePH+`)`, vendorAlnum) + `)`
+
+// mangledFloor is mangled with a floor of n units, a unit being a character of class or a whole pipeline
+// placeholder: a run with a placeholder in it and at least n-1 units on one side of its FIRST placeholder.
+// RE2 has no intersection, so "at least n units, one of them a placeholder" exactly would be n branches,
+// as withUpper is; this is two, and loses nothing a key needs. It never matches fewer than n units, and it
+// matches every such run of 2n-2 units or more: with the first placeholder at unit p of U, the first
+// branch fails only for p < n-1 and the second only for p > U-n, and both fail only if U < 2n-2.
+func mangledFloor(class string, n int) string {
+	unit := `(?:` + class + `|` + pipelinePH + `)`
+	return fmt.Sprintf(`(?:%s{%d,}%s%s*|%s*%s%s{%d,})`, class, n-1, pipelinePH, unit, class, pipelinePH, unit, n-1)
+}
 
 // looseKey is rule 11 for one key: the loose key, after the start of the text or a character outside
 // its lead. The character before is CONTEXT and the key is the group, so the glue stays where it was.
