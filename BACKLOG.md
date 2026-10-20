@@ -499,7 +499,7 @@ Deferred work, not a v1 blocker. Nothing here gates M6.
         Fixed, in Fixes below.
       - #70: the live export's drop count reaches the user only at exit, as queue
         messages labelled records (a 2× overstatement), with exit status 0. (Done with #70,
-        in TODO-VERSION.)
+        in v0.12.19.)
       - #73: `--record` for sources without their own clock.
 
       **What this unblocks, stated and not built:**
@@ -1691,7 +1691,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
          one error per source plus the two notices, so no sender blocks. **The exit status
          stays 0**: a source's outcome, a watched app's crash included, is reported, not
          exit-coded. What the exit status should mean is the question #70 also raises.
-         (Done with #70, in TODO-VERSION.)
+         (Done with #70, in v0.12.19.)
       3. **Shutdown is unchanged.** On Ctrl-C nothing is reported. `Run` returns only after
          every source has. A pending re-attach (#85) is not launched once the source is
          ending, by the same check that stops it at shutdown. The marks are untouched.
@@ -1777,7 +1777,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       - **#98 is unchanged.** A follower's context is now a child of Lines' own. It is freed
         when the Docker source ends, but it still accumulates during the run.
       - **#70 is unchanged**, and the exit status stays 0 there too. (Done with #70, in
-        TODO-VERSION.)
+        v0.12.19.)
       - **A Docker list error leaves the events subscription open until exit.** Lines
         subscribes to events before listing. When the list fails, it returns, but the events
         goroutine and its connection stay until the run's ctx is cancelled, because
@@ -3857,7 +3857,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       the notice, the status field, the `export_incomplete` kind, the bounded exit and the
       partial last line, and a new "Exit status" section lists 0 and 1.
 
-      Targets TODO-VERSION
+      Targets v0.12.19
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
