@@ -108,6 +108,13 @@ func TestTypeTags(t *testing.T) {
 		// #51: an sk- key with a '-' or a '_' in its tail is a key. Before the fix this came back unchanged,
 		// the key in the clear; the exact output is pinned in TestIssue51SkKeyWithASeparatorInItsTail.
 		{"key " + skProjKey + " rejected", "<TOKEN_1>"},
+		// #114: a Stripe, GitHub, Slack or Google secret is a key. Before the fix these came back unchanged,
+		// the key in the clear; the exact outputs are pinned in TestIssue114VendorSecretFormats.
+		{"key " + stripeLiveSecret + " rejected", "<TOKEN_1>"},
+		{"key " + githubClassicSecret + " rejected", "<TOKEN_1>"},
+		{"key " + githubPATSecret + " rejected", "<TOKEN_1>"},
+		{"key " + slackBotSecret + " rejected", "<TOKEN_1>"},
+		{"key " + googleAPISecret + " rejected", "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -163,6 +170,14 @@ func TestNoOverMasking(t *testing.T) {
 		"Accept-Language: sk-SK,sk;q=0.9",
 		"sk-1 failed",
 		"region sk-2",
+		// #114: a word that shares a vendor prefix stays by the floor, the witness or the lead
+		// (TestIssue114VendorSecretFormats).
+		"sk" + "_test_helper",
+		"gh" + "p_cache_dir",
+		"github" + "_pat_rotation_policy_v2_enabled",
+		"the xox" + "b- prefix",
+		"xox" + "b-2024-rollout-plan",
+		"AI" + "za_test_1",
 	}
 	for _, s := range survive {
 		m := New()
@@ -548,6 +563,20 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"postgres://<TOKEN_1>:<TOKEN_2>@<HOST_1>/db",
 		"peer worker-<TOKEN_1>.<HOST_1> down",
 		"/home/<TOKEN_1>/x",
+		// #114's new outputs fed back: our own tag behind each vendor prefix, raw and as the template leaves
+		// it, and the outputs themselves. A vendor body reads a pipeline placeholder as evidence, never ours,
+		// so a prefix before our tag gives rule 12 nothing to match.
+		"key sk" + "_live_<TOKEN_1> used",
+		"key wh" + "sec_<TOKEN_1> used",
+		"key gh" + "p_<TOKEN_1> used",
+		"key github" + "_pat_<TOKEN_1> used",
+		"key xox" + "b-<TOKEN_1> used",
+		"key xox" + "b<NUM><TOKEN_1> used",
+		"key xox" + "b<NUM><NUM>-<TOKEN_1> used",
+		"key AI" + "za<TOKEN_1> used",
+		"key <TOKEN_1>_prod used",
+		"GOOGLE_API_KEY=<TOKEN_1>",
+		"https://<HOST_1>/maps/api/geocode/json?address=x&key=<TOKEN_1>",
 	}
 	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
@@ -2030,6 +2059,11 @@ func TestIssue57PartlyRecognisedValue(t *testing.T) {
 // The readers are NAMED rather than counted, so a new one fails naming itself. 4d (a userinfo) and 9e (a
 // host) read all three keys. 3c (a bearer value, #110) reads JWT's and AWS's only: 3b runs after 3a, so
 // a bearer value with an sk- key inside it has always been 3a's whole.
+//
+// #114's vendor keys are the other way round: no reader at all. Each format family's key is the group of
+// exactly one detector, a verify-eligible TOKEN rule with group 1 among the chain's last, one per family,
+// and no other detector carries its shape. A vendor shape that joined keyShapes would put it inside 4d, 9e
+// and rule 11, and a vendor rule moved to 3b's slot would block the rules that mask such a key whole.
 func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
 	want := map[string][]string{
 		jwtKey: {"3c", "4d", "9e"},
@@ -2080,6 +2114,53 @@ func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
 			sort.Strings(readers)
 			if strings.Join(readers, ",") != strings.Join(want[src], ",") {
 				t.Errorf("the %s key is read by %v, want %v", key, readers, want[src])
+			}
+		}
+
+		vendor := []struct{ family, key string }{
+			{"Stripe", stripeLiveSecret},
+			{"GitHub classic", githubClassicSecret},
+			{"GitHub fine-grained", githubPATSecret},
+			{"Slack", slackBotSecret},
+			{"Google", googleAPISecret},
+		}
+		owner := map[int]string{}
+		for _, v := range vendor {
+			in := "key " + v.key + " used"
+			start, end := len("key "), len("key ")+len(v.key)
+			var hits []int
+			for i, d := range dets {
+				if loc := d.re.FindStringSubmatchIndex(in); loc != nil && loc[2*d.group] == start && loc[2*d.group+1] == end {
+					hits = append(hits, i)
+				}
+			}
+			if len(hits) != 1 {
+				t.Errorf("the %s key is the group of %d detectors, want exactly one", v.family, len(hits))
+				continue
+			}
+			i, d := hits[0], dets[hits[0]]
+			if d.tag != tagToken || d.group != 1 || !d.verify || d.fixpoint {
+				t.Errorf("the %s key's rule is detector %d (%s, group %d, verify %v), want a verify-eligible TOKEN rule with group 1",
+					v.family, i, d.tag, d.group, d.verify)
+			}
+			if i < len(dets)-len(vendor) {
+				t.Errorf("the %s key's rule is detector %d, want one of the last %d: a rule that runs earlier blocks the rules that mask such a key whole", v.family, i, len(vendor))
+			}
+			if o, dup := owner[i]; dup {
+				t.Errorf("the %s and %s keys share detector %d, want one rule per family", o, v.family, i)
+			}
+			owner[i] = v.family
+			src := d.re.String()
+			at := strings.Index(src, "])(")
+			if at < 0 || !strings.HasSuffix(src, ")") {
+				t.Errorf("the %s key's rule is not a loose key, a context then the key as group 1:\n pattern: %s", v.family, src)
+				continue
+			}
+			shape := src[at+len("])(") : len(src)-1]
+			for j, o := range dets {
+				if j != i && strings.Contains(o.re.String(), shape) {
+					t.Errorf("%s reads the %s key, which is rule 12's alone", name(j), v.family)
+				}
 			}
 		}
 	}
@@ -2707,6 +2788,335 @@ func TestIssue51SkKeyWithASeparatorInItsTail(t *testing.T) {
 	} {
 		if tag := New().residue(in); tag != tagToken {
 			t.Errorf("a raw sk- key does not mute: residue(%q) = %q, want %q", in, tag, tagToken)
+		}
+	}
+}
+
+// #114's invented keys, one or more per format family, shared by its test and the tables. Each is written
+// split at its vendor prefix, as #51's are, so that no source line carries a whole key-shaped literal for a
+// secret scanner to match; the strings are the same at run time.
+const (
+	stripeLiveSecret       = "sk" + "_live_" + "Rk4mQz8vLp2wXn6tYb9cHd3s"
+	stripeRestrictedSecret = "rk" + "_test_" + "Tq5wEr8yUi2oPa6sDf9gHj3kLz7x"
+	stripeWebhookSecret    = "wh" + "sec_" + "Mn8bVc6xZa4sDf2gHj0kLqWe5rTy7uIo"
+	githubClassicSecret    = "gh" + "p_" + "Xy7zWv5uTs3rQp1oNm9lKjHgFeDcBa8ZyQw4"
+	githubServerSecret     = "gh" + "s_" + "Lp2wXn6tYb9cHd3sRk4mQz8vEr8yUi2oPa6s"
+	githubPATSecret        = "github" + "_pat_" + "11ABCDE2F0aB3cD4eF5gH6" + "_" +
+		"iJ7kL8mN9oP0qR1sT2uV3wX4yZ5aB6cD7eF8gH9iJ0kL1mN2oP3qR4sT5uV"
+	slackBotSecret  = "xox" + "b-" + "2849163057-7340815926413-" + "Gk4Lm8Np2Qr6St0Uv3Wx7Yz1"
+	slackUserSecret = "xox" + "p-" + "2849163057-5817304926-6150928374-" + "9f3a2c7e1b8d4f60a5e9c2b7d1f8a3e6"
+	slackAppSecret  = "xa" + "pp-" + "1-A04BCDEF7GH-6283910475612-" +
+		"3f9a2c7e1b8d4f60a5e9c2b7d1f8a3e6c4b9d2f7a1e8c5b3d6f9a2e7c1b4d8f0"
+	googleAPISecret = "AI" + "za" + "SyD4k8Lm-2Qp9Rs_Tv7Wx1Yz5Bc3Fh6Jn0K"
+)
+
+// TestIssue114VendorSecretFormats is the named regression for #114. Stripe (sk_ and rk_ in live or test
+// mode, whsec_), GitHub (ghp_, gho_, ghu_, ghs_, ghr_ and github_pat_), Slack (xoxb-, xoxp-, xoxa-, xoxr-,
+// xoxs- and xapp-) and Google (AIza) secrets matched no detector -- 3b reads "sk-" with a hyphen only -- so
+// each was sent whole, raw and on the template, and residue() read the line as clean. A rule that owns the
+// value around one (a userinfo, a host, an email local part, a home directory, a bearer value) already
+// masked it whole; prose, a query value, a JSON value and an environment variable were the leak. v0.4.0
+// onward.
+//
+// Each format family is now one rule run LAST (rule 12, see vendorKeys), so it reads only text no rule
+// claimed and every rule before it sees main's input: the reader rows below are main's bytes. Glue before
+// a key is prose, #57's decision; after it the format's alphabet decides, as #108 and #51 decided it --
+// '_' is a github_pat_ or Google key's, '-' a Slack or Google key's, and a closer is never the key's. On the
+// template a pipeline placeholder is the evidence, over a floor in units, and after a Slack prefix's <NUM>
+// a letter of each case, as after sk<NUM>.
+func TestIssue114VendorSecretFormats(t *testing.T) {
+	type vendorRow struct {
+		name, key, env string
+		sent           []string // what main sent on one path or both; none may survive
+		tmplMains      bool     // the secret segment is <HEX> on the template, so the template is main's
+	}
+	keys := []vendorRow{
+		{"stripe sk_live_", stripeLiveSecret, "STRIPE_SECRET_KEY", []string{"sk" + "_live_", "mQz", "cHd"}, false},
+		{"stripe rk_test_", stripeRestrictedSecret, "STRIPE_SECRET_KEY", []string{"rk" + "_test_", "wEr", "kLz"}, false},
+		{"stripe whsec_", stripeWebhookSecret, "STRIPE_WEBHOOK_SECRET", []string{"wh" + "sec_", "bVc", "kLqWe"}, false},
+		{"github ghp_", githubClassicSecret, "GITHUB_TOKEN", []string{"gh" + "p_", "zWv", "lKjHgFeDcBa"}, false},
+		{"github ghs_", githubServerSecret, "GITHUB_TOKEN", []string{"gh" + "s_", "wXn", "yUi"}, false},
+		{"github github_pat_", githubPATSecret, "GITHUB_TOKEN", []string{"github" + "_pat_", "ABCDE", "_iJ"}, false},
+		{"slack xoxb-", slackBotSecret, "SLACK_BOT_TOKEN", []string{"xox" + "b", "Gk", "Np"}, false},
+		{"slack xoxp-", slackUserSecret, "SLACK_USER_TOKEN", []string{"xox" + "p-", "9f3a2c7e"}, true},
+		{"slack xapp-", slackAppSecret, "SLACK_APP_TOKEN", []string{"xa" + "pp-", "3f9a2c7e"}, true},
+		{"google AIza", googleAPISecret, "GOOGLE_API_KEY", []string{"AI" + "za", "SyD", "Rs_Tv"}, false},
+	}
+	fill := func(s string, k vendorRow) string {
+		return strings.NewReplacer("{K}", k.key, "{ENV}", k.env).Replace(s)
+	}
+
+	// The template is the pipeline's handwriting, read for real: every key's digits are <NUM> there, so the
+	// template rows below read a mangled key, the placeholder being the evidence.
+	for _, k := range keys {
+		if tKey, _ := pipeline.Templatize(k.key); !regexp.MustCompile(pipelinePH).MatchString(tKey) {
+			t.Fatalf("premise broken: the %s key %q is not mangled by the pipeline masker", k.name, tKey)
+		}
+	}
+
+	// The text around a key that no rule claims, the same for every family. The template is
+	// TemplatizeLine's, the real Template field. The query values are the commonest real placement of a
+	// Google key and a common one for the rest: there 9a masked the host on main and the key was sent.
+	closed := []struct{ name, in, want, tmpl string }{
+		{"prose", "key {K} rejected", "key <TOKEN_1> rejected", "key <TOKEN_1> rejected"},
+		{"env var", "{ENV}={K}", "{ENV}=<TOKEN_1>", "{ENV}=<TOKEN_1>"},
+		{"logfmt msg", `level=error msg="key {K} rejected" module=x`,
+			`level=error msg="key <TOKEN_1> rejected" module=x`, `level=error msg="key <TOKEN_1> rejected" module=x`},
+		{"json msg", `{"level":"error","msg":"key {K} rejected"}`,
+			`{"level":"error","msg":"key <TOKEN_1> rejected"}`, `{"level":<STR>,"msg":"key <TOKEN_1> rejected"}`},
+		{"json value", `{"api_key":"{K}"}`, `{"api_key":"<TOKEN_1>"}`, `{"api_key":<STR>}`},
+		{"google geocode query value", "https://maps.googleapis.com/maps/api/geocode/json?address=x&key={K}",
+			"https://<HOST_1>/maps/api/geocode/json?address=x&key=<TOKEN_1>",
+			"https://<HOST_1>/maps/api/geocode/json?address=x&key=<TOKEN_1>"},
+		{"stripe query value", "GET https://api.stripe.com/v1/charges?key={K} 401",
+			"GET https://<HOST_1>/v1/charges?key=<TOKEN_1> 401", "GET https://<HOST_1>/v<NUM>/charges?key=<TOKEN_1> <NUM>"},
+		{"github query value", "GET https://api.github.com/user?access_token={K} 401",
+			"GET https://<HOST_1>/user?access_token=<TOKEN_1> 401", "GET https://<HOST_1>/user?access_token=<TOKEN_1> <NUM>"},
+		// Glue before the key is prose and stays outside the placeholder (#57, #108).
+		{"'_' before", "token_{K} used", "token_<TOKEN_1> used", "token_<TOKEN_1> used"},
+		{"'-' before", "x-{K} used", "x-<TOKEN_1> used", "x-<TOKEN_1> used"},
+		{"'=' before", "token={K} used", "token=<TOKEN_1> used", "token=<TOKEN_1> used"},
+		{"':' before", "token:{K} used", "token:<TOKEN_1> used", "token:<TOKEN_1> used"},
+		// A closer after the key stays outside the placeholder (#90's class), one row each.
+		{"sentence dot", "key {K}. Retrying", "key <TOKEN_1>. Retrying", "key <TOKEN_1>. Retrying"},
+		{"comma", "key {K}, retrying", "key <TOKEN_1>, retrying", "key <TOKEN_1>, retrying"},
+		{"double quote", `rejected "{K}"`, `rejected "<TOKEN_1>"`, `rejected <STR>`},
+		{"single quote", "rejected '{K}'", "rejected '<TOKEN_1>'", "rejected <STR>"},
+		{"paren", "({K})", "(<TOKEN_1>)", "(<TOKEN_1>)"},
+		{"bracket", "[{K}]", "[<TOKEN_1>]", "[<TOKEN_1>]"},
+		{"brace", "{{K}}", "{<TOKEN_1>}", "{<TOKEN_1>}"},
+		{"colon", "{K}: rejected", "<TOKEN_1>: rejected", "<TOKEN_1>: rejected"},
+	}
+	check := func(t *testing.T, in, want string, sent []string) {
+		t.Helper()
+		m := New()
+		got := mustMask(t, m, in)
+		if got != want {
+			t.Errorf("a vendor secret not masked:\n in:   %q\n got:  %q\n want: %q", in, got, want)
+		}
+		for _, frag := range sent {
+			if strings.Contains(got, frag) {
+				t.Errorf("a fragment main sent survived: %q still in %q", frag, got)
+			}
+		}
+		if r := m.Restore(got); r != in {
+			t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", in, r)
+		}
+		// The new output is inert: masking it again changes nothing and the re-scan reads it clean.
+		if again := mustMask(t, New(), want); again != want {
+			t.Errorf("the masked output is not inert:\n out:   %q\n again: %q", want, again)
+		}
+		if tag := New().residue(want); tag != "" {
+			t.Errorf("residue() reads the masked output %q as %q", want, tag)
+		}
+	}
+	for _, k := range keys {
+		for _, c := range closed {
+			t.Run(k.name+"/"+c.name, func(t *testing.T) {
+				in := fill(c.in, k)
+				check(t, in, fill(c.want, k), k.sent)
+				if k.tmplMains {
+					return // the template is main's, pinned below
+				}
+				tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: in}))
+				check(t, tIn, fill(c.tmpl, k), k.sent)
+			})
+		}
+	}
+
+	// After a key, the format's alphabet decides, raw and templatized alike: '_' is a github_pat_ or Google
+	// key's and '-' a Slack or Google key's, so the word is absorbed; for the others the word is prose.
+	after := []struct{ name, in, want string }{
+		{"stripe, '_' after", "key " + stripeLiveSecret + "_prod used", "key <TOKEN_1>_prod used"},
+		{"stripe, '-' after", "key " + stripeLiveSecret + "-prod used", "key <TOKEN_1>-prod used"},
+		{"whsec, '_' after", "key " + stripeWebhookSecret + "_prod used", "key <TOKEN_1>_prod used"},
+		{"whsec, '-' after", "key " + stripeWebhookSecret + "-prod used", "key <TOKEN_1>-prod used"},
+		{"ghp, '_' after", "key " + githubClassicSecret + "_prod used", "key <TOKEN_1>_prod used"},
+		{"ghp, '-' after", "key " + githubClassicSecret + "-prod used", "key <TOKEN_1>-prod used"},
+		{"github_pat, '_' after is the key's", "key " + githubPATSecret + "_prod used", "key <TOKEN_1> used"},
+		{"github_pat, '-' after", "key " + githubPATSecret + "-prod used", "key <TOKEN_1>-prod used"},
+		{"xoxb, '_' after", "key " + slackBotSecret + "_prod used", "key <TOKEN_1>_prod used"},
+		{"xoxb, '-' after is the key's", "key " + slackBotSecret + "-prod used", "key <TOKEN_1> used"},
+		{"xapp, '_' after", "key " + slackAppSecret + "_prod used", "key <TOKEN_1>_prod used"},
+		{"xapp, '-' after is the key's", "key " + slackAppSecret + "-prod used", "key <TOKEN_1> used"},
+		{"google, '_' after is the key's", "key " + googleAPISecret + "_prod used", "key <TOKEN_1> used"},
+		{"google, '-' after is the key's", "key " + googleAPISecret + "-prod used", "key <TOKEN_1> used"},
+	}
+	for _, c := range after {
+		t.Run("after/"+c.name, func(t *testing.T) {
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			var sent []string
+			for _, k := range keys {
+				if strings.Contains(c.in, k.key) {
+					sent = k.sent
+				}
+			}
+			for _, in := range []string{c.in, tIn} {
+				check(t, in, c.want, sent)
+			}
+		})
+	}
+
+	// Byte-identical with main, raw and templatized, for every family: the rules that own a value around a
+	// key already masked it whole, and run before rule 12, so it never sees one. Each row is a position a
+	// reader of keyShapes would take if the vendor shapes joined it -- a userinfo (4d's), a host label and a
+	// list member (9e's), a bearer value (3c's) -- or one a key rule run at 3b's slot would block: an email,
+	// a bare private host, a home directory and #46's cell, where main masks the whole half.
+	same := []struct{ name, in, want, tmpl string }{
+		{"userinfo, '.' after the key (4d's position)", "s3://{K}.prod@bucket", "s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>"},
+		{"userinfo with a password (4d's position)", "s3://{K}.prod:secret@bucket", "s3://<TOKEN_1>@<HOST_1>", "s<NUM>://<TOKEN_1>@<HOST_1>"},
+		{"host label (9e's position)", "https://{K}.prod.acme.com/x", "https://<HOST_1>/x", "https://<HOST_1>/x"},
+		{"list member (9e's position)", "mongodb://h1,{K}.prod,host3/db",
+			"mongodb://<HOST_1>,<HOST_2>,<HOST_3>/db", "mongodb://<HOST_1>,<HOST_2>,<HOST_3>/db"},
+		{"bearer value, '.' after (3c's position)", "hdr Bearer {K}.prod expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"bearer value (3a)", "hdr Bearer {K} expired", "hdr Bearer <TOKEN_1> expired", "hdr Bearer <TOKEN_1> expired"},
+		{"email local part (5)", "mail {K}@example.com", "mail <EMAIL_1>", "mail <EMAIL_1>"},
+		{"bare private host, '-' before the key (9b)", "peer worker-{K}.corp.internal down", "peer <HOST_1> down", "peer <HOST_1> down"},
+		{"home directory (10)", "/home/{K}/x", "/home/<USER_1>/x", "/home/<USER_1>/x"},
+		{"the #46 cell, the key is the username (4)", "postgres://{K}:password@localhost/db",
+			"postgres://<TOKEN_1>@<HOST_1>/db", "postgres://<TOKEN_1>@<HOST_1>/db"},
+		{"the #46 mirror, the key is the password (4)", "postgres://appuser:{K}@db", "postgres://<TOKEN_1>@<HOST_1>", "postgres://<TOKEN_1>@<HOST_1>"},
+	}
+	for _, k := range keys {
+		for _, c := range same {
+			t.Run("same/"+k.name+"/"+c.name, func(t *testing.T) {
+				in := fill(c.in, k)
+				tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: in}))
+				for _, p := range []struct{ in, want string }{{in, c.want}, {tIn, c.tmpl}} {
+					if got := mustMask(t, New(), p.in); got != p.want {
+						t.Errorf("a shape outside #114 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+					}
+				}
+			})
+		}
+	}
+
+	// THE RESIDUALS, pinned: the raw line is closed and the template is main's. A user or app token's
+	// secret segment is <HEX> on the template, so nothing of it is left to send; but with a word character
+	// glued after the key the hex segment has no \b to end on, NUM takes its digits instead, and the letters
+	// a-f between them are sent, as on main.
+	residuals := []struct{ name, in, want, tmpl string }{
+		{"xoxp, the secret segment is <HEX>", "key " + slackUserSecret + " rejected", "key <TOKEN_1> rejected",
+			"key xox" + "p<NUM><NUM><NUM>-<HEX> rejected"},
+		{"xapp, the secret segment is <HEX>", "key " + slackAppSecret + " rejected", "key <TOKEN_1> rejected",
+			"key xa" + "pp<NUM>-A<NUM>BCDEF<NUM>GH<NUM>-<HEX> rejected"},
+		{"xoxp, a word character glued after", "key " + slackUserSecret + "_prod used", "key <TOKEN_1>_prod used",
+			"key xox" + "p<NUM><NUM><NUM><NUM>f<NUM>a<NUM>c<NUM>e<NUM>b<NUM>d<NUM>f<NUM>a<NUM>e<NUM>c<NUM>b<NUM>d<NUM>f<NUM>a<NUM>e<NUM>_prod used"},
+	}
+	for _, c := range residuals {
+		t.Run("residual/"+c.name, func(t *testing.T) {
+			check(t, c.in, c.want, []string{"9f3a2c7e", "3f9a2c7e"})
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			if tIn != c.tmpl {
+				t.Fatalf("premise broken: the template is not the pinned one:\n got:  %q\n want: %q", tIn, c.tmpl)
+			}
+			if got := mustMask(t, New(), tIn); got != tIn {
+				t.Errorf("a pinned residual moved:\n in:   %q\n got:  %q", tIn, got)
+			}
+		})
+	}
+
+	// THE COSTS on the template, pinned; the raw one is TestAcceptedOverMasking's. A placeholder is the
+	// evidence over a floor in units well below the raw one, so a short tail with a digit in it is a key
+	// there; and after a Slack prefix's <NUM> a letter of each case is. The raw line is unchanged in each.
+	costs := []struct{ name, in, tmpl string }{
+		{"stripe, eleven units with a digit", "key sk" + "_test_Abc123defghij used", "key <TOKEN_1> used"},
+		{"whsec, eleven units with a digit", "key wh" + "sec_Abc123defghij used", "key <TOKEN_1> used"},
+		{"ghp, eighteen units with a digit", "key gh" + "p_AbCdEfGhIjKl1MnOp used", "key <TOKEN_1> used"},
+		{"github_pat, twenty-seven units with a digit", "key github" + "_pat_AbCdEfGhIjKlMnOpQrStUvWx1Yz used", "key <TOKEN_1> used"},
+		{"google, thirty characters with digits", "key AI" + "zaSyD4k8Lm2Qp9RsTv7Wx1Yz5Bc3Fh6J used", "key <TOKEN_1> used"},
+		{"slack, mixed case after xoxb<NUM>", "size xox" + "b-12-Ab", "size <TOKEN_1>"},
+		{"slack, fifteen letters after xoxb<NUM>", "key xox" + "b-1-AbCdEfGhIjKlMnO used", "key <TOKEN_1> used"},
+	}
+	for _, c := range costs {
+		t.Run("cost/"+c.name, func(t *testing.T) {
+			tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: c.in}))
+			for _, p := range []struct{ in, want string }{{c.in, c.in}, {tIn, c.tmpl}} {
+				if got := mustMask(t, New(), p.in); got != p.want {
+					t.Errorf("a pinned cost moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
+				}
+			}
+		})
+	}
+
+	// What stays, raw and templatized, and what keeps it. The floor: a word after a prefix is short of
+	// the format's length, letters only so that no placeholder gives the template branch evidence either,
+	// and a short tail with a digit is under the template floor. The alphabet: '_' ends a Stripe or ghp_
+	// body, so a snake_case name after "sk_test_" is short pieces. The witness: a Slack prefix with no digit
+	// after it -- every Slack body starts with a numeric segment -- or a kebab-case name with no sixteen-run. The lead: a letter or digit before the prefix makes
+	// a longer word that merely contains it.
+	for _, s := range []string{
+		"sk" + "_test_helper",
+		"call sk" + "_live_mode now",
+		"sk" + "_test_create_customer_with_card_1",
+		"sk" + "_test_run42",
+		"wh" + "sec_rotated",
+		"wh" + "sec_secret_rotation_v2",
+		"wh" + "sec_v2_rotation",
+		"prefix gh" + "p_ is classic",
+		"gh" + "p_cache_dir",
+		"gh" + "p_v2",
+		"set gh" + "s_timeout=30s",
+		"key gh" + "p_AbCdEfGh1IjKlMnOpQ used",
+		"github" + "_pat_rotation_policy_v2_enabled",
+		"key github" + "_pat_AbCdEfGhIjKl1MnOpQrStUvWxYz used",
+		"AI" + "zaTest",
+		"AI" + "za_test_1",
+		"AI" + "za is the prefix",
+		"xox" + "b token missing",
+		"the xox" + "b- prefix",
+		"xox" + "b-2024-rollout-plan",
+		"set xox" + "b-1 retries",
+		"see xox" + "b-authenticationfailures",
+		"key sk" + "_live_" + "AbCdEfGhIjKlMnOpQrStUvW used",
+		"key wh" + "sec_" + "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdE used",
+		"key gh" + "p_" + "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGhI used",
+		"key github" + "_pat_" + strings.Repeat("AbCdEfGhIj", 8) + "K used",
+		"key AI" + "za" + "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh used",
+		"disk" + "_test_" + "Rk4mQz8vLp2wXn6tYb9cHd3s",
+		"ask" + "_live_" + "Rk4mQz8vLp2wXn6tYb9cHd3s",
+		"x" + githubClassicSecret,
+		"my" + githubPATSecret,
+		"x" + slackBotSecret,
+		"b" + googleAPISecret,
+	} {
+		tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: s}))
+		for _, in := range []string{s, tIn} {
+			if got := mustMask(t, New(), in); got != in {
+				t.Errorf("over-masked a name that is no key:\n in:  %q\n out: %q", in, got)
+			}
+		}
+	}
+
+	// The key in prose and in an environment variable is one value, under one placeholder, and an answer
+	// naming it restores the key alone.
+	for _, k := range keys {
+		t.Run("recurs/"+k.name, func(t *testing.T) {
+			m := New()
+			if got, want := mustMask(t, m, "key "+k.key+" rejected"), "key <TOKEN_1> rejected"; got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+			if got, want := mustMask(t, m, k.env+"="+k.key), k.env+"=<TOKEN_1>"; got != want {
+				t.Errorf("recurrence: got %q, want %q", got, want)
+			}
+			if got := m.Restore("rotate <TOKEN_1>"); got != "rotate "+k.key {
+				t.Errorf("Restore = %q, want the key alone", got)
+			}
+		})
+	}
+
+	// residue() reads the same rules, so a raw vendor secret mutes the escalation; main read every one of
+	// these as clean.
+	for _, k := range keys {
+		for _, in := range []string{
+			"key " + k.key + " rejected",
+			k.env + "=" + k.key,
+			"token_" + k.key + " used",
+			"https://maps.googleapis.com/maps/api/geocode/json?address=x&key=" + k.key,
+		} {
+			if tag := New().residue(in); tag != tagToken {
+				t.Errorf("a raw %s secret does not mute: residue(%q) = %q, want %q", k.name, in, tag, tagToken)
+			}
 		}
 	}
 }
@@ -3613,6 +4023,26 @@ var completenessRows = []completenessRow{
 	{"sk-key/env-var-end", "OPENAI_API_KEY=", skProjKey, ""},
 	{"sk-key/closing-quote", `rejected "`, skProjKey, `" twice`},
 	{"sk-key/sentence-dot", "key ", skProjKey, ". Retrying"},
+	// #114. One canonical row per format family first, in vendorKeys' order, then the rest of each family,
+	// the query values where a Google key is commonest, and the edges. After the canonical rows, for the
+	// same reason as the #48 rows.
+	{"vendor-key/stripe", "key ", stripeLiveSecret, " rejected"},
+	{"vendor-key/github", "key ", githubClassicSecret, " rejected"},
+	{"vendor-key/github-pat", "key ", githubPATSecret, " rejected"},
+	{"vendor-key/slack", "key ", slackBotSecret, " rejected"},
+	{"vendor-key/google", "key ", googleAPISecret, " rejected"},
+	{"vendor-key/stripe-restricted", "key ", stripeRestrictedSecret, " rejected"},
+	{"vendor-key/stripe-webhook", "key ", stripeWebhookSecret, " rejected"},
+	{"vendor-key/github-server", "key ", githubServerSecret, " rejected"},
+	{"vendor-key/slack-user", "key ", slackUserSecret, " rejected"},
+	{"vendor-key/slack-app", "key ", slackAppSecret, " rejected"},
+	{"vendor-key/google-query-value", "https://\x00maps.googleapis.com\x00/maps/api/geocode/json?address=x&key=", googleAPISecret, ""},
+	{"vendor-key/stripe-query-value", "GET https://\x00api.stripe.com\x00/v1/charges?key=", stripeLiveSecret, " 401"},
+	{"vendor-key/github-query-value", "GET https://\x00api.github.com\x00/user?access_token=", githubClassicSecret, " 401"},
+	{"vendor-key/env-var-end", "GOOGLE_API_KEY=", googleAPISecret, ""},
+	{"vendor-key/underscore-before", "token_", slackBotSecret, " used"},
+	{"vendor-key/closing-quote", `rejected "`, githubPATSecret, `" twice`},
+	{"vendor-key/sentence-dot", "key ", stripeWebhookSecret, ". Retrying"},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -3877,6 +4307,10 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// The second was a token on main too, with "-svc" left beside it.
 		{"a mixed-case name after sk- is a key", "deploy sk-" + "MyService-Deployment", "deploy <TOKEN_1>"},
 		{"a sixteen-letter word after sk- takes the words after it", "sk-internationalization-svc", "<TOKEN_1>"},
+		// #114's cost. A vendor body's floor is the format's shortest published length and nothing more, so a
+		// camelCase identifier at least that long after a vendor prefix is a key: here twenty-four letters
+		// after "sk_test_", where '_' would have ended a snake_case name in short pieces.
+		{"a long camelCase name after a stripe prefix is a key", "run sk" + "_test_createCustomerWithCardAndRefund ok", "run <TOKEN_1> ok"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -4076,6 +4510,22 @@ var templatizedRows = []templatizedRow{
 	// The userinfo cell the key's cont is exact for: a lowercase key's mangled run must go on across the '_',
 	// or the key stops at it, 4d sees no glue, and the rest of the userinfo is left to the email detector.
 	{"url-credentials/glued-key/underscore/lowercase", "url=s3://\x00sk-" + "abcdefghij0123456789xyz_prod\x00@\x00bucket.example.com\x00/x"},
+	// #114 through the composition, one row per format family and the rest of each family's prefixes. Every
+	// digit is <NUM> on the template, so the placeholder is the evidence; a Slack key's leading '-' and first
+	// segment are one <NUM>, NUM's sign, and a Google key's '-' before a digit goes the same way.
+	{"vendor-key/stripe", "key \x00" + stripeLiveSecret + "\x00 rejected"},
+	{"vendor-key/stripe-restricted", "key \x00" + stripeRestrictedSecret + "\x00 rejected"},
+	{"vendor-key/stripe-webhook", "key \x00" + stripeWebhookSecret + "\x00 rejected"},
+	{"vendor-key/github", "key \x00" + githubClassicSecret + "\x00 rejected"},
+	{"vendor-key/github-server", "key \x00" + githubServerSecret + "\x00 rejected"},
+	{"vendor-key/github-pat", "key \x00" + githubPATSecret + "\x00 rejected"},
+	{"vendor-key/slack", "key \x00" + slackBotSecret + "\x00 rejected"},
+	{"vendor-key/google", "key \x00" + googleAPISecret + "\x00 rejected"},
+	{"vendor-key/google-query-value", "https://\x00maps.googleapis.com\x00/maps/api/geocode/json?address=x&key=\x00" + googleAPISecret + "\x00"},
+	{"vendor-key/stripe-query-value", "GET https://\x00api.stripe.com\x00/v1/charges?key=\x00" + stripeLiveSecret + "\x00 401"},
+	{"vendor-key/github-query-value", "GET https://\x00api.github.com\x00/user?access_token=\x00" + githubClassicSecret + "\x00 401"},
+	{"vendor-key/env-var-end", "SLACK_BOT_TOKEN=\x00" + slackBotSecret + "\x00"},
+	{"vendor-key/sentence-dot", "key \x00" + googleAPISecret + "\x00. Retrying"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
@@ -4164,6 +4614,11 @@ func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
 		{"quote-edge/sk-proj-last", "rejected key \x00" + skProjKey + "\x00"},
 		{"quote-edge/sk-digit-first-first", "\x00" + skDigitFirstKey + "\x00 rejected"},
 		{"quote-edge/aws-key-first", "\x00AKIAIOSFODNN7EXAMPLE\x00 denied"},
+		{"quote-edge/stripe-key-last", "rejected key \x00" + stripeLiveSecret + "\x00"},
+		{"quote-edge/github-pat-last", "rejected key \x00" + githubPATSecret + "\x00"},
+		{"quote-edge/slack-key-first", "\x00" + slackBotSecret + "\x00 rejected"},
+		{"quote-edge/google-key-first", "\x00" + googleAPISecret + "\x00 rejected"},
+		{"quote-edge/github-key-last", "rejected key \x00" + githubClassicSecret + "\x00"},
 	}
 	rows := append(append([]templatizedRow{}, templatizedRows...), quoteEdgeRows...)
 	for _, f := range fields {
@@ -4459,6 +4914,14 @@ func TestNoOverMaskingAfterTemplating(t *testing.T) {
 		"Accept-Language: sk-SK,sk;q=0.9",
 		"sk-1 failed",
 		"region sk-2",
+		// #114: on the template a placeholder is the evidence, over a floor in units the short names below
+		// stay under, and xoxb<NUM> needs a letter of each case after it.
+		"sk" + "_test_create_customer_with_card_1",
+		"gh" + "p_v2",
+		"github" + "_pat_rotation_policy_v2_enabled",
+		"xox" + "b-2024-rollout-plan",
+		"set xox" + "b-1 retries",
+		"AI" + "za_test_1",
 	}
 	for _, s := range survive {
 		in, _ := pipeline.Templatize(s)
