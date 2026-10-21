@@ -66,9 +66,11 @@ func TestReadLinesSplitsAndKeepsFinalUnterminatedLine(t *testing.T) {
 	}
 }
 
+// TestReadLinesSurvivesLongLine is the M1 watch-out: bufio.Scanner fails on a line past its
+// 64KB default cap and ends the stream. A line of exactly MaxLineBytes — that same size —
+// arrives intact. (What happens past it is TestReadLinesCapsALine's subject.)
 func TestReadLinesSurvivesLongLine(t *testing.T) {
-	// Well beyond bufio.Scanner's 64KB default cap — this is the M1 watch-out.
-	long := strings.Repeat("x", 512*1024)
+	long := strings.Repeat("x", MaxLineBytes)
 	input := long + "\n"
 	got := collect(t, func(ctx context.Context, out chan<- model.LogLine) error {
 		return readLines(ctx, strings.NewReader(input), "test", model.Stdout, out)

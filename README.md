@@ -205,6 +205,17 @@ flowchart TD
     EXPL --> TSTATE
 ```
 
+**A line is at most 64 KiB.** Every source reads its lines through the same reader. A longer
+line keeps its first 64 KiB, less a character the cut would split, so it is cut to *at most*
+its first 64 KiB. The rest of it, up to its newline, is read and discarded without being held,
+so one runaway line costs neither memory nor pipeline time. The cut line is then processed like
+any other, by its head; nothing marks it in the text. The first time a line is cut, logscry says
+so once: on stderr with `--plain`, in the status bar in the TUI. The total is printed at exit,
+and the exit status is not affected. A Docker line's timestamp counts toward its 64 KiB. A
+journald entry is cut before it is decoded, so a cut entry is no longer JSON and shows as its
+raw text, with no unit or priority, and in a replay with no timestamp. No real capture has come
+close: the longest of 70,783 journal entries was 4.2 KiB.
+
 You can't call an LLM on every log line in real time — cost, latency, and noise all
 forbid it. The interesting part is the pipeline that avoids doing so:
 
@@ -1035,7 +1046,7 @@ is still synthetic.
 
 | Status | When |
 |---|---|
-| `0` | The run finished: its sources ended, or it was stopped with Ctrl-C or `SIGTERM`. A source that failed along the way (`-- ./app` exiting non-zero, a broken Docker events stream) is reported on stderr or in the status bar, not in the status. |
+| `0` | The run finished: its sources ended, or it was stopped with Ctrl-C or `SIGTERM`. A source that failed along the way (`-- ./app` exiting non-zero, a broken Docker events stream) is reported on stderr or in the status bar, not in the status, and so is a line cut at 64 KiB (see [How it works](#how-it-works)). |
 | `1` | logscry could not run as asked (a bad flag or config file, `-h`, no log source, an export file it could not open, a TUI that failed), **or** the export lost records (see [When the file cannot keep up](#when-the-file-cannot-keep-up)). |
 
 The status is the same in `--plain` and the TUI: it describes the run and the file, not the
@@ -1117,6 +1128,21 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   after the last line it read. One edge: a container that delivered nothing before it
   restarted is re-attached like a first attach, so with `--docker-tail 0` the lines it logs
   between the restart and the re-attach (milliseconds) are lost.
+- **A stream of distinct templates grows memory without bound.** logscry keeps every template
+  it has seen, with its masked pattern, for the whole run, and never drops one. Measured: about
+  3.5 MiB per 10,000 distinct templates of short lines, and about 629 MiB per 10,000 at the
+  64 KiB line cap, growing linearly. More lines of templates already seen cost nothing more: a
+  stream of one template repeated at the cap levels off at about 160 MiB. An ordinary host stays
+  far from this; the real journal captures replayed for the line cap produced at most about
+  3,100 templates each, over hours. Filed as #126.
+- **A journald message over 4096 bytes arrives as its raw JSON entry.** logscry runs
+  `journalctl -o json` without `--all`, and journalctl prints any field over 4096 bytes as
+  `null`. Such an entry is shown and templated as the whole JSON line. It is tagged `journald`
+  instead of `journald:<unit>`, it gets no level from its priority (so an error-class entry loses
+  its ERROR and stderr weight), and it carries the time logscry read it rather than its own; in a
+  replay it has no time and is counted untimed. Entries whose fields are 4096 bytes or less are
+  unaffected, and so is every other source. A capture recorded with plain `journalctl -o json`
+  for `--replay` has the same gap. Filed as #127.
 - **Reasoning models need a higher `--llm-max-tokens`.** A thinking model (e.g. `qwen3`,
   `deepseek-r1`) can spend the whole default budget on its chain of thought and return
   empty content with `finish_reason: length`. Prefer a plain instruct model such as
