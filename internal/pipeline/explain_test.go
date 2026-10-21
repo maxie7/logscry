@@ -342,7 +342,7 @@ func TestADroppedRetryTellsTheCardAndTheFileDifferentThings(t *testing.T) {
 
 	// The real path: the flag opens the record, and the drop closes it.
 	retriedAt := answeredAt.Add(time.Hour)
-	p.flagged(tmpl, Event{Line: model.LogLine{Source: "proc:app"}, Score: 1.35}, retriedAt) // Queued false: the queue is full
+	p.flagged(tmpl, Event{Line: model.LogLine{Source: "proc:app"}, Score: 1.35}, 1, retriedAt) // Queued false: the queue is full
 
 	ex := tmpl.Explanation
 	if ex.Summary != "A handler wrote to a nil map." {
@@ -596,5 +596,24 @@ func TestExplainingCountsFlagsInFlight(t *testing.T) {
 	check("at shutdown with one flag unanswered")
 	if p.explaining != 1 {
 		t.Errorf("explaining = %d at shutdown, want 1", p.explaining)
+	}
+}
+
+// TestAnAnswerWithoutItsFlagIsCountedNotDropped: every path that builds an answer copies the
+// request's flag (TestEveryTerminalPathCarriesTheRequestsFlag), so one that arrives without it
+// is a bug. The card rule would read flag 0 as the oldest flag there is and could drop the
+// answer without a trace; instead it is counted in Stats.Unidentified, which tests check, and
+// shown as the newest answer, as before flags had IDs.
+func TestAnAnswerWithoutItsFlagIsCountedNotDropped(t *testing.T) {
+	t0 := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	p, tmpl, _, r2 := twoFlagsInFlight(t, t0)
+	lost := answer(r2, model.ExplainDone, "second", t0.Add(3*time.Second))
+	lost.Flag = 0
+	p.attach(lost)
+	if p.unidentified != 1 {
+		t.Errorf("unidentified = %d, want 1", p.unidentified)
+	}
+	if ex := tmpl.Explanation; ex.State != model.ExplainDone || ex.Summary != "second" {
+		t.Errorf("card = %v %q, want the answer shown, not dropped", ex.State, ex.Summary)
 	}
 }
