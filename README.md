@@ -1096,10 +1096,6 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   That is a gap in the anonymizer's own pattern (#49), filed rather than fixed here because the
   fix belongs to the same constant #42 is about. The two IPv6 patterns diverged in #40 and #41; #42
   decides whether they stay two.
-- **A quoted value containing an escaped quote templates badly on the plain-text path.** The
-  `<STR>` mask does not read backslash escapes, so `config "user \"bob\" logged in"` templates
-  as `config <STR>bob\<STR>`: one template per value, with the text between the escapes left
-  in the template. JSON and logfmt lines decode their quoting and are not affected. Filed as #91.
 - **There are two "first seen"s, on two clocks, and they can disagree.** The card's `first`
   time and `--export`'s `first_seen` are **logscry's** clock: when logscry first processed
   the template. The age the model is told ("first seen N ago") is the **source's** clock: the
