@@ -28,7 +28,7 @@ docker:
   label: [] # ...or those carrying these k=v labels (AND-combined)
   tail: "100" # lines of history fetched per container on first attach ("all" for everything)
 
-# --- Sources: the systemd journal (Linux; runs `journalctl -f -o json`) ---
+# --- Sources: the systemd journal (Linux; runs `journalctl -f -o json --all`) ---
 # Reading the SYSTEM journal needs membership of the systemd-journal group, or root —
 # without it journalctl still follows, but only your own session. See the README.
 journald:

@@ -74,7 +74,7 @@ var priorityLevels = [priorityCount]string{
 // value the flag is simply omitted rather than passed as a no-op.
 const noPriorityFilter = 7
 
-// JournaldSource follows the systemd journal by running `journalctl -f -o json` and
+// JournaldSource follows the systemd journal by running `journalctl -f -o json --all` and
 // decoding one journal entry per line.
 //
 // It is one long-running Source like DockerSource: Lines blocks until ctx is cancelled
@@ -104,12 +104,18 @@ func NewJournaldSource(units []string, priority int) *JournaldSource {
 func (s *JournaldSource) Name() string { return "journald" }
 
 // args builds the journalctl command line: follow, one compact JSON object per line,
-// never a pager.
+// every field in full, never a pager.
 //
 // -o json rather than json-pretty because compact output is one entry per line, which is
 // exactly the newline-delimited shape readLines already handles.
+//
+// --all because without it journalctl prints any field over 4096 bytes as null
+// (journalctl(1), "json"), and an entry whose MESSAGE was nulled lost the message itself
+// (#127). In -o json it changes nothing else: a field that is not printable UTF-8 is an
+// array of byte values either way, which journalText reads. The cost is that an entry
+// can now be longer than 64 KiB, and readLines cuts it like any other line.
 func (s *JournaldSource) args() []string {
-	args := []string{"-f", "-o", "json", "--no-pager"}
+	args := []string{"-f", "-o", "json", "--all", "--no-pager"}
 	for _, u := range s.Units {
 		args = append(args, "-u", u)
 	}
@@ -173,16 +179,27 @@ func (s *JournaldSource) Lines(ctx context.Context, out chan<- model.LogLine) er
 // MESSAGE — is passed through untouched rather than dropped. journalctl is not supposed
 // to emit either, but showing a raw line beats silently losing one, and the pipeline
 // handles arbitrary text by definition.
+//
+// A MESSAGE that is present but null is the one exception: it is a message journalctl
+// did not print, which a capture recorded without --all holds for every field over 4096
+// bytes. The entry around it is intact, so it is decoded like any other, with
+// messageNotRecorded in place of the text — its unit, priority and time are worth keeping,
+// and in a replay a raw pass-through had no time at all (#127).
 func decode(ll model.LogLine) model.LogLine {
 	var entry map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(ll.Raw), &entry); err != nil {
 		return ll
 	}
-	msg, ok := journalText(entry["MESSAGE"])
-	if !ok {
+	raw, present := entry["MESSAGE"]
+	msg, ok := journalText(raw)
+	switch {
+	case ok:
+		ll.Raw = msg
+	case present && jsonNull(raw):
+		ll.Raw = messageNotRecorded
+	default:
 		return ll
 	}
-	ll.Raw = msg
 
 	if p, ok := journalPriority(entry["PRIORITY"]); ok {
 		// PRIORITY is authoritative only where it is not the default. At 6 systemd is
@@ -212,6 +229,12 @@ func decode(ll model.LogLine) model.LogLine {
 	return ll
 }
 
+// messageNotRecorded stands in for a MESSAGE that journalctl printed as null. It is
+// logscry's own text and says so up front: no producer wrote this line, and a reader of
+// the stream pane or an export must be able to see that at a glance.
+const messageNotRecorded = "logscry: message not recorded " +
+	"(journalctl -o json prints a long field as null without --all)"
+
 // unitFields are the entry fields naming what produced a line, best first.
 //
 // _SYSTEMD_UNIT leads because it is the string a user would type into --journald-unit,
@@ -240,10 +263,11 @@ func journalUnit(entry map[string]json.RawMessage) string {
 // unmarshal of the whole entry and lose a line that is perfectly readable.
 // A JSON null is rejected up front because it unmarshals into BOTH a string and a []byte
 // WITHOUT error, leaving each empty — so a "MESSAGE": null would be adopted as an empty
-// message and the line emitted blank, instead of falling back like the absent field it
-// is. (pipeline.jsonString guards the same trap for the same reason.)
+// message and the line emitted blank, instead of being read as the message journalctl did
+// not print, which decode handles itself. (pipeline.jsonString guards the same trap for the
+// same reason.)
 func journalText(raw json.RawMessage) (string, bool) {
-	if len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+	if len(raw) == 0 || jsonNull(raw) {
 		return "", false
 	}
 	var s string
@@ -255,6 +279,11 @@ func journalText(raw json.RawMessage) (string, bool) {
 		return string(b), true
 	}
 	return "", false
+}
+
+// jsonNull reports whether a field is a JSON null.
+func jsonNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
 }
 
 // journalPriority reads PRIORITY, which journalctl emits as a STRING ("6") though a

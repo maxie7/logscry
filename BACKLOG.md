@@ -4203,6 +4203,155 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.21
 
+- [x] **A journald message over 4096 bytes keeps its unit, level and time** — #127, found
+      while measuring #124. `args()` ran `journalctl -f -o json --no-pager` without `--all`, and
+      without it journalctl prints any field over 4096 bytes as `null` (journalctl(1), "json").
+      `decode` read nothing from a null MESSAGE and passed the whole entry through. The entry
+      was tagged `journald` instead of `journald:<unit>`, got no level from PRIORITY and no
+      stderr tag, and kept the receipt time. In a replay it was untimed, and as the **first**
+      entry it got the capture refused with `errUntimedCapture`, whose message says the entry
+      has no timestamp when it has one. Captures recorded with plain `-o json`, as README
+      advised, hold the same nulls. **Present since v0.8.0:** `git log -L` on `args()` shows one
+      commit, 42e9fe9 (#25), and v0.8.0 is the first tag that contains it. The replay side dates
+      from v0.10.0, when replay started reusing `decode`.
+
+      **The threshold.** journalctl(1) documents 4096 bytes. systemd v255's `logs-show.c`
+      (`update_json_data`) nulls a field when `strlen(name) + 1 + size >= 4096` and
+      `OUTPUT_SHOW_ALL` is unset. Measured, it is bracketed and not pinned: on the current boot
+      the largest `name=value` printed without `--all` was 3,604 bytes, and the smallest nulled
+      was 5,008, the #124 probe. Nothing in the code depends on the exact value, because `--all`
+      removes it, so no probe was spent pinning it, and the marker names no number.
+
+      **Decisions.**
+      1. **`--all` in `args()`.** In `-o json` it changes only the size→null rule.
+         `update_json_data` picks between a string and an array of bytes with
+         `utf8_is_printable` either way, and `journalText` reads both. "blob data" belongs to the
+         other output modes. Measured on the current boot, the
+         prediction written down first:
+
+         | measure | prediction | result |
+         |---|---|---|
+         | entries whose content differs with/without `--all` | 1–50 | 1 |
+         | fields null without `--all`, by name | MESSAGE 1, `_CMDLINE` 0–50, others 0 | MESSAGE 1, nothing else |
+         | differences other than null→value | 0 | 0 |
+         | longest line with `--all` | 5.5–20 KiB | 5,646 B |
+         | lines over 64 KiB with `--all` | 0 | 0 |
+
+         The prediction held except for `_CMDLINE`, where 0 sat at the edge of the range. One
+         surprise: all 4,666 lines differ *as text*. That is not `--all`'s doing. journalctl's
+         key order varies between runs, and two runs without `--all` differ on all 4,666 too.
+         Content was compared parsed, paired by `__CURSOR`. The startup backlog is unchanged:
+         `-n 10` gives 10 lines both ways, and `-f` over a short window gave 10–11 lines either
+         way, depending on traffic.
+
+         **The residual: an entry whose line passes 64 KiB.** Before, its big fields were null
+         and its line small. Now #124 cuts it, the head no longer parses, and `decode` passes it
+         through raw: `journald`, no level, the receipt time, untimed in a replay. Accepted:
+         - it is what that entry got before, and the truncation notice now announces it;
+         - doing without `--all` would cost every entry between 4 and 64 KiB;
+         - the boot measured has no line over 5,646 bytes.
+
+         Which transports can produce one:
+         - **stdout:** not as plain text, since `LineMax` (48K) splits it, but a binary or
+           heavily escaped line can (a non-UTF-8 byte is up to four characters of JSON);
+         - **journal protocol and syslog:** these have no split;
+         - **kernel and driver:** these stay far below. Docker splits at 16 KiB.
+
+         `--output-fields` was considered for shortening lines and rejected: MESSAGE alone can
+         pass 64 KiB, and it would change every live line. The cap itself is out of scope.
+      2. **A null MESSAGE is decoded, with logscry's marker as Raw.** When `MESSAGE` is present
+         and null, `decode` keeps unit, priority, level, stream and time, and `Raw` is
+         `messageNotRecorded`:
+         `logscry: message not recorded (journalctl -o json prints a long field as null without --all)`.
+         Live never produces one now, so this serves captures made without `--all`. Why not
+         keep the raw fallback:
+         - it left the entry untimed, or got the capture refused;
+         - it hid an error-class entry's ERROR, which a live run with `--all` would flag;
+         - its `Raw` was journald's metadata (host, machine ID, command line, cursor) posing as
+           a message.
+
+         **#124's objection to a marker** was that a marker sits inside text the producer wrote
+         and cannot be told apart from it. Here there is no producer text. What remains is a
+         reader mistaking the line for one the unit logged, and the `logscry: ` prefix answers
+         that. A test pins the prefix, that text detection gives the marker no level, and that
+         the anonymizer returns it byte-identical. The marker never reaches a model: replay is
+         dry-run only, and live has no nulls.
+
+         **Templating:** the hash is computed from the pattern alone, so all such entries
+         share **one template across units**, not one per unit. The raw fallback grouped them
+         by key shape instead.
+
+         **Scoring:**
+         - the first entry is novel;
+         - at PRIORITY ≤3 it carries ERROR and stderr, so it can escalate, as live would;
+         - at 6 the marker carries no level.
+
+         The cost of one shared template: a second unit's lost message inside the first one's
+         cooloff is suppressed. Accepted on 0 null MESSAGEs in 58,172 entries.
+
+         **Held:**
+         - an absent MESSAGE still passes through raw;
+         - so does a MESSAGE that is neither text nor null;
+         - no other field's null handling changed;
+         - `journalText` still rejects null, through a `jsonNull` helper the two share.
+      3. **Recording advice is `journalctl -o json --all`.** That covers README's Replay example
+         and its text, the `--journald` known limitation, the mermaid label, the journald
+         section and `examples/logscry.yaml`. The `--replay` flag help, the flag table and the
+         `errUntimedCapture` text describe the format, which `--all` does not change, and stay.
+      4. **README Known limitations.** The #127 entry is rewritten into the two residuals:
+         - a capture made without `--all`, which replays the marker;
+         - an entry over 64 KiB.
+
+      **Against the real journalctl.**
+      - **The #124 probe** (PRIORITY 6, stdout transport, no unit, so it is named by its
+        identifier). Extracted both ways and replayed. Every prediction held:
+
+        | | without `--all` | with `--all` |
+        |---|---|---|
+        | main | refused, `errUntimedCapture` | `journald:logscry-probe`, entry time, Raw 5,000 |
+        | branch | `journald:logscry-probe`, entry time, Raw = marker (92) | same as main |
+
+      - **One live probe,** `systemd-cat -t logscry-probe -p err`, 5,000 bytes starting
+        `logscry-probe-127 `, followed by main and the branch at once. Both predictions held:
+        - **main:** `journald`, no level, stdout, the receipt time (0.44 s after the entry's own),
+          Raw 616 bytes (the whole entry);
+        - **branch:** `journald:logscry-probe`, ERROR, stderr, the entry's own time, Raw 5,000.
+
+        The captures MANIFEST notes it beside the #124 probe. The identifier filter returns
+        exactly the two.
+      - **Regression over the ten boots,** `ab37*` and `logscry-probe` filtered: 58,172 entries,
+        0 null MESSAGEs. The prediction was zero change, and it held:
+        - per-line template hashes: 0 differing;
+        - distinct templates per boot: identical;
+        - escalations: 59 on both.
+
+      **Tests.** The red commit adds the inert constant so the tests compile.
+      - **Red on main by assertion:**
+        - `TestJournaldArgs`: all four rows gain `--all`;
+        - `TestJournaldNullMessageKeepsTheEntrysMetadata`: PRIORITY 3 and 6;
+        - `TestJournaldReadsALongMessageInFull`: a stand-in journalctl that nulls the field
+          unless given `--all`;
+        - `TestReplayKeepsANullMessageEntrysTime`: first and later.
+      - **Guards, green on main:**
+        - `TestJournaldNotRecordedMarkerIsLogscrysOwn`;
+        - `TestJournaldNonTextMessageDecodesAsBefore`: a 5,000-byte byte-array MESSAGE
+          decodes in full; an array of strings and a number pass through.
+      - **Existing test changed:** the null row of `TestJournaldPassesThroughWhatItCannotDecode`
+        moved out, since that entry is decoded now.
+      - **The full suite under `-race`:** 2,138 passing and 1 skipped on main, 2,147 and 1 on
+        the branch. The new tests pass under `-race -count=20`.
+
+      **Seen and left alone, out of scope:**
+      - #126, #121, #31, #36;
+      - the 64 KiB cap;
+      - `internal/llm/sse.go`;
+      - `internal/anonymize`;
+      - a field journalctl prints as an array of values, because the entry repeats it. That
+        MESSAGE still passes through raw, which is `decode`'s documented behaviour for what it
+        cannot read. 0 occurrences in the 58,172 boot entries and the 4,666 of the current boot.
+
+      Targets v0.12.22
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

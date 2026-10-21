@@ -105,6 +105,34 @@ func TestReplayRejectsUntimedCapture(t *testing.T) {
 	}
 }
 
+// TestReplayKeepsANullMessageEntrysTime: an entry recorded without --all whose MESSAGE was
+// printed as null still carries its own __REALTIME_TIMESTAMP. As the first entry it must not
+// get the capture refused for having no clock, and later on it must not be counted untimed
+// (#127).
+func TestReplayKeepsANullMessageEntrysTime(t *testing.T) {
+	path := writeCapture(t,
+		`{"MESSAGE":null,"PRIORITY":"3","_SYSTEMD_UNIT":"report.service","__REALTIME_TIMESTAMP":"1788000001000000"}`,
+		`{"MESSAGE":"one","PRIORITY":"6","_SYSTEMD_UNIT":"report.service","__REALTIME_TIMESTAMP":"1788000002000000"}`,
+		`{"MESSAGE":null,"PRIORITY":"6","_SYSTEMD_UNIT":"report.service","__REALTIME_TIMESTAMP":"1788000003000000"}`,
+	)
+	src := NewReplaySource(path, 0)
+	got, err := replayAll(t, src)
+	if err != nil {
+		t.Fatalf("replay refused the capture: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("replayed %d lines, want 3", len(got))
+	}
+	for i, usec := range []int64{1788000001000000, 1788000002000000, 1788000003000000} {
+		if want := time.UnixMicro(usec); !got[i].Time.Equal(want) {
+			t.Errorf("line %d: Time = %v, want the entry's own %v", i, got[i].Time, want)
+		}
+	}
+	if src.Untimed() != 0 {
+		t.Errorf("Untimed() = %d, want 0", src.Untimed())
+	}
+}
+
 // TestReplayRejectsMissingFile: a mistyped path is a startup error, not an empty replay.
 func TestReplayRejectsMissingFile(t *testing.T) {
 	if _, err := replayAll(t, NewReplaySource(filepath.Join(t.TempDir(), "nope.jsonl"), 0)); err == nil {
