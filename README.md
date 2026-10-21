@@ -871,7 +871,9 @@ truncated — a second run adds to the first. Without the flag no file is opened
 **One line per flagged anomaly, written when its explanation resolves.** An anomaly gets
 its line when it reaches a terminal state: explained, explanation-unavailable, or
 incomplete. Progressive `--llm-stream` updates never produce a line, and a template that
-keeps recurring does *not* get a second one — it only bumps a counter in memory.
+keeps recurring does *not* get a second one — it only bumps a counter in memory. A template
+that escalates *again*, once `--cache-ttl` has passed, gets a second record of its own, with
+its own counts and its own explanation, even when the model has not yet answered the first.
 
 **The numbers are as-of-flag-time, not final totals.** `count_at_flag` and
 `last_seen_at_flag` are what they were at the instant the anomaly crossed the threshold,

@@ -4352,6 +4352,143 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.22
 
+- [x] **Each answer is matched to its own flag, not to its template** — #121. With
+      `--cache-ttl` shorter than the model's answer time, a template can flag again while its
+      first flag is unanswered. Everything that matched an answer to a
+      flag used the template hash, which the two flags share. Three symptoms, one cause:
+      1. **The export.** The writer's `pairs`, `flags` and `orphans` were keyed by hash:
+         - the second flag replaced the first;
+         - the first answer was written with the second flag's `count_at_flag` and
+           `last_seen_at_flag`;
+         - the second answer wrote nothing.
+
+         The issue's reproduction (TTL 1 s, the same PANIC line at t0 and t0+2 s, answers in
+         order) gave one record with `count_at_flag` 2 and the first answer's summary.
+         **Present since v0.6.0:** the hash-keyed join is in the first export commit
+         (5c69018), and `--cache-ttl` has existed since v0.1.0 (fc45bf3).
+      2. **The card.** `attach` put any answer on the template's one explanation:
+         - an older answer arriving while the newer flag was pending ended "explaining…";
+         - in reverse order it replaced the newer answer;
+         - an older flag's partials overwrote the newer flag's.
+
+         **Present since v0.1.0** (7e2489f, `attach`).
+      3. **The "explaining" counter.** It went down only when the template's explanation left
+         pending, so the second terminal answer found it already terminal and the counter
+         stuck at 1. **Present since v0.5.0** (132dd8b).
+
+      None of the three is reachable at defaults: a 1 h TTL against a 30 s timeout with one
+      retry.
+
+      **Decisions.**
+      1. **A flag has an identity, `model.FlagID` (uint64).** The scorer mints it in
+         `Evaluate`, right after `decide` passes, counting from 1. Why there:
+         - every flag passes that point, in every mode;
+         - the request leaves for the model from inside `Evaluate`, before the pipeline sees
+           the flag;
+         - the scorer is owned by one goroutine, so a counter needs no lock;
+         - the values are ordered, which the card rule needs;
+         - a run's IDs repeat from run to run.
+
+         It is carried unchanged by the request, by `llm.explain`'s single `Explanation` and
+         every copy of it (each partial, the answer, every failure), by the queue-full
+         `Resolve`, and by the export's `Flag` and `WouldEscalate`.
+
+         **The JSONL gains no field.** A record already is one flag (M8), and two of one
+         template differ in `count_at_flag` and `last_seen_at_flag`. A `flag_id` restarts at
+         1 every run while one file appends many runs, so it would look like a key and not be
+         one. In the README's `diff before after` workflow, one changed flag would also shift
+         every later record's ID.
+      2. **The export joins on (hash, flag).** Every flag gets one record, joined to its own
+         answer or failure, in any order. #70's rules now hold per flag: the other half of a
+         lost record is dropped on arrival, and a flag unanswered at the run's end is never
+         written and not counted lost.
+
+         **The bound moves from per template to per flag in flight**, and it holds only if
+         every queued flag's terminal answer is delivered. Checked path by path:
+         - the worker returns without sending only when `ctx` is done (pool.go, after
+           `explain` and in the send's `select`);
+         - its send of a terminal answer blocks, and only a partial goes through the dropping
+           `trySend`;
+         - `pipeline.Run` and `printPlain` stop reading answers only on `ctx.Done`, or in
+           `--plain` on a stdout write error, which ends the run;
+         - `Resolve` ignores only pending updates.
+
+         So outside a run's end no terminal answer is lost. The entries are bounded by the
+         escalation queue, the workers and the answers waiting to be read.
+      3. **The card rule.** The card's state always belongs to its template's newest flag
+         (`Template.LastFlagID`). An older flag's final answer is shown only while no newer
+         flag has produced any answer text, labelled as from its own flag. An older flag's
+         partial updates never reach the card. Showing it rather than ignoring it is #34's
+         carry-forward arriving late; RDI §6 asks for it ("the previous one stays visible,
+         marked as belonging to the earlier flag"). Its `At` predates `LastFlagged`, so the
+         card says "answer from the flag at …". Its state and error stay the newest flag's.
+      4. **The counter goes up once per queued flag** (`escalated`; a queue-full drop and dry
+         run never reach it) **and down once per terminal answer** (`attach`). So it equals
+         the flags in flight.
+      5. **An answer without its flag is a bug, and tests catch it.** Every non-test
+         construction copies the request's flag:
+         - `llm.explain` builds the one `Explanation`, and success, a 4xx, a timeout, retries
+           exhausted, the anonymizer failing closed and a salvaged stream are all a
+           `(resp, err)` from `Explain` mapped onto it;
+         - partials copy it;
+         - `pipeline` builds the queue-full failure and the card's pending state from
+           `LastFlagID`;
+         - shutdown sends nothing.
+
+         In `attach`, flag 0 for a flagged template is counted in `Stats.Unidentified`, which
+         nothing renders and the run-level tests assert is 0. It is shown as the newest
+         answer, as before IDs existed, so a bug costs the card its ordering, not its answer.
+         I chose a counter over a test-only assertion so production never panics.
+      6. **Unchanged:**
+         - the cache stays keyed by hash, because "escalated recently" is per template by
+           design (RDI §6) and it is marked when the flag is decided, not by any answer;
+         - the escalation decision and the rate limiter;
+         - the per-card keys: collector, snapshot, TUI selection and expansion, which are
+           per template (#34).
+
+      **Measurements.** The ten boots, `ab37*` and `logscry-probe` filtered, were replayed
+      `--explain-dry-run --export`, main against branch. The prediction was byte-identical
+      exports, no new field, and a synchronous dry-run resolution. It held:
+
+      | TTL | records main | records branch | kinds | files differing | diff on kind, hash, count, reasons |
+      |---|---|---|---|---|---|
+      | default (1 h) | 59 | 59 | all `would_escalate` | 0 of 10 | 0 lines |
+      | 1 s | 61 | 61 | all `would_escalate` | 0 of 10 | 0 lines |
+
+      Replay is dry-run only, so it cannot reach the answered path; the tests below do.
+      **Model calls:**
+      - `TestCostCapHoldsUnderFlood`, `TestRateLimitCapsLLMCalls` and
+        `TestStreamCostGuarantee` pass unedited;
+      - the reproduction makes 2 requests with `Escalated` 2, on main and the branch.
+
+      **Tests.**
+      - **Red on main by assertion:**
+        - `TestReescalationBeforeTheFirstAnswerWritesTwoRecords`: the reproduction, with
+          rows for in order (with partials), reversed, the first failing, and the second
+          never answered. The dry-run row is a guard.
+        - `TestALostFlagNeverTakesAnotherFlagsRecord`: on main the first record vanished
+          uncounted.
+        - `TestAnOlderAnswerNeverDisplacesANewerFlag`: four rows.
+        - `TestExplainingCountsFlagsInFlight`: a queue-full drop, a failure, out-of-order
+          answers and shutdown.
+        - `TestEveryTerminalPathCarriesTheRequestsFlag`: the real pool and backend over
+          `httptest`, with shutdown as a guard.
+      - **With the fix:** `TestAnAnswerWithoutItsFlagIsCountedNotDropped`, the tripwire.
+      - **Existing tests changed:**
+        - `TestALeftBehindHalfIsReplaced` is replaced by
+          `TestAnUnansweredFlagNeverJoinsALaterOne`. It pinned the newer-flag-replaces-the-
+          older bound, the mechanism of this defect, and would have passed only because its
+          flags were all 0.
+        - Fixtures change mechanically: 8 `WouldEscalate` calls pass 0, 16 answers built from
+          a request copy its flag, and one direct `flagged` call passes flag 1.
+      - **The full suite under `-race`:** 2,147 passing and 1 skipped on main, 2,169 and 1 on
+        the branch. The new tests pass under `-race -count=20`.
+
+      **Seen and left alone, out of scope:** #126, #36, #28, the cache TTL default and
+      `internal/anonymize`.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
