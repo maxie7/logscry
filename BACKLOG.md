@@ -4079,12 +4079,12 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         patterns.
 
       **Found on the way, not addressed here:**
-      - **The template map is never pruned.** A stream of distinct templates grows memory
+      - **The template map is never pruned** (#126). A stream of distinct templates grows memory
         without bound: measured at about 3.5 MiB per 10k short lines and about 629 MiB per 10k
         lines at the cap, linear, with no plateau.
-      - **A journald MESSAGE over 4096 bytes arrives as the raw JSON entry.** `journalctl -o
-        json` without `--all` prints it as `null`, so the entry has no unit, no priority and the
-        receipt time. Confirmed with one synthetic 5,000-byte entry.
+      - **A journald MESSAGE over 4096 bytes arrives as the raw JSON entry** (#127).
+        `journalctl -o json` without `--all` prints it as `null`, so the entry has no unit, no
+        priority and the receipt time. Confirmed with one synthetic 5,000-byte entry.
 
       Targets TODO-VERSION
 

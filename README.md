@@ -1128,6 +1128,21 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   after the last line it read. One edge: a container that delivered nothing before it
   restarted is re-attached like a first attach, so with `--docker-tail 0` the lines it logs
   between the restart and the re-attach (milliseconds) are lost.
+- **A stream of distinct templates grows memory without bound.** logscry keeps every template
+  it has seen, with its masked pattern, for the whole run, and never drops one. Measured: about
+  3.5 MiB per 10,000 distinct templates of short lines, and about 629 MiB per 10,000 at the
+  64 KiB line cap, growing linearly. More lines of templates already seen cost nothing more: a
+  stream of one template repeated at the cap levels off at about 160 MiB. An ordinary host stays
+  far from this; the real journal captures replayed for the line cap produced at most about
+  3,100 templates each, over hours. Filed as #126.
+- **A journald message over 4096 bytes arrives as its raw JSON entry.** logscry runs
+  `journalctl -o json` without `--all`, and journalctl prints any field over 4096 bytes as
+  `null`. Such an entry is shown and templated as the whole JSON line. It is tagged `journald`
+  instead of `journald:<unit>`, it gets no level from its priority (so an error-class entry loses
+  its ERROR and stderr weight), and it carries the time logscry read it rather than its own; in a
+  replay it has no time and is counted untimed. Entries whose fields are 4096 bytes or less are
+  unaffected, and so is every other source. A capture recorded with plain `journalctl -o json`
+  for `--replay` has the same gap. Filed as #127.
 - **Reasoning models need a higher `--llm-max-tokens`.** A thinking model (e.g. `qwen3`,
   `deepseek-r1`) can spend the whole default budget on its chain of thought and return
   empty content with `finish_reason: length`. Prefer a plain instruct model such as
