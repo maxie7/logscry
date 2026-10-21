@@ -3886,6 +3886,208 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.19
 
+- [x] **A line is cut at 64 KiB, and the rest discarded without being held** — #124, found
+      while writing SECURITY.md, whose crafted-line item covers it. `readLines` read with
+      `bufio.Reader.ReadString('\n')`, which holds a line whole until its newline or EOF, and every
+      line source goes through it: stdin, both subprocess streams, journald (`mapLines`), Docker
+      (`readDockerStream`) and replay (`replayLines`). Nothing downstream bounded a line. The
+      coalescer's 64 KiB cap stops folding but does not cut, and the prompt's 1000-rune cut
+      limits only what reaches the model. While the pipeline templated a huge line, it handled
+      nothing else. The issue measured 64 MiB → 360 MiB RSS and 13.2 s, and 256 MiB → 1.37 GiB and
+      52.4 s. A huge line *with* a newline is the same defect. **Present since v0.1.0:**
+      `ReadString` arrived with the first stdin and subprocess sources (8177235), and v0.1.0 is
+      the first tag that contains it.
+
+      **Decisions.**
+      1. **The cap is `ingest.MaxLineBytes`, 64 KiB, with no flag.** It applies to a line's text,
+         what `Raw` holds, without its `\n` or trailing `\r`s, so `len(Raw) <= MaxLineBytes` holds
+         for every line from every source. Why this size:
+         - **It equals `maxCoalesceBytes`.** One physical line never exceeds the coalescer's own
+           unit, and a coalesced event stays under about 128 KiB.
+         - **It sits above what the producers write.** journald splits a stdout line at
+           `LineMax` (48K by default), and `journalctl -o json` without `--all` prints any field
+           over 4096 bytes as `null`. Docker splits a message at 16 KiB. Only stdin and
+           subprocess have no producer-side bound.
+         - **It sits far above the captures.** Measured over the 10 boots and ab37: 70,783
+           entries, counts and lengths only. The prediction, written down first: longest line
+           4–10 KiB, none over any candidate cap, under 10 null MESSAGEs. The maximum and the
+           count over the cap held; the null MESSAGEs did not, since there were none.
+
+           | set | `_TRANSPORT` | entries | longest line (B) | over 64 KiB |
+           |---|---|---|---|---|
+           | boots | stdout | 26,361 | 4,239 | 0 |
+           | boots | journal | 17,480 | 1,637 | 0 |
+           | boots | kernel | 14,019 | 1,143 | 0 |
+           | boots | syslog | 5,097 | 2,039 | 0 |
+           | boots | driver | 60 | 1,518 | 0 |
+           | ab37 | stdout | 7,391 | 1,386 | 0 |
+           | ab37 | journal | 195 | 1,530 | 0 |
+           | ab37 | syslog | 168 | 1,813 | 0 |
+           | ab37 | kernel | 12 | 812 | 0 |
+
+         - **Larger would multiply into what a crafted stream can make logscry hold.** Every line
+           in flight can be held at the cap: the `lines`, `grouped` and plain `events` channels
+           (1024 each) and the 2000-event stream ring, which every mode builds. At 1 MiB that is
+           gigabytes, and about 200 ms of templating per line.
+         - **The old "large JSON log records survive" comment.** It was about `bufio.Scanner`,
+           whose default limit is also 64 KiB: past it, Scanner *fails and ends the stream*. Here a
+           line up to 64 KiB arrives intact, and past it the stream goes on. A JSON record over
+           64 KiB is templated as text, because its cut head no longer parses.
+           `TestReadLinesSurvivesLongLine` now holds a line of exactly `MaxLineBytes` (Scanner's
+           failure point) instead of 512 KiB. It is the one existing test whose input changed.
+         - **No flag.** Every user would pay the stream cost of a higher cap, and nothing in the
+           data asks for one.
+      2. **Past the cap, the head is kept and the rest discarded up to the newline.** Splitting
+         was rejected:
+         - each later chunk starts mid-token, so it is a novel template;
+         - a 64 MiB line would become 1,024 events of one template, a burst that escalates;
+         - every byte would still be templated.
+
+         Truncating bounds the pipeline's work per line and keeps what identifies the line,
+         which sits at its front: timestamp, level, source. At the cut:
+         - **UTF-8.** A character the cut would split is dropped whole, which is why the notice
+           says "at most".
+         - **Line endings.** A line is over the cap only if a byte other than `\r` follows it
+           before the `\n` or EOF. So `cap + "\r\n"` and `cap + "\r\r\n"` are intact and not
+           counted, while `cap + "\rx\n"` is cut. That is today's `TrimRight(line, "\r\n")`.
+      3. **What a cut line becomes, per source** (a test for each):
+         - **stdin.** Its head.
+         - **subprocess.** stdout and stderr are cut separately, each counted.
+         - **Docker.** The timestamp is at the front, so it survives and is parsed. It counts
+           toward the 64 KiB, so the message keeps the cap less the stamp. The mark advances as
+           for any stamped line.
+         - **journald.** The cut entry no longer parses, so `decode` passes it through raw, as it
+           does any undecodable line: source `journald`, no level, the receipt time. That is
+           acceptable, because losing the line would be worse, and because with fields nulled
+           past 4096 bytes an entry would need about 16 maximal fields to reach 64 KiB.
+         - **replay.** The cut entry is replayed raw and has no timestamp. Past the first line it
+           is counted in `Untimed()` and in the replay notice. **Known edge:** a cut *first*
+           entry makes replay refuse the whole capture with `errUntimedCapture`, whose message
+           says the entry carries no timestamp when it was in fact cut. It is pinned as is by
+           `TestReplayRefusesACaptureWhoseFirstEntryIsCut`. Reaching it takes a first entry over
+           64 KiB, which needs a capture made with `--all` or a hand-built file; README records
+           with plain `-o json`. The truncation notice prints beside the refusal. On main the
+           same entry replayed whole.
+      4. **Shown once, counted, exit status unchanged, no marker.**
+         - **The count.** `ingest.Truncations` holds it and is attached to the run's context
+           (`WithTruncations`), because `Source.Lines` takes nothing else per run, so no source
+           or constructor changed. It calls `notify` on the first cut, at the moment the cap is
+           crossed, so a line that never ends is announced while it is being discarded.
+         - **The notice.** It goes down the background-notice channel: on stderr with `--plain`,
+           in the status line in the TUI.
+
+           `logscry: ingest: a line over 64 KiB was cut to at most its first 64 KiB and the rest
+           discarded; the total is reported at exit`
+
+           `errs` gains a slot for it.
+         - **At exit.** `logscry: ingest: N line(s) over 64 KiB were truncated`.
+         - **`Stop`.** `mapLines`, `replayLines` and `readDockerStream` return on a cancel
+           without waiting for their reader, so a reader can still cut a line after `errs` has
+           closed. `Stop` runs before the close, under the same lock as `notify`.
+         - **No exit code.** It differs from #70: an export loss leaves a file that is missing
+           records, and status 1 is how a job learns its artifact is wrong. A cut line was still
+           read, templated, scored and exported, so every output is complete. Like the prompt's
+           1000-rune cut and a failing source (#97), it is a property of the input. Exit-coding it
+           would fail a CI job for piping a log with one base64 blob in it.
+         - **No marker in `Raw`.** A marker would be indistinguishable from text the producer
+           wrote, and would be templated, sent to the model and exported as if logged. Template
+           hashes: a line at or under the cap is byte-identical to main and keeps its hash, and
+           only lines over 64 KiB move.
+      5. **Bounded by construction.**
+         - **The reader.** It reads with `ReadSlice` through bufio's 4 KiB buffer. Text past one
+           buffer is appended to a reused slice that never grows past the cap. Past the cap,
+           bytes are only scanned for a non-`\r`, never stored.
+         - **Cancellation.** ctx is checked after every full buffer, so a cancel mid-discard
+           returns at once.
+         - **No spinning.** Each full buffer is consumed, so a newline-less stream makes
+           progress, and a reader that returns nothing gets bufio's `io.ErrNoProgress`.
+         - **Memory per stream.** The buffer plus at most 64 KiB.
+
+      **Measurements.** Every prediction was written down before its run.
+      - **The issue's harness, rebuilt.** One run of `a` with no newline,
+        `--plain --explain-dry-run`, peak RSS from `/usr/bin/time`:
+
+        | | 64 MiB | 256 MiB |
+        |---|---|---|
+        | main | 358.6 MiB, 13.15 s | 1,403.5 MiB, 50.79 s |
+        | branch | 14.4 MiB, 0.06 s | 14.2 MiB, 0.14 s |
+        | reader alone, main | 141.2 MiB | 533.3 MiB |
+        | reader alone, branch | 10.5 MiB | 10.6 MiB |
+
+        The prediction was under 25 MiB and under 1 s for the binary, and under 15 MiB for the
+        reader alone. It held.
+      - **The residual bound for a crafted stream.** Identical 1 MiB lines (one template), each
+        cut to 64 KiB, through the binary in plain dry-run:
+
+        | lines | peak RSS | wall |
+        |---|---|---|
+        | 2,000 | 154.9 MiB | 22.4 s |
+        | 20,000 | 157.1 MiB | 230.5 s |
+
+        It plateaus and does not grow with the input. The prediction was 150–400 MiB and
+        300–800 MiB with a ratio under 2.5×. The plateau held; the 20,000-line range was too
+        high. So about 160 MiB is the worst case for a stream of maximum-length lines **of one
+        template**. A stream of *distinct* templates is not bounded by this change, because
+        the template map is never pruned (found here; see the end of this entry).
+      - **Replay of all 11 captures, main vs branch.** Predicted zero change, since no line is
+        over the cap. It held:
+        - events: 58,405 on both;
+        - escalations: 60 on both;
+        - templates: identical counts per capture;
+        - per-event template hashes: 0 differing.
+      - **Allocations on ordinary lines.** `BenchmarkReadLines`, median of 5:
+
+        | line | main | branch |
+        |---|---|---|
+        | 64 B | 1 alloc, 80 B | 1 alloc, 64 B |
+        | 256 B | 1 alloc, 288 B | 1 alloc, 256 B |
+        | 1 KiB | 1 alloc, 1,152 B | 1 alloc, 1,024 B |
+        | 4 KiB | 3 allocs, 8,984 B | 1 alloc, 4,096 B |
+        | 16 KiB | 7 allocs, 34,960 B | 1 alloc, 16,384 B |
+
+        Time per line is equal or lower at every size: 16 KiB went from 14.1 µs to 6.9 µs.
+
+      **Tests.** All of them fail on main by assertion. Input is generated lazily by an
+      `io.Reader`, so no test allocates its input. The red commit adds `MaxLineBytes` and an
+      inert `Truncations` so the tests compile on main.
+      - **`TestReadLinesCapsALine`.** Exactly the cap, cap+1, CRLF after and straddling the cap,
+        `\r\r\n`, a `\r` that text follows, and 2-, 3- and 4-byte runes straddling the cap at
+        every offset or ending exactly at it.
+      - **`TestReadLinesHugeLineIsBoundedInMemory`.** A 64 MiB line, then `next`, intact.
+        TotalAlloc is measured around the `readLines` call alone, with the test not parallel,
+        against a 16 MiB bound. Main: 135,980,016 bytes. Branch: 322,160 bytes in each of 20 runs
+        under `-race` (min = max).
+      - **The rest:**
+        - `TestReadLinesCapsALineAtEOF`;
+        - `TestReadLinesStopsDiscardingOnCancel`: within 2 s, at most 64 KiB read after the
+          cancel; main reads 8 MiB more;
+        - `TestTruncationsNotifyOnce`;
+        - `TestTruncationsStopEndsNotification`;
+        - one per source: stdin, subprocess, Docker, journald, replay, and the replay edge
+          above;
+        - `TestPlainReportsTruncationOnce`: the notice once, the total at exit, `run` returns
+          nil.
+      - **The guard** `TestReadLinesEndsOnAReaderThatMakesNoProgress` passes on main too.
+      - **The full suite under `-race`.** 2,094 passing and 1 skipped on main; 2,126 and 1 on the
+        branch. No existing test changed outcome. The new tests pass under `-race -count=20`.
+
+      **Seen and left alone, out of scope:**
+      - **`internal/llm/sse.go`** reads the model endpoint's response with the same unbounded
+        `ReadString`. It is the same class across a different trust boundary: an endpoint the
+        operator configured.
+      - **Untouched:** the coalescer, the prompt cut, #91, #121, and the masker order and
+        patterns.
+
+      **Found on the way, not addressed here:**
+      - **The template map is never pruned.** A stream of distinct templates grows memory
+        without bound: measured at about 3.5 MiB per 10k short lines and about 629 MiB per 10k
+        lines at the cap, linear, with no plateau.
+      - **A journald MESSAGE over 4096 bytes arrives as the raw JSON entry.** `journalctl -o
+        json` without `--all` prints it as `null`, so the entry has no unit, no priority and the
+        receipt time. Confirmed with one synthetic 5,000-byte entry.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
