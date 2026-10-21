@@ -4088,6 +4088,121 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.20
 
+- [x] **A double-quoted string reads backslash escapes** — #91, found while building #83.
+      `strPat` was `"[^"]*"|'[^']*'`, and it knew nothing of escapes:
+      - `config "user \"bob\" logged in" applied` templated as `config <STR>bob\<STR> applied`;
+      - the alice line templated as `config <STR>alice\<STR> applied`;
+      - `["!", "\"", "#"]` mis-paired into `[<STR>, <STR><STR>#\"]`.
+
+      That was one template per value, with the text between the escapes left in the template.
+      It affects the plain-text path only. JSON (M9) and logfmt (#83) decode their quoting
+      before the text masker sees a value. **Present since v0.1.0:** the pattern is unchanged
+      since the first templating commit (78fcb70), and v0.1.0 is the first tag that contains
+      it.
+
+      **The rule.**
+      `strPat = (?:strBoundary strEscaped) | strPlain | strSingle`, where:
+      - `strEscaped` is `"(?:[^"\\]|\\.)*"`, the issue's candidate;
+      - `strBoundary` is `(?:^|[^\\'"])`;
+      - `strPlain` and `strSingle` are the old two alternatives, unchanged.
+
+      The boundary belongs to `strEscaped` alone. The grouping makes that explicit, and the
+      comment says so, so it is not "fixed" into applying to all three. RE2 has no lookbehind,
+      so the boundary character is consumed and `maskSTR` re-emits it, the shape `maskIP` uses
+      for IPv6 (#33).
+
+      What it buys: a template differs from the old pattern's only where a quote follows an odd
+      run of backslashes.
+      - Without one, `strEscaped` ends where `"[^"]*"` ends. `\\"` closes under both.
+      - A backslash before a line break fails `strEscaped`, so `strPlain` takes it as before.
+      - A match opened one character early is re-emitted unchanged.
+
+      **Decisions, each a test row.** The direction of each trade is given.
+      - **Escaped backslash before the close**, `open "C:\\temp\\" failed`. It closes there,
+        as before: `open <STR> failed`. No trade.
+      - **A literal trailing backslash with a later quote**, `copy "C:\logs\" rotated "x"`.
+        It is now `copy <STR>x"`, where it was `<STR> rotated <STR>`. **Accepted, toward
+        merging:** the string runs on to the next quote, so lines differing in between merge,
+        and `x` stays in the template. Nothing in the text tells a literal backslash from an
+        escape. It takes a quoted Windows path on a Linux host with another quote later on
+        the line, and the captures hold none.
+      - **Unterminated, ending in `\"`**, `read "partial\"`. `strEscaped` cannot close, so
+        `strPlain` gives today's `read <STR>`. The unguarded candidate would match nothing
+        there and leave the value in the template, one template per value. The fallback also
+        covers lines #124 cut mid-string.
+      - **An escaped quote outside any string**, `key=\"bob\" said "hi"`. It stays
+        `key=\<STR> said <STR>`. Unguarded, the candidate opens at the escaped quote and runs
+        on: `key=\<STR>hi"`, merging distinct events. The captures had no line of this
+        shape, so the guard rests on the argument and on its mutant, not on data.
+      - **A double-quoted string right after an apostrophe**, `'"x"'`. It stays `<STR>`. The
+        boundary class excludes `'`, so a match opened one character early cannot take
+        precedence over `strSingle`.
+      - **Adjacent strings**, `"a""b\"c"`. It stays `<STR><STR>c"`, today's mis-pairing.
+        **Residual:** the first string's match has consumed the quote before the second
+        string, so no boundary character is left for it, and the second string is
+        `strPlain`'s. The boundary was not widened. Widening would not reach this case, and
+        admitting `"` would let a match open on a quote that `maskSTR` then swallows.
+      - **The single-quote twin is not taken.** `say 'it\'s' now` stays `say <STR>s' now`.
+        Measured on the ten boots, the twin changed no line beyond the one `strEscaped`
+        already moves. Apostrophes in prose already pair across words under `'[^']*'`, so a
+        twin would change prose pairing on no evidence.
+
+      **Measured.** The corpus is the ten boots, with `boot-2026-10-12-1134` filtered of its
+      `ab37*` entries: 58,172 lines (4,845 entries filtered). Predictions were written down
+      before each run.
+      - **Per-line template diff, the #83 method.** Every entry goes through
+        `TemplatizeLine(Normalize(decode(raw)))`, old against new:
+        - **the rule:** 1 line moved, an escaped quote inside a closed string, on the stdout
+          transport. Predicted: exactly 1, that category. **Held.**
+        - **the unguarded candidate and the twin:** each differs from the rule on 0 lines.
+          Predicted: twin 0, held; candidate ≥ 1, held at 1.
+        - **lines carrying an escaped quote:** 45. The other 44 keep their template: they
+          are JSON or logfmt lines, or carry the escaped quote outside a string.
+      - **Templates and escalations.** Replay, `--explain-dry-run`, main binary against the
+        branch binary, plus the replay harness for templates:
+        - templates: 27,865 on both, +0 on every boot;
+        - escalations: 59 on both, equal per boot;
+        - events: 1 of 45,796 differs, the moved line.
+
+        Predicted: 0 and 0. **Held.**
+      - **The anonymizer, unedited.** Main and branch give the same 237 passing results, by
+        name, for these three:
+        - `TestTemplatizedMaskingIsComplete`;
+        - `TestEveryUncollapsedDetectorHasATemplatizedRow`;
+        - `TestLogfmtTemplatizedMaskingIsComplete`.
+
+      **Tests.**
+      - **`TestStrEscapes`.** The issue's lines, the alice twin sharing one hash, the array,
+        and the trailing-backslash row fail on main by assertion. The other six rows above
+        pass on main and pin what stays.
+      - **`TestStrMaskMovesOnlyEscapedQuotes`.** It compares 20,000 strings from a fixed seed
+        against the old pattern, asserting that a template may differ only where a quote
+        follows an odd run of backslashes. The alphabet includes `\n`, `é` and `<NUM>`, and
+        no escape pairs are removed, so `\\"` is in the inputs. 97 of the 20,000 differ, all
+        with an escaped quote.
+      - **Mutants.** Each turns tests red:
+        - the unguarded candidate;
+        - no fallback;
+        - a boundary admitting `'`;
+        - the twin;
+        - the boundary in front of all three;
+        - a `strEscaped` that reads `\\"` as an escape. Only the property guard catches this
+          one.
+      - **The full suite under `-race`.** 2,126 passing and 1 skipped on main; 2,138 and 1 on
+        the branch. No existing test changed outcome. The new tests pass under
+        `-race -count=20`.
+
+      **What a user sees.** In exports, `template_hash` and `pattern` change only for a
+      plain-text line whose quoted string carries an escaped quote. Such a line is now one
+      template whatever the value.
+
+      Seen and left alone, out of scope: #92, #36, #31, #49 and #42, and the anonymizer's
+      detectors. The masker order, and every pattern other than STR's, are byte-identical.
+
+      README: the #91 Known-limitations entry goes.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
