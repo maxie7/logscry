@@ -156,7 +156,7 @@ flowchart TD
         A1["stdin<br/>e.g. tail -f file"]
         A2["subprocess<br/>logscry -- ./app"]
         A3["Docker logs<br/>ContainerLogs + Events<br/>stdcopy demux"]
-        A4["journald<br/>journalctl -f -o json<br/>PRIORITY to level"]
+        A4["journald<br/>journalctl -f -o json --all<br/>PRIORITY to level"]
     end
 
     subgraph CORE["Pipeline core — single goroutine, owns state"]
@@ -321,7 +321,7 @@ A full annotated config lives at [`examples/logscry.yaml`](examples/logscry.yaml
 
 `--journald` follows the systemd journal, so logscry can triage the host itself — units,
 the kernel, the boot — and not only what runs inside a container. It works by running
-`journalctl -f -o json` and decoding one entry per line, which is why the binary stays
+`journalctl -f -o json --all` and decoding one entry per line, which is why the binary stays
 pure Go and `CGO_ENABLED=0`: binding libsystemd would need cgo and would break the
 cross-compiled darwin/windows builds. It needs `journalctl` on `PATH`, and journald
 exists only on Linux.
@@ -982,7 +982,7 @@ third option. It plays a recorded capture through the same decode, grouping, tem
 scoring and export as a live run. Time comes from the capture, not from the wall clock:
 
 ```console
-$ journalctl -o json --since "2026-08-29 09:00" --until "2026-08-29 15:00" > capture.jsonl
+$ journalctl -o json --all --since "2026-08-29 09:00" --until "2026-08-29 15:00" > capture.jsonl
 $ logscry --replay capture.jsonl --explain-dry-run --plain --export before.jsonl
 $ logscry --replay capture.jsonl --explain-dry-run --plain --export after.jsonl --burst-min-count 30
 $ diff before.jsonl after.jsonl
@@ -1001,9 +1001,11 @@ With `--replay`:
 - the limiter still admits 10 escalations per *capture* minute, so a replay flags what the
   live run would have flagged.
 
-**It replays journald captures.** Record one with `journalctl -o json`: a time range as
-above, a unit with `-u`, or `journalctl -f -o json | tee capture.jsonl` to record while
-following. Entries go through the same decode as `--journald`, so `PRIORITY` still sets the
+**It replays journald captures.** Record one with `journalctl -o json --all`: a time range
+as above, a unit with `-u`, or `journalctl -f -o json --all | tee capture.jsonl` to record
+while following. Without `--all`, journalctl records any field over 4096 bytes as `null`, so
+a long message is lost from the capture (see [Known limitations](#known-limitations-v1)).
+Entries go through the same decode as `--journald`, so `PRIORITY` still sets the
 level. A file with no timestamps is refused, not replayed with a frozen clock. Plain text,
 subprocess output and `docker logs` carry no timestamps and cannot be replayed yet
 (#73).
@@ -1073,7 +1075,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   group gets a *working* follow of their own session only, with no system-service logs
   and no error to explain why. See [journald](#journald---journald-linux-only) for the
   one-line fix. There is no cursor: `-f` picks up from roughly now, so an event
-  further back won't appear until it recurs. Record with `journalctl -o json` and use
+  further back won't appear until it recurs. Record with `journalctl -o json --all` and use
   [`--replay`](#replay---replay-file) to score history.
 - **Three IPv6 shapes are deliberately not masked in the pipeline's `<IP>` template mask.**
   The template mask requires a boundary before the match and at least two hex groups, because
@@ -1131,14 +1133,25 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   stream of one template repeated at the cap levels off at about 160 MiB. An ordinary host stays
   far from this; the real journal captures replayed for the line cap produced at most about
   3,100 templates each, over hours. Filed as #126.
-- **A journald message over 4096 bytes arrives as its raw JSON entry.** logscry runs
-  `journalctl -o json` without `--all`, and journalctl prints any field over 4096 bytes as
-  `null`. Such an entry is shown and templated as the whole JSON line. It is tagged `journald`
-  instead of `journald:<unit>`, it gets no level from its priority (so an error-class entry loses
-  its ERROR and stderr weight), and it carries the time logscry read it rather than its own; in a
-  replay it has no time and is counted untimed. Entries whose fields are 4096 bytes or less are
-  unaffected, and so is every other source. A capture recorded with plain `journalctl -o json`
-  for `--replay` has the same gap. Filed as #127.
+- **A capture recorded without `--all` has lost its long journald messages.** Without
+  `--all`, `journalctl -o json` writes any field over 4096 bytes as `null`, and the message is
+  not in the file at all. That limit is journalctl(1)'s; systemd's `logs-show.c` applies it to
+  the field's name, `=` and value together (`>= 4096`), and on a real boot a 3,604-byte field
+  was printed and a 5,008-byte one written as `null`. `--replay` keeps the rest of such an entry, its `journald:<unit>`
+  tag, the level from its priority and its own time, and shows
+  `logscry: message not recorded (journalctl -o json prints a long field as null without --all)`
+  in place of the text. The `logscry:` prefix marks the line as logscry's, not the unit's. All
+  such entries share that one template, whatever their unit. Re-record with
+  `journalctl -o json --all` to keep the messages. `--journald` itself runs with `--all` and is
+  not affected.
+- **A journald entry whose JSON line passes 64 KiB is shown as its raw JSON head.** Like any
+  line, it is cut at 64 KiB and announced (see [How it works](#how-it-works)). The cut entry is
+  no longer JSON, so it is tagged `journald`, gets no level from its priority, and carries the
+  time logscry read it; in a replay it is counted untimed. A unit's stdout cannot reach that
+  as plain text, since journald splits a stdout line at 48K, but a binary or heavily escaped
+  one can: JSON writes a non-UTF-8 byte as up to four characters. A message sent through the
+  journal protocol or syslog has no such split. On the one boot measured with `--all`, 4,666
+  entries, the longest line was 5,646 bytes.
 - **Reasoning models need a higher `--llm-max-tokens`.** A thinking model (e.g. `qwen3`,
   `deepseek-r1`) can spend the whole default budget on its chain of thought and return
   empty content with `finish_reason: length`. Prefer a plain instruct model such as
