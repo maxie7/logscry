@@ -36,7 +36,46 @@ const (
 	ipv4Pat = `\b\d{1,3}(?:\.\d{1,3}){3}\b`
 	hexPat  = `0x[0-9a-fA-F]+|\b[0-9a-fA-F]{8,}\b`
 	numPat  = `[+-]?\d+(?:\.\d+)?`
-	strPat  = `"[^"]*"|'[^']*'`
+)
+
+// The quoted-string pattern, in three alternatives (#91). A double-quoted string reads
+// backslash escapes, so `"user \"bob\" logged in"` is ONE string. Without that, a Go-quoted
+// value carrying an escaped quote was a string per escape, the text between them was left in
+// the template, and every value made its own template.
+//
+//   - strEscaped is the escape-reading string. It may open only at the start of the text, or
+//     after a character other than a backslash, an apostrophe or a double quote. Not after a
+//     backslash: a quote escaped outside any string (`key=\"bob\" said "hi"`) would open one
+//     and run on to the next real quote, merging every word in between. Not after an
+//     apostrophe or a double quote: the match would start one character early and take
+//     precedence over strSingle, or over a string that closed there. RE2 has no lookbehind,
+//     so the character is CONSUMED and maskSTR re-emits it, as maskIP does for IPv6.
+//   - strPlain is the old double-quoted rule, the fallback wherever strEscaped cannot match:
+//     a string that never closes (`read "partial\"`), and a quote with no boundary before it.
+//   - strSingle is the old single-quoted rule, unchanged. An escape-reading twin was measured
+//     on ten journald boots (58,172 lines) and changed no line strEscaped does not already
+//     move, while apostrophes in prose already pair across words under it.
+//
+// The boundary belongs to strEscaped ALONE: strPat groups the two, and the alternation binds
+// looser than that concatenation. Moving it in front of all three would change every pairing
+// the fallbacks exist to keep.
+//
+// What this buys: a template differs from the old pattern's only where a quote follows an odd
+// run of backslashes. An escaped backslash before a closing quote (`"a\\"`) closes the string
+// under both, a backslash before a line break is left to strPlain, and a string opened one
+// character early is re-emitted unchanged. On the ten boots it moved one line.
+//
+// The trade accepted: a quoted path whose trailing backslash is literal, followed later on
+// the line by another quote (`copy "C:\logs\" rotated "x"`), reads as an escape and runs on to
+// that quote. Nothing in the text tells the two apart. The residual kept: a quote right after
+// a closing quote is no boundary, so in `"a""b\"c"` the second string is strPlain's and still
+// mis-pairs.
+const (
+	strBoundary = `(?:^|[^\\'"])`
+	strEscaped  = `"(?:[^"\\]|\\.)*"`
+	strPlain    = `"[^"]*"`
+	strSingle   = `'[^']*'`
+	strPat      = `(?:` + strBoundary + strEscaped + `)|` + strPlain + `|` + strSingle
 )
 
 // The IPv6 pattern, in two parts, because on its own the address grammar also
@@ -125,7 +164,7 @@ var maskers = []masker{
 	{"IP", mustLongest(ipv4Pat + `|` + ipv6Pat), maskIP},
 	{"HEX", regexp.MustCompile(hexPat), maskHex},
 	{"NUM", regexp.MustCompile(numPat), constMask("<NUM>")},
-	{"STR", regexp.MustCompile(strPat), constMask("<STR>")},
+	{"STR", regexp.MustCompile(strPat), maskSTR},
 }
 
 // maskIP emits <IP>, re-emitting the boundary character that ipv6Boundary had to
@@ -138,6 +177,16 @@ func maskIP(match string) string {
 		return "<IP>"
 	}
 	return match[:n] + "<IP>"
+}
+
+// maskSTR emits <STR>, re-emitting the boundary character strEscaped had to consume. A match
+// beginning with a quote carries none: it began at the start of the text, or is a fallback.
+func maskSTR(match string) string {
+	r, n := utf8.DecodeRuneInString(match)
+	if r == '"' || r == '\'' {
+		return "<STR>"
+	}
+	return match[:n] + "<STR>"
 }
 
 // maskHex masks 0x-prefixed literals and hex runs that contain a letter, but
