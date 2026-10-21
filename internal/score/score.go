@@ -241,7 +241,8 @@ type EscalationRequest struct {
 	Context []string // recent lines across all sources, oldest first
 	Pattern string   // the masked template, e.g. "user <NUM> failed"
 	Hash    string
-	Count   int // occurrences of this template so far
+	Flag    model.FlagID // which flag this is; the answer carries it back (see model.FlagID)
+	Count   int          // occurrences of this template so far
 	Score   float64
 	Reasons []string // human-readable: why this fired
 
@@ -260,6 +261,8 @@ type Result struct {
 	// happened, so a card is never left waiting on an answer that is not coming.
 	Queued  bool
 	Reasons []string
+	// Flag names the escalation when Escalate is set, and is 0 otherwise.
+	Flag model.FlagID
 }
 
 // Stats are the running escalation counters. Suppressed and Dropped exist so the UI
@@ -283,6 +286,7 @@ type Scorer struct {
 	stats Stats
 	start time.Time // time of the first line seen; zero until then
 	lines int
+	flags model.FlagID // the last flag minted; see Evaluate
 }
 
 // New returns a Scorer. out is the escalation channel the LLM worker pool consumes in
@@ -327,6 +331,13 @@ func (s *Scorer) Evaluate(line model.LogLine, tmpl *model.Template, prevLastSeen
 
 	res.Escalate = s.decide(tmpl, res.Score, now)
 	if res.Escalate {
+		// The flag's identity is minted here, where the flag is decided, because this is
+		// the one point every flag passes in every mode, and the request leaves for the
+		// model from inside this call — before the pipeline has seen the flag at all. A
+		// counter is enough: the scorer is owned by one goroutine, the values are ordered
+		// (which the card needs: older vs newer), and a run's IDs repeat run to run.
+		s.flags++
+		res.Flag = s.flags
 		res.Queued = s.emit(line, tmpl, res)
 	}
 	// After the emit, so an escalation's context is the lines that *preceded* it.
@@ -582,6 +593,7 @@ func (s *Scorer) emit(line model.LogLine, tmpl *model.Template, res Result) bool
 		Context: s.ring.Lines(),
 		Pattern: tmpl.Pattern,
 		Hash:    tmpl.Hash,
+		Flag:    res.Flag,
 		Count:   tmpl.Count,
 		Score:   res.Score,
 		Reasons: res.Reasons,

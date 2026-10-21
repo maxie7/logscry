@@ -79,6 +79,9 @@ type Template struct {
 	FlagCount    int
 	FirstFlagged time.Time
 	LastFlagged  time.Time
+	// LastFlagID names the newest flag, stamped with LastFlagged. An answer is matched to
+	// its flag by this, never by the hash, which two flags of one template share (#121).
+	LastFlagID FlagID
 
 	// Explanation is the LLM's verdict on this template, nil until it escalates. It
 	// is set to a pending value the moment the event is handed to the LLM stage and
@@ -89,6 +92,13 @@ type Template struct {
 
 // ExplainState is how far an escalated template has got through the LLM stage.
 type ExplainState int
+
+// FlagID names one flag: one decision by the scorer that a template escalates. The scorer
+// mints it, counting from 1, and every half of that flag's story carries it unchanged — the
+// request, each streamed update, the final answer or failure, and the export record's join.
+// The template hash cannot do this job: two flags of one template share it, and an answer
+// still out when its template flags again was joined to the wrong one (#121). 0 is no flag.
+type FlagID uint64
 
 const (
 	// ExplainPending is escalated, waiting on the model. The UI says "explaining…"
@@ -106,6 +116,10 @@ const (
 // answer on the template that asked for it, without any lock on the template map.
 type Explanation struct {
 	Hash string
+	// Flag is the flag this explanation answers: the request's, copied unchanged. The hash
+	// routes the answer to its template's card; Flag says which of that template's flags it
+	// belongs to.
+	Flag FlagID
 	// Pattern is the masked template this explains. The hash routes the answer; the
 	// pattern is what a line-oriented consumer (--plain) prints to say which of the
 	// escalations that scrolled past a few seconds ago this one is about.

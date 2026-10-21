@@ -145,12 +145,12 @@ func TestExportWritesOneLinePerStreamedAnswer(t *testing.T) {
 	lines <- model.LogLine{Source: "proc:app", Stream: model.Stderr, Raw: "PANIC: nil map write in handler 42"}
 	req := <-escalations
 
-	partial := model.Explanation{Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainPending,
+	partial := model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: model.ExplainPending,
 		Summary: "A handler wrote to a nil map."}
 	explanations <- partial
 	partial.LikelyCause = "The cache map is never initialised."
 	explanations <- partial
-	explanations <- model.Explanation{Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainDone,
+	explanations <- model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: model.ExplainDone,
 		Summary: "A handler wrote to a nil map.", LikelyCause: "The cache map is never initialised.",
 		Suggestion: "Make the map in NewServer."}
 
@@ -190,7 +190,7 @@ func TestExportIsIdenticalForBothRenderers(t *testing.T) {
 
 		p.Process(line, time.Now())
 		req := <-escalations
-		p.attach(model.Explanation{Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainDone,
+		p.attach(model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: model.ExplainDone,
 			Summary: "A handler wrote to a nil map.", At: time.Now()})
 
 		recs := read()
@@ -210,7 +210,7 @@ func TestExportIsIdenticalForBothRenderers(t *testing.T) {
 
 		p.Process(line, time.Now())
 		req := <-escalations
-		exp.Resolve(model.Explanation{Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainDone,
+		exp.Resolve(model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: model.ExplainDone,
 			Summary: "A handler wrote to a nil map.", At: time.Now()})
 
 		recs := read()
@@ -333,5 +333,161 @@ func TestExportStaysFrozenWhileTheCardMoves(t *testing.T) {
 	// And the first record must NOT have been dragged up to the card's live numbers.
 	if recs[0]["count_at_flag"] == recs[1]["count_at_flag"] {
 		t.Error("both records carry the same count_at_flag: the export followed the card")
+	}
+}
+
+// answerTo is the pool's answer to req: its hash, flag and pattern, copied unchanged, as
+// llm.explain copies them.
+func answerTo(req score.EscalationRequest, state model.ExplainState, summary string, at time.Time) model.Explanation {
+	ex := model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: state, At: at}
+	if state == model.ExplainFailed {
+		ex.Err = summary
+	} else {
+		ex.Summary = summary
+	}
+	return ex
+}
+
+// TestReescalationBeforeTheFirstAnswerWritesTwoRecords is the issue's reproduction (#121).
+// With the explanation cache shorter than the model's answer time, a template flags again
+// while its first flag is unanswered. The writer joined a flag to its answer by template hash,
+// so the second flag replaced the first: the first answer was written with the second flag's
+// count_at_flag, and the second answer wrote nothing. Every flag must produce exactly one
+// record, joined to its own answer or failure, whatever order the answers arrive in.
+//
+// The test is the model: it takes both requests off the escalation channel and answers them
+// in the order each row chooses. No sleep orders anything — Run handles one item at a time,
+// so the second request is taken only after the second flag has reached the writer.
+func TestReescalationBeforeTheFirstAnswerWritesTwoRecords(t *testing.T) {
+	t0 := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	type want struct {
+		kind, state, text string // text is the summary, or the error when unavailable
+	}
+	tests := []struct {
+		name   string
+		dryRun bool
+		// answer sends the model's side, given the two requests in flag order.
+		answer func(out chan<- model.Explanation, r1, r2 score.EscalationRequest)
+		want   map[float64]want // by count_at_flag; a missing count means no record
+	}{
+		{
+			name: "answers in order, the first streamed in pieces",
+			answer: func(out chan<- model.Explanation, r1, r2 score.EscalationRequest) {
+				out <- answerTo(r1, model.ExplainPending, "first, so far", t0.Add(time.Second))
+				out <- answerTo(r1, model.ExplainDone, "first", t0.Add(time.Second))
+				out <- answerTo(r2, model.ExplainDone, "second", t0.Add(3*time.Second))
+			},
+			want: map[float64]want{1: {"anomaly", "explained", "first"}, 2: {"anomaly", "explained", "second"}},
+		},
+		{
+			name: "answers reversed",
+			answer: func(out chan<- model.Explanation, r1, r2 score.EscalationRequest) {
+				out <- answerTo(r2, model.ExplainDone, "second", t0.Add(3*time.Second))
+				out <- answerTo(r1, model.ExplainDone, "first", t0.Add(time.Second))
+			},
+			want: map[float64]want{1: {"anomaly", "explained", "first"}, 2: {"anomaly", "explained", "second"}},
+		},
+		{
+			name: "the first fails and the second succeeds",
+			answer: func(out chan<- model.Explanation, r1, r2 score.EscalationRequest) {
+				out <- answerTo(r1, model.ExplainFailed, "model timed out", t0.Add(time.Second))
+				out <- answerTo(r2, model.ExplainDone, "second", t0.Add(3*time.Second))
+			},
+			want: map[float64]want{1: {"anomaly", "unavailable", "model timed out"}, 2: {"anomaly", "explained", "second"}},
+		},
+		{
+			// #70's rule for a flag the run ends without answering — never written, and not
+			// counted lost — now holds per flag, and costs the other flag nothing.
+			name: "the second is never answered before shutdown",
+			answer: func(out chan<- model.Explanation, r1, _ score.EscalationRequest) {
+				out <- answerTo(r1, model.ExplainDone, "first", t0.Add(time.Second))
+			},
+			want: map[float64]want{1: {"anomaly", "explained", "first"}},
+		},
+		{
+			name:   "dry-run: no model, each flag resolved on the spot",
+			dryRun: true,
+			want:   map[float64]want{1: {"would_escalate", "not_requested", ""}, 2: {"would_escalate", "not_requested", ""}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := escalateAlways()
+			cfg.CacheTTL = time.Second // shorter than the model takes: the precondition
+			exp, read := exportTo(t)
+			lines := make(chan model.LogLine)
+			snaps := make(chan Snapshot, 1)
+			opts := Options{Snapshots: snaps, Interval: time.Hour, Export: exp, SourceTime: true}
+			var escalations chan score.EscalationRequest
+			var explanations chan model.Explanation
+			if !tc.dryRun {
+				escalations = make(chan score.EscalationRequest, 4)
+				explanations = make(chan model.Explanation, 8)
+				opts.Escalations, opts.Explanations = escalations, explanations
+			}
+			sc := score.New(cfg, escalations)
+			opts.Scorer = sc
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				Run(context.Background(), lines, opts)
+			}()
+
+			panicAt := func(at time.Time) model.LogLine {
+				return model.LogLine{Time: at, Source: "proc:app", Stream: model.Stderr, Raw: "PANIC: nil map write in handler 42"}
+			}
+			requests := 0
+			var r1, r2 score.EscalationRequest
+			lines <- panicAt(t0)
+			if !tc.dryRun {
+				r1 = <-escalations
+				requests++
+			}
+			lines <- panicAt(t0.Add(2 * time.Second))
+			if !tc.dryRun {
+				r2 = <-escalations
+				requests++
+				tc.answer(explanations, r1, r2)
+				close(explanations)
+			}
+			close(lines)
+			<-done
+			final := <-snaps
+
+			if got := sc.Stats().Escalated; got != 2 {
+				t.Errorf("Escalated = %d, want 2", got)
+			}
+			if want := map[bool]int{false: 2, true: 0}[tc.dryRun]; requests != want {
+				t.Errorf("%d requests reached the model, want %d", requests, want)
+			}
+			if final.Stats.Unidentified != 0 {
+				t.Errorf("%d answers arrived without their flag", final.Stats.Unidentified)
+			}
+			recs := read()
+			if len(recs) != len(tc.want) {
+				t.Errorf("%d records, want %d:\n%v", len(recs), len(tc.want), recs)
+			}
+			for _, r := range recs {
+				count, _ := r["count_at_flag"].(float64)
+				w, ok := tc.want[count]
+				if !ok {
+					t.Errorf("unexpected record with count_at_flag %v: %v", count, r)
+					continue
+				}
+				delete(tc.want, count)
+				ex := r["explanation"].(map[string]any)
+				text := ex["summary"]
+				if w.state == "unavailable" {
+					text = ex["error"]
+				}
+				if r["kind"] != w.kind || ex["state"] != w.state || text != w.text {
+					t.Errorf("record with count_at_flag %v is %v/%v/%q, want %s/%s/%q",
+						count, r["kind"], ex["state"], text, w.kind, w.state, w.text)
+				}
+			}
+			for count := range tc.want {
+				t.Errorf("no record with count_at_flag %v", count)
+			}
+		})
 	}
 }

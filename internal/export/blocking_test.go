@@ -28,7 +28,7 @@ func flood(w *Writer, n int) {
 	for i := range n {
 		h := fmt.Sprintf("h%05d", i)
 		w.Flag(flagFor(h))
-		w.WouldEscalate(h, time.Date(2026, 8, 29, 10, 40, 0, 0, time.UTC))
+		w.WouldEscalate(h, 0, time.Date(2026, 8, 29, 10, 40, 0, 0, time.UTC))
 	}
 }
 

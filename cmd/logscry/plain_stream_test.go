@@ -71,12 +71,12 @@ func TestPlainSuppressesStreamedPartials(t *testing.T) {
 		case req := <-escalations:
 			// Two progressive updates, then the terminal one — exactly what a streamed
 			// answer delivers.
-			explanations <- model.Explanation{Hash: req.Hash, Pattern: req.Pattern,
+			explanations <- model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern,
 				State: model.ExplainPending, Summary: "A handler wrote to a nil map."}
-			explanations <- model.Explanation{Hash: req.Hash, Pattern: req.Pattern,
+			explanations <- model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern,
 				State: model.ExplainPending, Summary: "A handler wrote to a nil map.",
 				LikelyCause: "The cache map is never initialised."}
-			explanations <- model.Explanation{Hash: req.Hash, Pattern: req.Pattern,
+			explanations <- model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern,
 				State:   model.ExplainDone,
 				Summary: "A handler wrote to a nil map.", LikelyCause: "The cache map is never initialised.",
 				Suggestion: "Make the map in NewServer."}

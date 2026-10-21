@@ -70,7 +70,10 @@ func work(ctx context.Context, b Backend, cfg Config, in <-chan score.Escalation
 // the way out, deliberately, so that a slow or broken model cannot make the same error
 // escalate over and over.
 func explain(ctx context.Context, b Backend, cfg Config, req score.EscalationRequest, out chan<- model.Explanation) model.Explanation {
-	ex := model.Explanation{Hash: req.Hash, Pattern: req.Pattern, At: cfg.now()}
+	// The one Explanation built for this request. Every way out below — the answer, any
+	// failure, a salvaged stream, each partial — is a copy of it, which is how they all carry
+	// the request's Flag: the only thing that matches an answer to its flag (#121).
+	ex := model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, At: cfg.now()}
 
 	resp, err := b.Explain(ctx, ExplainRequest{
 		Trigger:  req.Trigger,

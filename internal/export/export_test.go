@@ -215,7 +215,7 @@ func TestRecordTimesAreWrittenInUTC(t *testing.T) {
 	t.Run("would_escalate", func(t *testing.T) {
 		w, path := openTemp(t)
 		w.Flag(flag)
-		w.WouldEscalate("abc123", at)
+		w.WouldEscalate("abc123", 0, at)
 		check(t, decodeOne(t, closeAndRead(t, w, path)))
 	})
 }
@@ -313,7 +313,7 @@ func TestIncompleteAnswerIsMarked(t *testing.T) {
 func TestWouldEscalateIsUnmistakable(t *testing.T) {
 	w, path := openTemp(t)
 	w.Flag(flagFor("abc123"))
-	w.WouldEscalate("abc123", time.Now())
+	w.WouldEscalate("abc123", 0, time.Now())
 
 	got := decodeOne(t, closeAndRead(t, w, path))
 	if got["kind"] != KindWouldEscalate {
@@ -448,7 +448,7 @@ func TestNilWriterIsInert(t *testing.T) {
 	var w *Writer
 	w.Flag(flagFor("abc123"))
 	w.Resolve(doneFor("abc123"))
-	w.WouldEscalate("abc123", time.Now())
+	w.WouldEscalate("abc123", 0, time.Now())
 	if n := w.Dropped(); n != 0 {
 		t.Errorf("Dropped() = %d on a nil writer, want 0", n)
 	}

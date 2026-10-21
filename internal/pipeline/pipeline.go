@@ -81,6 +81,7 @@ type Pipeline struct {
 	explained      int // answered
 	explainFailed  int // model unavailable, or the escalation never got queued
 	explainDropped int // escalations that never reached the pool: the queue was full
+	unidentified   int // answers without their flag's ID; always 0 (see Stats.Unidentified)
 }
 
 // New returns an empty Pipeline scoring with sc, which may be nil.
@@ -107,7 +108,7 @@ func (p *Pipeline) Process(line model.LogLine, now time.Time) Event {
 		res := p.scorer.Evaluate(line, tmpl, prevLastSeen, now)
 		ev.Score, ev.Escalate, ev.Queued, ev.Reasons = res.Score, res.Escalate, res.Queued, res.Reasons
 		if ev.Escalate {
-			p.flagged(tmpl, ev, now)
+			p.flagged(tmpl, ev, res.Flag, now)
 		}
 	}
 	return ev
@@ -121,7 +122,7 @@ func (p *Pipeline) Process(line model.LogLine, now time.Time) Event {
 // is the point-in-time semantics the file promises: a record describes the event "this
 // template escalated", so its count and last-seen are the ones that were true when it did,
 // not the ones that are true when a model finishes answering seconds later.
-func (p *Pipeline) flagged(tmpl *model.Template, ev Event, now time.Time) {
+func (p *Pipeline) flagged(tmpl *model.Template, ev Event, flag model.FlagID, now time.Time) {
 	// The flag history, which is the CARD's half of this moment and the exact opposite of
 	// the record below: it accumulates on the template and stays live, where the record is
 	// written once and frozen. Stamped here because this is the one place every mode passes
@@ -132,9 +133,11 @@ func (p *Pipeline) flagged(tmpl *model.Template, ev Event, now time.Time) {
 		tmpl.FirstFlagged = now
 	}
 	tmpl.LastFlagged = now
+	tmpl.LastFlagID = flag
 
 	p.export.Flag(export.Flag{
 		Hash:      tmpl.Hash,
+		ID:        flag,
 		Pattern:   tmpl.Pattern,
 		Level:     ev.Line.Level,
 		Source:    ev.Line.Source,
@@ -151,7 +154,7 @@ func (p *Pipeline) flagged(tmpl *model.Template, ev Event, now time.Time) {
 	// honest reason, and it keeps the queue-full branch below unreachable in dry-run, where
 	// Queued is false only because the scorer emits to a nil channel (see score.emit).
 	if !p.explain {
-		p.export.WouldEscalate(tmpl.Hash, now)
+		p.export.WouldEscalate(tmpl.Hash, flag, now)
 		return
 	}
 	p.escalated(tmpl, ev.Queued, now)
@@ -179,7 +182,7 @@ func (p *Pipeline) escalated(tmpl *model.Template, queued bool, now time.Time) {
 		// A record describes one flag, and this flag produced no answer: writing the
 		// previous one into it would claim the model replied when it was never asked.
 		p.export.Resolve(model.Explanation{
-			Hash: tmpl.Hash, Pattern: tmpl.Pattern,
+			Hash: tmpl.Hash, Flag: tmpl.LastFlagID, Pattern: tmpl.Pattern,
 			State: model.ExplainFailed, Err: queueFull, At: now,
 		})
 		p.explainFailed++
@@ -188,6 +191,9 @@ func (p *Pipeline) escalated(tmpl *model.Template, queued bool, now time.Time) {
 	}
 	next.State = model.ExplainPending
 	tmpl.Explanation = next
+	// Once per QUEUED flag, and only here: each one gets exactly one terminal answer from the
+	// pool, which attach counts back down. A dropped flag never reaches this line, and a dry
+	// run never calls escalated at all.
 	p.explaining++
 }
 
@@ -195,9 +201,11 @@ func (p *Pipeline) escalated(tmpl *model.Template, queued bool, now time.Time) {
 // the template already holds, or an empty one if it has none. The caller sets the state.
 //
 // The copy preserves At — the moment the ANSWER was produced, not this flag — because that
-// is the whole of how a card knows the answer it is showing belongs to an earlier flag.
+// is the whole of how a card knows the answer it is showing belongs to an earlier flag. It
+// preserves Flag for the same reason: Flag says whose answer the text is, and the card rule
+// in attach compares it.
 func (p *Pipeline) reexplaining(tmpl *model.Template, now time.Time) *model.Explanation {
-	next := model.Explanation{Hash: tmpl.Hash, Pattern: tmpl.Pattern, At: now}
+	next := model.Explanation{Hash: tmpl.Hash, Flag: tmpl.LastFlagID, Pattern: tmpl.Pattern, At: now}
 	if prev := tmpl.Explanation; prev != nil && prev.Summary != "" {
 		next = *prev
 		next.Err = "" // whatever went wrong last time is not this attempt's news
@@ -223,23 +231,62 @@ func (p *Pipeline) attach(ex model.Explanation) {
 	if !ok {
 		return // a template we no longer know about; nothing to show it on
 	}
-	ex = keepEarlierAnswer(tmpl.Explanation, ex)
-	// A streamed answer arrives as several pending updates before its terminal one, so the
-	// counter must move only on the transition OUT of pending — decrementing on every
-	// update would leave "explaining N" at zero while cards were still filling in.
-	if tmpl.Explanation != nil && tmpl.Explanation.State == model.ExplainPending &&
-		ex.State != model.ExplainPending {
-		p.explaining--
-	}
-	tmpl.Explanation = &ex
-
+	// The counters are per FLAG. Every queued flag gets exactly one terminal answer, and
+	// escalated counted it in once, so each terminal answer counts one out — whichever of the
+	// template's flags it belongs to, and whatever the card does with it below. Partials are
+	// not answers: a streamed answer arrives as several of them before its terminal one.
 	switch ex.State {
 	case model.ExplainDone:
+		p.explaining--
 		p.explained++
 	case model.ExplainFailed:
+		p.explaining--
 		p.explainFailed++
 	case model.ExplainPending:
 	}
+
+	if ex.Flag == 0 && tmpl.LastFlagID != 0 {
+		// An answer that lost its flag on the way: every path that builds one copies the
+		// request's (see llm.explain), so this is a bug, and Stats.Unidentified is how a test
+		// sees it. It is shown as the newest answer, as before flags had IDs, rather than
+		// dropped: a bug here must cost the card its ordering, not its answer.
+		p.unidentified++
+		ex.Flag = tmpl.LastFlagID
+	}
+	if ex.Flag < tmpl.LastFlagID {
+		if next, ok := olderAnswer(tmpl.Explanation, ex); ok {
+			tmpl.Explanation = &next
+		}
+		return
+	}
+	ex = keepEarlierAnswer(tmpl.Explanation, ex)
+	tmpl.Explanation = &ex
+}
+
+// olderAnswer applies the card rule to an answer for an older flag of a template that has
+// flagged again (#121): the card's state always belongs to the template's newest flag; an
+// older flag's final answer is shown only while no newer flag has produced any answer text,
+// labelled as from its own flag; and an older flag's partial updates never reach the card.
+// It reports false when the card is to stay as it is.
+//
+// Showing the older answer is #34's carry-forward, arriving late: had it come a moment before
+// the newer flag, reexplaining would have put it under the newer flag's pending state exactly
+// like this, and RDI §6 asks for that ("the previous one stays visible, marked as belonging to
+// the earlier flag, while the new one is fetched"). Its At and Flag come with it, so the card
+// says which flag it is from; the State and Err stay the newest flag's — still explaining, or
+// a failed retry.
+func olderAnswer(cur *model.Explanation, ex model.Explanation) (model.Explanation, bool) {
+	if ex.State == model.ExplainPending || ex.Summary == "" {
+		return model.Explanation{}, false // a partial, or a failure with nothing to show
+	}
+	if cur == nil {
+		return model.Explanation{}, false // unreachable: a flagged template has a card state
+	}
+	if cur.Summary != "" && cur.Flag >= ex.Flag {
+		return model.Explanation{}, false // the card already shows text at least as new
+	}
+	ex.State, ex.Err = cur.State, cur.Err
+	return ex, true
 }
 
 // keepEarlierAnswer stops a failed re-explanation from emptying a card that already has a

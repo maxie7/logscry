@@ -78,6 +78,7 @@ const (
 // how the flag ended (see Resolve, WouldEscalate).
 type Flag struct {
 	Hash      string
+	ID        model.FlagID // the flag's identity, which its resolution carries back (#121)
 	Pattern   string
 	Level     string
 	Source    string
@@ -142,6 +143,7 @@ type Incomplete struct {
 // writes.
 type resolution struct {
 	hash        string
+	flag        model.FlagID
 	kind        string
 	explanation Explanation
 }
@@ -155,16 +157,26 @@ type msg struct {
 	seq    uint64
 }
 
-// hash is the template the message is about.
-func (m msg) hash() string {
-	if m.isFlag {
-		return m.flag.Hash
-	}
-	return m.res.hash
+// pairKey names the record a half belongs to: one flag of one template. The flag ID is what
+// tells two flags of one template apart — a template can flag again while its first flag is
+// still unanswered, and keyed by hash alone the second flag took the first one's answer
+// (#121). The hash stays in the key so an answer can only ever join a flag of its own
+// template.
+type pairKey struct {
+	hash string
+	flag model.FlagID
 }
 
-// pairState is what send knows about the record a template has in flight: the seq it was
-// given, which half has gone through send, and whether that half was dropped.
+// key is the record the message is half of.
+func (m msg) key() pairKey {
+	if m.isFlag {
+		return pairKey{m.flag.Hash, m.flag.ID}
+	}
+	return pairKey{m.res.hash, m.res.flag}
+}
+
+// pairState is what send knows about one record in flight: the seq it was given, which half
+// has gone through send, and whether that half was dropped.
 type pairState struct {
 	seq    uint64
 	isFlag bool
@@ -209,15 +221,18 @@ type Writer struct {
 	// one step. The live send never waits while holding it; the blocking one (replay) has a
 	// single sender, the pipeline goroutine, so nothing waits behind it.
 	//
-	// pairs is keyed by template hash, so it holds at most one entry per template. An entry
+	// pairs is keyed by flag (pairKey), so it holds one entry per flag in flight. An entry
 	// lives from a record's first half to its second. While a run is live every flag gets
 	// exactly one resolution: on the spot in a dry run, at once as "unavailable" when the LLM
 	// queue is full, and otherwise the pool's one terminal answer, explained or failed (a
-	// failed anonymization is a failure). So an entry is left behind only by a run that ends
-	// with an answer outstanding, and the next half of the same side for that template
-	// replaces it.
+	// failed anonymization is a failure), which the pool always delivers — only a partial is
+	// ever dropped on the way. So the entries are bounded by the flags the model has not yet
+	// answered — the escalation queue, the workers and the answers waiting to be read — and
+	// an entry is left behind only by a run that ends with an answer outstanding. Until #121
+	// the key was the template hash: the bound was per template, and a template's newer flag
+	// replaced its older one, which is how an answer came to be written under the wrong flag.
 	mu    sync.Mutex
-	pairs map[string]pairState
+	pairs map[pairKey]pairState
 	seq   uint64
 	// queued counts records whose two halves both went into the queue, which the writer
 	// goroutine will therefore start writing unless Close gives up first.
@@ -237,11 +252,11 @@ type Writer struct {
 
 	// Owned by the writer goroutine — do not touch from anywhere else.
 	f       sink
-	offset  int64          // file offset of the end of the last COMPLETE record
-	flags   map[string]msg // flagged, awaiting a resolution
-	orphans map[string]msg // resolved, awaiting its flag (see run)
-	err     error          // first write error; read after <-finished
-	broken  bool           // a partial line could not be rolled back: stop writing
+	offset  int64           // file offset of the end of the last COMPLETE record
+	flags   map[pairKey]msg // flagged, awaiting a resolution
+	orphans map[pairKey]msg // resolved, awaiting its flag (see run)
+	err     error           // first write error; read after <-finished
+	broken  bool            // a partial line could not be rolled back: stop writing
 }
 
 // Open opens path for appending and starts the writer goroutine. An existing file is added
@@ -297,11 +312,11 @@ func newWriter(f sink, offset int64) *Writer {
 		trailerDone: make(chan struct{}),
 		stall:       defaultStall,
 		trailerWait: defaultTrailerWait,
-		pairs:       make(map[string]pairState),
+		pairs:       make(map[pairKey]pairState),
 		f:           f,
 		offset:      offset,
-		flags:       make(map[string]msg),
-		orphans:     make(map[string]msg),
+		flags:       make(map[pairKey]msg),
+		orphans:     make(map[pairKey]msg),
 	}
 	go w.run()
 	return w
@@ -332,7 +347,7 @@ func (w *Writer) Resolve(ex model.Explanation) {
 	if w == nil || ex.State == model.ExplainPending {
 		return
 	}
-	w.send(msg{res: resolution{hash: ex.Hash, kind: KindAnomaly, explanation: explanationOf(ex)}})
+	w.send(msg{res: resolution{hash: ex.Hash, flag: ex.Flag, kind: KindAnomaly, explanation: explanationOf(ex)}})
 }
 
 // WouldEscalate resolves a flag in a run with no LLM stage attached (--explain-dry-run),
@@ -342,12 +357,13 @@ func (w *Writer) Resolve(ex model.Explanation) {
 // those is the artifact that makes a threshold change diffable. The record is marked
 // unmistakably — kind "would_escalate", state "not_requested" — because it has no summary,
 // cause, or suggestion, and must never be read as an explained anomaly.
-func (w *Writer) WouldEscalate(hash string, at time.Time) {
+func (w *Writer) WouldEscalate(hash string, flag model.FlagID, at time.Time) {
 	if w == nil {
 		return
 	}
 	w.send(msg{res: resolution{
 		hash:        hash,
+		flag:        flag,
 		kind:        KindWouldEscalate,
 		explanation: Explanation{State: stateNotRequested, At: at},
 	}})
@@ -478,13 +494,13 @@ func (w *Writer) stalled(abandoned uint64) error {
 // writer has been told to stop, nothing will read the queue again, and a sender waiting on
 // it would wait forever. That send is counted as a drop, which it is.
 func (w *Writer) send(m msg) {
-	hash := m.hash()
+	key := m.key()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if p, ok := w.pairs[hash]; ok && p.isFlag != m.isFlag {
-		// The second half of the record in flight for this template.
-		delete(w.pairs, hash)
+	if p, ok := w.pairs[key]; ok && p.isFlag != m.isFlag {
+		// The second half of this flag's record.
+		delete(w.pairs, key)
 		if p.lost {
 			return // the record is already counted lost; its other half must not be written
 		}
@@ -496,15 +512,16 @@ func (w *Writer) send(m msg) {
 		}
 		return
 	}
-	// A first half. One of the same side still in flight for this template is replaced, as
-	// the writer has always replaced it: the newer half is the one a resolution will answer.
+	// A first half. Each flag has its own key, so a second flag of the same template starts
+	// a record of its own instead of meeting this one; only a half of the same side with the
+	// same key — a caller sending one flag twice — would replace it, as the writer always has.
 	w.seq++
 	m.seq = w.seq
 	queued := w.enqueue(m)
 	if !queued {
 		w.dropped.Add(1)
 	}
-	w.pairs[hash] = pairState{seq: m.seq, isFlag: m.isFlag, lost: !queued}
+	w.pairs[key] = pairState{seq: m.seq, isFlag: m.isFlag, lost: !queued}
 }
 
 // enqueue puts m on the channel, or reports that it could not: the channel was full, or, for a
@@ -565,19 +582,19 @@ func (w *Writer) run() {
 // The halves join only when they carry the same seq, i.e. belong to one record. A waiting half
 // with another seq is stale — its partner was dropped (see send) — and gives way.
 //
-// Both maps hold only unmatched halves, one per template at most. A flag left unmatched at
-// shutdown is simply never written, which is correct: it never reached a terminal state.
+// Both maps hold only unmatched halves, one per flag. A flag left unmatched at shutdown is
+// simply never written, which is correct: it never reached a terminal state.
 func (w *Writer) handle(m msg) {
 	defer w.progress.Add(1)
-	hash := m.hash()
+	key := m.key()
 	waiting, other := w.orphans, w.flags
 	if !m.isFlag {
 		waiting, other = w.flags, w.orphans
 	}
-	if p, ok := waiting[hash]; ok {
-		// Deleting is what makes a second terminal explanation for the same hash write
+	if p, ok := waiting[key]; ok {
+		// Deleting is what makes a second terminal explanation for the same flag write
 		// nothing. The next line for this template needs a new flag, i.e. a new escalation.
-		delete(waiting, hash)
+		delete(waiting, key)
 		if p.seq == m.seq {
 			if m.isFlag {
 				w.writeRecord(record(m.flag, p.res))
@@ -587,7 +604,7 @@ func (w *Writer) handle(m msg) {
 			return
 		}
 	}
-	other[hash] = m
+	other[key] = m
 }
 
 // writeRecord writes one joined record, unless Close has given up on the disk, in which case

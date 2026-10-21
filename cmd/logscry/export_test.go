@@ -90,12 +90,12 @@ func TestPlainExportsOneLinePerStreamedAnomaly(t *testing.T) {
 
 		select {
 		case req := <-escalations:
-			explanations <- model.Explanation{Hash: req.Hash, Pattern: req.Pattern,
+			explanations <- model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern,
 				State: model.ExplainPending, Summary: "A handler wrote to a nil map."}
-			explanations <- model.Explanation{Hash: req.Hash, Pattern: req.Pattern,
+			explanations <- model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern,
 				State: model.ExplainPending, Summary: "A handler wrote to a nil map.",
 				LikelyCause: "The cache map is never initialised."}
-			explanations <- model.Explanation{Hash: req.Hash, Pattern: req.Pattern,
+			explanations <- model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern,
 				State:   model.ExplainDone,
 				Summary: "A handler wrote to a nil map.", LikelyCause: "The cache map is never initialised.",
 				Suggestion: "Make the map in NewServer.", At: time.Now()}
@@ -160,7 +160,7 @@ func TestPlainWithoutExportCreatesNoFile(t *testing.T) {
 		lines <- model.LogLine{Source: "proc:app", Stream: model.Stderr, Level: "PANIC",
 			Raw: "PANIC: nil map write in handler 42"}
 		req := <-escalations
-		explanations <- model.Explanation{Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainDone,
+		explanations <- model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: model.ExplainDone,
 			Summary: "A handler wrote to a nil map."}
 
 		close(lines)
