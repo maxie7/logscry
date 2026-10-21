@@ -94,6 +94,17 @@ func run(ctx context.Context, args []string) (err error) {
 		}
 	}()
 
+	// Lines cut at ingest.MaxLineBytes are announced once while the run is live (see below),
+	// and their total is printed here at exit. Registered before the terminal is taken over, so
+	// it runs after the TUI has restored it. The exit status is untouched: the cut lines were
+	// still processed, and every output describes them (#124).
+	var cuts *ingest.Truncations
+	defer func() {
+		if n := cuts.Count(); n > 0 {
+			fmt.Fprintf(os.Stderr, "logscry: ingest: %d line(s) over %d KiB were truncated\n", n, ingest.MaxLineBytes>>10)
+		}
+	}()
+
 	sources, stdinOnly := sources(cfg)
 	replay, _ := sources[0].(*ingest.ReplaySource) // nil unless --replay: it is then the only source
 
@@ -108,15 +119,19 @@ func run(ctx context.Context, args []string) (err error) {
 	}
 
 	lines := make(chan model.LogLine, 1024)
-	// Room for the journald notice below, one error per source and the replay notice, so
-	// no sender ever blocks.
-	errs := make(chan error, len(sources)+2)
+	// Room for the journald notice below, one error per source, the truncation notice and the
+	// replay notice, so no sender ever blocks.
+	errs := make(chan error, len(sources)+3)
 	if notice := journaldNotice(cfg); notice != nil {
 		errs <- notice
 	}
+	cuts = ingest.NewTruncations(func() { errs <- errTruncated })
+	ingestCtx := ingest.WithTruncations(ctx, cuts)
 	go func() {
 		defer close(lines)
 		defer close(errs)
+		// Before errs closes: a reader can outlive its source after a cancel, and still cut.
+		defer cuts.Stop()
 		// A source error is reported the moment that source ends, and the other sources
 		// keep running (#97): one failing source must not hide behind, or stop, the rest.
 		// Run does not report what a cancelled context (Ctrl-C) stopped. In TUI mode the
@@ -126,7 +141,7 @@ func run(ctx context.Context, args []string) (err error) {
 		// errors joined, and is read only to skip the replay notice after a failed replay,
 		// so nothing is reported twice.
 		report := func(err error) { errs <- fmt.Errorf("ingest: %w", err) }
-		if err := ingest.Run(ctx, sources, lines, report); err != nil && ctx.Err() == nil {
+		if err := ingest.Run(ingestCtx, sources, lines, report); err != nil && ctx.Err() == nil {
 			return
 		}
 		if n := replayNotice(replay); n != nil {
@@ -165,6 +180,12 @@ func run(ctx context.Context, args []string) (err error) {
 	}
 	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, exp, cfg)
 }
+
+// errTruncated is the notice for the first line cut at ingest.MaxLineBytes. It goes down the
+// background-notice channel, which the TUI shows in its status line and --plain prints to
+// stderr. "At most": a character the cut would split is dropped whole.
+var errTruncated = fmt.Errorf("ingest: a line over %[1]d KiB was cut to at most its first %[1]d KiB "+
+	"and the rest discarded; the total is reported at exit", ingest.MaxLineBytes>>10)
 
 // replayNotice reports the lines of a finished replay whose time could not be followed, or
 // nil when there were none or this is not a replay. Both kinds were replayed rather than
