@@ -2,7 +2,12 @@
 
 package pipeline
 
-import "testing"
+import (
+	"math/rand/v2"
+	"regexp"
+	"strings"
+	"testing"
+)
 
 func TestTemplatizeMaskers(t *testing.T) {
 	tests := []struct {
@@ -216,4 +221,113 @@ func TestTemplatizeIdempotent(t *testing.T) {
 	if hash2 != hash {
 		t.Errorf("hash changed on re-templatize: %s -> %s", hash, hash2)
 	}
+}
+
+// TestStrEscapes is #91's table. A double-quoted string reads backslash escapes, so a Go-quoted
+// value carrying an escaped quote is one <STR>, not a string per escape with the text between
+// them left in the template. Every other row pins a decided edge of the rule (see strPat): the
+// ones that keep today's output, and the one trade accepted toward merging.
+func TestStrEscapes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"escaped quotes inside a string", `config "user \"bob\" logged in" applied`, "config <STR> applied"},
+		{"the same line, another value", `config "user \"alice\" logged in" applied`, "config <STR> applied"},
+		{"an escaped quote as a value", `["!", "\"", "#"]`, "[<STR>, <STR>, <STR>]"},
+		// Accepted, toward merging: a path whose trailing backslash is literal reads as an escape,
+		// and the string runs to the next quote.
+		{"a trailing backslash with a later quote", `copy "C:\logs\" rotated "x"`, `copy <STR>x"`},
+		// The rows below keep today's output.
+		{"an escaped backslash before the close", `open "C:\\temp\\" failed`, "open <STR> failed"},
+		{"unterminated, ending in an escaped quote", `read "partial\"`, "read <STR>"},
+		{"an escaped quote outside any string", `key=\"bob\" said "hi"`, `key=\<STR> said <STR>`},
+		{"a double-quoted string inside single quotes", `'"x"'`, "<STR>"},
+		{"a single-quoted string with an escape", `say 'it\'s' now`, `say <STR>s' now`},
+		// Residual: a quote right after a closing quote is no boundary, so the second string is
+		// read as today and still mis-pairs.
+		{"adjacent strings, the second escaped", `"a""b\"c"`, `<STR><STR>c"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, _ := Templatize(tt.in); got != tt.want {
+				t.Errorf("Templatize(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+	_, bob := Templatize(`config "user \"bob\" logged in" applied`)
+	_, alice := Templatize(`config "user \"alice\" logged in" applied`)
+	if bob != alice {
+		t.Errorf("one line shape, two values: hashes %s and %s, want one template", bob, alice)
+	}
+}
+
+// oldStrPat is the STR pattern before #91, the reference TestStrMaskMovesOnlyEscapedQuotes
+// holds the masker to.
+const oldStrPat = `"[^"]*"|'[^']*'`
+
+// templatizeWithOldStr is Templatize with STR swapped for oldStrPat, every other masker and
+// the order as they are.
+func templatizeWithOldStr(t *testing.T, message string) string {
+	t.Helper()
+	last := maskers[len(maskers)-1]
+	if last.name != "STR" {
+		t.Fatalf("premise broken: the last masker is %s, not STR", last.name)
+	}
+	ref := append(append([]masker{}, maskers[:len(maskers)-1]...),
+		masker{"STR", regexp.MustCompile(oldStrPat), constMask("<STR>")})
+	pattern := message
+	for _, m := range ref {
+		pattern = m.re.ReplaceAllStringFunc(pattern, m.fn)
+	}
+	return strings.TrimSpace(wsRe.ReplaceAllString(pattern, " "))
+}
+
+// hasEscapedQuote reports whether s holds a '"' preceded by an odd run of backslashes: a quote
+// that an escape-reading string treats as content.
+func hasEscapedQuote(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '"' {
+			continue
+		}
+		n := 0
+		for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+			n++
+		}
+		if n%2 == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// TestStrMaskMovesOnlyEscapedQuotes pins what #91 may move: a line's template differs from
+// the old STR pattern's only if the line holds an escaped quote. Everything else, an escaped
+// backslash before a closing quote included, templates exactly as it did.
+//
+// The inputs are 20,000 strings from a fixed seed over the characters that decide string
+// pairing, plus a line break (a coalesced event), a multi-byte rune (the boundary is a rune)
+// and a placeholder (an earlier masker's output beside a quote).
+func TestStrMaskMovesOnlyEscapedQuotes(t *testing.T) {
+	alphabet := []string{"a", "1", `"`, "'", `\`, `\`, ":", "=", "[", "]", ",", " ", "\n", "é", "<NUM>"}
+	rng := rand.New(rand.NewPCG(91, 91))
+	moved := 0
+	for range 20000 {
+		var b strings.Builder
+		for range 1 + rng.IntN(24) {
+			b.WriteString(alphabet[rng.IntN(len(alphabet))])
+		}
+		s := b.String()
+		got, _ := Templatize(s)
+		want := templatizeWithOldStr(t, s)
+		if got == want {
+			continue
+		}
+		moved++
+		if !hasEscapedQuote(s) {
+			t.Errorf("Templatize(%q) = %q, the old pattern gives %q, and the line holds no escaped quote", s, got, want)
+		}
+	}
+	t.Logf("%d of 20000 strings template differently from the old pattern, each holding an escaped quote", moved)
 }
