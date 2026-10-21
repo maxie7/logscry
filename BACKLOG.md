@@ -4487,7 +4487,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Seen and left alone, out of scope:** #126, #36, #28, the cache TTL default and
       `internal/anonymize`.
 
-      Targets TODO-VERSION
+      Targets v0.12.23
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
