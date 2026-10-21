@@ -4350,7 +4350,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         MESSAGE still passes through raw, which is `decode`'s documented behaviour for what it
         cannot read. 0 occurrences in the 58,172 boot entries and the 4,666 of the current boot.
 
-      Targets TODO-VERSION
+      Targets v0.12.22
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
