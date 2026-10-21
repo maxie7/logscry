@@ -81,6 +81,7 @@ type Pipeline struct {
 	explained      int // answered
 	explainFailed  int // model unavailable, or the escalation never got queued
 	explainDropped int // escalations that never reached the pool: the queue was full
+	unidentified   int // answers without their flag's ID; always 0 (see Stats.Unidentified)
 }
 
 // New returns an empty Pipeline scoring with sc, which may be nil.
@@ -151,7 +152,7 @@ func (p *Pipeline) flagged(tmpl *model.Template, ev Event, now time.Time) {
 	// honest reason, and it keeps the queue-full branch below unreachable in dry-run, where
 	// Queued is false only because the scorer emits to a nil channel (see score.emit).
 	if !p.explain {
-		p.export.WouldEscalate(tmpl.Hash, now)
+		p.export.WouldEscalate(tmpl.Hash, 0, now)
 		return
 	}
 	p.escalated(tmpl, ev.Queued, now)

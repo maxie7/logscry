@@ -241,7 +241,8 @@ type EscalationRequest struct {
 	Context []string // recent lines across all sources, oldest first
 	Pattern string   // the masked template, e.g. "user <NUM> failed"
 	Hash    string
-	Count   int // occurrences of this template so far
+	Flag    model.FlagID // which flag this is; the answer carries it back (see model.FlagID)
+	Count   int          // occurrences of this template so far
 	Score   float64
 	Reasons []string // human-readable: why this fired
 
@@ -260,6 +261,8 @@ type Result struct {
 	// happened, so a card is never left waiting on an answer that is not coming.
 	Queued  bool
 	Reasons []string
+	// Flag names the escalation when Escalate is set, and is 0 otherwise.
+	Flag model.FlagID
 }
 
 // Stats are the running escalation counters. Suppressed and Dropped exist so the UI

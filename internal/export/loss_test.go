@@ -47,7 +47,7 @@ func heldWriter(t *testing.T) (*Writer, *gatedSink, func()) {
 	}
 	t.Cleanup(release)
 	w.Flag(flagFor("held"))
-	w.WouldEscalate("held", time.Date(2026, 8, 29, 10, 40, 0, 0, time.UTC))
+	w.WouldEscalate("held", 0, time.Date(2026, 8, 29, 10, 40, 0, 0, time.UTC))
 	waitFor(t, "the writer to take the held record", func() bool { return len(w.in) == 0 })
 	return w, sink, release
 }
@@ -59,7 +59,7 @@ func fillQueue(w *Writer, n int) {
 	for i := range n / 2 {
 		h := fmt.Sprintf("fill%04d", i)
 		w.Flag(flagFor(h))
-		w.WouldEscalate(h, at)
+		w.WouldEscalate(h, 0, at)
 	}
 	if n%2 == 1 {
 		w.Flag(flagFor("pad")) // a lone flag: it only takes a slot
@@ -253,7 +253,7 @@ func TestCompleteFileIsUnchanged(t *testing.T) {
 		want.Write(b)
 	}
 	w.Flag(flagFor("dry"))
-	w.WouldEscalate("dry", at)
+	w.WouldEscalate("dry", 0, at)
 	b, err := encode(record(flagFor("dry"), resolution{hash: "dry", kind: KindWouldEscalate,
 		explanation: Explanation{State: stateNotRequested, At: at}}))
 	if err != nil {
@@ -402,54 +402,101 @@ func TestTrailerWriteIsBounded(t *testing.T) {
 	}
 }
 
-// pending is how many templates send is holding a half-record for.
+// pending is how many half-records send is holding.
 func pending(w *Writer) int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return len(w.pairs)
 }
 
-// TestALeftBehindHalfIsReplaced: a flag whose answer never comes — a run that ended with it
-// outstanding — leaves an entry behind, one per template at most, and the next escalation of
-// that template replaces it. The bookkeeping stays bounded by the number of templates, and the
-// old flag is never written.
-func TestALeftBehindHalfIsReplaced(t *testing.T) {
+// TestAnUnansweredFlagNeverJoinsALaterOne: a flag whose answer never comes — a run that ended
+// with it outstanding — leaves its entry behind until exit, and nothing else. Entries are per
+// FLAG: 3 rounds of 100 templates flagged and never answered hold 300, and a later, answered
+// flag of each template writes its own record without touching them. (Until #121 the entries
+// were per template, and the newer flag replaced the older — the mechanism by which an answer
+// still out when its template flagged again was written under the wrong flag.)
+//
+// The live bound is the flags in flight: every queued flag gets exactly one terminal answer
+// while the run is live, so only a run's end leaves entries behind.
+func TestAnUnansweredFlagNeverJoinsALaterOne(t *testing.T) {
 	sink := &chunkSink{}
 	w := newWriter(sink, 0)
 	const templates = 100
 	t2 := time.Date(2026, 8, 29, 11, 0, 2, 0, time.UTC)
+	id := model.FlagID(0)
 	for round := range 3 {
 		for i := range templates {
+			id++
 			f := flagFor(fmt.Sprintf("t%03d", i))
-			f.Count = 1
+			f.ID, f.Count = id, 1
 			w.Flag(f) // answered never
 		}
-		if got := pending(w); got != templates {
-			t.Fatalf("round %d: %d entries held for %d templates", round, got, templates)
+		if got, want := pending(w), (round+1)*templates; got != want {
+			t.Fatalf("round %d: %d entries held, want %d, one per unanswered flag", round, got, want)
 		}
 	}
 	for i := range templates {
+		id++
 		h := fmt.Sprintf("t%03d", i)
 		f := flagFor(h)
-		f.Count = 2
+		f.ID, f.Count = id, 2
 		ex := doneFor(h)
-		ex.At = t2
+		ex.Flag, ex.At = id, t2
 		w.Flag(f)
 		w.Resolve(ex)
 	}
-	if got := pending(w); got != 0 {
-		t.Errorf("%d entries held after every template's latest escalation was answered", got)
+	if got := pending(w); got != 3*templates {
+		t.Errorf("%d entries held after the answered round, want the %d unanswered flags", got, 3*templates)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
 	recs := decodeLines(t, sink.contents())
 	if len(recs) != templates {
-		t.Fatalf("%d records, want one per template", len(recs))
+		t.Fatalf("%d records, want one per answered flag", len(recs))
 	}
 	for _, r := range recs {
 		if r["count_at_flag"] != float64(2) || r["explanation"].(map[string]any)["at"] != t2.Format(time.RFC3339) {
-			t.Errorf("a record joins a left-behind flag: %v", r)
+			t.Errorf("a record joins an unanswered flag: %v", r)
 		}
+	}
+	if lost := w.Dropped(); lost != 0 {
+		t.Errorf("Dropped() = %d: an unanswered flag is not a lost record", lost)
+	}
+}
+
+// TestALostFlagNeverTakesAnotherFlagsRecord is #70's accounting with two flags of one template
+// in flight (#121). The first flag is queued; the queue is then full, and the second is lost.
+// The second's answer must be dropped on arrival, as #70 drops the other half of any lost
+// record — and the first flag's answer must still complete the first flag's record. Keyed by
+// template hash, the first answer was taken for the other half of the LOST flag and dropped
+// with it: the first record vanished without being counted.
+func TestALostFlagNeverTakesAnotherFlagsRecord(t *testing.T) {
+	w, sink, release := heldWriter(t)
+	t1, t2 := time.Date(2026, 8, 29, 11, 0, 1, 0, time.UTC), time.Date(2026, 8, 29, 11, 0, 2, 0, time.UTC)
+	f1, r1 := escalationOf(1, t1)
+	f2, r2 := escalationOf(2, t2)
+	f1.ID, r1.Flag = 1, 1
+	f2.ID, r2.Flag = 2, 2
+	w.Flag(f1) // queued
+	fillQueue(w, queueCap-1)
+	w.Flag(f2) // the queue is full: lost
+	release()
+	waitFor(t, "the queue to drain", func() bool { return len(w.in) == 0 })
+	w.Resolve(r1)
+	w.Resolve(r2) // the lost flag's other half: dropped on arrival
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := recordsFor(decodeLines(t, sink.contents()), "x")
+	if len(got) != 1 {
+		t.Fatalf("x has %d records, want 1 (the first flag's):\n%v", len(got), got)
+	}
+	if c, at := got[0]["count_at_flag"], got[0]["explanation"].(map[string]any)["at"]; c != float64(1) || at != t1.Format(time.RFC3339) {
+		t.Errorf("x's record has count_at_flag %v and explanation.at %v; want 1 and %s, both from the first flag",
+			c, at, t1.Format(time.RFC3339))
+	}
+	if lost := w.Dropped(); lost != 1 {
+		t.Errorf("Dropped() = %d, want 1 record (the second flag's)", lost)
 	}
 }

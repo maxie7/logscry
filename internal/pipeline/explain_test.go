@@ -84,6 +84,7 @@ func TestExplanationLandsOnItsTemplate(t *testing.T) {
 	req := <-escalations
 	explanations <- model.Explanation{
 		Hash:        req.Hash,
+		Flag:        req.Flag,
 		Pattern:     req.Pattern,
 		State:       model.ExplainDone,
 		Summary:     "A handler wrote to a nil map.",
@@ -140,7 +141,7 @@ func TestStreamedPartialsKeepTheCardPending(t *testing.T) {
 
 	// Two progressive updates, as the summary and then the cause complete.
 	explanations <- model.Explanation{
-		Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainPending,
+		Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: model.ExplainPending,
 		Summary: "A handler wrote to a nil map.",
 	}
 	partial := waitFor(t, snaps, "the streamed summary to appear", func(s Snapshot) bool {
@@ -158,7 +159,7 @@ func TestStreamedPartialsKeepTheCardPending(t *testing.T) {
 	}
 
 	explanations <- model.Explanation{
-		Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainPending,
+		Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: model.ExplainPending,
 		Summary: "A handler wrote to a nil map.", LikelyCause: "The cache map is never initialised.",
 	}
 	second := waitFor(t, snaps, "the streamed cause to appear", func(s Snapshot) bool {
@@ -171,7 +172,7 @@ func TestStreamedPartialsKeepTheCardPending(t *testing.T) {
 
 	// Only the terminal update moves the counters.
 	explanations <- model.Explanation{
-		Hash: req.Hash, Pattern: req.Pattern, State: model.ExplainDone,
+		Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: model.ExplainDone,
 		Summary: "A handler wrote to a nil map.", LikelyCause: "The cache map is never initialised.",
 		Suggestion: "Make the map in NewServer.",
 	}
@@ -422,7 +423,7 @@ func TestRunWaitsForExplanationsAfterEOF(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	explanations <- model.Explanation{Hash: req.Hash, State: model.ExplainDone, Summary: "the last word"}
+	explanations <- model.Explanation{Hash: req.Hash, Flag: req.Flag, State: model.ExplainDone, Summary: "the last word"}
 	close(explanations)
 
 	select {
@@ -436,5 +437,164 @@ func TestRunWaitsForExplanationsAfterEOF(t *testing.T) {
 	if len(last.Escalations) != 1 || last.Escalations[0].Explanation == nil ||
 		last.Escalations[0].Explanation.Summary != "the last word" {
 		t.Errorf("the final snapshot lost the last explanation: %+v", last.Escalations)
+	}
+}
+
+// twoFlagsInFlight returns a pipeline whose one template has flagged twice, the second time
+// while the first flag is still unanswered: the cache TTL (1s) is shorter than the model's
+// answer time, which is #121's precondition. It returns the two requests in flag order.
+func twoFlagsInFlight(t *testing.T, t0 time.Time) (*Pipeline, *model.Template, score.EscalationRequest, score.EscalationRequest) {
+	t.Helper()
+	cfg := escalateAlways()
+	cfg.CacheTTL = time.Second
+	escalations := make(chan score.EscalationRequest, 4)
+	p := New(score.New(cfg, escalations))
+	p.explain = true
+	line := model.LogLine{Source: "proc:app", Stream: model.Stderr, Raw: "PANIC: nil map write in handler 42"}
+	ev := p.Process(line, t0)
+	p.Process(line, t0.Add(2*time.Second))
+	if len(escalations) != 2 {
+		t.Fatalf("%d escalations, want 2", len(escalations))
+	}
+	return p, p.templates[ev.Hash], <-escalations, <-escalations
+}
+
+// answer is the pool's terminal or partial answer to req, carrying req's flag as llm.explain does.
+func answer(req score.EscalationRequest, state model.ExplainState, text string, at time.Time) model.Explanation {
+	ex := model.Explanation{Hash: req.Hash, Flag: req.Flag, Pattern: req.Pattern, State: state, At: at}
+	if state == model.ExplainFailed {
+		ex.Err = text
+	} else {
+		ex.Summary = text
+	}
+	return ex
+}
+
+// TestAnOlderAnswerNeverDisplacesANewerFlag pins the card rule for two flags of one template
+// in flight (#121): the card's state always belongs to the template's newest flag; an older
+// flag's final answer is shown only while no newer flag has produced any answer text,
+// labelled as from its own flag; and an older flag's partial updates never reach the card.
+//
+// Showing the older answer is #34's mechanism, not a new one: had it arrived a moment before
+// the second flag, reexplaining would have carried it forward under the pending state exactly
+// so. Its At predates LastFlagged, which is what makes the card say "answer from the flag at".
+func TestAnOlderAnswerNeverDisplacesANewerFlag(t *testing.T) {
+	t0 := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	at1, at2 := t0.Add(time.Second), t0.Add(3*time.Second)
+
+	t.Run("an older answer fills a pending card and keeps it pending", func(t *testing.T) {
+		p, tmpl, r1, r2 := twoFlagsInFlight(t, t0)
+		p.attach(answer(r1, model.ExplainDone, "first", at1))
+		ex := tmpl.Explanation
+		if ex.State != model.ExplainPending || ex.Summary != "first" || !ex.At.Equal(at1) || ex.Flag != r1.Flag {
+			t.Errorf("card = %v %q at %v (flag %d), want pending, the first answer, at %v (flag %d)",
+				ex.State, ex.Summary, ex.At, ex.Flag, at1, r1.Flag)
+		}
+		if !ex.At.Before(tmpl.LastFlagged) {
+			t.Errorf("At %v is not before the newest flag %v: the card cannot say the answer is older", ex.At, tmpl.LastFlagged)
+		}
+		if p.explaining != 1 {
+			t.Errorf("explaining = %d, want 1: the second flag is still out", p.explaining)
+		}
+		p.attach(answer(r2, model.ExplainDone, "second", at2))
+		if ex := tmpl.Explanation; ex.State != model.ExplainDone || ex.Summary != "second" || ex.Flag != r2.Flag {
+			t.Errorf("card = %v %q (flag %d), want done with the second answer", ex.State, ex.Summary, ex.Flag)
+		}
+		if p.explaining != 0 {
+			t.Errorf("explaining = %d, want 0", p.explaining)
+		}
+	})
+	t.Run("a newer answer is never replaced by an older one", func(t *testing.T) {
+		p, tmpl, r1, r2 := twoFlagsInFlight(t, t0)
+		p.attach(answer(r2, model.ExplainDone, "second", at2))
+		p.attach(answer(r1, model.ExplainDone, "first", at1))
+		if ex := tmpl.Explanation; ex.State != model.ExplainDone || ex.Summary != "second" || ex.Flag != r2.Flag {
+			t.Errorf("card = %v %q (flag %d), want done with the second answer", ex.State, ex.Summary, ex.Flag)
+		}
+	})
+	t.Run("an older partial never reaches the card", func(t *testing.T) {
+		p, tmpl, r1, r2 := twoFlagsInFlight(t, t0)
+		p.attach(answer(r1, model.ExplainPending, "first, so far", at1))
+		if ex := tmpl.Explanation; ex.State != model.ExplainPending || ex.Summary != "" || ex.Flag != r2.Flag {
+			t.Errorf("card = %v %q (flag %d), want the second flag's empty pending state", ex.State, ex.Summary, ex.Flag)
+		}
+		p.attach(answer(r2, model.ExplainPending, "second, so far", at2))
+		p.attach(answer(r1, model.ExplainDone, "first", at1))
+		if ex := tmpl.Explanation; ex.State != model.ExplainPending || ex.Summary != "second, so far" {
+			t.Errorf("card = %v %q, want the second flag's partial: an older answer replaced newer text", ex.State, ex.Summary)
+		}
+	})
+	t.Run("an older answer after the newer flag failed shows as a failed retry", func(t *testing.T) {
+		p, tmpl, r1, r2 := twoFlagsInFlight(t, t0)
+		p.attach(answer(r2, model.ExplainFailed, "model timed out", at2))
+		p.attach(answer(r1, model.ExplainDone, "first", at1))
+		ex := tmpl.Explanation
+		if ex.State != model.ExplainFailed || ex.Err != "model timed out" || ex.Summary != "first" || !ex.At.Equal(at1) {
+			t.Errorf("card = %v %q err %q at %v, want failed, the first answer, the second's error, at %v",
+				ex.State, ex.Summary, ex.Err, ex.At, at1)
+		}
+		if p.explaining != 0 {
+			t.Errorf("explaining = %d, want 0", p.explaining)
+		}
+	})
+}
+
+// TestExplainingCountsFlagsInFlight pins the invariant behind "explaining N": it equals the
+// flags handed to the model whose terminal answer has not arrived. It goes up once per QUEUED
+// flag (escalated) and down once per terminal answer (attach) — so a queue-full drop never
+// counts, a failure ends its flag like an answer does, the order of answers is irrelevant, and
+// at shutdown it is the unanswered flags. Until #121 it went down only when the template's one
+// explanation left pending, so a second flag's answer finding the card already answered left
+// the counter stuck.
+func TestExplainingCountsFlagsInFlight(t *testing.T) {
+	t0 := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	cfg := escalateAlways()
+	cfg.CacheTTL = time.Second
+	escalations := make(chan score.EscalationRequest, 1) // full after one: the queue-full case
+	p := New(score.New(cfg, escalations))
+	p.explain = true
+	inFlight := 0 // requests taken off the queue whose terminal answer has not been sent
+	check := func(step string) {
+		t.Helper()
+		if p.explaining != inFlight {
+			t.Errorf("%s: explaining = %d, want %d flags in flight", step, p.explaining, inFlight)
+		}
+	}
+	fault := func(text string, at time.Time) Event {
+		return p.Process(model.LogLine{Source: "proc:app", Stream: model.Stderr, Raw: "PANIC: " + text}, at)
+	}
+	take := func() score.EscalationRequest {
+		inFlight++
+		return <-escalations
+	}
+	settle := func(ex model.Explanation) {
+		p.attach(ex)
+		inFlight--
+	}
+
+	fault("nil map write", t0) // queued, and the queue is now full
+	fault("nil map write", t0) // cached: no flag at all
+	ev := fault("disk full on volume", t0.Add(time.Second))
+	if !ev.Escalate || ev.Queued {
+		t.Fatalf("the second template escalated=%v queued=%v, want a queue-full drop", ev.Escalate, ev.Queued)
+	}
+	a1 := take()
+	check("after a queue-full drop")
+	fault("nil map write", t0.Add(2*time.Second)) // the TTL has passed: a second flag of a
+	a2 := take()
+	check("two flags of one template in flight")
+	settle(answer(a2, model.ExplainDone, "second", t0.Add(3*time.Second))) // out of order
+	check("after the newer answer")
+	fault("socket closed", t0.Add(4*time.Second))
+	c1 := take()
+	settle(answer(c1, model.ExplainFailed, "model timed out", t0.Add(5*time.Second)))
+	check("after a failure")
+	settle(answer(a1, model.ExplainDone, "first", t0.Add(6*time.Second))) // the older answer, last
+	check("after the older answer")
+	fault("bad request", t0.Add(7*time.Second))
+	take() // never answered: the run ends here
+	check("at shutdown with one flag unanswered")
+	if p.explaining != 1 {
+		t.Errorf("explaining = %d at shutdown, want 1", p.explaining)
 	}
 }

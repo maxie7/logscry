@@ -62,6 +62,12 @@ type Stats struct {
 	Explaining    int
 	ExplainFailed int
 	Dropped       int
+
+	// Unidentified counts answers that arrived without their flag's ID (model.FlagID) for a
+	// template that has one. It is always 0: every path that builds an answer copies the
+	// request's flag, and a non-zero count is a bug in one of them. Such an answer is still
+	// shown, as the newest, rather than dropped. Tests read it; nothing renders it.
+	Unidentified int
 }
 
 // Snapshot is an immutable view of the pipeline state at one instant. The
@@ -231,6 +237,7 @@ func (c *collector) snapshot(p *Pipeline, now time.Time) Snapshot {
 			Explaining:      p.explaining,
 			ExplainFailed:   p.explainFailed,
 			Dropped:         p.explainDropped,
+			Unidentified:    p.unidentified,
 		},
 	}
 }

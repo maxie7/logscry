@@ -78,6 +78,7 @@ const (
 // how the flag ended (see Resolve, WouldEscalate).
 type Flag struct {
 	Hash      string
+	ID        model.FlagID // the flag's identity, which its resolution carries back (#121)
 	Pattern   string
 	Level     string
 	Source    string
@@ -342,7 +343,7 @@ func (w *Writer) Resolve(ex model.Explanation) {
 // those is the artifact that makes a threshold change diffable. The record is marked
 // unmistakably — kind "would_escalate", state "not_requested" — because it has no summary,
 // cause, or suggestion, and must never be read as an explained anomaly.
-func (w *Writer) WouldEscalate(hash string, at time.Time) {
+func (w *Writer) WouldEscalate(hash string, _ model.FlagID, at time.Time) {
 	if w == nil {
 		return
 	}

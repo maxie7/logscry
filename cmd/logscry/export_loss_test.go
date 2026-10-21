@@ -200,7 +200,7 @@ func TestTUIOptionsCarryExportLoss(t *testing.T) {
 	for i := range 2000 {
 		h := fmt.Sprintf("h%04d", i)
 		exp.Flag(export.Flag{Hash: h})
-		exp.WouldEscalate(h, at)
+		exp.WouldEscalate(h, 0, at)
 	}
 	o := tuiOptions(cfg, false, exp)
 	if o.ExportLost == nil {
