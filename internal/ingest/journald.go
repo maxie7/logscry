@@ -212,6 +212,12 @@ func decode(ll model.LogLine) model.LogLine {
 	return ll
 }
 
+// messageNotRecorded stands in for a MESSAGE that journalctl printed as null. It is
+// logscry's own text and says so up front: no producer wrote this line, and a reader of
+// the stream pane or an export must be able to see that at a glance.
+const messageNotRecorded = "logscry: message not recorded " +
+	"(journalctl -o json prints a long field as null without --all)"
+
 // unitFields are the entry fields naming what produced a line, best first.
 //
 // _SYSTEMD_UNIT leads because it is the string a user would type into --journald-unit,

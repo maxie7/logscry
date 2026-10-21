@@ -10,11 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/maxie7/logscry/internal/anonymize"
 	"github.com/maxie7/logscry/internal/model"
+	"github.com/maxie7/logscry/internal/pipeline"
 )
 
 // sampleEntry is a real `journalctl -o json` line, captured verbatim from a systemd
@@ -165,10 +168,8 @@ func TestJournaldPassesThroughWhatItCannotDecode(t *testing.T) {
 		"",
 		"{not json at all",
 		`{"PRIORITY":"3","_SYSTEMD_UNIT":"nginx.service"}`, // JSON, but no MESSAGE
-		// A null MESSAGE is an ABSENT one, not an empty one. It unmarshals into both a
-		// string and a []byte without error, so treating it as text would emit a blank
-		// line in place of the entry.
-		`{"MESSAGE":null,"PRIORITY":"3"}`,
+		// A null MESSAGE is not here: it is a message journalctl did not print, and the
+		// entry around it is decoded (TestJournaldNullMessageKeepsTheEntrysMetadata).
 	} {
 		in := received(raw)
 		got := decode(in)
@@ -225,6 +226,8 @@ func TestJournaldGarbledTimestampKeepsTheReceiptTime(t *testing.T) {
 	}
 }
 
+// TestJournaldArgs: every configuration asks for --all, because without it journalctl
+// prints a field over 4096 bytes as null and the entry's message is lost (#127).
 func TestJournaldArgs(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -235,25 +238,25 @@ func TestJournaldArgs(t *testing.T) {
 		{
 			"defaults follow everything as JSON",
 			NewJournaldSource(nil, 7),
-			[]string{"-f", "-o", "json", "--no-pager"},
+			[]string{"-f", "-o", "json", "--all", "--no-pager"},
 			"-p", // -p 7 is identical to no filter, so it is omitted rather than passed
 		},
 		{
 			"units become one -u each",
 			NewJournaldSource([]string{"nginx", "sshd.service"}, 7),
-			[]string{"-f", "-o", "json", "--no-pager", "-u", "nginx", "-u", "sshd.service"},
+			[]string{"-f", "-o", "json", "--all", "--no-pager", "-u", "nginx", "-u", "sshd.service"},
 			"-p",
 		},
 		{
 			"a priority floor below 7 is passed",
 			NewJournaldSource(nil, 3),
-			[]string{"-f", "-o", "json", "--no-pager", "-p", "3"},
+			[]string{"-f", "-o", "json", "--all", "--no-pager", "-p", "3"},
 			"-u",
 		},
 		{
 			"priority 0 is a floor, not an absent one",
 			NewJournaldSource(nil, 0),
-			[]string{"-f", "-o", "json", "--no-pager", "-p", "0"},
+			[]string{"-f", "-o", "json", "--all", "--no-pager", "-p", "0"},
 			"-u",
 		},
 	}
@@ -456,4 +459,168 @@ func TestJournalTextRejectsNonText(t *testing.T) {
 			t.Errorf("journalText(%s) = (%q, true), want ok=false", raw, v)
 		}
 	}
+}
+
+// TestJournaldNullMessageKeepsTheEntrysMetadata: a capture recorded without --all holds
+// a MESSAGE journalctl printed as null. The message is gone, but the rest of the entry is
+// not: its unit, priority and time are still there to be read, and passing the entry
+// through raw threw all three away — an error-class entry lost its ERROR, and a replay
+// counted it untimed (#127).
+func TestJournaldNullMessageKeepsTheEntrysMetadata(t *testing.T) {
+	at := time.UnixMicro(1788000002000000)
+	tests := []struct {
+		name   string
+		entry  string
+		level  string
+		stream model.Stream
+	}{
+		{
+			"an error-class entry keeps ERROR and stderr",
+			`{"MESSAGE":null,"PRIORITY":"3","_SYSTEMD_UNIT":"report.service","__REALTIME_TIMESTAMP":"1788000002000000"}`,
+			"ERROR", model.Stderr,
+		},
+		{
+			"an entry at the default priority gets no level, as any other",
+			`{"MESSAGE":null,"PRIORITY":"6","_SYSTEMD_UNIT":"report.service","__REALTIME_TIMESTAMP":"1788000002000000"}`,
+			"", model.Stdout,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := decode(received(tc.entry))
+			if got.Raw != messageNotRecorded {
+				t.Errorf("Raw = %q, want the not-recorded marker", got.Raw)
+			}
+			if got.Source != "journald:report" {
+				t.Errorf("Source = %q, want journald:report", got.Source)
+			}
+			if got.Level != tc.level || got.Stream != tc.stream {
+				t.Errorf("Level, Stream = %q, %v, want %q, %v", got.Level, got.Stream, tc.level, tc.stream)
+			}
+			if !got.Time.Equal(at) {
+				t.Errorf("Time = %v, want the entry's own %v", got.Time, at)
+			}
+		})
+	}
+}
+
+// TestJournaldNotRecordedMarkerIsLogscrysOwn: the marker must read as logscry's, never as
+// something the unit logged, and it must not acquire meaning on its way through. Text
+// detection must find no level in it, so a lost message at the default priority is not
+// given a severity by the words logscry chose; and the anonymizer must leave it byte for
+// byte, so what is shown is what was written.
+func TestJournaldNotRecordedMarkerIsLogscrysOwn(t *testing.T) {
+	if !strings.HasPrefix(messageNotRecorded, "logscry: ") {
+		t.Errorf("marker %q does not start with logscry: ", messageNotRecorded)
+	}
+	if got := pipeline.Normalize(model.LogLine{Raw: messageNotRecorded}); got.Level != "" {
+		t.Errorf("text detection gives the marker level %q, want none", got.Level)
+	}
+	masked, err := anonymize.New().Mask(messageNotRecorded)
+	if err != nil {
+		t.Fatalf("Mask: %v", err)
+	}
+	if masked != messageNotRecorded {
+		t.Errorf("Mask changed the marker:\n got %q\nwant %q", masked, messageNotRecorded)
+	}
+}
+
+// TestJournaldReadsALongMessageInFull drives the live source through a stand-in journalctl
+// that does what the real one does with a field over 4096 bytes: prints it as null unless
+// it was given --all. The entry must arrive whole, with its unit, level, stream and time.
+func TestJournaldReadsALongMessageInFull(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	msg := "slow request trace " + strings.Repeat("ab", 2490) + "!" // 5000 bytes
+	if len(msg) != 5000 {
+		t.Fatalf("fixture is %d bytes, want 5000", len(msg))
+	}
+	entry := func(message string) string {
+		return `{"MESSAGE":` + message + `,"PRIORITY":"3","_SYSTEMD_UNIT":"report.service",` +
+			`"__REALTIME_TIMESTAMP":"1788000002000000"}` + "\n"
+	}
+	quoted, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	full, nulled := filepath.Join(dir, "full.json"), filepath.Join(dir, "nulled.json")
+	if err := os.WriteFile(full, []byte(entry(string(quoted))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nulled, []byte(entry("null")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "journalctl")
+	body := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --all ] && exec cat '" + full + "'; done\n" +
+		"exec cat '" + nulled + "'\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatalf("write stand-in: %v", err)
+	}
+
+	src := NewJournaldSource(nil, 7)
+	src.path = script
+	out := make(chan model.LogLine, 4)
+	if err := src.Lines(context.Background(), out); err != nil {
+		t.Fatalf("Lines: %v", err)
+	}
+	close(out)
+	var got []model.LogLine
+	for ll := range out {
+		got = append(got, ll)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d lines, want 1", len(got))
+	}
+	ll := got[0]
+	if ll.Source != "journald:report" || ll.Level != "ERROR" || ll.Stream != model.Stderr {
+		t.Errorf("Source, Level, Stream = %q, %q, %v, want journald:report, ERROR, stderr",
+			ll.Source, ll.Level, ll.Stream)
+	}
+	if want := time.UnixMicro(1788000002000000); !ll.Time.Equal(want) {
+		t.Errorf("Time = %v, want the entry's own %v", ll.Time, want)
+	}
+	if ll.Raw != msg {
+		t.Errorf("Raw is %d bytes, want the 5000-byte message", len(ll.Raw))
+	}
+}
+
+// TestJournaldNonTextMessageDecodesAsBefore guards the edge of the null-MESSAGE rule: it
+// is for a literal null and nothing else. A byte-array MESSAGE — what journalctl prints
+// for a non-UTF-8 field, with or without --all — still decodes in full, however long, and
+// a MESSAGE that is neither text nor null still passes through untouched.
+func TestJournaldNonTextMessageDecodesAsBefore(t *testing.T) {
+	t.Run("a byte-array message over 4096 bytes", func(t *testing.T) {
+		b := make([]byte, 5000)
+		for i := range b {
+			b[i] = byte(0x80 + i%64) // continuation bytes alone: never valid UTF-8
+		}
+		nums := make([]string, len(b))
+		for i, c := range b {
+			nums[i] = strconv.Itoa(int(c))
+		}
+		raw := `{"MESSAGE":[` + strings.Join(nums, ",") + `],"PRIORITY":"3",` +
+			`"_SYSTEMD_UNIT":"report.service","__REALTIME_TIMESTAMP":"1788000002000000"}`
+		got := decode(received(raw))
+		if got.Raw != string(b) {
+			t.Errorf("Raw is %d bytes, want the 5000 raw bytes", len(got.Raw))
+		}
+		if got.Source != "journald:report" || got.Level != "ERROR" ||
+			!got.Time.Equal(time.UnixMicro(1788000002000000)) {
+			t.Errorf("decoded %q %q %v, want journald:report, ERROR, the entry time",
+				got.Source, got.Level, got.Time)
+		}
+	})
+	t.Run("a message that is neither text nor null", func(t *testing.T) {
+		for _, raw := range []string{
+			`{"MESSAGE":["first","second"],"PRIORITY":"3","_SYSTEMD_UNIT":"report.service"}`,
+			`{"MESSAGE":42,"PRIORITY":"3","_SYSTEMD_UNIT":"report.service"}`,
+		} {
+			in := received(raw)
+			if got := decode(in); got != in {
+				t.Errorf("raw %q: line was modified: %+v, want %+v", raw, got, in)
+			}
+		}
+	})
 }
