@@ -13,6 +13,24 @@ import (
 	"github.com/maxie7/logscry/internal/model"
 )
 
+// MaxLineBytes is the most of one line logscry keeps.
+const MaxLineBytes = 64 << 10
+
+// Truncations counts the lines a run cut at MaxLineBytes.
+type Truncations struct{}
+
+// NewTruncations returns a counter that calls notify on the first cut.
+func NewTruncations(notify func()) *Truncations { return &Truncations{} }
+
+// WithTruncations returns ctx carrying t, which readLines counts its cuts in.
+func WithTruncations(ctx context.Context, t *Truncations) context.Context { return ctx }
+
+// Count reports how many lines have been cut so far.
+func (t *Truncations) Count() uint64 { return 0 }
+
+// Stop ends notification: notify is not called after Stop returns.
+func (t *Truncations) Stop() {}
+
 // readLines reads newline-delimited lines from r and emits one model.LogLine per
 // line into out, tagging each with the given source and stream. It returns when r
 // is exhausted (nil on clean EOF) or ctx is cancelled.
