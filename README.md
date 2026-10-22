@@ -148,6 +148,15 @@ own when stdout is not a terminal, so piping and redirecting never see escape co
 The fastest way to see all of this is the **[demo](examples/demo)**: one
 `docker compose up` and one `logscry --docker-all`.
 
+### From an AI coding agent
+
+[`skills/logscry/SKILL.md`](skills/logscry/SKILL.md) teaches an agent (Claude Code, Cursor,
+Codex and others that read the `SKILL.md` format) to run logscry itself: pick the source,
+start with `--explain-dry-run`, bound a follow with `timeout`, read the `--export` file
+instead of the screen, and ask before sending anything to a remote model. Copy the
+`skills/logscry` folder into your agent's skills directory, for Claude Code
+`~/.claude/skills/` or a project's `.claude/skills/`.
+
 ## How it works
 
 ```mermaid
