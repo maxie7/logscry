@@ -1103,8 +1103,10 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   cost we accepted. Expanded addresses, compressed addresses after a space or bracket,
   bracketed `[addr]:port`, CIDR suffixes, and all IPv4 are unaffected. **This is the template
   mask only.** The `--llm-anonymize` anonymizer is a separate detector set and masks all three
-  shapes in full — it must, because there under-masking is disclosure rather than
-  fragmentation. It does **not** mask an IPv4-mapped address in full: `::ffff:192.168.1.1` masks
+  shapes in full on the raw trigger and context lines — it must, because there under-masking is
+  disclosure rather than fragmentation. On the Template field it does not: by the time the
+  anonymizer reads it, the pipeline has turned these shapes' digits into `<NUM>`, and the hex
+  letters left behind are sent (#135). It does **not** mask an IPv4-mapped address in full: `::ffff:192.168.1.1` masks
   as far as `::ffff:192`, which is a legal hex group, and the remaining three octets are sent.
   That is a gap in the anonymizer's own pattern (#49), filed rather than fixed here because the
   fix belongs to the same constant #42 is about. The two IPv6 patterns stay two on purpose (#42),
@@ -1121,6 +1123,21 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   glued to a word character on both sides, so any rule that refuses it also refuses an address
   written the same way, and would send it. The template mask refuses these shapes, because there
   an over-match corrupts the card; here an under-match is disclosure. Decided in #42.
+- **#134 — with `--llm-anonymize`, an address that begins with `::` and is glued to the token
+  before it by `:` is sent.** `peer:::ffff:0:0` reaches the model as `peer<IP_1>:ffff:0:0`, which
+  sends the whole address; `src:::a:b:c` goes as `sr<IP_1>:a:b:c`, which sends `a:b:c`. A match
+  ending in `::` starts one colon early and takes the first colon of the address's own `::`, and
+  what is left is a shape no rule matches, so the re-scan reads it as clean. Since v0.4.0.
+  Affected: a `::`-led address written straight after a `:`. Not affected: the same address after
+  a space, a bracket, `=` or `,`, and every address that does not begin with `::`.
+- **#135 — with `--llm-anonymize`, the Template field sends the hex letters of an IPv6 address the
+  template mask fragments.** The three shapes the template mask leaves uncollapsed (a one-group
+  prefix, the bare loopback, an address glued onto the token before it) reach the anonymizer with
+  their digits already `<NUM>`, and it cannot recognise an address in what is left:
+  `peer:2001:db8::1` is sent as `peer:<NUM>:db<NUM><IP_1><NUM>` (sending `db`), and
+  `route fe80::/64` as `route fe<NUM><IP_1>/<NUM>` (sending `fe`). Since v0.8.5. Affected: the
+  Template field only. Not affected: the raw trigger and context lines, where all three shapes are
+  masked whole, and every address the template mask collapses to `<IP>`.
 - **There are two "first seen"s, on two clocks, and they can disagree.** The card's `first`
   time and `--export`'s `first_seen` are **logscry's** clock: when logscry first processed
   the template. The age the model is told ("first seen N ago") is the **source's** clock: the

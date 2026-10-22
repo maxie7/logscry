@@ -4698,7 +4698,9 @@ var lonePipelinePlaceholder = regexp.MustCompile(`^` + pipelinePH + `$`)
 // One honesty note about that exemption. It is per canonical row, and the IPv6 shapes the
 // pipeline deliberately does NOT collapse (fe80::1 templates as fe<NUM>::<NUM>, README "Known
 // limitations", #40) are not covered by the IPv6 row's exemption. They lose their digits to
-// <NUM> before this package ever sees them, so what survives is structure rather than value.
+// <NUM> before this package ever sees them, but NOT their hex letters, and a hex letter is a digit
+// of the address: "peer:2001:db8::1" arrives as "peer:<NUM>:db<NUM>::<NUM>" and "db" is sent. That
+// is a leak, not structure, and it is #135.
 // The two IPv6 patterns stay two on purpose (#42); ipv6_compare_test.go compares them.
 func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 	// The templatized marked spans of every row, as (payload, start, end) triples.

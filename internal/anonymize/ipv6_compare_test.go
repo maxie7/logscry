@@ -88,12 +88,12 @@ var ipv6MustDiffer = []ipv6Row{
 	//   - "bare ::": the match is "::" alone, the unspecified address, which carries no bits.
 	//     Refusing it was measured (#42) and not taken: on a run of three colons the match then
 	//     starts one colon later, and ":::1:2:3:4:5:6:7:8" sends its last group. That
-	//     belongs to ISSUE-TBD's fix.
-	{"prompt cost: bare ::, see ISSUE-TBD (issue's line)", "CDBusNMHelper::GetDNSConfig failed",
+	//     belongs to #134's fix.
+	{"prompt cost: bare ::, see #134 (issue's line)", "CDBusNMHelper::GetDNSConfig failed",
 		"CDBusNMHelper::GetDNSConfig failed", "CDBusNMHelper<IP_1>GetDNSConfig failed"},
 	{"prompt cost: e::C (constructor)", "CNSSCertStore::CNSSCertStore entered",
 		"CNSSCertStore::CNSSCertStore entered", "CNSSCertStor<IP_1>NSSCertStore entered"},
-	{"prompt cost: bare ::, see ISSUE-TBD (plain)", "CWidgetLoader::instantiate failed",
+	{"prompt cost: bare ::, see #134 (plain)", "CWidgetLoader::instantiate failed",
 		"CWidgetLoader::instantiate failed", "CWidgetLoader<IP_1>instantiate failed"},
 	{"prompt cost: e::C (eats left)", "CNetHelperBase::CNetHelperBase entered",
 		"CNetHelperBase::CNetHelperBase entered", "CNetHelperBas<IP_1>NetHelperBase entered"},
@@ -113,20 +113,20 @@ var ipv6MustDiffer = []ipv6Row{
 		"call ::AddRef now", "call <IP_1>Ref now"},
 	{"prompt cost: e::C (at line start)", "Cafe::draw failed",
 		"Cafe::draw failed", "<IP_1>raw failed"},
-	{"prompt cost: bare ::, see ISSUE-TBD (bare operator)", "operator :: used",
+	{"prompt cost: bare ::, see #134 (bare operator)", "operator :: used",
 		"operator :: used", "operator <IP_1> used"},
 	{"prompt cost: e::C (hex member)", "call ::Add(x)",
 		"call ::Add(x)", "call <IP_1>(x)"},
-	{"prompt cost: bare ::, see ISSUE-TBD (unspecified address)", "listen [::]:8080",
+	{"prompt cost: bare ::, see #134 (unspecified address)", "listen [::]:8080",
 		"listen [::]:<NUM>", "listen [<IP_1>]:8080"},
 
-	// ISSUE-TBD: an address that begins with "::" and is glued on by ':' is SENT. A match ending
+	// #134: an address that begins with "::" and is glued on by ':' is SENT. A match ending
 	// in "::" starts one colon early and takes the first colon of the address's own "::"; the
 	// rest no longer matches. These rows pin today's output, leak included, so the fix shows up
 	// here as a diff.
-	{"KNOWN_GAP ISSUE-TBD: a leading-elision address glued on by ':' is sent", "peer:::ffff:0:0 down",
+	{"KNOWN_GAP #134: a leading-elision address glued on by ':' is sent", "peer:::ffff:0:0 down",
 		"peer:::ffff:<NUM>:<NUM> down", "peer<IP_1>:ffff:0:0 down"},
-	{"KNOWN_GAP ISSUE-TBD: the same after a token ending in a hex character", "src:::a:b:c lost",
+	{"KNOWN_GAP #134: the same after a token ending in a hex character", "src:::a:b:c lost",
 		"src:::a:b:c lost", "sr<IP_1>:a:b:c lost"},
 }
 

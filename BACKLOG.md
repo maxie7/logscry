@@ -4563,7 +4563,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       **Mutants, and what each turned red:**
       - Refusing the bare `::`: 6 table rows (the four bare-`::` cost rows, the three-level row
-        and one ISSUE-TBD row).
+        and one #134 row).
       - Dropping `(?i)`: the four upper-case completeness rows, 10 table rows and the C++ row of
         `TestAcceptedOverMasking`.
       - Dropping the one-group trailing form: three completeness rows and 4 table rows.
@@ -4584,7 +4584,10 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       sent: `peer:::ffff:0:0` goes as `peer<IP_1>:ffff:0:0`. A match ending in `::` takes the
       address's first colon, and `residue()` reads the rest as clean. It dates from v0.4.0 and is
       the same under leftmost-first. It is pinned as two KNOWN_GAP rows in the table and filed as
-      ISSUE-TBD, carrying the measurements above and the three-colon constraint.
+      #134, carrying the measurements above and the three-colon constraint. The wire check found a
+      second: on the Template field, the hex letters of an address the template mask leaves
+      uncollapsed are sent (`db<NUM>`, `fe<NUM>`), since #33's narrowing in v0.8.5. Same on main
+      and on the branch; #135.
 
       Seen, out of scope: #49, #59, #65, #116, #36, the detector order.
 
