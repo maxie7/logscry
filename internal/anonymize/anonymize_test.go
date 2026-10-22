@@ -627,6 +627,53 @@ func TestIssue41CompressedIPv6(t *testing.T) {
 	}
 }
 
+// gluedRunRightBoundaryRows are lines on which rule 7a (#134) must NOT fire, with their exact
+// output, which is v0.12.23's. In each, what follows the groups after a ':::' could continue a value
+// a later rule reads, so 7a stops short and 7 and the rest run as before. TestIssue134RightBoundary
+// asserts both the string and that it equals the v0.12.23 chain's.
+var gluedRunRightBoundaryRows = []struct {
+	name, in, want string
+}{
+	// A key, a URL and a field value glued straight after the run: their first characters are hex,
+	// and taking them would leave a prefix no later rule recognises.
+	{"a key glued after the run", "key:::" + googleAPISecret + " used", "key<IP_1>:<TOKEN_1> used"},
+	{"a hex-only scheme glued after the run", "peer:::ab://h.example/x", "peer<IP_1>:ab://<HOST_1>/x"},
+	{"a hex-led scheme glued after the run", "peer:::ftp://h.example/x", "peer<IP_1>:ftp://<HOST_1>/x"},
+	{"':::' as a field separator", "ts:::INFO:::msg", "ts<IP_1>:INFO<IP_1>:msg"},
+	{"an S3 ARN", "arn:aws:s3:::backup-bucket/key", "arn:aws:s<IP_1>:backup-bucket/key"},
+	// A dotted name or number after the run: '.' continues an IPv4 address or a host.
+	{"a public name after the run", "peer:::1.example.com down", "peer<IP_1>:1.example.com down"},
+	{"a private name after the run", "peer:::1.db.corp.internal down", "peer<IP_1>:<HOST_1> down"},
+	{"a version after the run", "peer:::1.2.3 down", "peer<IP_1>:1.2.3 down"},
+	// KNOWN_GAP ISSUE-TBD: the rest of #134's class. Each neighbour can continue a value a later
+	// rule reads, so 7a does not fire, and 7 sends the groups as it always did. Pinned, leak
+	// included, so closing them shows up here as a diff.
+	{"KNOWN_GAP ISSUE-TBD a hyphen after the groups", "peer:::1-x", "peer<IP_1>:1-x"},
+	{"KNOWN_GAP ISSUE-TBD an underscore after the groups", "peer:::1_x", "peer<IP_1>:1_x"},
+	{"KNOWN_GAP ISSUE-TBD a letter after the groups", "peer:::1x", "peer<IP_1>:1x"},
+	{"KNOWN_GAP ISSUE-TBD a dot inside a word after the groups", "peer:::1.x", "peer<IP_1>:1.x"},
+	// RESIDUAL #49: a glued v4-mapped address. 8 masks the quad, because 7 stops at the bare "::";
+	// 7a taking ":::ffff:192" would send ".168.1.1". It needs the same right boundary after the quad.
+	{"RESIDUAL #49 glued v4-mapped", "peer:::ffff:192.168.1.1 down", "peer<IP_1>:ffff:<IP_2> down"},
+}
+
+// TestIssue134RightBoundary is the other half of #134's guard: where 7a must not fire, the output
+// is v0.12.23's, byte for byte.
+func TestIssue134RightBoundary(t *testing.T) {
+	ref := referenceDetectors(t, baseDetectors)
+	for _, c := range gluedRunRightBoundaryRows {
+		t.Run(c.name, func(t *testing.T) {
+			got := mustMask(t, New(), c.in)
+			if got != c.want {
+				t.Errorf("right boundary moved:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+			if old := mustMask(t, mapperOn(ref), c.in); got != old {
+				t.Errorf("differs from v0.12.23:\n in:   %q\n got:  %q\n then: %q", c.in, got, old)
+			}
+		})
+	}
+}
+
 // TestIssue46PreMaskedCredentialHalf is the named regression guard for #46, and the reason it
 // is not called "the password leaks" is the finding: the defect is SYMMETRIC.
 //
@@ -3831,6 +3878,29 @@ var completenessRows = []completenessRow{
 	{"ipv6/upper-case-short", "via ", "FE80::1", " dev"},
 	{"ipv6/upper-case-prefix", "route ", "FE80::", "/64 dev"},
 	{"ipv6/upper-case-leading-elision", "from ", "::FFFF:0:0", " y"},
+	// #134: a "::"-led address glued on by ':' (rule 7a). The colon that glues it, and the hex
+	// character of a hex-ending token, go with it (TestAcceptedOverMasking), so they are declared
+	// as part of the secret. Each row ends at a different boundary, flush.
+	{"ipv6/glued-colon-leading-elision", "peer", ":::ffff:0:0", ",down"},
+	{"ipv6/glued-colon-after-hex", "sr", "c:::a:b:c", ")"},
+	{"ipv6/glued-colon-loopback", "peer", ":::1", "]"},
+	{"ipv6/glued-colon-end-of-text", "peer", ":::1", ""},
+	{"ipv6/glued-equals-colon", "x=", ":::1", ";"},
+	// #42's constraint: refusing the bare "::" alone would have sent the last group of this one.
+	{"ipv6/glued-colon-eight-groups", "x", ":::1:2:3:4:5:6:7:8", `"`},
+	{"ipv6/glued-colon-upper-case", "PEER", ":::FFFF:0:0", "'"},
+	{"ipv6/netstat-port", "tcp6 0 0 ", ":::22", " \x00::\x00:* LISTEN"},
+	// A prefix length, and a home path straight after: the home rule's value starts after the '/',
+	// which is context to 7a and not masked.
+	{"ipv6/glued-colon-prefix-length", "dst", ":::1", "/128 dev"},
+	{"ipv6/glued-colon-before-a-home-path", "at", ":::1", "/home/\x00bob\x00/x"},
+	// A zone id: '%' is in the userinfo and email classes, but those rules run before 7a.
+	{"ipv6/glued-colon-zone-id", "peer", ":::1", "%lo up"},
+	// A dot that ends a sentence: followed by a space or by nothing, it continues no address or name.
+	{"ipv6/glued-colon-sentence-dot", "listening on ", ":::22", ". Retrying"},
+	{"ipv6/glued-colon-sentence-dot-end-of-text", "peer", ":::1", "."},
+	// The control: bracketed, the unspecified address was always masked whole.
+	{"ipv6/unspecified-bracketed-port", "listen [", "::", "]:22"},
 	// Greed guard: IPv4's trailing \b and char class must stop before ":".
 	{"ipv4/with-port", "connect ", "10.0.0.5", ":8080 refused"},
 	{"email", "mail to ", "bob@team.example.org", " bounced"},
@@ -4333,7 +4403,7 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// after "sk_test_", where '_' would have ended a snake_case name in short pieces.
 		{"a long camelCase name after a stripe prefix is a key", "run sk" + "_test_createCustomerWithCardAndRefund ok", "run <TOKEN_1> ok"},
 	}
-	for _, c := range cases {
+	for _, c := range append(cases, gluedRunOverMaskingRows...) {
 		t.Run(c.name, func(t *testing.T) {
 			m := New()
 			if got := mustMask(t, m, c.in); got != c.want {
@@ -4365,6 +4435,25 @@ func TestAcceptedOverMasking(t *testing.T) {
 			}
 		})
 	}
+}
+
+// gluedRunOverMaskingRows are #134's accepted over-masking rows. TestAcceptedOverMasking runs them
+// with its own; they are at package level so the superset gate (TestGluedRunMasksASupersetOfMain)
+// runs their inputs too.
+var gluedRunOverMaskingRows = []struct {
+	name string
+	in   string
+	want string
+}{
+	// #134's costs. A "::"-led address glued on by ':' is masked from the run of colons on, so the
+	// colon that glues it goes into the placeholder. netstat writes the unspecified address and a
+	// port as ":::22", which is "::" and ":22" -- and reads exactly like ":" and "::22", the shape
+	// #134 sent -- so the port goes with it, and ":::22" and the "::" of ":::*" are two values now.
+	// ":::*" itself is 7's as before: '*' does not end a value. A ':::' operator between spaces is
+	// one placeholder where main left its third colon beside one.
+	{"the colon that glues an address goes with it", "peer:::1 down", "peer<IP_1> down"},
+	{"a netstat port goes with the unspecified address", "tcp6 0 0 :::22 :::* LISTEN", "tcp6 0 0 <IP_1> <IP_2>:* LISTEN"},
+	{"a ':::' operator is one placeholder", "xs ::: ys", "xs <IP_1> ys"},
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4547,6 +4636,9 @@ var templatizedRows = []templatizedRow{
 	{"vendor-key/github-query-value", "GET https://\x00api.github.com\x00/user?access_token=\x00" + githubClassicSecret + "\x00 401"},
 	{"vendor-key/env-var-end", "SLACK_BOT_TOKEN=\x00" + slackBotSecret + "\x00"},
 	{"vendor-key/sentence-dot", "key \x00" + googleAPISecret + "\x00. Retrying"},
+	// #134: rule 7a reads the pipeline's placeholders after the run, so the digits the template
+	// mask turned into <NUM> do not end the value there.
+	{"ipv6/glued-colon-leading-elision", "peer\x00:::ffff:0:0\x00 down"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
