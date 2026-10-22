@@ -804,6 +804,14 @@ Each time the audit's own count was right and its scope was narrower than the se
   sent. And a Slack user token (`xoxp-…`) with a word character glued right after it is masked on
   the raw line but sends its secret segment's letters on the template. Not affected: the Stripe,
   GitHub, Slack and Google formats #114 covers, in every other placement.
+- **#134** — an IPv6 address that begins with `::` and is glued to the token before it by `:` is
+  sent: `peer:::ffff:0:0` sends `ffff:0:0`, and `src:::a:b:c` sends `a:b:c`. A match ending in
+  `::` takes the first colon of the address's own `::`. Not affected: the same address after a
+  space, a bracket, `=` or `,`.
+- **#135** — on the template, an IPv6 address the template mask leaves uncollapsed sends its hex
+  letters: `peer:2001:db8::1` sends `db`, and `route fe80::/64` sends `fe`. Not affected: the raw
+  line, where these shapes are masked whole, and every address the template mask collapses to
+  `<IP>`.
 - ~~**#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
   pre-masked template.~~ **Closed in `v0.12.8`.** See the paragraph above. `s3://…@bucket`
   sent `bucket`. It was not an interference defect but a tolerance gap left over from #43, listed
