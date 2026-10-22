@@ -3810,6 +3810,27 @@ var completenessRows = []completenessRow{
 	{"ipv6/expanded", "peer ", "2001:db8:0:0:0:0:2:1", " down"},
 	// Greed guard: the address must stop at "]", not swallow the port.
 	{"ipv6/bracketed-port", "peer [", "2001:db8::dead:beef", "]:443 refused"},
+	// The leak-direction forms (#42). The pipeline drops some of them on purpose (#33), and any
+	// narrowing here that drops one of them is disclosure. Each must stay one placeholder.
+	{"ipv6/loopback", "bind ", "::1", " port"},
+	{"ipv6/loopback-bracketed-port", "listen [", "::1", "]:8080"},
+	{"ipv6/zone-id", "via ", "fe80::1", "%eth0 dev"},
+	{"ipv6/prefix-one-group", "route ", "fe80::", "/64 dev"},
+	{"ipv6/prefix-two-groups", "route ", "2001:db8::", "/32 dev"},
+	{"ipv6/leading-elision", "from ", "::ffff:0:0", " y"},
+	{"ipv6/bracketed-short-port", "peer [", "2001:db8::1", "]:8080 closed"},
+	{"ipv6/glued-colon", "peer:", "2001:db8::1", " closed"},
+	{"ipv6/glued-equals", "x=", "fe80::1", " up"},
+	{"ipv6/glued-underscore-one-group", "id_", "fe80::", "/64 up"},
+	{"ipv6/glued-underscore-letter-led", "id_", "fe80::a", " up"},
+	{"ipv6/glued-underscore", "addr_", "2001:db8::1", " up"},
+	{"ipv6/letter-led-last-group", "via ", "fe80::a", " dev"},
+	{"ipv6/eight-groups", "peer ", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", " down"},
+	{"ipv6/eight-groups-glued", "peer:", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", " down"},
+	{"ipv6/upper-case", "peer ", "2001:DB8::DEAD:BEEF", " down"},
+	{"ipv6/upper-case-short", "via ", "FE80::1", " dev"},
+	{"ipv6/upper-case-prefix", "route ", "FE80::", "/64 dev"},
+	{"ipv6/upper-case-leading-elision", "from ", "::FFFF:0:0", " y"},
 	// Greed guard: IPv4's trailing \b and char class must stop before ":".
 	{"ipv4/with-port", "connect ", "10.0.0.5", ":8080 refused"},
 	{"email", "mail to ", "bob@team.example.org", " bounced"},
