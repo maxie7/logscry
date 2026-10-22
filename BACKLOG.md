@@ -4757,7 +4757,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Seen and left alone, out of scope:** #49, #135, #59, #65, #116, #36, the C++
       over-redaction, the detector order, every other detector, `internal/pipeline`.
 
-      Targets TODO-VERSION
+      Targets v0.12.24
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and

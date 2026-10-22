@@ -762,7 +762,7 @@ after a bearer key joins the value (`auth Bearer AKIA…EXAMPLE. retry` →
 `auth Bearer <TOKEN_1> retry`), as the bearer rule already reads a dot in any other bearer token.
 Measured over the same 70,783 records: nothing changed. None contains `bearer`.
 
-**A `::`-led address glued on by `:` was sent before `TODO-VERSION`.** In a `:::` run the IPv6
+**A `::`-led address glued on by `:` was sent before `v0.12.24`.** In a `:::` run the IPv6
 rule's earliest match ended in `::` (the bare `::`, or `c::` after a token ending in a hex
 character) and so took the first colon of the address's own `::`. What was left had one leading
 colon and no `::`, so no rule matched it and the fail-closed check read it as clean:
@@ -831,7 +831,7 @@ Each time the audit's own count was right and its scope was narrower than the se
 - **ISSUE-TBD** — an IPv6 address that begins with `::` and is glued to the token before it by
   `:` is still sent when something other than a boundary follows it: `peer:::ffff:0:0-y` sends
   `ffff:0:0-y`. The same goes for `_`, a letter, a dot inside a word, and other punctuation. This
-  is the rest of the class `TODO-VERSION` masks only up to a space, closing punctuation, `/`, `%`,
+  is the rest of the class `v0.12.24` masks only up to a space, closing punctuation, `/`, `%`,
   a sentence dot or the end of the line. Not affected: the same address followed by one of those,
   or after a space, a bracket, `=` or `,`.
 - **#135** — on the template, an IPv6 address the template mask leaves uncollapsed sends its hex
@@ -1162,7 +1162,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `peer:::ffff:0:0-y down` reaches the model as `peer<IP_1>:ffff:0:0-y down`, which sends the
   whole address. A match ending in `::` starts one colon early and takes the first colon of the
   address's own `::`, and what is left is a shape no rule matches, so the re-scan reads it as
-  clean. Since v0.4.0. `TODO-VERSION` masks the address whole when a boundary follows it: a space,
+  clean. Since v0.4.0. `v0.12.24` masks the address whole when a boundary follows it: a space,
   closing punctuation, `/`, `%`, a sentence dot, or the end of the line. It does not mask it when
   `-`, `_`, a letter, a dot inside a word, or other punctuation follows, because each of those can
   continue a value a later rule owns (a hostname, a key, a field separator). The glued
