@@ -645,13 +645,13 @@ var gluedRunRightBoundaryRows = []struct {
 	{"a public name after the run", "peer:::1.example.com down", "peer<IP_1>:1.example.com down"},
 	{"a private name after the run", "peer:::1.db.corp.internal down", "peer<IP_1>:<HOST_1> down"},
 	{"a version after the run", "peer:::1.2.3 down", "peer<IP_1>:1.2.3 down"},
-	// KNOWN_GAP ISSUE-TBD: the rest of #134's class. Each neighbour can continue a value a later
+	// KNOWN_GAP #137: the rest of #134's class. Each neighbour can continue a value a later
 	// rule reads, so 7a does not fire, and 7 sends the groups as it always did. Pinned, leak
 	// included, so closing them shows up here as a diff.
-	{"KNOWN_GAP ISSUE-TBD a hyphen after the groups", "peer:::1-x", "peer<IP_1>:1-x"},
-	{"KNOWN_GAP ISSUE-TBD an underscore after the groups", "peer:::1_x", "peer<IP_1>:1_x"},
-	{"KNOWN_GAP ISSUE-TBD a letter after the groups", "peer:::1x", "peer<IP_1>:1x"},
-	{"KNOWN_GAP ISSUE-TBD a dot inside a word after the groups", "peer:::1.x", "peer<IP_1>:1.x"},
+	{"KNOWN_GAP #137 a hyphen after the groups", "peer:::1-x", "peer<IP_1>:1-x"},
+	{"KNOWN_GAP #137 an underscore after the groups", "peer:::1_x", "peer<IP_1>:1_x"},
+	{"KNOWN_GAP #137 a letter after the groups", "peer:::1x", "peer<IP_1>:1x"},
+	{"KNOWN_GAP #137 a dot inside a word after the groups", "peer:::1.x", "peer<IP_1>:1.x"},
 	// RESIDUAL #49: a glued v4-mapped address. 8 masks the quad, because 7 stops at the bare "::";
 	// 7a taking ":::ffff:192" would send ".168.1.1". It needs the same right boundary after the quad.
 	{"RESIDUAL #49 glued v4-mapped", "peer:::ffff:192.168.1.1 down", "peer<IP_1>:ffff:<IP_2> down"},

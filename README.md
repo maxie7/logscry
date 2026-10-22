@@ -779,8 +779,8 @@ lines mask exactly as before. What it costs, pinned: the gluing colon goes into 
 a netstat port after the unspecified address goes with it (`:::22` → `<IP_1>`, because `:::22`
 also reads as `:` before `::22`), and a `:::` operator is one placeholder. **This does not close
 the class.** When anything else follows the groups, such as `-`, `_`, a letter, a dot inside a
-word, or other punctuation, the address is still sent, exactly as before. That remainder is
-ISSUE-TBD, below. So is the glued IPv4-mapped form (`peer:::ffff:192.168.1.1`), which belongs
+word, or other punctuation, the address is still sent, exactly as before. That remainder is #137,
+below. So is the glued IPv4-mapped form (`peer:::ffff:192.168.1.1`), which belongs
 to #49. The new rule was checked against the chain as v0.12.23 built it, over every hand-written
 row and 32,000 generated inputs, with and without an extra host suffix. The bytes it masks include
 every byte v0.12.23 masked, for every input. Measured over ten journald boots (58,172 lines, raw
@@ -828,7 +828,7 @@ Each time the audit's own count was right and its scope was narrower than the se
   sent. And a Slack user token (`xoxp-…`) with a word character glued right after it is masked on
   the raw line but sends its secret segment's letters on the template. Not affected: the Stripe,
   GitHub, Slack and Google formats #114 covers, in every other placement.
-- **ISSUE-TBD** — an IPv6 address that begins with `::` and is glued to the token before it by
+- **#137** — an IPv6 address that begins with `::` and is glued to the token before it by
   `:` is still sent when something other than a boundary follows it: `peer:::ffff:0:0-y` sends
   `ffff:0:0-y`. The same goes for `_`, a letter, a dot inside a word, and other punctuation. This
   is the rest of the class `v0.12.24` masks only up to a space, closing punctuation, `/`, `%`,
@@ -1157,7 +1157,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   glued to a word character on both sides, so any rule that refuses it also refuses an address
   written the same way, and would send it. The template mask refuses these shapes, because there
   an over-match corrupts the card; here an under-match is disclosure. Decided in #42.
-- **ISSUE-TBD — with `--llm-anonymize`, an address that begins with `::` and is glued to the
+- **#137 — with `--llm-anonymize`, an address that begins with `::` and is glued to the
   token before it by `:` is still sent when a word character or other punctuation follows it.**
   `peer:::ffff:0:0-y down` reaches the model as `peer<IP_1>:ffff:0:0-y down`, which sends the
   whole address. A match ending in `::` starts one colon early and takes the first colon of the

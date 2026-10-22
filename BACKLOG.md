@@ -4677,7 +4677,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         - a key, a hex scheme, a hex-led scheme, `ts:::INFO:::msg`, an S3 ARN;
         - `:::1.example.com`, `:::1.db.corp.internal` (the host stays `<HOST_1>`), `:::1.2.3`;
         - RESIDUAL #49 `peer:::ffff:192.168.1.1`;
-        - KNOWN_GAP ISSUE-TBD rows for `-`, `_`, a letter and a dot inside a word.
+        - KNOWN_GAP #137 rows for `-`, `_`, a letter and a dot inside a word.
       - **`:::*`.** Its address `::` is masked on both, and `<IP_n>:*` stays (`*` is not END).
       - **Comparison table.** The two #134 KNOWN_GAP rows become "leak direction" rows in
         `ipv6MustDiffer`: the anonymizer now masks whole and the pipeline leaves them uncollapsed.
@@ -4690,7 +4690,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         textual rule separates them);
       - `xs ::: ys` is one placeholder.
 
-      **What it does not reach: the rest of the class, ISSUE-TBD.** Followed by `-`, `_`, a
+      **What it does not reach: the rest of the class, #137.** Followed by `-`, `_`, a
       letter, a dot inside a word, or other punctuation (`*`, `!`, `?`, `&`, `=`, `#`, `+`, `@`,
       `:`, `~`, `|`, `$`, `^`, `` ` ``, `(`, `[`, `{`, `<`), a glued address is still sent, the
       same as v0.12.23. 22 neighbours were confirmed identical on both. None of them can simply
