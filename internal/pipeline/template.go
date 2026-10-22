@@ -116,6 +116,14 @@ const (
 //     keeps the hex groups, so those lines fragment per-address instead of collapsing.
 //   - Residual false positive, unfixable by any textual rule: hex-only segments of
 //     four characters or fewer on both sides ("dec::add") ARE an address shape.
+//
+// internal/anonymize carries a second IPv6 pattern (ipv6Pattern), and the two stay two
+// on purpose (#42). They fail in opposite directions. Here an over-match corrupts the
+// card. There an under-match sends part of an address to the model. So the three
+// losses above would be leaks there, and that pattern keeps them; the C++ shapes this
+// one refuses are redacted there. A single pattern would have to pick one of the two
+// failures. internal/anonymize/ipv6_compare_test.go runs both over one table and names
+// each difference, so a change here that moves a row fails there.
 const (
 	ipv6Group    = `[0-9a-fA-F]{1,4}`
 	ipv6Boundary = `(?:^|[^0-9A-Za-z:.])`

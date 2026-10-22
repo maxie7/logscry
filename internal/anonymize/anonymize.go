@@ -1548,6 +1548,21 @@ func mangled(class string) string {
 
 // ipv6Pattern is the standard comprehensive IPv6 matcher, covering the "::" elision forms
 // and the loopback "::1". Kept as a named constant because it is unreadable inline.
+//
+// The pipeline's template mask has its own, ipv6Pat in internal/pipeline/template.go, and the two
+// stay two on purpose (#42). That one wants a boundary before the match and two hex groups,
+// because there an over-match corrupts the card (#33). Here an under-match is disclosure. So this
+// one keeps what that one drops: "::1", "fe80::/64", and an address glued onto the token before it.
+// It pays for that in the prompt: a C++ scope operator is redacted as an address
+// (CDBusNMHelper<IP_1>GetDNSConfig), and the hex letters beside the "::" go with it.
+//
+// No rule separates the two. In CNSSCertStore::CNSSCertStore, "e::C" is a valid address glued to
+// a word character on both sides, so refusing it refuses an address glued the same way. Refusing
+// only a bare "::", which carries no bits, was measured and not taken. On a run of three colons
+// the match then starts one colon later, and ":::1:2:3:4:5:6:7:8" sends its last group.
+//
+// internal/anonymize/ipv6_compare_test.go runs both patterns over one table and names each
+// difference, so a change here that moves a row fails there.
 const ipv6Pattern = `(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}` +
 	`|(?:[0-9a-f]{1,4}:){1,7}:` +
 	`|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}` +

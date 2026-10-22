@@ -3810,6 +3810,27 @@ var completenessRows = []completenessRow{
 	{"ipv6/expanded", "peer ", "2001:db8:0:0:0:0:2:1", " down"},
 	// Greed guard: the address must stop at "]", not swallow the port.
 	{"ipv6/bracketed-port", "peer [", "2001:db8::dead:beef", "]:443 refused"},
+	// The leak-direction forms (#42). The pipeline drops some of them on purpose (#33), and any
+	// narrowing here that drops one of them is disclosure. Each must stay one placeholder.
+	{"ipv6/loopback", "bind ", "::1", " port"},
+	{"ipv6/loopback-bracketed-port", "listen [", "::1", "]:8080"},
+	{"ipv6/zone-id", "via ", "fe80::1", "%eth0 dev"},
+	{"ipv6/prefix-one-group", "route ", "fe80::", "/64 dev"},
+	{"ipv6/prefix-two-groups", "route ", "2001:db8::", "/32 dev"},
+	{"ipv6/leading-elision", "from ", "::ffff:0:0", " y"},
+	{"ipv6/bracketed-short-port", "peer [", "2001:db8::1", "]:8080 closed"},
+	{"ipv6/glued-colon", "peer:", "2001:db8::1", " closed"},
+	{"ipv6/glued-equals", "x=", "fe80::1", " up"},
+	{"ipv6/glued-underscore-one-group", "id_", "fe80::", "/64 up"},
+	{"ipv6/glued-underscore-letter-led", "id_", "fe80::a", " up"},
+	{"ipv6/glued-underscore", "addr_", "2001:db8::1", " up"},
+	{"ipv6/letter-led-last-group", "via ", "fe80::a", " dev"},
+	{"ipv6/eight-groups", "peer ", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", " down"},
+	{"ipv6/eight-groups-glued", "peer:", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", " down"},
+	{"ipv6/upper-case", "peer ", "2001:DB8::DEAD:BEEF", " down"},
+	{"ipv6/upper-case-short", "via ", "FE80::1", " dev"},
+	{"ipv6/upper-case-prefix", "route ", "FE80::", "/64 dev"},
+	{"ipv6/upper-case-leading-elision", "from ", "::FFFF:0:0", " y"},
 	// Greed guard: IPv4's trailing \b and char class must stop before ":".
 	{"ipv4/with-port", "connect ", "10.0.0.5", ":8080 refused"},
 	{"email", "mail to ", "bob@team.example.org", " bounced"},
@@ -4121,8 +4142,8 @@ func completenessSecretFor(d detector) (string, bool) {
 // (see the package comment): matching too much costs one placeholder in a restatement that
 // is already lossy, while matching too little is disclosure. The second row is the shape #33
 // fixed in the pipeline; this package has always over-masked it and now over-masks it by one
-// more character. Whether the two IPv6 patterns should be one is #42's question, not this
-// change's.
+// more character. The two IPv6 patterns stay two on purpose (#42), and that row is now one of the
+// prompt-cost rows in ipv6_compare_test.go, which says why no rule can separate it from an address.
 func TestAcceptedOverMasking(t *testing.T) {
 	cases := []struct {
 		name string
@@ -4677,8 +4698,10 @@ var lonePipelinePlaceholder = regexp.MustCompile(`^` + pipelinePH + `$`)
 // One honesty note about that exemption. It is per canonical row, and the IPv6 shapes the
 // pipeline deliberately does NOT collapse (fe80::1 templates as fe<NUM>::<NUM>, README "Known
 // limitations", #40) are not covered by the IPv6 row's exemption. They lose their digits to
-// <NUM> before this package ever sees them, so what survives is structure rather than value.
-// Whether the two IPv6 patterns should be one is #42's question.
+// <NUM> before this package ever sees them, but NOT their hex letters, and a hex letter is a digit
+// of the address: "peer:2001:db8::1" arrives as "peer:<NUM>:db<NUM>::<NUM>" and "db" is sent. That
+// is a leak, not structure, and it is #135.
+// The two IPv6 patterns stay two on purpose (#42); ipv6_compare_test.go compares them.
 func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 	// The templatized marked spans of every row, as (payload, start, end) triples.
 	//
