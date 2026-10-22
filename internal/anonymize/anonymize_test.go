@@ -4142,8 +4142,8 @@ func completenessSecretFor(d detector) (string, bool) {
 // (see the package comment): matching too much costs one placeholder in a restatement that
 // is already lossy, while matching too little is disclosure. The second row is the shape #33
 // fixed in the pipeline; this package has always over-masked it and now over-masks it by one
-// more character. Whether the two IPv6 patterns should be one is #42's question, not this
-// change's.
+// more character. The two IPv6 patterns stay two on purpose (#42), and that row is now one of the
+// prompt-cost rows in ipv6_compare_test.go, which says why no rule can separate it from an address.
 func TestAcceptedOverMasking(t *testing.T) {
 	cases := []struct {
 		name string
@@ -4699,7 +4699,7 @@ var lonePipelinePlaceholder = regexp.MustCompile(`^` + pipelinePH + `$`)
 // pipeline deliberately does NOT collapse (fe80::1 templates as fe<NUM>::<NUM>, README "Known
 // limitations", #40) are not covered by the IPv6 row's exemption. They lose their digits to
 // <NUM> before this package ever sees them, so what survives is structure rather than value.
-// Whether the two IPv6 patterns should be one is #42's question.
+// The two IPv6 patterns stay two on purpose (#42); ipv6_compare_test.go compares them.
 func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 	// The templatized marked spans of every row, as (payload, start, end) triples.
 	//

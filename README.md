@@ -1107,8 +1107,20 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   fragmentation. It does **not** mask an IPv4-mapped address in full: `::ffff:192.168.1.1` masks
   as far as `::ffff:192`, which is a legal hex group, and the remaining three octets are sent.
   That is a gap in the anonymizer's own pattern (#49), filed rather than fixed here because the
-  fix belongs to the same constant #42 is about. The two IPv6 patterns diverged in #40 and #41; #42
-  decides whether they stay two.
+  fix belongs to the same constant #42 is about. The two IPv6 patterns stay two on purpose (#42),
+  because each fails in the other's cheap direction; `internal/anonymize/ipv6_compare_test.go`
+  runs both over one table and names every place they differ.
+- **With `--llm-anonymize`, a C++ scope operator is redacted as an IPv6 address.**
+  `CDBusNMHelper::GetDNSConfig failed` reaches the model as
+  `CDBusNMHelper<IP_1>GetDNSConfig failed`. Where the name has hex letters next to the `::`, the
+  placeholder takes them too: `CNSSCertStore::CNSSCertStore` goes as
+  `CNSSCertStor<IP_1>NSSCertStore`. The card is not affected, because `Restore` puts the real name
+  back. The cost lands on the model, which is asked about a symbol that does not exist and may
+  explain the fault worse. This is a deliberate trade in the disclosure direction, and a sharper
+  pattern cannot undo it: `e::C` inside `CNSSCertStore::CNSSCertStore` is a valid IPv6 address
+  glued to a word character on both sides, so any rule that refuses it also refuses an address
+  written the same way, and would send it. The template mask refuses these shapes, because there
+  an over-match corrupts the card; here an under-match is disclosure. Decided in #42.
 - **There are two "first seen"s, on two clocks, and they can disagree.** The card's `first`
   time and `--export`'s `first_seen` are **logscry's** clock: when logscry first processed
   the template. The age the model is told ("first seen N ago") is the **source's** clock: the

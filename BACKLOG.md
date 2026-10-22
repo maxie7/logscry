@@ -4489,6 +4489,107 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.23
 
+- [x] **The two IPv6 patterns stay two, and one table compares them** — #42. The template mask
+      (`ipv6Pat`, internal/pipeline) and the anonymizer's detector 7 (`ipv6Pattern`) were two
+      copies of one matcher with nothing connecting them. #33 narrowed the first; #41 changed how
+      the second is compiled. A person editing one could reasonably believe they were done.
+
+      **The decision: two patterns, on purpose.** Of the three candidates:
+      - **One shared source was impossible.** The two fail in opposite directions. One pattern
+        has to pick a side. The pipeline's side sends `::1`, `fe80::/64` and
+        `peer:2001:db8::1` to the model. The anonymizer's side corrupts templates again and moves
+        every #33 hash. Each of those is a `mustDiffer` row now, not an argument.
+      - **A common core was rejected.** The only text both could share without rewriting the
+        pipeline's source is the hex group. Anything larger would mean rewriting the pipeline
+        alternation around the anonymizer's needs. That puts hashes at risk for no change in
+        behaviour, and makes the anonymizer follow any later pipeline edit silently, which its
+        package comment forbids.
+      - **Drift is made visible instead.** `internal/anonymize/ipv6_compare_test.go` runs the
+        real `pipeline.Templatize` (how `bareHostPattern` already reads the pipeline, #105) and
+        `New().Mask` over one hand-written table. It asserts both outputs exactly and DERIVES
+        whether the two took the same span: the anonymizer's `<IP_n>` read as `<IP>`, then
+        templatized, must equal the pipeline's pattern. Every `mustDiffer` row is named for its
+        reason. An arity guard runs every elision of two or more groups (33 classes) plus the
+        full form, which no hand-written row covers one by one. There is no new export and no
+        import cycle: anonymize already imports pipeline. Both pattern sites now say what the
+        other is, why they differ, and where the table is.
+
+      **No pattern changes.** The anonymizer's C++
+      over-redaction (`CDBusNMHelper<IP_1>GetDNSConfig`, `CNSSCertStor<IP_1>NSSCertStore`) is a
+      prompt cost and not a leak, and it stays:
+      - **No rule separates it from an address.** In `CNSSCertStore::CNSSCertStore`, `e::C` IS a
+        valid address glued to a word character on both sides. A narrowing that refused it was
+        planned and rejected: it would have stopped masking `id_fe80::/64` and `id_fe80::a`.
+        That is an address glued onto the token before it, sent to the model in exchange for
+        prompt quality. Every group carries bits.
+      - **Refusing a bare `::`, which carries no bits, was measured and not taken.** It removes
+        16 of 907 scope-operator matches on raw lines and 6 of 886 on templates (3 of the 5
+        distinct templates that carry one), 0 address-shaped matches, and 3 of the table's 13 C++
+        shapes plus part of a fourth. But "only bare-`::` bytes change" is not true in general.
+        On a run of three colons the match starts one colon later, and
+        `x :::1:2:3:4:5:6:7:8 y` sends `8`. The captures hold no such run, so a differential
+        over them would have passed. A probe found it.
+      - **A context-dependent variant fails closed.** Refusing `::` only when it is glued on both
+        sides leaves `Log<IP_1>::init` after `::Dec` is masked, the re-scan reads that `::` as an
+        address, and the escalation is skipped.
+
+      **Predictions, then results.**
+      - Pipeline, per-line hash diff over the ten boots (58,172 lines, `ab37*` and
+        `logscry-probe` filtered), main vs branch. Predicted 0, measured **0**. `internal/pipeline`
+        changes only in a comment; the #33 tests pass unedited.
+      - Anonymizer, differential through `New()` and through `New("lab")`, on raw lines and
+        templates. Predicted 0 bytes. Measured **0 of 232,688** capture records and **0 of 294**
+        corpus records.
+      - Bare-`::` share of scope-operator matches. Predicted about 40%, measured 1.8% by volume:
+        **wrong**. Two high-frequency templates carry a group on one side. By distinct template it
+        is 3 of 5.
+      - Table shapes the bare refusal would fix. Predicted 3 full and 1 partial of 13. Measured
+        the same.
+      - Address-shaped matches it would remove, and shifted matches. Predicted 0 and 0. Measured
+        0 and 0 on the captures, and wrong in general (the run of three colons above).
+      - Wire check. Each binary ran against a capturing endpoint (`--plain --llm-anonymize
+        --warmup-lines 0`) on 17 `[FATAL]` lines, one per leak-direction form plus two C++ lines,
+        with #59's `postgres://user:p/ss@db` in the context.
+        - **0** whole addresses and **0** address groups were sent by either binary.
+        - `p/ss` was sent in 17 of 17 requests on both, so the grep is not vacuous.
+        - Both send `CDBusNMHelper<IP_n>GetDNSConfig` and `CNSSCertStor<IP_1>NSSCertStore`.
+        - The request bodies are byte-identical.
+
+      **Tests.** The table, the arity guard, and 19 completeness rows for the leak-direction forms
+      (loopback, one-group prefix, zone id, glued by `:`, `=` and `_`, eight groups bare and glued,
+      upper case). All pass on main: this is a guard, not a red/green pair. `go test -race ./...`:
+      2,169 passing and 1 skipped on main, 2,262 and 1 on the branch, and no existing result
+      changed outcome. The new tests pass under `-race -count=20`.
+
+      **Mutants, and what each turned red:**
+      - Refusing the bare `::`: 6 table rows (the four bare-`::` cost rows, the three-level row
+        and one ISSUE-TBD row).
+      - Dropping `(?i)`: the four upper-case completeness rows, 10 table rows and the C++ row of
+        `TestAcceptedOverMasking`.
+      - Dropping the one-group trailing form: three completeness rows and 4 table rows.
+      - Compiling detector 7 leftmost-first: #41's tests, the arity guard (21 classes), 15 table
+        rows.
+      - Porting the pipeline pattern into the anonymizer: 7 completeness rows and 21 table rows.
+      - On the pipeline side, every mutant reddens the table as well as its own test:
+        - dropping the boundary;
+        - admitting `:` into it;
+        - re-admitting a one-group form at either end.
+
+        Compiling the IP masker leftmost-first is caught only by the arity guard (15 classes).
+        The #33 tests stay green under it.
+      - #49's seam is visible. A v4-mapped alternative in either pattern turns exactly one row
+        red: the KNOWN_GAP v4-mapped row.
+
+      **Found on the way, not fixed.** An address that begins with `::` and is glued on by `:` is
+      sent: `peer:::ffff:0:0` goes as `peer<IP_1>:ffff:0:0`. A match ending in `::` takes the
+      address's first colon, and `residue()` reads the rest as clean. It dates from v0.4.0 and is
+      the same under leftmost-first. It is pinned as two KNOWN_GAP rows in the table and filed as
+      ISSUE-TBD, carrying the measurements above and the three-colon constraint.
+
+      Seen, out of scope: #49, #59, #65, #116, #36, the detector order.
+
+      No release (no behaviour change).
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
