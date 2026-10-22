@@ -4593,6 +4593,172 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       No release (no behaviour change).
 
+- [x] **A `::`-led address glued on by `:` is masked whole up to a boundary** — #134, found in
+      #42. **Since v0.4.0 (2da31be), 49 tags.**
+
+      **Cause.** Detector 7 is leftmost-longest, so it takes the earliest start. In a `:::` run, a
+      match ending in `::` starts one colon early:
+      - the bare `::` after any token;
+      - `(h:){1,7}:` after a token ending in a hex character.
+
+      It takes the first colon of the address's own `::`. The rest (`:ffff:0:0`, `:a:b:c`) has one
+      leading colon and no `::`. No alternative matches it, and `residue()` reads it as clean
+      (#41's blindness). `peer:::ffff:0:0 down` sent `ffff:0:0`. `src:::a:b:c lost` sent `a:b:c`.
+      Netstat's `:::22` sent `:22`. `x :::1:2:3:4:5:6:7:8 y` sent one colon. That colon was #42's
+      reason not to delete the bare `::`, so the bare `::` stays.
+
+      **The rule: 7a, a new chain entry immediately before 7.** The rest of the chain order is
+      unchanged.
+      ```
+      7a   := (?i) ( lead tail ) END            END is context, not masked
+      lead := ( h{1,4} (":" h{1,4})* )? ":{3,}"  raw hex only
+      tail := ( U{1,4} (":" U{1,4})* )?         U = hex | a pipeline placeholder (#43)
+      END  := [\s , ; ) ] } > " ' / %] | "." (\s | $) | $
+      ```
+      - **The left end is 7's.** With up to seven groups before the run, alt 2's start is the
+        same as 7a's. With eight or more, alt 1 starts earlier, which is why `lead` is unbounded
+        in count. Where `lead` cannot reach back, a `::` remainder is re-masked by 7
+        (`a::b:::c ` → `<IP_2><IP_1> `).
+      - **The parse is forced.** Between the run and END there are only single-colon groups. So
+        the match does not depend on alternation order, and the Longest-off mutant on 7a alone
+        turns nothing red.
+      - **The right end is bounded.** That is what keeps every later value whole. With no END,
+        7a takes `:::AIza…`'s hex prefix (rule 12 is cut), `:::ab://`'s scheme (9a),
+        `:::1.db.corp.internal`'s first label (9b), and the first octet of
+        `:::ffff:192.168.1.1` (8). 7a matches only where a character that no later value
+        contains follows. Everywhere else 7 and the rest run exactly as on v0.12.23.
+      - **END was widened one candidate at a time, each against the gate.**
+        - `'/'` went in. The home-path value starts AT the `/`, and END is not consumed, so
+          the user name after it is still the home rule's. The URL-path, userinfo and
+          prefix-length probes (`postgres://u:::1/x@db/app`, `http://:::1/x`,
+          `route:::1/home/bob/x`) pass the gate.
+        - `'%'` went in. The userinfo classes admit `%`, but a userinfo there would be inside
+          the address's own span, and the probes (`postgres://u:::1%x@db/app`, `u:::1%40x@h`)
+          stay as they were.
+        - A terminal `.` went in: a `.` followed by whitespace or the end, as a two-character
+          context.
+
+        Strictly more, gate corpus at 1,000 cores: 537 at the base END, 657 with `/`, 791 with
+        `%`, 834 with the terminal `.`. No candidate failed. A bare `.` does fail: the
+        gate turns red. On v0.12.23 the `.` of `peer:::1.db.corp.internal` was masked inside a
+        host, and with a bare `.` it is sent (`peer<IP_1>.<HOST_1>`). On
+        `peer:::ffff:192.168.1.1` the bare `.` sends `.168.1.1`.
+      - **#49's seam.** 7a's source is `lead + tail + END` consts. #49 adds one alternative,
+        `(?:0{1,4}:)?ffff:` + `ipv4Pattern`, beside `tail` in the composition line. `lead`, `tail`,
+        END and the chain entry are untouched. Checked in a scratch copy:
+        - the probe `peer:::ffff:192.168.1.1 down` gives `peer<IP_1> down`;
+        - the gate stays green;
+        - exactly one row turns red, the RESIDUAL #49 row.
+
+        Glued v4-mapped needs the same right-boundary treatment.
+
+      **The superset gate, asserted at the chain level.** `TestGluedRunMasksASupersetOfMain`
+      runs `baseDetectors` and `buildDetectors({"lab"})` against the same chains as v0.12.23
+      built them: 7a removed, and 7 on its v0.12.23 pattern, frozen in the test file as the
+      reference (not an equality pin, because #49 changes `ipv6Pattern` on purpose). For every
+      input, the masked byte positions come from the output plus `byToken`, and the test fails if
+      those do not rebuild the input. It asserts three things:
+      - the bytes masked now include every byte v0.12.23 masked;
+      - an input without `:::` comes back byte for byte as before;
+      - an input v0.12.23 masked is not refused now.
+
+      Its corpus is every completeness, templatized, comparison-table and right-boundary row,
+      #134's three over-mask rows, 20 probes (each END character next to a value a later rule reads), and
+      a seeded generator (PCG 134): colon runs 1–4, hex 0–8, `.`, `/`, `%`, `[`, `]`, letters,
+      digits, `_`, space, glued to a word, to a hex-ending word, after `=` and unglued. All of it
+      runs raw and templatized. 250 cores keep it to 18 s under `-race`. 2,532 inputs, 179 mask
+      strictly more. This replaces #42's "only bare-`::` bytes change", the property that failed.
+
+      **Shapes.**
+      - **Masked whole now:** `peer:::ffff:0:0`, `src:::a:b:c` (→ `sr<IP_1>`; the `c` was taken
+        on v0.12.23 too), `peer:::1`, `x=:::1`, `x:::1:2:3:4:5:6:7:8`, upper case, netstat
+        `:::22`, before `/128`, a home path, `%lo` and a sentence dot.
+      - **Unchanged and asserted equal to v0.12.23** (`TestIssue134RightBoundary`):
+        - a key, a hex scheme, a hex-led scheme, `ts:::INFO:::msg`, an S3 ARN;
+        - `:::1.example.com`, `:::1.db.corp.internal` (the host stays `<HOST_1>`), `:::1.2.3`;
+        - RESIDUAL #49 `peer:::ffff:192.168.1.1`;
+        - KNOWN_GAP ISSUE-TBD rows for `-`, `_`, a letter and a dot inside a word.
+      - **`:::*`.** Its address `::` is masked on both, and `<IP_n>:*` stays (`*` is not END).
+      - **Comparison table.** The two #134 KNOWN_GAP rows become "leak direction" rows in
+        `ipv6MustDiffer`: the anonymizer now masks whole and the pipeline leaves them uncollapsed.
+        The four bare-`::` cost rows lose "see #134", because the bare `::` stays.
+        `internal/pipeline` is untouched.
+
+      **What it costs, pinned in `TestAcceptedOverMasking`:**
+      - the gluing colon goes into the placeholder;
+      - netstat's `:::22` loses its port (`::` then `:22` also reads as `:` then `::22`, and no
+        textual rule separates them);
+      - `xs ::: ys` is one placeholder.
+
+      **What it does not reach: the rest of the class, ISSUE-TBD.** Followed by `-`, `_`, a
+      letter, a dot inside a word, or other punctuation (`*`, `!`, `?`, `&`, `=`, `#`, `+`, `@`,
+      `:`, `~`, `|`, `$`, `^`, `` ` ``, `(`, `[`, `{`, `<`), a glued address is still sent, the
+      same as v0.12.23. 22 neighbours were confirmed identical on both. None of them can simply
+      be END, because each can continue a value a later rule owns: a host label, a key, a dotted
+      quad, the field separator, a userinfo or query. The shapes #134's text lists are all
+      masked whole.
+
+      **Predictions, then results.**
+      - `go test -race ./...` on main: predicted 2,262 passing and 1 skipped, **held**.
+      - Same on the branch: predicted 2,299 and 1, **held**. No existing result changed outcome:
+        6 table rows were renamed and 43 names are new.
+      - Gate strictly more at the base END: predicted 250–450, measured **537**, **missed**.
+      - Captures differential, the ten boots (58,172 lines, `ab37*` and `logscry-probe`
+        filtered, raw and `TemplatizeLine`, `New()` and `New("lab")`): predicted 0 changed and
+        0 less of 232,688. **Held**: 0 changed, 0 less, 0 more, 0 errors on either side, 0
+        holding `:::`.
+      - Residue, clean on v0.12.23 and refused on the branch: predicted 0, **0** on the corpus
+        and the captures.
+      - Template hashes over the boots: predicted 0, **0 of 58,172** moved.
+      - Corpus differential at 4,000 cores (32,612 inputs per mapper): predicted 0 less, **held**.
+        - `New()`: 3,036 strictly more. I predicted about 11,000 by scaling from the wrong base,
+          so this **missed**.
+        - `New("lab")`: identical, 3,036 strictly more and 0 less.
+        - Predicted every changed output to mask strictly more: **missed**. 2,494 mask the same
+          bytes in fewer placeholders, a colon run that v0.12.23 split as `<IP_1><IP_1>` and that
+          is now one.
+      - Wire check. Each binary ran against a capturing endpoint (`--plain --llm-anonymize
+        --warmup-lines 0`) on 7 `[FATAL]` lines, with #59's `postgres://user:p/ss@db` before
+        them. **Held**:
+        - main sent 6 distinct tails (`ffff:0:0`, `a:b:c`, `:1` twice, `:22`, `FFFF:0:0`);
+        - the branch sent 0;
+        - `[::]:22` and `:::*`'s address were masked on both;
+        - `p/ss` was sent in 7 of 7 requests on both.
+      - `-race -count=20` on the new tests: green.
+
+      **Mutants, and what each turned red:**
+      - **`:{3,}` → `::`, 7a without its colon run.** 23 red: the gate (both mappers), 13
+        completeness rows, the templatized row and its two logfmt forms, 2 table rows and 3
+        over-mask rows. **Held.**
+      - **Bare `::` deleted from 7, the #42 trap.** 23 red: the gate, 5 bare-cost table rows,
+        the `[::]:22` and netstat completeness rows, the netstat over-mask row, 12
+        right-boundary rows, and `TestNoDetectorGroupLandsOnOurOwnOutput`. The last two were not
+        predicted.
+      - **`Longest()` off on 7a only.** 0 red, **held**.
+      - **`Longest()` off in `mustLongest`.** 68 red: #41, the arity guard (21 classes), 15
+        table rows, the #57/#58/#61/#67/#105 rows and the C++ over-mask rows. None of 7a's rows.
+      - **7a after 7.** 21 red, all of 7a's rows; the gate stays green. The order is what
+        carries the change.
+      - **A bare `.` in END.** 8 red: the gate, 5 right-boundary rows, and
+        `TestEveryDetectorsContextSurvivesTemplating`, which was not predicted.
+      - **END removed.** 17 red: the gate, 13 right-boundary rows, and the netstat completeness
+        and over-mask rows.
+      - **Without `/`, `%` or the terminal `.`.** 2, 1 and 2 red, each its own completeness
+        rows, gate green. **Held.**
+
+      **Tests.**
+      - **Red on v0.12.23:** 13 completeness rows (the `[::]:22` control passes), one
+        templatized row and its two logfmt forms, 2 table rows, 3 over-mask rows.
+      - **Passing on both:** the gate (trivially on v0.12.23) and `TestIssue134RightBoundary`.
+      - **Existing tests changed:** `TestAcceptedOverMasking` also runs #134's rows, which sit in
+        the package var `gluedRunOverMaskingRows` so the gate can read them. Its own cases stay
+        where they were.
+
+      **Seen and left alone, out of scope:** #49, #135, #59, #65, #116, #36, the C++
+      over-redaction, the detector order, every other detector, `internal/pipeline`.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
