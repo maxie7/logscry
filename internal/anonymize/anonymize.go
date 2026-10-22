@@ -505,7 +505,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all twenty-seven rather than to the one detector known to need it, because
+// It is applied to all twenty-eight rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -781,6 +781,44 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 			tolerant(`[A-Za-z0-9._%+-]`) + `@` + tolerant(`[A-Za-z0-9._-]`) + `\.[A-Za-z]{2,}\b`), 0, true, false},
 		// 6 ran HERE until #48 and now runs after 9b — see the block below and the package
 		//    comment. The numbering is the audit table's, not the chain's.
+		// 7a. A "::"-led address glued on by ':' (#134). It runs HERE, directly before 7, and the
+		//     number is 9d's convention: it is 7's rule, for one shape.
+		//
+		//     Until #134, 7 sent it. In a run of three colons, a 7 match that ends in "::" -- the bare
+		//     "::" after a token, or "c::" after a hex-ending one -- starts one colon early and takes
+		//     the first colon of the address's own "::". What is left, ":ffff:0:0" in
+		//     peer:::ffff:0:0, has no "::" and fewer than eight groups, so nothing matches it and
+		//     residue() reads it as clean: #41's blindness. No address contains three colons in a
+		//     row, so ":::" is exactly where that cut happens.
+		//
+		//     THIS IS NOT A REORDERING, and the left end is why. 7a starts where 7 would: the groups
+		//     before the run are 7's own (single colons, at most four hex characters each), and their
+		//     count is unbounded only because 7 starts on the first of eight groups too (alternative
+		//     1). Where they cannot reach further, what is left before them ends in "::", and 7 masks
+		//     that as it always did. So 7a only moves the RIGHT end of a match 7 would have made.
+		//
+		//     THE RIGHT END IS BOUNDED, and that is the whole safety argument. After the groups comes
+		//     CONTEXT from ipv6GluedRunEnd, which is not masked: whitespace, closing punctuation, '/',
+		//     '%', a '.' that ends a sentence, or the end of the text. Where none follows, 7a does not
+		//     match and 7 and everything after it run exactly as before. Each of those ends every value
+		//     a later rule reads, or starts one outside the group (a home path's "/home/"). A '-', '_',
+		//     a letter or any other '.' could each CONTINUE such a value -- an IPv4 address, a host, a
+		//     URL scheme, a key -- and masking the groups would cut it: on peer:::ffff:192.168.1.1, 8
+		//     masks the quad today, and taking "192" would send ".168.1.1". So 7a may mask more than 7,
+		//     never cut what another rule would have masked; that is asserted over a corpus in
+		//     TestGluedRunMasksASupersetOfMain, not only argued here. Those neighbours stay 7's, and
+		//     what 7 sends beside them is the rest of #134's class.
+		//
+		//     The groups after the run read the pipeline's placeholders, so the Template field's
+		//     :::ffff:<NUM>:<NUM> is one value as well (#43). The groups before it do not, so on the
+		//     template too 7a starts where 7 does.
+		//
+		//     WHAT IT COSTS is pinned in TestAcceptedOverMasking: the gluing colon goes into the
+		//     placeholder, so does a port written netstat's way (:::22 is "::" and ":22", and reads the
+		//     same as ":" and "::22"), and a ':::' operator between spaces is one placeholder.
+		//
+		//     verify:true, as 7. Its group excludes our '<' and '>', so the mapping cannot nest.
+		{tagIP, mustLongest(ipv6GluedRunPattern), 1, true, false},
 		// 7. IPv6 — before host and IPv4. The alternatives cover the :: elisions; forms
 		//    without "::" and fewer than eight groups (times, MACs) do not match.
 		{tagIP, mustLongest(ipv6Pattern), 0, true, false},
@@ -1561,6 +1599,9 @@ func mangled(class string) string {
 // only a bare "::", which carries no bits, was measured and not taken. On a run of three colons
 // the match then starts one colon later, and ":::1:2:3:4:5:6:7:8" sends its last group.
 //
+// A run of three colons is rule 7a's first (#134, ipv6GluedRunPattern). This pattern's bare "::"
+// and "c::" end one colon into such a run, and the address after it was sent.
+//
 // internal/anonymize/ipv6_compare_test.go runs both patterns over one table and names each
 // difference, so a change here that moves a row fails there.
 const ipv6Pattern = `(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}` +
@@ -1572,6 +1613,25 @@ const ipv6Pattern = `(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}` +
 	`|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}` +
 	`|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}` +
 	`|:(?:(?::[0-9a-f]{1,4}){1,7}|:)`
+
+// ipv6GluedRunPattern is 7a's source (#134): a "::"-led address glued on by ':', as far as a
+// boundary. The group is the run and the groups around it; the boundary after it is context.
+// See the chain entry for why each part is what it is.
+const ipv6GluedRunPattern = `(?i)(` + ipv6GluedRunLead + ipv6GluedRunTail + `)` + ipv6GluedRunEnd
+
+// ipv6GluedRunLead is the groups before the run, 7's own, then the run of three colons or more.
+const ipv6GluedRunLead = `(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?:{3,}`
+
+// ipv6GluedRunTail is the groups after the run, separated by single colons. A unit is a hex
+// character or one of the pipeline's placeholders, so the Template field's form is read too.
+const ipv6GluedRunTail = `(?:` + ipv6GluedRunUnit + `{1,4}(?::` + ipv6GluedRunUnit + `{1,4})*)?`
+
+const ipv6GluedRunUnit = `(?:[0-9a-f]|` + pipelinePH + `)`
+
+// ipv6GluedRunEnd is what may follow: whitespace, closing punctuation, '/' (a prefix length, a
+// path), '%' (a zone id), a '.' followed by whitespace or nothing (a sentence's end), or the end of
+// the text. Each was admitted only after TestGluedRunMasksASupersetOfMain stayed green with it.
+const ipv6GluedRunEnd = `(?:[\s,;)\]}>"'/%]|\.(?:\s|$)|$)`
 
 // bareHostPattern is 9b's source: dotted labels, then one of suffixes.
 //
