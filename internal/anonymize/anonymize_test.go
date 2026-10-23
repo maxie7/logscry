@@ -652,15 +652,12 @@ var gluedRunRightBoundaryRows = []struct {
 	{"KNOWN_GAP #137 an underscore after the groups", "peer:::1_x", "peer<IP_1>:1_x"},
 	{"KNOWN_GAP #137 a letter after the groups", "peer:::1x", "peer<IP_1>:1x"},
 	{"KNOWN_GAP #137 a dot inside a word after the groups", "peer:::1.x", "peer<IP_1>:1.x"},
-	// RESIDUAL #49: a glued v4-mapped address. 8 masks the quad, because 7 stops at the bare "::";
-	// 7a taking ":::ffff:192" would send ".168.1.1". It needs the same right boundary after the quad.
-	{"RESIDUAL #49 glued v4-mapped", "peer:::ffff:192.168.1.1 down", "peer<IP_1>:ffff:<IP_2> down"},
 }
 
 // TestIssue134RightBoundary is the other half of #134's guard: where 7a must not fire, the output
 // is v0.12.23's, byte for byte.
 func TestIssue134RightBoundary(t *testing.T) {
-	ref := referenceDetectors(t, baseDetectors)
+	ref := referenceDetectors(t, baseDetectors, refV01223)
 	for _, c := range gluedRunRightBoundaryRows {
 		t.Run(c.name, func(t *testing.T) {
 			got := mustMask(t, New(), c.in)
@@ -669,6 +666,51 @@ func TestIssue134RightBoundary(t *testing.T) {
 			}
 			if old := mustMask(t, mapperOn(ref), c.in); got != old {
 				t.Errorf("differs from v0.12.23:\n in:   %q\n got:  %q\n then: %q", c.in, got, old)
+			}
+		})
+	}
+}
+
+// dottedQuadRightBoundaryRows are lines on which neither rule 7b nor 7a's dotted-quad alternative
+// (#49) may fire, with their exact output, which is v0.12.24's. TestIssue49RightBoundary asserts both
+// the string and that it equals the v0.12.24 chain's.
+var dottedQuadRightBoundaryRows = []struct {
+	name, in, want string
+}{
+	// Not an address: the quad is detector 8's ipv4Pattern, so an octet out of range, a leading zero,
+	// three octets or five are no dotted quad, and what main does with them stands. On five, 8 masks
+	// the last four, which a quad ending after the fourth would cut.
+	{"an octet out of range", "peer ::ffff:10.0.0.256 down", "peer <IP_1>.0.0.256 down"},
+	{"a leading zero", "peer ::ffff:010.0.0.5 down", "peer <IP_1>.0.0.5 down"},
+	{"three octets", "peer ::ffff:10.0.0 down", "peer <IP_1>.0.0 down"},
+	{"five octets", "peer ::ffff:10.0.0.5.6 down", "peer <IP_1>.<IP_2> down"},
+	// A value a later rule reads through the character after the quad: a private name (9b), and an
+	// address glued on by ':' (7's next match).
+	{"a private name after the quad", "peer ::ffff:10.0.0.5.corp.internal down", "peer <IP_1>.<HOST_1> down"},
+	{"an address after the quad", "peer ::ffff:10.0.0.5:ab::1 down", "peer <IP_1>.0.0.<IP_2> down"},
+	// KNOWN_GAP #137: the right-boundary remainder of 7a and 7b alike. Each follower can continue a
+	// value a later rule reads, so neither rule fires, and the octets go as they always did. Pinned,
+	// leak included, so closing them shows up here as a diff.
+	{"KNOWN_GAP #137 a dotted name after the quad", "peer ::ffff:10.0.0.5.example down", "peer <IP_1>.0.0.5.example down"},
+	{"KNOWN_GAP #137 a hyphen after the quad", "peer ::ffff:10.0.0.5-x down", "peer <IP_1>.0.0.5-x down"},
+	{"KNOWN_GAP #137 a letter after the quad", "peer ::ffff:10.0.0.5x down", "peer <IP_1>.0.0.5x down"},
+	{"KNOWN_GAP #137 an underscore after the quad", "peer ::ffff:10.0.0.5_x down", "peer <IP_1>.0.0.5_x down"},
+	{"KNOWN_GAP #137 a hyphen after a glued quad", "peer:::ffff:10.0.0.5-x down", "peer<IP_1>:ffff:<HOST_1> down"},
+	{"KNOWN_GAP #137 a dotted name after a glued quad", "peer:::ffff:10.0.0.5.example down", "peer<IP_1>:ffff:<HOST_1> down"},
+}
+
+// TestIssue49RightBoundary is #49's guard on the right: where neither rule may fire, the output is
+// v0.12.24's, byte for byte.
+func TestIssue49RightBoundary(t *testing.T) {
+	ref := referenceDetectors(t, baseDetectors, refV01224)
+	for _, c := range dottedQuadRightBoundaryRows {
+		t.Run(c.name, func(t *testing.T) {
+			got := mustMask(t, New(), c.in)
+			if got != c.want {
+				t.Errorf("right boundary moved:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+			if old := mustMask(t, mapperOn(ref), c.in); got != old {
+				t.Errorf("differs from v0.12.24:\n in:   %q\n got:  %q\n then: %q", c.in, got, old)
 			}
 		})
 	}
@@ -4134,6 +4176,33 @@ var completenessRows = []completenessRow{
 	{"vendor-key/underscore-before", "token_", slackBotSecret, " used"},
 	{"vendor-key/closing-quote", `rejected "`, githubPATSecret, `" twice`},
 	{"vendor-key/sentence-dot", "key ", stripeWebhookSecret, ". Retrying"},
+	// #49: an IPv6 address whose last 32 bits are a dotted quad, every form RFC 3986's grammar allows
+	// (rule 7b, and 7a's dotted-quad alternative when glued on by ':'). The compatible form is first, so
+	// it is 7b's canonical row: its template, ::<IP>, keeps a shape 7b reads. Each row ends at a
+	// different boundary, flush.
+	{"ipv6/dotted-quad/compatible", "bind ", "::192.0.2.1", " port"},
+	{"ipv6/dotted-quad/mapped", "peer ", "::ffff:192.0.2.1", " down"},
+	{"ipv6/dotted-quad/siit", "via ", "::ffff:0:192.0.2.1", ","},
+	{"ipv6/dotted-quad/nat64", "nat ", "64:ff9b::192.0.2.1", ")"},
+	{"ipv6/dotted-quad/full", "peer ", "0:0:0:0:0:ffff:192.0.2.1", " down"},
+	{"ipv6/dotted-quad/upper-case", "peer ", "::FFFF:192.0.2.1", `"`},
+	{"ipv6/dotted-quad/bracketed-port", "peer [", "::ffff:192.0.2.1", "]:443 refused"},
+	{"ipv6/dotted-quad/prefix-length", "route ", "::ffff:0.0.0.0", "/96 dev"},
+	{"ipv6/dotted-quad/zone-id", "via ", "::ffff:192.0.2.1", "%eth0 dev"},
+	{"ipv6/dotted-quad/sentence-dot", "from ", "::ffff:192.0.2.1", ". Retrying"},
+	{"ipv6/dotted-quad/end-of-text", "from ", "::ffff:192.0.2.1", ""},
+	{"ipv6/dotted-quad/after-equals", "addr=", "::ffff:192.0.2.1", ";"},
+	{"ipv6/dotted-quad/after-underscore", "id_", "::ffff:192.0.2.1", " up"},
+	// Unbracketed, the port goes with the address (TestAcceptedOverMasking), so it is declared as part
+	// of the secret; so is the hex character of a hex-ending token, as on 7.
+	{"ipv6/dotted-quad/unbracketed-port", "peer ", "::ffff:192.0.2.1:443", " refused"},
+	{"ipv6/dotted-quad/after-hex", "sr", "c::ffff:192.0.2.1", ")"},
+	// Glued on by ':' (7a). The first is the RESIDUAL #49 row of #134's right-boundary table.
+	{"ipv6/dotted-quad/glued-mapped", "peer", ":::ffff:192.168.1.1", " down"},
+	{"ipv6/dotted-quad/glued-compatible", "peer", ":::192.0.2.1", " down"},
+	{"ipv6/dotted-quad/glued-upper-case", "PEER", ":::FFFF:192.0.2.1", "'"},
+	{"ipv6/dotted-quad/glued-port", "peer", ":::ffff:192.0.2.1:443", " refused"},
+	{"ipv6/dotted-quad/glued-after-hex", "sr", "c:::ffff:192.0.2.1", ")"},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -4403,7 +4472,7 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// after "sk_test_", where '_' would have ended a snake_case name in short pieces.
 		{"a long camelCase name after a stripe prefix is a key", "run sk" + "_test_createCustomerWithCardAndRefund ok", "run <TOKEN_1> ok"},
 	}
-	for _, c := range append(cases, gluedRunOverMaskingRows...) {
+	for _, c := range append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...) {
 		t.Run(c.name, func(t *testing.T) {
 			m := New()
 			if got := mustMask(t, m, c.in); got != c.want {
@@ -4454,6 +4523,22 @@ var gluedRunOverMaskingRows = []struct {
 	{"the colon that glues an address goes with it", "peer:::1 down", "peer<IP_1> down"},
 	{"a netstat port goes with the unspecified address", "tcp6 0 0 :::22 :::* LISTEN", "tcp6 0 0 <IP_1> <IP_2>:* LISTEN"},
 	{"a ':::' operator is one placeholder", "xs ::: ys", "xs <IP_1> ys"},
+}
+
+// dottedQuadOverMaskingRows are #49's accepted over-masking rows, at package level for the gate's
+// sake as #134's are. After a dotted quad nothing hex can follow, so an unbracketed ":443" before a
+// boundary is a port and not a group; it goes into the placeholder anyway, glued or not, because a
+// rule bounded on the right by a boundary could not fire on the line otherwise. A token ending in a
+// hex character gives it to the address, as on 7, and a prefix longer than an address is one value.
+var dottedQuadOverMaskingRows = []struct {
+	name string
+	in   string
+	want string
+}{
+	{"the port after an unbracketed dotted quad goes with it", "peer ::ffff:192.0.2.1:443 refused", "peer <IP_1> refused"},
+	{"the port after a glued dotted quad goes with it", "peer:::ffff:192.0.2.1:443 refused", "peer<IP_1> refused"},
+	{"a hex character before a dotted-quad address goes with it", "src::ffff:192.0.2.1 up", "sr<IP_1> up"},
+	{"seven groups before a quad are one value", "x 1:2:3:4:5:6:7:192.0.2.1 y", "x <IP_1> y"},
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4639,6 +4724,13 @@ var templatizedRows = []templatizedRow{
 	// #134: rule 7a reads the pipeline's placeholders after the run, so the digits the template
 	// mask turned into <NUM> do not end the value there.
 	{"ipv6/glued-colon-leading-elision", "peer\x00:::ffff:0:0\x00 down"},
+	// #49: an address ending in a dotted quad. Most forms come back from the template mask as
+	// <IP>.<NUM>.<NUM>, with no byte of the value left; these three keep a shape. The compatible form is
+	// ::<IP> and the full form with letter groups a:b:c:d:e:f:<IP>, both rule 7b's; the glued form is
+	// :::ffff:<IP>, which 7a's tail already read.
+	{"ipv6/dotted-quad/compatible", "bind \x00::192.0.2.1\x00 port"},
+	{"ipv6/dotted-quad/full-letter-groups", "peer \x00a:b:c:d:e:f:192.0.2.1\x00 down"},
+	{"ipv6/dotted-quad/glued-mapped", "peer\x00:::ffff:192.0.2.1\x00 down"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
