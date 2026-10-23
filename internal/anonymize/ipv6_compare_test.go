@@ -61,11 +61,6 @@ var ipv6MustAgree = []ipv6Row{
 	// Hex-only segments of four characters or fewer on both sides ARE an address shape. Both
 	// mask it, and no textual rule can tell it apart.
 	{"KNOWN_RESIDUAL hex-only qualified name", "dec::add failed", "<IP> failed", "<IP_1> failed"},
-	// #49: neither pattern has a v4-mapped alternative. Both stop at the first octet, which is a
-	// legal hex group, and this side SENDS the other three. When #49 adds the alternative here,
-	// the anonymizer returns <IP_1>, the relation flips, and this row has to move.
-	{"KNOWN_GAP v4-mapped stops at the first octet (#49)", "peer ::ffff:192.168.1.1 down",
-		"peer <IP>.<NUM>.<NUM> down", "peer <IP_1>.168.1.1 down"},
 }
 
 // ipv6MustDiffer are lines on which the two take different spans ON PURPOSE. Each row's name is
@@ -128,6 +123,26 @@ var ipv6MustDiffer = []ipv6Row{
 		"peer:::ffff:<NUM>:<NUM> down", "peer<IP_1> down"},
 	{"leak direction: the same after a token ending in a hex character", "src:::a:b:c lost",
 		"src:::a:b:c lost", "sr<IP_1> lost"},
+
+	// #49: an address whose last 32 bits are a dotted quad. The pipeline's pattern has no such form, so
+	// it takes the groups and the first octet, a legal hex group, and leaves the other three to <NUM>;
+	// the full form it does not take at all. Nothing of the value is left on the template (but for the
+	// full form's groups, #135's class). Here the address is rule 7b's, or 7a's when glued on by ':', and
+	// is masked whole.
+	{"leak direction: an IPv4-mapped address", "peer ::ffff:192.168.1.1 down",
+		"peer <IP>.<NUM>.<NUM> down", "peer <IP_1> down"},
+	{"leak direction: an IPv4-compatible address", "bind ::192.0.2.1 port",
+		"bind ::<IP> port", "bind <IP_1> port"},
+	{"leak direction: an SIIT address", "via ::ffff:0:192.0.2.1 dev",
+		"via <IP>.<NUM>.<NUM> dev", "via <IP_1> dev"},
+	{"leak direction: a NAT64 address", "nat 64:ff9b::192.0.2.1 up",
+		"nat <IP>.<NUM>.<NUM> up", "nat <IP_1> up"},
+	{"leak direction: a full-form address ending in a dotted quad", "peer 0:0:0:0:0:ffff:192.0.2.1 down",
+		"peer <NUM>:<NUM>:<NUM>:<NUM>:<NUM>:ffff:<IP> down", "peer <IP_1> down"},
+	{"leak direction: a bracketed IPv4-mapped address with a port", "peer [::ffff:192.0.2.1]:443 refused",
+		"peer [<IP>.<NUM>.<NUM>]:<NUM> refused", "peer [<IP_1>]:443 refused"},
+	{"leak direction: an IPv4-mapped address glued on by ':'", "peer:::ffff:192.0.2.1 down",
+		"peer:::ffff:<IP> down", "peer<IP_1> down"},
 }
 
 // TestIPv6MasksAgreeOrDifferOnPurpose is the comparison #42 asked for. It asserts each row's

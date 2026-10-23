@@ -780,11 +780,37 @@ a netstat port after the unspecified address goes with it (`:::22` → `<IP_1>`,
 also reads as `:` before `::22`), and a `:::` operator is one placeholder. **This does not close
 the class.** When anything else follows the groups, such as `-`, `_`, a letter, a dot inside a
 word, or other punctuation, the address is still sent, exactly as before. That remainder is #137,
-below. So is the glued IPv4-mapped form (`peer:::ffff:192.168.1.1`), which belongs
-to #49. The new rule was checked against the chain as v0.12.23 built it, over every hand-written
-row and 32,000 generated inputs, with and without an extra host suffix. The bytes it masks include
-every byte v0.12.23 masked, for every input. Measured over ten journald boots (58,172 lines, raw
-and templated, 232,688 records): nothing changed. None holds a `:::` run.
+below. The glued IPv4-mapped form (`peer:::ffff:192.168.1.1`) was #49's, and is masked whole since
+`v0.12.25` (next paragraph). The new rule was checked against the chain as v0.12.23 built it,
+over every hand-written row and 32,000 generated inputs, with and without an extra host suffix. The
+bytes it masks include every byte v0.12.23 masked, for every input. Measured over ten journald boots
+(58,172 lines, raw and templated, 232,688 records): nothing changed. None holds a `:::` run.
+
+**An IPv6 address ending in a dotted quad was sent in part before `v0.12.25`.** The last 32
+bits of any IPv6 address may be written as an IPv4 address, and the IPv6 rule had no such form. It
+took the groups and the first octet, which is a legal hex group, and stopped at the dot. The three
+octets left over are no IPv4 address, so no rule matched them and the fail-closed check read the
+line as clean: `peer ::ffff:10.0.0.5 down` reached the model as `peer <IP_1>.0.0.5 down`. The same
+went for `::10.0.0.5`, `::ffff:0:10.0.0.5`, `64:ff9b::10.0.0.5`, upper case and the bracketed
+`[::ffff:10.0.0.5]:443`. The full form `0:0:0:0:0:ffff:10.0.0.5` sent its groups instead, the IPv4
+rule taking the quad alone, and glued on by `:` (`peer:::ffff:10.0.0.5`) it sent `:ffff:`. v0.4.0 →
+v0.12.24, fifty tagged releases. The fix is one more rule, run just before the IPv6 rule, for every
+form RFC 3986 allows: an address with a `::` or six groups, then a dotted quad, matched only when
+the same boundary as the rule above follows. The `:::` rule takes the same right end, so the glued
+form is masked whole too. A wider IPv6 pattern was measured and not taken: ending at the quad with
+nothing after it cuts a value a later rule reads through the next character (`::ffff:10.0.0.5.6`
+would send `.6`). What it costs, pinned: an unbracketed port goes into the placeholder
+(`::ffff:10.0.0.5:443` → `<IP_1>`; after a dotted quad no hex group can follow, so it is not
+ambiguous, and it is lost all the same), the hex character of a token written straight before the
+address goes with it, as for every IPv6 address, and a prefix longer than an address is one value.
+When `-`, `_`, a letter, a dot inside a word or other punctuation follows the quad, the address is
+sent as before: that is #137, below. On the Template field most of these forms arrive as
+`<IP>.<NUM>.<NUM>` with nothing of the value left; the full form keeps its groups there, which is
+#135. Checked against the chain as `v0.12.24` built it, over every hand-written row, the dotted-quad
+probes, prefixes of six to twelve groups and 1,000 generated lines, each raw and templatized,
+with and without an extra host suffix: the bytes it masks include every byte `v0.12.24` masked,
+for every input. Measured over the same ten journald boots: nothing changed. None holds an
+address ending in a dotted quad.
 
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
@@ -819,8 +845,6 @@ Each time the audit's own count was right and its scope was narrower than the se
   pre-pass identifying the authority first; what closed it is a rule more specific than the
   address rule on exactly the span they share, an address joined to hostname labels, which no
   ordering argument rules out.
-- **#49** — an IPv4-mapped IPv6 address masks only as far as its first octet:
-  `::ffff:192.168.1.1` sends `.168.1.1`.
 - **#116** — AWS secret access keys, Twilio (`SK…`, `AC…`), SendGrid (`SG.…`), npm (`npm_…`),
   GitLab (`glpat-…`), Hugging Face (`hf_…`), Shopify (`shpat_…`) and PyPI (`pypi-…`) tokens match
   no detector and are sent whole on the raw line; on the template only their digits are lost. In a
@@ -828,16 +852,20 @@ Each time the audit's own count was right and its scope was narrower than the se
   sent. And a Slack user token (`xoxp-…`) with a word character glued right after it is masked on
   the raw line but sends its secret segment's letters on the template. Not affected: the Stripe,
   GitHub, Slack and Google formats #114 covers, in every other placement.
-- **#137** — an IPv6 address that begins with `::` and is glued to the token before it by
-  `:` is still sent when something other than a boundary follows it: `peer:::ffff:0:0-y` sends
-  `ffff:0:0-y`. The same goes for `_`, a letter, a dot inside a word, and other punctuation. This
-  is the rest of the class `v0.12.24` masks only up to a space, closing punctuation, `/`, `%`,
-  a sentence dot or the end of the line. Not affected: the same address followed by one of those,
-  or after a space, a bracket, `=` or `,`.
+- **#137** — an IPv6 address that the two boundary-bounded rules own is still sent when something
+  other than a boundary follows it. Glued to the token before it by `:`, an address that begins with
+  `::` goes in part: `peer:::ffff:0:0-y` sends `ffff:0:0-y`. An address ending in a dotted quad goes
+  in part glued or not: `peer ::ffff:10.0.0.5-x` sends `.0.0.5-x`, and `::ffff:10.0.0.5.example`
+  sends `.0.0.5.example`. The same goes for `_`, a letter, a dot inside a word, and other
+  punctuation. This is the rest of the classes `v0.12.24` and `v0.12.25` mask only up to a
+  space, closing punctuation, `/`, `%`, a sentence dot or the end of the line. Not affected: the
+  same addresses followed by one of those, and every other IPv6 address.
 - **#135** — on the template, an IPv6 address the template mask leaves uncollapsed sends its hex
-  letters: `peer:2001:db8::1` sends `db`, and `route fe80::/64` sends `fe`. Not affected: the raw
-  line, where these shapes are masked whole, and every address the template mask collapses to
-  `<IP>`.
+  letters: `peer:2001:db8::1` sends `db`, and `route fe80::/64` sends `fe`. So does the full form of
+  an address ending in a dotted quad, whose groups the template mask leaves beside an `<IP>`
+  (`2001:db8:1:2:3:4:10.0.0.5` sends `db`; `0:0:0:0:0:ffff:10.0.0.5` sends `ffff`). Not
+  affected: the raw line, where these shapes are masked whole, and every address the template mask
+  collapses to `<IP>`.
 - ~~**#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
   pre-masked template.~~ **Closed in `v0.12.8`.** See the paragraph above. `s3://…@bucket`
   sent `bucket`. It was not an interference defect but a tolerance gap left over from #43, listed
@@ -1140,12 +1168,14 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   shapes in full on the raw trigger and context lines — it must, because there under-masking is
   disclosure rather than fragmentation. On the Template field it does not: by the time the
   anonymizer reads it, the pipeline has turned these shapes' digits into `<NUM>`, and the hex
-  letters left behind are sent (#135). It does **not** mask an IPv4-mapped address in full: `::ffff:192.168.1.1` masks
-  as far as `::ffff:192`, which is a legal hex group, and the remaining three octets are sent.
-  That is a gap in the anonymizer's own pattern (#49), filed rather than fixed here because the
-  fix belongs to the same constant #42 is about. The two IPv6 patterns stay two on purpose (#42),
-  because each fails in the other's cheap direction; `internal/anonymize/ipv6_compare_test.go`
-  runs both over one table and names every place they differ.
+  letters left behind are sent (#135). An address ending in a dotted quad (`::ffff:192.168.1.1`)
+  is masked whole on the raw lines since `v0.12.25`, by a rule of its own beside the
+  anonymizer's IPv6 pattern rather than inside it; until then it was masked only as far as
+  `::ffff:192` and the remaining three octets were sent. On the Template field it arrives as
+  `<IP>.<NUM>.<NUM>`, with nothing of the value left. The two IPv6 patterns stay two on purpose
+  (#42), because each fails in the other's cheap direction;
+  `internal/anonymize/ipv6_compare_test.go` runs both over one table and names every place they
+  differ.
 - **With `--llm-anonymize`, a C++ scope operator is redacted as an IPv6 address.**
   `CDBusNMHelper::GetDNSConfig failed` reaches the model as
   `CDBusNMHelper<IP_1>GetDNSConfig failed`. Where the name has hex letters next to the `::`, the
@@ -1158,21 +1188,26 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   written the same way, and would send it. The template mask refuses these shapes, because there
   an over-match corrupts the card; here an under-match is disclosure. Decided in #42.
 - **#137 — with `--llm-anonymize`, an address that begins with `::` and is glued to the
-  token before it by `:` is still sent when a word character or other punctuation follows it.**
+  token before it by `:`, or that ends in a dotted quad, is still sent when a word character or
+  other punctuation follows it.**
   `peer:::ffff:0:0-y down` reaches the model as `peer<IP_1>:ffff:0:0-y down`, which sends the
   whole address. A match ending in `::` starts one colon early and takes the first colon of the
   address's own `::`, and what is left is a shape no rule matches, so the re-scan reads it as
   clean. Since v0.4.0. `v0.12.24` masks the address whole when a boundary follows it: a space,
   closing punctuation, `/`, `%`, a sentence dot, or the end of the line. It does not mask it when
   `-`, `_`, a letter, a dot inside a word, or other punctuation follows, because each of those can
-  continue a value a later rule owns (a hostname, a key, a field separator). The glued
-  IPv4-mapped form (`peer:::ffff:192.168.1.1`) is #49's. Affected: a `::`-led address written
-  straight after a `:` and followed by one of those characters. Not affected: every address that
-  does not begin with `::`, and the same address after a space, a bracket, `=` or `,`.
+  continue a value a later rule owns (a hostname, a key, a field separator). `v0.12.25` masks an
+  address ending in a dotted quad whole on the same terms, glued or not, so it stops at the same
+  characters: `peer ::ffff:10.0.0.5-x down` reaches the model as `peer <IP_1>.0.0.5-x down`, and
+  a fifth octet, a dotted name or an address glued on by `:` after the quad leave it to the rules as
+  they were. Affected: a `::`-led address written straight after a `:`, or an address ending in a
+  dotted quad, followed by one of those characters. Not affected: every other address, and the same
+  addresses followed by a boundary.
 - **#135 — with `--llm-anonymize`, the Template field sends the hex letters of an IPv6 address the
   template mask fragments.** The three shapes the template mask leaves uncollapsed (a one-group
-  prefix, the bare loopback, an address glued onto the token before it) reach the anonymizer with
-  their digits already `<NUM>`, and it cannot recognise an address in what is left:
+  prefix, the bare loopback, an address glued onto the token before it), and the full form of an
+  address ending in a dotted quad, reach the anonymizer with their digits already `<NUM>`, and it
+  cannot recognise an address in what is left:
   `peer:2001:db8::1` is sent as `peer:<NUM>:db<NUM><IP_1><NUM>` (sending `db`), and
   `route fe80::/64` as `route fe<NUM><IP_1>/<NUM>` (sending `fe`). Since v0.8.5. Affected: the
   Template field only. Not affected: the raw trigger and context lines, where all three shapes are

@@ -505,7 +505,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all twenty-eight rather than to the one detector known to need it, because
+// It is applied to all twenty-nine rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -804,7 +804,9 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     a later rule reads, or starts one outside the group (a home path's "/home/"). A '-', '_',
 		//     a letter or any other '.' could each CONTINUE such a value -- an IPv4 address, a host, a
 		//     URL scheme, a key -- and masking the groups would cut it: on peer:::ffff:192.168.1.1, 8
-		//     masks the quad today, and taking "192" would send ".168.1.1". So 7a may mask more than 7,
+		//     masked the quad, and taking "192" would have sent ".168.1.1". Since #49 the groups may end
+		//     in a dotted quad (ipv6DottedQuadTail, shared with 7b), so that address is one value, up to
+		//     the same boundary. So 7a may mask more than 7,
 		//     never cut what another rule would have masked; that is asserted over a corpus in
 		//     TestGluedRunMasksASupersetOfMain, not only argued here. Those neighbours stay 7's, and
 		//     what 7 sends beside them is the rest of #134's class.
@@ -819,6 +821,46 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//
 		//     verify:true, as 7. Its group excludes our '<' and '>', so the mapping cannot nest.
 		{tagIP, mustLongest(ipv6GluedRunPattern), 1, true, false},
+		// 7b. An address whose last 32 bits are a dotted quad (#49). It runs HERE, after 7a and directly
+		//     before 7, and the number is 7a's convention: it is 7's rule, for one shape.
+		//
+		//     Until #49, 7 sent it. RFC 3986 lets the last 32 bits of any IPv6 form be written as an IPv4
+		//     address -- ::ffff:10.0.0.5, ::10.0.0.5, ::ffff:0:10.0.0.5, 64:ff9b::10.0.0.5,
+		//     0:0:0:0:0:ffff:10.0.0.5 -- and 7 has no such form. It took the groups and the first octet,
+		//     a legal hex group, and stopped at the dot; 8 cannot read three octets, so
+		//     "peer ::ffff:10.0.0.5 down" was sent as "peer <IP_1>.0.0.5 down" and residue() read it as
+		//     clean: #41's blindness. The full form lost its groups instead, to 8 taking the quad alone.
+		//
+		//     THIS IS NOT A REORDERING, and the left end is why. The groups before the "::" are 7's own,
+		//     unbounded in count as 7a's are, so 7b starts where 7 would; bounded to the RFC's counts it
+		//     would start later than 7 on a longer prefix and send what 7 masks. The full form wants six
+		//     groups or more, so a quad after a word and one colon ("src:10.0.0.5") stays 8's. The groups
+		//     are raw hex only, so on the Template field too 7b starts where 7 does.
+		//
+		//     THE RIGHT END IS BOUNDED, by 7a's boundary and for 7a's reason. Placed inside 7 the forms
+		//     would end at the quad wherever it stopped, and the character after it can continue a value
+		//     a later rule reads: on "::ffff:10.0.0.5.6", 7 then 8 mask "::ffff:10" and "0.0.5.6", and
+		//     ending at the quad sends ".6"; a private name or an address glued on by ':' would lose
+		//     the character that joins it. With the boundary, 7b matches only where a character no later
+		//     value contains follows, and everywhere else 7 and the rest run as before. That is asserted
+		//     against v0.12.24 in TestDottedQuadMasksASupersetOfV01224. What it leaves -- a '-', '_', a
+		//     letter or a dot inside a word after the quad -- is #137's, as for 7a.
+		//
+		//     7a TAKES THE SAME RIGHT END, through ipv6DottedQuadTail, and must. On a glued address 7a
+		//     declines, 7b starts one colon later and the gluing colon is sent, which 7's bare "::" masks.
+		//     So 7b runs after 7a, and the two cannot disagree about where an address ends.
+		//
+		//     WHAT IT COSTS is pinned in TestAcceptedOverMasking: an unbracketed port after the quad goes
+		//     into the placeholder, because ':' is not a boundary and the rule could not fire otherwise
+		//     (after a dotted quad nothing hex can follow, so the port is not ambiguous; it is lost all the
+		//     same); the hex character of a hex-ending token goes with the address, as on 7; and a prefix
+		//     longer than an address is one value with the quad. On the Template field most of these forms
+		//     arrive as <IP>.<NUM>.<NUM>, with nothing of the value left, which this rule does not read:
+		//     reading it would cut a name 9d masks there (db.<IP>.<NUM>.<NUM>).
+		//
+		//     verify:true, as 7. Its group admits the pipeline's <IP> and none of our tags, so the mapping
+		//     cannot nest.
+		{tagIP, mustLongest(ipv6DottedQuadPattern), 1, true, false},
 		// 7. IPv6 — before host and IPv4. The alternatives cover the :: elisions; forms
 		//    without "::" and fewer than eight groups (times, MACs) do not match.
 		{tagIP, mustLongest(ipv6Pattern), 0, true, false},
@@ -1602,6 +1644,11 @@ func mangled(class string) string {
 // A run of three colons is rule 7a's first (#134, ipv6GluedRunPattern). This pattern's bare "::"
 // and "c::" end one colon into such a run, and the address after it was sent.
 //
+// An address ending in a dotted quad is rule 7b's (#49, ipv6DottedQuadPattern), not an alternative
+// here. A match of this pattern ends wherever its alternative does, with no context after it, and a
+// dotted-quad form ending at the quad would cut a value a later rule reads through the next character
+// ("::ffff:10.0.0.5.6", where 8 masks the last four octets after this pattern stops at "10").
+//
 // internal/anonymize/ipv6_compare_test.go runs both patterns over one table and names each
 // difference, so a change here that moves a row fails there.
 const ipv6Pattern = `(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}` +
@@ -1616,8 +1663,9 @@ const ipv6Pattern = `(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}` +
 
 // ipv6GluedRunPattern is 7a's source (#134): a "::"-led address glued on by ':', as far as a
 // boundary. The group is the run and the groups around it; the boundary after it is context.
-// See the chain entry for why each part is what it is.
-const ipv6GluedRunPattern = `(?i)(` + ipv6GluedRunLead + ipv6GluedRunTail + `)` + ipv6GluedRunEnd
+// Since #49 the groups after the run may end in a dotted quad (ipv6DottedQuadTail), which is 7b's
+// right end too. See the chain entry for why each part is what it is.
+const ipv6GluedRunPattern = `(?i)(` + ipv6GluedRunLead + `(?:` + ipv6GluedRunTail + `|` + ipv6DottedQuadTail + `))` + ipv6GluedRunEnd
 
 // ipv6GluedRunLead is the groups before the run, 7's own, then the run of three colons or more.
 const ipv6GluedRunLead = `(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?:{3,}`
@@ -1632,6 +1680,20 @@ const ipv6GluedRunUnit = `(?:[0-9a-f]|` + pipelinePH + `)`
 // path), '%' (a zone id), a '.' followed by whitespace or nothing (a sentence's end), or the end of
 // the text. Each was admitted only after TestGluedRunMasksASupersetOfMain stayed green with it.
 const ipv6GluedRunEnd = `(?:[\s,;)\]}>"'/%]|\.(?:\s|$)|$)`
+
+// ipv6DottedQuadPattern is 7b's source (#49): an IPv6 address whose last 32 bits are written as a
+// dotted quad, as far as a boundary. The group is the address; the boundary after it is 7a's, and
+// context. The first alternative carries a "::", the second is the full form, six groups or more.
+const ipv6DottedQuadPattern = `(?i)(` +
+	`(?:(?:[0-9a-f]{1,4}:)*[0-9a-f]{1,4})?::` + ipv6DottedQuadTail +
+	`|(?:[0-9a-f]{1,4}:){6}` + ipv6DottedQuadTail +
+	`)` + ipv6GluedRunEnd
+
+// ipv6DottedQuadTail is the right end both 7a and 7b take before the boundary: hex groups, each
+// followed by ':', then the quad -- detector 8's ipv4Pattern, or the pipeline's <IP> on the Template
+// field -- and an optional port. It is ONE const because 7a must take every glued address 7b would
+// take one colon later; see 7b.
+const ipv6DottedQuadTail = `(?:[0-9a-f]{1,4}:)*(?:` + ipv4Pattern + `|<IP>)(?::[0-9]{1,5})?`
 
 // bareHostPattern is 9b's source: dotted labels, then one of suffixes.
 //

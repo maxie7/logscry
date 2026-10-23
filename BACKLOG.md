@@ -4759,6 +4759,190 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.24
 
+- [x] **An IPv6 address ending in a dotted quad is masked whole up to a boundary** — #49, found
+      in #46's interference audit. **Since v0.4.0 (2da31be), 50 tags.**
+
+      **Cause.** RFC 3986 lets the last 32 bits of any IPv6 address (`ls32`) be written as an
+      IPv4 address, and detector 7 has no such form. Leftmost-longest takes the groups and the
+      first octet, which is a legal hex group, and stops at the dot. The three octets left over
+      are no IPv4 address, so detector 8 does not read them, and `residue()` reads the line as
+      clean (#41's blindness). On v0.12.24:
+      - `peer ::ffff:10.0.0.5 down` sent `.0.0.5`, as did the compatible (`::Q`), SIIT
+        (`::ffff:0:Q`) and NAT64 (`64:ff9b::Q`) forms, upper case, `[…]:443`, and a glued
+        NAT64 (`peer:64:ff9b::Q`);
+      - the full form `0:0:0:0:0:ffff:Q` sent its groups instead: 7 does not match it, and 8
+        takes the quad alone;
+      - glued on by `:` (`peer:::ffff:Q`), 7a's tail took `ffff:10` but could not reach END, so
+        7 masked the run's bare `::` and `:ffff:` was sent.
+
+      **The rule: 7b, a new chain entry between 7a and 7.** The rest of the chain order is
+      unchanged, and `ipv6Pattern` is byte-identical to v0.12.24's.
+      ```
+      7b   := (?i) ( (h{1,4} (":" h{1,4})*)? "::" quad      raw hex only
+                   | (h{1,4} ":"){6}           quad ) END   END is 7a's, context
+      quad := (h{1,4} ":")* ( ipv4Pattern | "<IP>" ) (":" [0-9]{1,5})?
+      7a   := (?i) ( lead ( tail | quad ) ) END             one alternative added
+      ```
+      - **Not inside 7, and measured.** 7's group 0 has no right context. The family in
+        `ipv6Pattern` ends at the quad whatever follows, so it cuts a value a later rule reads
+        through the next character: `::ffff:10.0.0.5.6` sends `.6` (v0.12.24 sent `.`), and a
+        `.corp.internal` or `:ab::1` after the quad each send one more punctuation byte. Mutant
+        (f) below turns the gate red on exactly those.
+      - **The right end is bounded, by 7a's END.** 7b matches only an address ending in a
+        dotted quad AND followed by a character no later value contains. Everywhere else 7 and
+        the rest run exactly as on v0.12.24, which is the whole safety argument.
+      - **The left end is 7's.** Counts are unbounded, as in 7a's `lead`: bounded to the RFC's,
+        `1:2:3:4:5:6::ffff:Q ` would start at `4` and send `1:2:3:`, which v0.12.24 masks. The
+        no-`::` branch needs six groups, so `src:10.0.0.5` and `id:10.0.0.5` are left alone. The
+        groups are raw hex only, so on the template 7b starts where 7 does.
+      - **The whole span wins because of END, not alternation.** 7b can end only before END. In
+        7a, `tail` cannot reach END on `ffff:192.168.1.1` (a `.` before a digit is not END), so
+        only `quad` can. The Longest-off mutant on 7b alone turns nothing red.
+      - **The shared const is load-bearing.** If 7a declined a glued form that 7b took one
+        colon later, the gluing colon would be sent; v0.12.24 masks it inside its bare `::`.
+        Mutant (c) shows it.
+      - **The octet grammar is detector 8's** `ipv4Pattern`: 0–255, no leading zeros, one
+        definition for 7b, 8 and 9d. Outside it the quad is no address, END fails and
+        v0.12.24's output stands (`::ffff:10.0.0.256`, `010.`, three or five octets).
+      - verify:true, as for 7 and 7a. The group admits only the pipeline's `<IP>`, never a
+        `_`, so the mapping cannot nest.
+
+      **What it costs, pinned in `TestAcceptedOverMasking`:**
+      - an unbracketed port goes into the placeholder (`::ffff:10.0.0.5:443` → `<IP_1>`, glued
+        too). After a dotted `ls32` no hex group can follow, so `:digits` is a port. Leaving it
+        as context would make 7b read the pipeline's `<IP>.<NUM>.<NUM>`, and reading that sends
+        `db.` on `db.<IP>.<NUM>.<NUM>`, which 9d masks on v0.12.24. Bracketed, `]` is END and
+        `[<IP_1>]:443` keeps it;
+      - the hex character of a token written straight before the address goes with it
+        (`src::ffff:Q` → `sr<IP_1>`), as for every IPv6 address;
+      - a prefix longer than an address is one value (`1:2:3:4:5:6:7:Q` → `<IP_1>`).
+
+      **What it does not reach: #137, now the right-boundary remainder of both 7a and 7b.**
+      Followed by `-`, `_`, a letter or a dot inside a word, glued or not, the address is sent
+      as on v0.12.24: `peer ::ffff:10.0.0.5-x down` sends `.0.0.5-x`, `.example` sends
+      `.0.0.5.example`, and glued `-x` or `.corp.internal` leave `:ffff:` and the host to the
+      rules as they were. Pinned as `KNOWN_GAP #137` rows in `dottedQuadRightBoundaryRows`,
+      each equal to the v0.12.24 chain. `:ab::1` and `.corp.internal` after an unglued quad are
+      handled exactly as on v0.12.24.
+
+      **On the Template field** the "::" forms arrive as `<IP>.<NUM>.<NUM>`, with no value
+      byte left. Compatible arrives as `::<IP>` and 7b reads it (the canonical templatized row).
+      The full form with digit groups arrives as `<NUM>:…:ffff:<IP>`, and `ffff` and any hex
+      letters are sent, on v0.12.24 too: #135's class, named and not taken here.
+      `TestEveryUncollapsedDetectorHasATemplatizedRow` stays green unedited.
+
+      **The superset gate, against v0.12.24.** `TestDottedQuadMasksASupersetOfV01224` runs
+      `baseDetectors` and `buildDetectors({"lab"})` against the chains as v0.12.24 built them:
+      7b dropped, and 7a and 7 on frozen literal copies, `ipv6GluedRunPatternAtV01224` and
+      `ipv6PatternAtV01224` (both checked against `git show v0.12.24` in a scratch archive;
+      `TestDetector7UnchangedAtV01224` asserts that 7 is the same in both releases).
+      `referenceDetectors` now takes a release, so #134's v0.12.23 gate shares the body
+      (`assertMasksASuperset`). Three claims, as #134's:
+      - the bytes masked now include every byte v0.12.24 masked;
+      - an input v0.12.24 masked is not refused now;
+      - an input with no `:` before a dotted quad and no `:<IP>` comes back byte for byte.
+        #134's gate excludes those inputs too, besides `:::`. That clause is edited because
+        it has to be.
+
+      Corpus: everything #134's gate ran, plus:
+      - the new completeness, templatized, table, over-mask and right-boundary rows;
+      - 23 probes, each END character and port next to a value a later rule reads;
+      - `dottedQuadGroupCountProbes`: 6, 7, 8, 9 and 12 groups before a quad, with and without
+        `::`, after `peer `, `peer:` and a hex-ending word;
+      - a seeded generator (PCG 49) of 1,000 lines: colon runs 1–3, hex groups 0–8, valid,
+        out-of-range, leading-zero, three- and five-octet quads, ports, names, letters, END
+        characters.
+
+      Everything runs raw and templatized: 4,726 inputs per mapper.
+
+      **Predictions, then results.**
+      - `go test -race ./...`: 2,299 passing and 1 skipped on main, **held**. The branch:
+        predicted 2,354 and 1 (57 new tests, 2 removed rows), **held**.
+      - Red commit on v0.12.24: predicted 37 red subtests (20 completeness, 2 templatized and
+        their 4 logfmt forms, 7 table rows, 4 over-mask rows). **Held.**
+      - v0.12.24 gate: 0 less and 0 refused, both mappers, **held**. Strictly more: predicted
+        "exactly the inputs on which 7b or 7a's quad alternative fires", counted at 132.
+        Measured **113**, **missed**: 19 of the 132 are templated `:::…:<IP>` inputs that 7a's
+        old tail already read whole. I ran this count before writing the number down. The
+        v0.12.23 gate: 0 less, 381 strictly more.
+      - Group-count probes, raw, each predicted by hand. **Held, all ten.** v0.12.24 sent:
+
+        | prefix before `10.0.0.5` | v0.12.24 sent |
+        |---|---|
+        | `1:2:3:4:5:6:` | `1:2:3:4:5:6:` |
+        | `1:2:3:4:5:6:7:` | `.0.0.5` |
+        | `1:2:3:4:5:6:7:8:` | `:` |
+        | `1:2::3:4:5:6:` | `.0.0.5` |
+        | `1:2:3::4:5:6:7:` | `:` |
+        | `1:2:3:4::5:6:7:8:` | `:8:` |
+        | `::1:2:3:4:5:6:` | `.0.0.5` |
+        | `1:2:3:4:5:6:7:8:9:` | `:9:` |
+        | `1:2:3:4:5:6:7:8:9:a:b:c:` | `:9:a:b:c:` |
+        | `1:2:3:4:5:6:7:8::9:` | `.0.0.5` |
+
+        The branch sends nothing on any of them (`<IP_1>` whole; `sr<IP_1>` after a hex-ending
+        word). Templated, every one equals v0.12.24. `peer:` before `::1:2:…` makes a glued
+        run: v0.12.24 sent `:1:2:3:4:5:6:`, the branch nothing.
+      - Captures differential, the ten boots, raw and `TemplatizeLine`, `New()` and
+        `New("lab")`. The harness's filter read `Source`, which does not carry the `ab37*`
+        identifier, so it ran 63,016 lines, not #134's 58,172 (a superset: the 4,844 extra are
+        the entries #134 filtered). I predicted 58,172: **missed**. A count-only scan of the
+        journal holds 0 messages with an `ls32`-shaped address, or a `:` before a dotted quad, in
+        either slice. I predicted that last count non-zero: **missed**. Then predicted 0
+        changed, 0 less, 0 more and 0 errors of 252,064 records. **Held**, in each of the four
+        cells. Template hashes: 0 of 63,016 moved. Residue, clean on v0.12.24 and refused on
+        the branch: 0, on the corpus and the captures.
+      - Wire check. Each binary ran against a capturing endpoint (`--plain --llm-anonymize
+        --warmup-lines 0 --rate-limit 100000 --cache-ttl 1s`) on 15 `[FATAL]` lines, with #59's
+        `postgres://user:p/ss@db` before them.
+        - main sent octets for mapped, compatible, SIIT, NAT64, upper case and bracketed:
+          **held**. It also sent them for the glued NAT64 form, which I did not predict.
+        - main sent the full form's `0:0:0:0:0:ffff:` but no octet, and for the glued forms
+          `:ffff:`, `:ffff:0:`, `:FFFF:` and `:443`, no octet: **held**.
+        - the branch sent 0 octets and 0 address bytes on the Message field, **held**. The
+          only prefix left is on the Template field of the full form, `…:<NUM>:ffff:<IP>`, the
+          same on main: #135.
+        - `p/ss` was sent in 15 of 15 requests on both.
+      - `-race -count=20` on the new tests: green (2,265 s). The first run hit `go test`'s
+        default 10-minute timeout, not an assertion, and was re-run with `-timeout 90m`.
+
+      **Mutants, and what each turned red:**
+      - **(a) 7b removed.** 30 red, every unglued row; the gate stays green. **Held.**
+      - **(b) the quad loosened to `[0-9]{1,3}`.** 2 red, the out-of-range and leading-zero
+        rows. **Held.**
+      - **(c) 7a's quad alternative removed.** 11 red, the glued rows and both gates, which
+        catch the gluing colon. **Held.**
+      - **(d) `Longest()` off in `mustLongest`.** 69 red. Predicted #134's 68 and none of
+        #49's: **missed** by one,
+        `TestIssue49RightBoundary/an_address_after_the_quad`, whose expected output is 7's
+        work after the quad.
+      - **(e) `Longest()` off on 7b only.** 0 red, **held**.
+      - **(f) the family inside `ipv6Pattern` instead of 7b.** 11 red: the gate (21 byte
+        errors, the `.6`, `.corp.internal` and `:ab::1` cases) and 7 right-boundary rows.
+        **Held.** Placement is what makes it safe.
+      - **(g) 7b before 7a.** 14 red, the glued rows and the gates. **Held.**
+      - **(h) 7b after 7.** 25 red, the unglued rows; 7 takes `::ffff:10` first. Not
+        predicted as a number.
+      - **(i) the port dropped from the group.** 4 red, the port rows. **Held.**
+      - **(j) END removed from 7b.** 13 red, the gates and 9 right-boundary rows. **Held.**
+
+      **Tests.**
+      - **Red on v0.12.24:** the 37 above.
+      - **Passing on both:** `TestIssue49RightBoundary`, `TestDetector7UnchangedAtV01224`, and
+        the gate (trivially on v0.12.24).
+      - **Existing tests changed:**
+        - the RESIDUAL #49 row left `gluedRunRightBoundaryRows` and is a completeness row now;
+        - the KNOWN_GAP v4-mapped row left `ipv6MustAgree` and is a leak-direction row in
+          `ipv6MustDiffer`;
+        - `TestAcceptedOverMasking` also runs `dottedQuadOverMaskingRows`;
+        - `TestIssue134RightBoundary` names its release in the `referenceDetectors` call.
+        No existing row was moved or re-indented.
+
+      **Seen and left alone, out of scope:** #137, #135, #59, #65, #116, #36, the C++
+      over-redaction, the detector order, every other detector, `internal/pipeline`.
+
+      Targets v0.12.25
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
@@ -5550,7 +5734,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 8 → 9b | `worker-10.0.0.5.corp.internal` | `worker-` | **DEFECT** (#54), **FIXED**. New in the #48 sweep; not in the original table |
       | 1/2/3b → 4, 4b, 4c | `s3://AKIA…EXAMPLE.prod:secret@bucket` | `.prod` | **DEFECT** (#57), **FIXED**. A key inside a half, not a half: a rule run before the key detectors |
       | 1/2/3b → 9a, 9c | `mongodb://h1,AKIA…EXAMPLE.prod,host3/db` | `.prod`, `host3` | **DEFECT** (#57), **FIXED**, the same way; a bare private-suffix host is a pinned residual |
-      | 7 → 8 | `::ffff:192.168.1.1` | `.168.1.1` | **DEFECT, filed #49** |
+      | 7 → 8 | `::ffff:192.168.1.1` | `.168.1.1` | **DEFECT** (#49), **FIXED**, by a rule run before 7 (7b) that masks the whole address up to a boundary, not by an order. A quad followed by something other than a boundary is #137's |
       **Detector 10 has no defects at all**, and that is a computed result rather than an
       untested area: every interferer that can reach a `/home/` username masks it entirely.
       **Detector 5's blockers are all theoretical** — it is the composite with the most paths
