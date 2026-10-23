@@ -781,12 +781,12 @@ also reads as `:` before `::22`), and a `:::` operator is one placeholder. **Thi
 the class.** When anything else follows the groups, such as `-`, `_`, a letter, a dot inside a
 word, or other punctuation, the address is still sent, exactly as before. That remainder is #137,
 below. The glued IPv4-mapped form (`peer:::ffff:192.168.1.1`) was #49's, and is masked whole since
-`TODO-VERSION` (next paragraph). The new rule was checked against the chain as v0.12.23 built it,
+`v0.12.25` (next paragraph). The new rule was checked against the chain as v0.12.23 built it,
 over every hand-written row and 32,000 generated inputs, with and without an extra host suffix. The
 bytes it masks include every byte v0.12.23 masked, for every input. Measured over ten journald boots
 (58,172 lines, raw and templated, 232,688 records): nothing changed. None holds a `:::` run.
 
-**An IPv6 address ending in a dotted quad was sent in part before `TODO-VERSION`.** The last 32
+**An IPv6 address ending in a dotted quad was sent in part before `v0.12.25`.** The last 32
 bits of any IPv6 address may be written as an IPv4 address, and the IPv6 rule had no such form. It
 took the groups and the first octet, which is a legal hex group, and stopped at the dot. The three
 octets left over are no IPv4 address, so no rule matched them and the fail-closed check read the
@@ -857,7 +857,7 @@ Each time the audit's own count was right and its scope was narrower than the se
   `::` goes in part: `peer:::ffff:0:0-y` sends `ffff:0:0-y`. An address ending in a dotted quad goes
   in part glued or not: `peer ::ffff:10.0.0.5-x` sends `.0.0.5-x`, and `::ffff:10.0.0.5.example`
   sends `.0.0.5.example`. The same goes for `_`, a letter, a dot inside a word, and other
-  punctuation. This is the rest of the classes `v0.12.24` and `TODO-VERSION` mask only up to a
+  punctuation. This is the rest of the classes `v0.12.24` and `v0.12.25` mask only up to a
   space, closing punctuation, `/`, `%`, a sentence dot or the end of the line. Not affected: the
   same addresses followed by one of those, and every other IPv6 address.
 - **#135** — on the template, an IPv6 address the template mask leaves uncollapsed sends its hex
@@ -1169,7 +1169,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   disclosure rather than fragmentation. On the Template field it does not: by the time the
   anonymizer reads it, the pipeline has turned these shapes' digits into `<NUM>`, and the hex
   letters left behind are sent (#135). An address ending in a dotted quad (`::ffff:192.168.1.1`)
-  is masked whole on the raw lines since `TODO-VERSION`, by a rule of its own beside the
+  is masked whole on the raw lines since `v0.12.25`, by a rule of its own beside the
   anonymizer's IPv6 pattern rather than inside it; until then it was masked only as far as
   `::ffff:192` and the remaining three octets were sent. On the Template field it arrives as
   `<IP>.<NUM>.<NUM>`, with nothing of the value left. The two IPv6 patterns stay two on purpose
@@ -1196,7 +1196,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   clean. Since v0.4.0. `v0.12.24` masks the address whole when a boundary follows it: a space,
   closing punctuation, `/`, `%`, a sentence dot, or the end of the line. It does not mask it when
   `-`, `_`, a letter, a dot inside a word, or other punctuation follows, because each of those can
-  continue a value a later rule owns (a hostname, a key, a field separator). `TODO-VERSION` masks an
+  continue a value a later rule owns (a hostname, a key, a field separator). `v0.12.25` masks an
   address ending in a dotted quad whole on the same terms, glued or not, so it stops at the same
   characters: `peer ::ffff:10.0.0.5-x down` reaches the model as `peer <IP_1>.0.0.5-x down`, and
   a fifth octet, a dotted name or an address glued on by `:` after the quad leave it to the rules as
