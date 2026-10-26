@@ -4943,6 +4943,200 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.25
 
+- [x] **A raw `/` in a userinfo half is masked with its authority, whole** — #59, row 19 of the
+      #55 sweep. A credential leak. **Since v0.4.0 (2da31be), 51 tags.**
+
+      **Cause.** RFC 3986 §3.2 ends the authority at the first `/`, so every credential class
+      (4, 4b, 4c, 4d) excludes it and 9a's userinfo context stops there too. From `://` no rule
+      found the `@`, and 9a fell back to its no-userinfo branch and masked the first label-shaped
+      run as the host. On v0.12.25:
+      - `postgres://user:p/ss@db/app` sent `p/ss@db` as `postgres://<HOST_1>:p/ss@db/app`;
+      - with a '/' in the username, `us/er:pass@db` sent `/er:pass@db`;
+      - a dotted host was masked by accident by the email rule (`<HOST_1>:p/<EMAIL_1>`), and an
+        address by detector 8, which left the password;
+      - an empty username (`redis://:p/ss@redis:6379/0`) matched nothing and was sent whole;
+      - `residue()` read every one of them as clean: no rule described the shape (#55's
+        blindness).
+
+      **The remedy: (b), the authority masked whole as one TOKEN, not (a), fail closed.** The
+      issue's candidate was (a). It was measured against (b) before any code:
+      - disclosure is a tie: (b) sends 0 bytes of the authority on every recognised shape, and
+        (a) sends nothing;
+      - the shape is carried by legal URIs. Of the candidate's fires over the planning corpus,
+        168 of 168 username-branch fires and 94 of 407 password-branch fires parse with
+        `url.Parse` (a `p:8/x` password, whose last colon Go reads as a port; a `?` before the
+        `:`). Under (a) each mutes an escalation, under (b) each costs one placeholder over a
+        path. A safe (a) has to drop the username branch, which leaves `us/er:pass@db` sending
+        its password;
+      - (b) refused 0 of 30,892 corpus runs and 0 of 232,688 capture records, and can be held to
+        the per-byte superset gate below. (a) adds a failure mode by definition;
+      - "a widened class would be guessing at intent" is true of choosing a parse, and (b)
+        chooses none: the token holds the RFC's host (`user:p`) and its path as far as the
+        author's authority runs, and what follows is path, query or fragment under both.
+
+      Card, export and model for `connect postgres://user:p/ss@db/app failed`: the model gets
+      `connect postgres://<TOKEN_1>/app failed` and the request is sent; the card and the export
+      carry the restored explanation (`explanation.state: "explained"`) with real values, as for
+      any masked line. `internal/pipeline` is untouched, and no template hash moves.
+
+      **The rule: 4e, a new chain entry first, ahead of 4d.** No existing rule's source changed.
+      ```
+      4e   := "://" ( ( H* ":" NP "/" R* | H+ "/" R* ":" R* ) "@" TAIL ) END   group 1, TOKEN
+      H    := [^:/@\[\]\s<>]  | pipelinePH      before the first '/': no ':', '@' or bracket
+      NP   := U* ND U*,  U := [^/@\[\]\s<>] | pipelinePH,
+              ND := [^0-9/@\[\]\s<>] | <(TS|UUID|IP|HEX|STR)>     not a port
+      R    := [^\s<>]     | pipelinePH      the rest of the userinfo: '/', '@', ':' admitted
+      TAIL := ([^@/?#\s<>"'`] | pipelinePH)*  host[:port], inside the group
+      END  := [/?#\s>"'`] | $               context
+      ```
+      - **The shape.** Outside brackets a host carries no ':'. An authority, up to its first '/',
+        with no '@' and a ':' whose right side is not all digits (nor `<NUM>`) is no
+        `host[:port]`; with an '@' after the '/', the author meant a userinfo. The username
+        branch is a '/' before any ':', then a ':' and an '@'. That one is a legal URI, which is
+        why only (b) can afford it.
+      - **The group is the whole authority.** TAIL admits no '@', so leftmost-longest ends the
+        group at the last '@' whose host reaches END, #58's rule. TAIL stops at a quote or
+        backtick, so a quoted or JSON DSN keeps its closing quote outside, and at `?` and `#`, so
+        a query survives.
+      - **The host goes inside, and that was measured.** The variant bounded at the delimiting
+        '@', host left to 9a, sends a byte v0.12.25 masked on 303 inputs per mapper: the '@' the
+        email rule had masked by accident (`…:p/ss@db.acme.com/prod`).
+      - **First, not a reordering.** A key in either half is inside the token (#57's reasoning),
+        and 9e and 3c cannot tag part of the authority first. It is disjoint from 4d, whose group
+        excludes '/', and absent wherever no raw '/' comes before the '@', so every legal DSN
+        reaches 4, 4b, 4c, 4d and 9a exactly as on v0.12.25.
+      - verify:true, as every credential rule. Its classes exclude '<' and '>', so it cannot fire
+        on our output and the mapping cannot nest.
+
+      **What it does not reach, by design.** Each is a legal URI the text cannot tell from a host
+      and a path, and masking it means masking every URL path with an '@' in it. Pinned in
+      `slashUserinfoResidualRows`, each with its leak present and equal to v0.12.25, raw and
+      templatized, and named in README Known limitations:
+      - `user:1234/5@db`, a password that is all digits before the '/', reads as a port: sends
+        `1234/5@db`;
+      - `us/er@db`, a password-less username, reads as an email in a path: sends `/er@db`;
+      - `user:p@s/s@db`, an '@' before the '/', is a legal userinfo with an '@' in its path:
+        sends `/s@db`;
+      - `user:/ss@db`, a password that starts with '/', reads as an empty port: sends `/ss@db`.
+
+      Percent-encoded (`%2F`), all four are masked whole, by detector 4 and 9a. No new issue: the
+      ambiguity is real, as #42's is.
+
+      **What it costs, pinned in `slashUserinfoOverMaskingRows` and run by
+      `TestAcceptedOverMasking`:**
+      - `docker://quay.io/ns/img:1.2@sha256:abc123` → `docker://<TOKEN_1>`;
+      - `https://h/a:b@c`, and a '/' and an '@' in a query after a port
+        (`https://host:8080?next=/a@b`), each one token through the host;
+      - `https://web.archive.org/web/2020/https://u:p@h/x` → `https://<TOKEN_1>/x`;
+      - a later '@' with no whitespace before it extends the token, across JSON fields too
+        (`{"dsn":"postgres://u:p/ss@db","mail":"bob@corp.com"}` → `{"dsn":"postgres://<TOKEN_1>"}`),
+        as detector 4's does since #58;
+      - an unbracketed `http://2001:db8::1/x@y`, whose address goes into the token;
+      - the host carries no tag of its own, so it is not seen to recur.
+
+      **The superset gate.** `TestSlashUserinfoMasksASupersetOfV01225` runs `baseDetectors` and
+      `buildDetectors({"lab"})` against a reference built as the live chain minus exactly the one
+      entry whose pattern is `mustLongest(slashUserinfo)`'s. `withoutSlashUserinfo` fails unless
+      the reference has `len(chain)-1` entries with every other entry in the same order. No
+      frozen literal is needed, because no rule was edited. Checked once, in a scratch archive of
+      `v0.12.25`: a fingerprint of every entry's tag, pattern, group, verify and fixpoint gives
+      `29 32c29fde9ffaaacb` (default) and `29 5f54d507556813e1` (`lab`) for v0.12.25's chain and
+      for the branch's reference, identical; the branch's live chain has 30. Claims:
+      - the bytes masked now include every byte v0.12.25 masked;
+      - an input v0.12.25 masked is not refused now;
+      - an input with no `://`, then a '/', then an '@' (`://\S*/\S*@`) comes back byte for byte;
+      - the same rows and the residual rows equal the reference, raw and templatized.
+
+      Corpus: `supersetCorpus()` (#134's and #49's), every #59 row, and
+      `slashUserinfoGenerated(500)`, a PCG(59, 0) generator of schemes, userinfo halves with and
+      without ':', '/', '@', `%2F`, '?', '#', digits and a key built by concatenation, hosts
+      (bare, dotted, private, IPv4, bracketed, a list, empty), ports, paths, tails and framings
+      (quoted, `<…>`, JSON, prose, `Bearer`). Raw and templatized: 5,808 inputs per mapper, 237
+      strictly more, 0 less, 0 refused.
+
+      **Predictions, then results.** Each prediction was written into the plan before its run.
+      - Planning harness (scratchpad, overlaid with `go test -overlay`; `git status` clean before
+        and after every run):
+        - every settled, same and residual shape as predicted: **held**. "Templatized forms equal
+          their raw outputs": **missed** as worded, since the pipeline rewrites digits
+          (`redis://<TOKEN_1>/<NUM>`); the masking held on every template;
+        - the candidate against v0.12.25 over 15,446 inputs per mapper: 0 less, 0 refused, 0
+          moved, 996 strictly more = 996 fires: **held**;
+        - the username branch legal to `url.Parse` on every fire: **held**, 168 of 168. The
+          password branch on none: **missed**, 94 of 407;
+        - the ten journald boots, filtered on `SYSLOG_IDENTIFIER` for `ab37*` and
+          `logscry-probe`: 58,172 lines (as #134's), 232,688 records, 0 fires: **held**. The
+          filter dropped 4,845 entries, one more than the 4,844 #49's numbers imply.
+      - `go test -race ./...`: main 2,354 passed and 1 skipped, **held**; the branch 2,401 and 1
+        (19 + 11 + 5 + 3 new parents and subtests, 2 completeness, 1 templatized, 2 logfmt, 6
+        over-mask, 1 llm; 3 rows deleted), **held**.
+      - Red commit on v0.12.25: predicted 30 red (29 anonymize subtests and the llm test).
+        **Held.**
+      - Per-byte differential, v0.12.25 against the branch, `New()` and `New("lab")`:
+        - corpus, 21,626 records per mapper: changed = more = fires = 1,278, 0 less, 0 refused:
+          **held**;
+        - the ten boots, raw and `TemplatizeLine`: 0 in every cell, **held**;
+        - residue, clean on v0.12.25 and refused on the branch: 0, **held**.
+      - Wire check. Each binary ran against a capturing endpoint (`--plain --llm-anonymize
+        --warmup-lines 0 --rate-limit 100000 --cache-ttl 1s`) on 13 `[FATAL]` lines: the control
+        below, then twelve '/'-userinfo shapes with invented passwords and hosts (bare, dotted,
+        address, empty username, '/' in the username, in both halves, an '@' after the '/', a
+        host list, a bracketed host, a key, a '?' before the '/', a digit-ending colon).
+        - 13 requests each: **held**;
+        - main sent every predicted fragment, in its trigger and in each later context, and none
+          of the five predicted as masked by accident (a dotted host's email mask, the key):
+          **held**;
+        - the branch sent 0 of them: **held**;
+        - the control's `.0.0.5-x` was in 13 of 13 requests on both: **held**.
+      - `-race -count=20 -timeout 120m` on the new tests: green (anonymize 1,059 s, llm 1 s).
+
+      **Mutants, and what each turned red** (predicted, then measured):
+      - **(1) the non-port condition removed.** Predicted 3 (port row, R1, R5); **6**: those,
+        both gates and #61's "comma-separated urls, credential in the second" row. **Missed** as
+        a number.
+      - **(2) the bracket exclusion removed.** Predicted 2 (the two bracketed rows); **4**, with
+        both gates. **Missed.**
+      - **(3) the group bounded at the '@', host to 9a.** The gate and every closed exact row:
+        **32**, **held**.
+      - **(3b) R without '@'.** Predicted 1 (an '@' after the '/'); **4**, with JSON across fields
+        and both gates. **Missed.**
+      - **(4) R admits whitespace.** Predicted 2 (an email after a space, the whitespace-bound
+        row); **5**, with both gates and `TestURLAndConnStringHostsMaskedRegardlessOfTLD`.
+        **Missed.**
+      - **(5) 4e after 9a.** Every closed row, gate green: **28**, gate green. The empty-username
+        and verify-eligible rows stay green, so **missed** by two.
+      - **(6) the username branch removed.** Predicted 4; **7**, with the username completeness
+        row, the web.archive over-mask and the llm test. **Missed.**
+      - **(7) `Longest()` off on 4e.** 0, **held**.
+      - **(8) '?' and '#' excluded before the '/'.** 2, **held**.
+
+      Every miss is in the direction of more red: a mutant broke a row I had not attributed to it.
+      None turned a gate green that should fail.
+
+      **The new standing wire-check control: `[FATAL] peer ::ffff:10.0.0.5-x down`, fragment
+      `.0.0.5-x`.** #59's `postgres://user:p/ss@db` was the open control in every wire check since
+      v0.12.10, and it is masked now. The new one is #137's, open and named in README Known
+      limitations. Measured: v0.12.25 and the branch both send `.0.0.5-x` on the raw field. It
+      holds no `://`, so 4e cannot reach it. It stays valid until #137 is addressed, and that
+      change names the next control.
+
+      **Tests.**
+      - **Red on v0.12.25:** the 30 above: `TestIssue59SlashInUserinfo`, two completeness rows,
+        one templatized row and its two logfmt forms, six over-mask rows and
+        `TestAnonymizeSlashUserinfoOnTheWire`.
+      - **Passing on both:** `TestIssue59ShapesNotReached` and the same rows' pinned outputs.
+      - **Green commit only:** the gate and the reference comparison, since `slashUserinfo`
+        does not exist on v0.12.25.
+      - **Existing tests changed:** the three #59 open rows in `TestIssue55`, `TestIssue58` and
+        `TestIssue61` were deleted, each replaced by a comment naming 4e;
+        `TestAcceptedOverMasking` also runs `slashUserinfoOverMaskingRows`. No existing row was
+        moved or re-indented.
+
+      **Seen and left alone, out of scope:** #137, #135, #65, #116, #36, the IPv6 detectors,
+      detector 4's JSON-field absorption, every other detector, `internal/pipeline`.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
@@ -5527,7 +5721,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 15–16 | multi-colon | masked, span unchanged | only the first colon was ever structural |
       | 17 | a half recognised only in PART | `.prod` sent, residue clean | **#57, now FIXED** |
       | 18 | raw `@` in a half | the TRUE HOST sent | **FIXED (#58)** |
-      | 19 | raw `/` in a half | host and remainder sent | **OPEN — #59** |
+      | 19 | raw `/` in a half | host and remainder sent | **masked whole since `TODO-VERSION` (#59); four shapes by design** |
       | 20–22 | no scheme; unexpressible shapes | — | computed, not run |
 
       **Row 17 is not a leftover of #55 and is filed on its own terms, as #57.** An earlier detector
