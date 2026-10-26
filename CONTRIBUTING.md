@@ -35,6 +35,12 @@ go build ./...
 
 `make build`, `make test`, `make lint`, and `make fmt` wrap the common ones.
 
+Both test commands above run every test. CI differs in one place: the anonymizer's superset
+gates, pure single-goroutine tests that take minutes under the race detector, run in full in its
+coverage step and are skipped by name in its race step. A new superset gate must follow their
+name pattern, `Test…MasksASupersetOf…`, and be added to `SUPERSET_GATES` in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml); CI fails until it is.
+
 ## Commits
 
 Use [Conventional Commits](https://www.conventionalcommits.org): `feat:`, `fix:`,
