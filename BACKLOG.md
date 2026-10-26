@@ -5137,6 +5137,229 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.26
 
+- [x] **A JSON-escaped URL is masked as its unescaped form would be** — GHSA-p47p-xrhj-3x7p, a
+      private advisory. A credential leak. **Since v0.4.0 (2da31be), 52 tags.**
+
+      **Cause.** Every URL rule anchors on a literal `://` and stops at a literal `/`: 4e, 4d, 9e,
+      4, 4b, 4c, 9a and 9c. A JSON encoder that escapes `/` writes `postgres:\/\/user:pass@host\/db`:
+      PHP's `json_encode` does so by default, and so does any encoder for a string nested in
+      another (`\\/`). No rule matched. The username, the password and the host were sent, and
+      `residue()` read the line as clean, because no rule described the shape (#55's blindness).
+      Measured on v0.12.26 at the wire:
+      - `\/`, `\u002f`, `\u002F`, `\\/`, and `\u003a` with `\u0040`, in a JSON field, a JSON message,
+        JSON in JSON, logfmt and prose: user, password and host sent on the trigger, the source and
+        every later context line;
+      - a dotted or private host: only the username, because the email rule masked `pw@host` by
+        accident. An address host: the username and the password;
+      - the Template field: sent for a plain-text line, a logfmt bare value, a logfmt message
+        (re-quoted as `\\/`) and a JSON message with two levels (`\\/`). Masked for a JSON message
+        with one level, which the pipeline decodes. `<STR>` for every other JSON field and a
+        quoted value in prose.
+
+      **The remedy: (a), a view with projection, plus a union with v0.12.26's own spans.** Measured
+      against (b), unescaping the whole line, and (c), teaching each rule, before any code:
+      - (a) as stated masks LESS than v0.12.26 on three shapes, where v0.12.26 reads an escape's
+        characters as part of a value:
+        - `postgres://user:1234\/5@db`: 4e takes the `\` for the character that makes the
+          password's head no port;
+        - `postgres://us\u002fer@db`: detector 4 takes `us\u002fer` for a username;
+        - `bob\u002fx@corp.com`: the email rule takes `u002fx` for the local part.
+
+        Resolved, each is a shape that masks less (#59's residuals, a shorter local part). Hence
+        the union: both passes' spans are masked, so the result is a superset of v0.12.26 by
+        construction, and the gate checks it;
+      - (b) changes bytes outside every placeholder, cannot be held to the per-byte gate (the
+        rebuild fails by definition), makes Restore put `/` on the card where the log had `\/`,
+        and has the same three under-masks;
+      - (c) is #43/#52's every-context class multiplied: eight anchors, `/` as a boundary in more,
+        each needing `\/`, `\u002f` and the pipeline's `\u<NUM>f`, and every future rule
+        repeating it.
+
+      **How it works, `escapeview.go`.** `Mask` finds the escaped forms with one pattern; a line
+      without one goes to `maskText`, v0.12.26's body unchanged. `maskEscaped`:
+      1. runs the chain on scratch Mappers, on the line and on its view;
+      2. reads each pass's spans back from its output and mapping, and refuses if the two do not
+         rebuild the input. That is the one new refusal, and it fires only when the line carries,
+         as text, a placeholder that pass then mints;
+      3. projects the view's spans onto the line (a resolved escape is one byte of the view);
+      4. masks overlapping spans as one value. The tag is the view span's when the value is
+         exactly one, else TOKEN if any span is a TOKEN, else the widest span's;
+      5. mints in the view pass's order, so an escaped line is numbered as its unescaped form, with
+         the line's own bytes, so Restore returns the escapes;
+      6. re-scans the output and the view of the output.
+
+      No detector changed: a fingerprint of every chain entry's tag, pattern, group, verify and
+      fixpoint gives `60 entries 3ae59109…` for the v0.12.26 archive and the branch alike
+      (default and `lab`).
+
+      **Which escapes.** The view resolves `\/`, `\u002f`/`\u002F`, `\u003a`/`\u003A` and `\u0040`,
+      each after any run of backslashes, and `\u<NUM>f`/`\u<NUM>F`, the pipeline's form of
+      `\u002f`, asked of `pipeline.Templatize` as #105 does for a host suffix. `\/` is resolved
+      everywhere, not only inside a JSON string: a JSON fragment inside a plain-text or logfmt line
+      is no JSON line, and the Template field re-quotes with Go syntax. Not resolved, and named in
+      README Known limitations:
+      - `\u<NUM>a` and `\u<NUM>`, the template forms of an escaped `:` and `@`. `\u<NUM>` is also
+        the template of `\u0022`, `\u0027` and `\u0026`, which .NET writes by default. Affected:
+        the Template field of a plain-text or logfmt line;
+      - any other `\u` escape of a URL character (`\u002e`), which no known encoder writes.
+
+      Pinned in `jsonEscapeResidualRows`, each with its leak present.
+
+      **What it costs, pinned in `jsonEscapeOverMaskingRows` and run by `TestAcceptedOverMasking`:**
+      - `copy C:\/Users\/bob\/x failed` → `copy C:\/Users\/<USER_1>\/x failed`;
+      - `\u<NUM>f` stands for other code points with three leading digits and an `f` too (`п`, `я`
+        in Python's ASCII-only JSON): read as `/`, so over-mask only. 0 in the boots, and a line with
+        nothing URL-shaped in it comes back unchanged (`jsonEscapeSameRows`);
+      - 32 twins in which v0.12.26's email rule masked the `@` by accident (9 sources: the canonical
+        credential, multi-colon, pct-encoded `@`, a raw `@` in the username, the two premasked
+        usernames, the empty username, and the password-less dotted and private hosts; each in
+        `\/`, `\u002f`, `\u002F` and `\\/`, but 4 kept below): the credential, the `@` and the host
+        are one TOKEN, and the host loses its own tag;
+      - 6 twins in `jsonEscapeLettersMasked`, where v0.12.26 read an escape's letters as a value
+        (`u002fappuser@db.acme.com` as an email, `u0040cache.acme.internal` as a private host): the
+        letters stay inside the value and the escape's backslash is left beside the placeholder.
+        The plan expected these 4 at-masked twins as plain TOKEN rows and did not foresee the 2
+        colon-and-at ones. They are the union's same mechanism as the witness rows, over-mask only.
+
+      **Twins.** `TestJSONEscapedTwinsMaskWhatTheUnescapedRowMasks`: the completeness rows of every
+      `://`-anchored rule (31, read by name, so no row moved), #59's 17 rows and its 4 residual rows,
+      each in five forms (`\/`, `\u002f`, `\u002F`, `\\/`, `\/` with `\u003a`/`\u0040`): 260
+      subtests. Each asserts its exact output and the absence of every part of the credential and
+      the host. Where v0.12.26 masked more, the exact output is the over-mask row's.
+
+      **The superset gate.** `TestJSONEscapeViewMasksASupersetOfV01226` runs `baseDetectors` and
+      `buildDetectors({"lab"})` against `maskAtV01226`, a frozen test-side copy of v0.12.26's `Mask`
+      body over the same chain. Checked once against the real archive: its outputs and errors equal
+      v0.12.26's over 113,280 records (corpus and literals, both mappers), 0 differences. Claims:
+      - the bytes masked now include every byte v0.12.26 masked;
+      - an input v0.12.26 masked is not refused now;
+      - an input with no `\` before `/` or `u` comes back byte for byte;
+      - the witness and same rows equal the reference, raw and templatized;
+      - a line with no escape that carries one of our placeholders as text equals the reference
+        whole (`jsonEscapePlaceholderTextRows`, added when mutant M7 survived).
+
+      Corpus: #59's (#134's, #49's, the completeness rows, templatized, the IPv6 tables, #59's rows
+      and generator) as written, in each of the five forms and as PHP's `json_encode` writes it into
+      a message field; every new row; and `jsonEscapeGenerated(1000)`, a PCG(12, 27) generator of
+      escaped URLs, DSNs, emails and home paths, mixed escapes per character, one or two levels, in a
+      JSON message, another JSON field, JSON in JSON, logfmt and prose. The last two each raw,
+      through `Templatize` and through `TemplatizeLine`. 22,438 inputs per mapper (14,206 with an
+      escape): 0 less, 0 refused, 0 moved without an escape; strictly more 7,816 (default) and
+      7,645 (`lab`).
+
+      **The 40 inline `TestAcceptedOverMasking` cases** are not in the committed gate: copying them
+      would put the documented AWS example key back into the diff. They are covered by the
+      scratchpad differential below, constant-folded so a case built by concatenation counts (40 of
+      40 evaluated). The plan said 44; the function holds 40, on main as on the branch, and 44 was a
+      miscount during planning.
+
+      **Predictions, then results.** Each prediction was written into a scratchpad file before its run.
+      - `go test -race ./...`: main 2,401 passed and 1 skipped, **held**; the branch 2,764 and 1,
+        **held**: +363, of which 347 are the red commit's tests, 2 are net over-mask rows and 14 are
+        green-only.
+      - Red commit on v0.12.26: predicted 331 red. The first run gave 330: the shell heredoc that
+        appended the llm source subtest decoded its `\u002f` into a real `/`, so that input held no
+        escape. Repaired, 331: **held**.
+      - Superset gate, 22,438 inputs per mapper: 0 less, 0 refused, 0 moved, **held**. Strictly more,
+        predicted about 11,000 (9,000–13,000) with `lab` at or above default: 7,816 and 7,645,
+        **missed** on both counts. The 171 inputs masked more on default only all hold `.lab`, which
+        v0.12.26 with that suffix already masked by suffix.
+      - Fingerprint, v0.12.26 archive against the branch: identical, 60 entries, **held**.
+      - Frozen `maskAtV01226` against the archive's `Mask`: 0 differences in 113,280 records, **held**.
+      - Per-byte differential, v0.12.26 against the branch, `New()` and `New("lab")`:
+        - corpus, 22,438 records per mapper: 0 less, 0 refused, more 7,816 and 7,645, **held**;
+        - every string literal of the 69 test files, constant-folded (7,244 distinct, the 40 inline
+          over-mask cases included), in the six escaped forms, each raw, through `Templatize` and
+          through `TemplatizeLine`: 34,202 inputs per mapper. 0 less and 0 refused by the re-scan,
+          **held**; more 3,385 per mapper, in the predicted 3,000–6,000, **held**. Refused by the
+          rebuild check: **25 per mapper, predicted 0, missed**. Seven are the fail-closed row's own
+          variants. Eighteen are escaped forms of three test strings that are masked output, a
+          placeholder as text beside a raw host (`postgres:\/\/<TOKEN_1>@<HOST_1>@db`), which v0.12.26
+          sent with the host raw. Five more records per mapper cannot be read back on v0.12.26's side,
+          the collision named below, and count as neither less nor more;
+        - the ten journald boots, `SYSLOG_IDENTIFIER` `ab37*` and `logscry-probe` filtered: 58,172
+          messages (4,845 filtered), raw and `TemplatizeLine`, 232,688 records: 0 changed, 0 less,
+          0 more, 0 refused, **held**. None holds an escape form.
+      - Residue, clean on v0.12.26 and refused on the branch: by the re-scan 0 on the corpus, the
+        literals and the boots, **held**. By the rebuild check, counted apart: 0, 25 per mapper and 0.
+      - Wire check. Each binary ran against a capturing endpoint (`--plain --llm-anonymize
+        --warmup-lines 0 --rate-limit 100000 --cache-ttl 1s`) on 16 lines written by Python, with
+        invented values: the control, then escaped DSNs in prose, a JSON field, a JSON message at one
+        and two levels, JSON in JSON, logfmt message and bare value, `\u002f`, `\u002F`,
+        `\u003a`/`\u0040`, dotted, private and address hosts, and a clean line.
+        - 16 requests each, the control in 16 of 16: **held**;
+        - v0.12.26 sent every predicted fragment on the trigger and in each later context:
+          **held**. On the Template field it also sent the address-host and private-host lines,
+          which are plain `dsn=` lines like the bare-host one: **missed**, two lines;
+        - v0.4.0 sent the same on the trigger: the lower bound, since v0.3.0 has no anonymizer;
+        - the branch sent none of them, in any field: **held**.
+      - Benchmarks, predicted: the ordinary line within noise, the escaped lines 2–3×: **held**.
+
+      **Mutants, and what each turned red** (predicted, then measured):
+      - **M1, the view without projection** (`maskText(view)`): 336 red, every escape row, twin,
+        witness, same and residual row, the fail-closed row, the over-mask rows, both gates and llm
+        restore. **Held.**
+      - **M2, `\/` only:** 191, **held**, with one residual row I had not attributed.
+      - **M3a, projection one byte late:** 326. Predicted the gate green; it went red on both
+        mappers, with the view re-scan test. **Missed.**
+      - **M3b, one byte early:** 324, the same, with two witness rows. **Missed.**
+      - **M4, context lines without the view:** llm context only, **held**.
+      - **M5, the Template field without the view:** llm template ×2 and restore, whose Template
+        carries `\/`. **Missed** by one.
+      - **M6, the union dropped:** 82: the witnesses, the dotted host, 38 twins, 38 over-mask rows
+        and both gates. **Held.**
+      - **M7, no fast path:** predicted the gate red; **0 red**. No committed input told the two
+        paths apart. Closed with `jsonEscapePlaceholderTextRows`, lines with no escape that carry a
+        placeholder as text, compared whole in the gate: M7 then turns both gate subtests red.
+      - **M8, the re-scan without the view:** `TestEscapedResidueReadsTheView` only, **held**.
+      - **M9, a single backslash only:** 71, the runs, nested twins, offsets, llm context and
+        template. **Held.**
+      - **M10, the template forms not derived:** 6, **held**.
+
+      Every miss but M7 is in the direction of more red. M7 is the one mutant that survived, and the
+      gate now covers it.
+
+      **`-race`.** `-race -count=20 -timeout 60m` on every new test but the gate: green (anonymize
+      61.7 s, llm 3.2 s). The gate ran `-race -count=2 -timeout 60m`, because `Mask` is pure and
+      single-goroutine and repeating a deterministic gate finds nothing: green, 572 s. The literal
+      differential is a scratchpad harness comparing the outputs of that same pure function, so the
+      race detector cannot change its result, and its non-race run stands.
+
+      **Benchmarks** (`BenchmarkMask`, main vs branch, no threshold pinned), medians of 10 on an
+      i5-13500HX:
+      - an ordinary line, 152.9 µs on main and 151.3 µs on the branch: 0.99, no regression;
+      - one escaped DSN, 113.2 → 229.4 µs: 2.03×;
+      - a JSON line with several escaped URLs, 251.2 → 523.8 µs: 2.09×.
+
+      A line with an escape runs the chain twice.
+
+      **Wire-check control: `[FATAL] peer ::ffff:10.0.0.5-x down`, fragment `.0.0.5-x`,** #137's,
+      still open: sent by v0.12.26, v0.4.0 and the branch in 16 of 16 requests each.
+
+      **Found on the way, not fixed here:** a line that carries one of our placeholders as text gets
+      that placeholder minted for a real value too, so Restore cannot tell them apart:
+      `login as <HOST_1> from db.corp.internal` is sent as `login as <HOST_1> from <HOST_1>` and restored
+      as `login as db.corp.internal from db.corp.internal`. Confirmed on v0.12.26. Nothing more reaches
+      the endpoint; drafted as a public issue. On a line with an escape this is now the new refusal.
+
+      **Tests.**
+      - **Red on v0.12.26:** 331 subtests: `TestJSONEscapedURL` 25, the twins 260,
+        `TestJSONEscapeShapesNotReached` 2, `TestJSONEscapePlaceholderShapedLiteralFailsClosed` 1,
+        `TestAcceptedOverMasking` 37, `TestAnonymizeJSONEscapesOnTheWire` 6.
+      - **Passing on both:** `TestJSONEscapeKeepsWhatV01226Masked` (the three witnesses),
+        `TestJSONEscapeLeavesTheseAsV01226`, the gate (trivially on v0.12.26), `BenchmarkMask`.
+      - **Green commit only:** `TestEscapeViewOffsets`, `TestEscapedResidueReadsTheView`, the six
+        `jsonEscapeLettersMasked` pins with the four at-masked twins they replace, and the gate's
+        `jsonEscapePlaceholderTextRows`.
+      - **Existing tests changed:** `TestAcceptedOverMasking` also runs `jsonEscapeOverMaskingRows`.
+        No existing row was moved or re-indented.
+
+      **Seen and left alone, out of scope:** #137, #135, #65, #116, #36, #126, the IPv6 detectors,
+      detector 4's JSON-field absorption, `internal/pipeline`, and a `\"`-quoted DSN's backslash
+      going into 4e's token.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
