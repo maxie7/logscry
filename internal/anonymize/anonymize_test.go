@@ -115,6 +115,16 @@ func TestTypeTags(t *testing.T) {
 		{"key " + githubPATSecret + " rejected", "<TOKEN_1>"},
 		{"key " + slackBotSecret + " rejected", "<TOKEN_1>"},
 		{"key " + googleAPISecret + " rejected", "<TOKEN_1>"},
+		// #116: a Twilio, SendGrid, npm, GitLab, Hugging Face, Shopify or PyPI token is a key. Before the fix
+		// these came back unchanged, the key in the clear; the exact outputs are pinned in
+		// TestIssue116PrefixedVendorTokens.
+		{"key " + twilioAPIKeySID + " rejected", "<TOKEN_1>"},
+		{"key " + sendgridSecret + " rejected", "<TOKEN_1>"},
+		{"key " + npmSecret + " rejected", "<TOKEN_1>"},
+		{"key " + gitlabPATSecret + " rejected", "<TOKEN_1>"},
+		{"key " + huggingFaceSecret + " rejected", "<TOKEN_1>"},
+		{"key " + shopifyAccessSecret + " rejected", "<TOKEN_1>"},
+		{"key " + pypiSecret + " rejected", "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -178,6 +188,15 @@ func TestNoOverMasking(t *testing.T) {
 		"the xox" + "b- prefix",
 		"xox" + "b-2024-rollout-plan",
 		"AI" + "za_test_1",
+		// #116: a word that shares a vendor prefix stays by the floor, the alphabet or the lead
+		// (TestIssue116PrefixedVendorTokens).
+		"np" + "m_config_cache",
+		"h" + "f_hub_download",
+		"S" + "G.web-tier-01",
+		"gl" + "rt-runner-token",
+		"py" + "pi-simple-index",
+		"sh" + "pss_rotation",
+		"A" + "CCEPTED",
 	}
 	for _, s := range survive {
 		m := New()
@@ -577,6 +596,18 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"key <TOKEN_1>_prod used",
 		"GOOGLE_API_KEY=<TOKEN_1>",
 		"https://<HOST_1>/maps/api/geocode/json?address=x&key=<TOKEN_1>",
+		// #116's new outputs fed back: our own tag behind each new prefix, raw and as the template leaves it.
+		// A vendor body reads a pipeline placeholder as evidence, never ours.
+		"key S" + "K<TOKEN_1> used",
+		"key S" + "G.<TOKEN_1> used",
+		"key np" + "m_<TOKEN_1> used",
+		"key gl" + "pat-<TOKEN_1> used",
+		"key gl" + "pat<NUM><TOKEN_1> used",
+		"key h" + "f_<TOKEN_1> used",
+		"key sh" + "pat_<TOKEN_1> used",
+		"key py" + "pi-AgE<TOKEN_1> used",
+		"key xox" + "p<NUM><NUM><NUM><NUM><TOKEN_1> used",
+		"TWILIO_API_KEY=<TOKEN_1>",
 	}
 	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
@@ -4200,6 +4231,26 @@ var completenessRows = []completenessRow{
 	// so the declared secret runs to the path.
 	{"url-credentials/raw-slash-in-password", "dsn=postgres://", "svcuser:hun/ter2@db.acme.com", "/prod"},
 	{"url-credentials/raw-slash-in-username", "dsn=postgres://", "svc/user:hunter2@db:5432", "/app"},
+	// #116. One canonical row per new format family first, in vendorKeys' order, then the rest of each
+	// family and the edges. A Twilio SK SID is that family's canonical row: an AC SID alone is one hex run,
+	// which the pipeline collapses.
+	{"vendor-key/pypi", "key ", pypiSecret, " rejected"},
+	{"vendor-key/gitlab", "key ", gitlabPATSecret, " rejected"},
+	{"vendor-key/sendgrid", "key ", sendgridSecret, " rejected"},
+	{"vendor-key/npm", "key ", npmSecret, " rejected"},
+	{"vendor-key/hugging-face", "key ", huggingFaceSecret, " rejected"},
+	{"vendor-key/shopify", "key ", shopifyAccessSecret, " rejected"},
+	{"vendor-key/twilio", "key ", twilioAPIKeySID, " rejected"},
+	{"vendor-key/gitlab-routable", "key ", gitlabRoutable, " rejected"},
+	{"vendor-key/gitlab-runner", "key ", gitlabRunnerSecret, " rejected"},
+	{"vendor-key/hugging-face-digits", "key ", huggingFaceDigits, " rejected"},
+	{"vendor-key/shopify-shared", "key ", shopifySharedSecret, " rejected"},
+	{"vendor-key/twilio-account", "key ", twilioAccountSID, " rejected"},
+	{"vendor-key/sendgrid-env-var-end", "SENDGRID_API_KEY=", sendgridSecret, ""},
+	{"vendor-key/gitlab-sentence-dot", "key ", gitlabRoutable, ". Retrying"},
+	{"vendor-key/pypi-closing-quote", `rejected "`, pypiSecret, `" twice`},
+	{"vendor-key/npm-underscore-before", "token_", npmSecret, " used"},
+	{"vendor-key/twilio-underscore-after", "key ", twilioAPIKeySID, "_prod used"},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -4469,7 +4520,7 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// after "sk_test_", where '_' would have ended a snake_case name in short pieces.
 		{"a long camelCase name after a stripe prefix is a key", "run sk" + "_test_createCustomerWithCardAndRefund ok", "run <TOKEN_1> ok"},
 	}
-	for _, c := range append(append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...), jsonEscapeOverMaskingRows...) {
+	for _, c := range append(append(append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...), jsonEscapeOverMaskingRows...), vendorSecretOverMaskingRows...) {
 		t.Run(c.name, func(t *testing.T) {
 			m := New()
 			if got := mustMask(t, m, c.in); got != c.want {
@@ -4520,6 +4571,19 @@ var gluedRunOverMaskingRows = []struct {
 	{"the colon that glues an address goes with it", "peer:::1 down", "peer<IP_1> down"},
 	{"a netstat port goes with the unspecified address", "tcp6 0 0 :::22 :::* LISTEN", "tcp6 0 0 <IP_1> <IP_2>:* LISTEN"},
 	{"a ':::' operator is one placeholder", "xs ::: ys", "xs <IP_1> ys"},
+}
+
+// vendorSecretOverMaskingRows are #116's accepted over-masking rows, at package level for the gate's sake
+// as #134's are. A body's floor is the format's shortest length and nothing more, and GitLab's body is
+// inferred and permissive on purpose, so a long enough name after a prefix is a key: a kebab-case name of
+// twenty after a GitLab prefix, a camelCase word of thirty-four after "hf_".
+var vendorSecretOverMaskingRows = []struct {
+	name string
+	in   string
+	want string
+}{
+	{"a long kebab-case name after a gitlab prefix is a key", "flag gl" + "pat-rotation-policy-enabled on", "flag <TOKEN_1> on"},
+	{"a long camelCase word after hf_ is a key", "load h" + "f_" + "modelRepositoryDownloadCacheManager ok", "load <TOKEN_1> ok"},
 }
 
 // dottedQuadOverMaskingRows are #49's accepted over-masking rows, at package level for the gate's
@@ -4731,6 +4795,21 @@ var templatizedRows = []templatizedRow{
 	// #59: a raw '/' in the password, a digit in each half and in the host. 4e's authority is one
 	// placeholder on the template too.
 	{"url-credentials/raw-slash/middle-digit", "FATAL db postgres://\x00svc7user:hun2/ter@db01.corp.internal:5432\x00/prod lost"},
+	// #116 through the composition, one row per new format family and the rest of each family's prefixes.
+	// Every digit is <NUM> on the template, so the placeholder is the evidence; a GitLab body's '-' before a
+	// digit goes with it as NUM's sign, and a routable token's ".01." is ".<NUM>.".
+	{"vendor-key/pypi", "key \x00" + pypiSecret + "\x00 rejected"},
+	{"vendor-key/gitlab", "key \x00" + gitlabPATSecret + "\x00 rejected"},
+	{"vendor-key/gitlab-routable", "key \x00" + gitlabRoutable + "\x00 rejected"},
+	{"vendor-key/gitlab-runner", "key \x00" + gitlabRunnerSecret + "\x00 rejected"},
+	{"vendor-key/sendgrid", "key \x00" + sendgridSecret + "\x00 rejected"},
+	{"vendor-key/npm", "key \x00" + npmSecret + "\x00 rejected"},
+	{"vendor-key/hugging-face-digits", "key \x00" + huggingFaceDigits + "\x00 rejected"},
+	{"vendor-key/shopify", "key \x00" + shopifyAccessSecret + "\x00 rejected"},
+	{"vendor-key/shopify-shared", "key \x00" + shopifySharedSecret + "\x00 rejected"},
+	{"vendor-key/twilio", "key \x00" + twilioAPIKeySID + "\x00 rejected"},
+	{"vendor-key/sendgrid-env-var-end", "SENDGRID_API_KEY=\x00" + sendgridSecret + "\x00"},
+	{"vendor-key/gitlab-sentence-dot", "key \x00" + gitlabRoutable + "\x00. Retrying"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
@@ -4824,6 +4903,13 @@ func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
 		{"quote-edge/slack-key-first", "\x00" + slackBotSecret + "\x00 rejected"},
 		{"quote-edge/google-key-first", "\x00" + googleAPISecret + "\x00 rejected"},
 		{"quote-edge/github-key-last", "rejected key \x00" + githubClassicSecret + "\x00"},
+		{"quote-edge/pypi-key-last", "rejected key \x00" + pypiSecret + "\x00"},
+		{"quote-edge/gitlab-routable-last", "rejected key \x00" + gitlabRoutable + "\x00"},
+		{"quote-edge/sendgrid-key-first", "\x00" + sendgridSecret + "\x00 rejected"},
+		{"quote-edge/npm-key-last", "rejected key \x00" + npmSecret + "\x00"},
+		{"quote-edge/hugging-face-key-first", "\x00" + huggingFaceDigits + "\x00 rejected"},
+		{"quote-edge/shopify-key-last", "rejected key \x00" + shopifyAccessSecret + "\x00"},
+		{"quote-edge/twilio-key-first", "\x00" + twilioAPIKeySID + "\x00 rejected"},
 	}
 	rows := append(append([]templatizedRow{}, templatizedRows...), quoteEdgeRows...)
 	for _, f := range fields {
@@ -5129,6 +5215,13 @@ func TestNoOverMaskingAfterTemplating(t *testing.T) {
 		"xox" + "b-2024-rollout-plan",
 		"set xox" + "b-1 retries",
 		"AI" + "za_test_1",
+		// #116: under each new family's template floor, or no placeholder after the prefix.
+		"S" + "G.web-tier-01",
+		"gl" + "pat-v2",
+		"sh" + "pat_v2",
+		"code S" + "K1a",
+		"use h" + "f_xet_storage_v2",
+		"np" + "m_config_cache_v2",
 	}
 	for _, s := range survive {
 		in, _ := pipeline.Templatize(s)
