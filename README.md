@@ -421,7 +421,7 @@ notice at startup when that is the case.
 back, so the terminal and the cards show what the log wrote while the provider sees a
 type-tagged placeholder (`<IP_1>`, `<HOST_2>`) in place of every value logscry recognizes. A
 placeholder the log itself carries as text is never given to a value, so it reaches the provider
-and the card as written; before `TODO-VERSION` it could be.
+and the card as written; before `v0.12.28` it could be.
 The tag is kept on purpose: the model still needs to know it is reasoning about *an IP* or
 *a host that recurs*. The mapping is per-request and in memory only — never written to
 disk, never reused.
@@ -905,7 +905,7 @@ What it costs, pinned:
   credential, the `@` and the host are one `<TOKEN_n>`. The host has no tag of its own there.
 - Where v0.12.26 read an escape's letters as part of a value (`\u002fappuser@db.acme.com`), those
   letters stay inside it, and the escape's backslash is left beside the placeholder.
-- One new way to skip an escalation, until `TODO-VERSION`: a line with an escape that also carried one
+- One new way to skip an escalation, until `v0.12.28`: a line with an escape that also carried one
   of logscry's own placeholders as text, the same one a pass then minted for a value, was refused
   rather than sent. Such a line is sent now, with the placeholder kept as text (below).
 
@@ -917,7 +917,7 @@ include every byte `v0.12.26` masked, for every input. Measured over the same te
 nothing changed. None holds an escaped `/`, `:` or `@`.
 
 **A line carrying one of logscry's own placeholders as text was read back with the wrong value
-before `TODO-VERSION`.** This was a correctness defect, not a leak: nothing more reached the model
+before `v0.12.28`.** This was a correctness defect, not a leak: nothing more reached the model
 endpoint. The placeholder counter never looked at the text, so a line that already said `<HOST_1>`
 had `<HOST_1>` minted for a real value too. `login as <HOST_1> from db.corp.internal` went as
 `login as <HOST_1> from <HOST_1>`.
