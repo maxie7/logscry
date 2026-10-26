@@ -146,6 +146,15 @@
 // character each; the one class that does NOT is listEnd, where '_' stays a terminator because
 // there it decides what 9c falls back to, and the fallback is today's output (see listEnd).
 //
+// A JSON-ESCAPED URL IS READ AS A VIEW, NOT BY A RULE (GHSA-p47p-xrhj-3x7p). A JSON encoder that escapes
+// '/' -- PHP's json_encode, and any string nested in another -- writes postgres:\/\/user:pass@host\/db, and
+// every URL rule anchors on a literal "://" and stops at a literal '/', so none matched and the username,
+// the password and the host were sent. The "://" anchor is in eight rules and '/' is a boundary in more,
+// so teaching each one the escapes is #43's every-context class multiplied. Instead a line with an
+// escaped '/', ':' or '@' is masked twice, as written and with those escapes resolved, and every value
+// either pass masks is masked in the line as written (see maskEscaped). No detector changed, and a line
+// with no escape takes exactly the path it took before.
+//
 // The one deliberate exception is the pipeline's own placeholders: see pipelinePH.
 package anonymize
 
@@ -273,7 +282,38 @@ func New(extraHostSuffixes ...string) *Mapper {
 // #59 WIDENS IT by one class, for #55's reason -- no pattern described the shape. 4e is verify-eligible,
 // so an authority with a raw '/' in its userinfo that ever survives masking whole mutes. The four shapes
 // 4e cannot tell from a legal URI are described by no rule, and the re-scan reads them as clean.
+//
+// GHSA-p47p-xrhj-3x7p WIDENS IT to what an escape hides. On a line with an escaped '/', ':' or '@' the
+// re-scan reads the output and the output with those escapes resolved, so a verify-eligible value an
+// escape hid from the line as written mutes. That fix adds ONE NEW WAY TO REFUSE: such a line is masked
+// in two passes whose spans are read back from their output, and a line that carries, as text, a
+// placeholder one of those passes then mints for a value cannot be read back, so the escalation is
+// skipped rather than sent with a guess. Escapes the view does not resolve -- the template of the "u"
+// escape of ':' or '@', and any other "u" escape of a URL character -- are described by no rule, and
+// the re-scan reads them as clean.
 func (m *Mapper) Mask(s string) (string, error) {
+	view, offs := escapeView(s)
+	if offs == nil {
+		return m.maskText(s)
+	}
+	return m.maskEscaped(s, view, offs)
+}
+
+// maskText masks a line with no escape in it: the chain, then the re-scan. It is Mask as v0.12.26 shipped
+// it, for every line without one.
+func (m *Mapper) maskText(s string) (string, error) {
+	out, err := m.chain(s)
+	if err != nil {
+		return "", err
+	}
+	if tag := m.residue(out); tag != "" {
+		return "", errSurvived(tag)
+	}
+	return out, nil
+}
+
+// chain runs every detector over s in order, 9c to its fixpoint.
+func (m *Mapper) chain(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
 		if !d.fixpoint {
@@ -284,9 +324,6 @@ func (m *Mapper) Mask(s string) (string, error) {
 		if out, err = m.applyToFixpoint(out, d); err != nil {
 			return "", err
 		}
-	}
-	if tag := m.residue(out); tag != "" {
-		return "", fmt.Errorf("anonymize: a %s value survived masking", tag)
 	}
 	return out, nil
 }

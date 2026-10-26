@@ -202,6 +202,16 @@ func jsonEscapeCorpus() []string {
 	return out
 }
 
+// jsonEscapePlaceholderTextRows carry one of our placeholders as text and no escape, beside a value the
+// chain mints that same placeholder for. A line with no escape is masked on v0.12.26's path, so each comes
+// back exactly as v0.12.26 returns it; on the two-pass path its spans could not be read back, and it would
+// be refused. Their bytes cannot be read back from the output, so the gate compares them whole.
+var jsonEscapePlaceholderTextRows = []string{
+	"login as <HOST_1> from db.corp.internal",
+	"replay of postgres://svcuser:pwsecret@pghost/db: <TOKEN_1> rejected",
+	"mail <EMAIL_1> to bob@corp.com",
+}
+
 // anyEscape is an over-reach of every form the view reads: a '\' before '/' or 'u'. It is written
 // independently of the view's pattern, so an input it does not find is one the view cannot touch.
 var anyEscape = regexp.MustCompile(`\\[/u]`)
@@ -209,7 +219,8 @@ var anyEscape = regexp.MustCompile(`\\[/u]`)
 // TestJSONEscapeViewMasksASupersetOfV01226 is the gate GHSA-p47p-xrhj-3x7p's fix stands on. For every
 // input, through New() and a Mapper with an extra suffix: the bytes masked now include every byte
 // v0.12.26 masked; an input v0.12.26 masked is not refused now; an input with no '\' before '/' or 'u'
-// comes back byte for byte; and the witness and same rows come back exactly as v0.12.26 returns them.
+// comes back byte for byte; and the witness and same rows, and a line with no escape that carries one of
+// our placeholders as text, come back exactly as v0.12.26 returns them.
 func TestJSONEscapeViewMasksASupersetOfV01226(t *testing.T) {
 	corpus := jsonEscapeCorpus()
 	live := func(m *Mapper, s string) (string, error) { return m.Mask(s) }
@@ -264,6 +275,13 @@ func TestJSONEscapeViewMasksASupersetOfV01226(t *testing.T) {
 				refOut, _, _ := maskedBytesWith(t, maskAtV01226, c.dets, in)
 				if out, _, _ := maskedBytesWith(t, live, c.dets, in); out != refOut {
 					t.Errorf("a line the view must leave as v0.12.26 masks it moved:\n in:  %q\n ref: %q\n got: %q", in, refOut, out)
+				}
+			}
+			for _, in := range jsonEscapePlaceholderTextRows {
+				refOut, refErr := maskAtV01226(mapperOn(c.dets), in)
+				out, err := mapperOn(c.dets).Mask(in)
+				if out != refOut || (err == nil) != (refErr == nil) {
+					t.Errorf("a line with no escape left v0.12.26's path:\n in:  %q\n ref: %q (%v)\n got: %q (%v)", in, refOut, refErr, out, err)
 				}
 			}
 			t.Logf("%d inputs, %d with an escape, %d mask strictly more than v0.12.26", len(corpus), escaped, more)

@@ -269,23 +269,48 @@ var jsonEscapeAtMasked = []struct{ name, want string }{
 	{"url-credentials/no-password/private-host", "dsn=postgres://<TOKEN_1>:6379/0"},
 }
 
+// jsonEscapeLettersMasked are twins on which v0.12.26 read the letters of an escape as part of a value, as
+// it does for jsonEscapeWitnessRows: "u002fappuser" as an email's local part, "u0040cache.acme.internal"
+// as a host on a private suffix. Every byte v0.12.26 masked stays masked, so the value takes those
+// letters, and the escape's backslash is left beside the placeholder; with the '@' escaped, the host is
+// cut there and keeps its own tag. Nothing is sent: TestJSONEscapedTwinsMaskWhatTheUnescapedRowMasks
+// still asserts that no part of the credential or the host survives.
+var jsonEscapeLettersMasked = []struct{ name, in, want string }{
+	{"the escape's letters v0.12.26 masked, url-credentials/no-password/dotted-host (u002f)",
+		`dsn=postgres:\u002f\u002fappuser@db.acme.com\u002fprod`, `dsn=postgres:\u002f\<TOKEN_1>\u002fprod`},
+	{"the escape's letters v0.12.26 masked, url-credentials/no-password/dotted-host (u002F)",
+		`dsn=postgres:\u002F\u002Fappuser@db.acme.com\u002Fprod`, `dsn=postgres:\u002F\<TOKEN_1>\u002Fprod`},
+	{"the escape's letters v0.12.26 masked, url-credentials/no-password/private-host (u002f)",
+		`dsn=postgres:\u002f\u002fappuser@cache.acme.internal:6379\u002f0`, `dsn=postgres:\u002f\<TOKEN_1>:6379\u002f0`},
+	{"the escape's letters v0.12.26 masked, url-credentials/no-password/private-host (u002F)",
+		`dsn=postgres:\u002F\u002Fappuser@cache.acme.internal:6379\u002F0`, `dsn=postgres:\u002F\<TOKEN_1>:6379\u002F0`},
+	{"the escape's letters v0.12.26 masked, url-credentials/empty-username (colon and at)",
+		`dsn=redis\u003a\/\/\u003as3cr3tpw\u0040cache.acme.internal\u003a6379\/0`, `dsn=redis\u003a\/\/<TOKEN_1>\<HOST_1>\u003a6379\/0`},
+	{"the escape's letters v0.12.26 masked, url-credentials/no-password/private-host (colon and at)",
+		`dsn=postgres\u003a\/\/appuser\u0040cache.acme.internal\u003a6379\/0`, `dsn=postgres\u003a\/\/<TOKEN_1>\<HOST_1>\u003a6379\/0`},
+}
+
 // jsonEscapeOverMaskingRows are GHSA-p47p-xrhj-3x7p's accepted over-masking rows, at package level for
 // the gate's sake as #59's are. TestAcceptedOverMasking runs them.
 //
 // The first is the cost of resolving "\/" everywhere rather than only inside a JSON string: a path that
-// escapes its slashes is a path, so a home directory on it is masked. The rest are jsonEscapeAtMasked's
-// twins, one per form that keeps the '@' raw.
+// escapes its slashes is a path, so a home directory on it is masked. Then jsonEscapeAtMasked's twins,
+// one per form that keeps the '@' raw, and jsonEscapeLettersMasked.
 var jsonEscapeOverMaskingRows = append([]struct {
 	name string
 	in   string
 	want string
 }{
 	{"an escaped path outside json is read as a path", `copy C:\/Users\/bob\/x failed`, `copy C:\/Users\/<USER_1>\/x failed`},
-}, jsonEscapeAtMaskedTwins()...)
+}, append(jsonEscapeAtMaskedTwins(), jsonEscapeLettersMasked...)...)
 
 // jsonEscapeAtMaskedTwins escapes each jsonEscapeAtMasked row's completeness payload and its want, in every
-// form that keeps the '@' raw.
+// form that keeps the '@' raw, but those jsonEscapeLettersMasked pins.
 func jsonEscapeAtMaskedTwins() []struct{ name, in, want string } {
+	letters := make(map[string]bool)
+	for _, l := range jsonEscapeLettersMasked {
+		letters[l.in] = true
+	}
 	var out []struct{ name, in, want string }
 	for _, a := range jsonEscapeAtMasked {
 		r, ok := completenessRowNamed(a.name)
@@ -294,7 +319,7 @@ func jsonEscapeAtMaskedTwins() []struct{ name, in, want string } {
 		}
 		payload := payloadOf(r.prefix) + r.secret + payloadOf(r.suffix)
 		for _, f := range jsonEscapeForms {
-			if f.name == "colon and at" {
+			if f.name == "colon and at" || letters[f.esc(payload)] {
 				continue
 			}
 			out = append(out, struct{ name, in, want string }{
