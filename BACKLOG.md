@@ -5360,6 +5360,50 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.27
 
+- [x] **CI runs the anonymizer's superset gates once, outside the race detector** — #143. The
+      four superset gates (#134's, #49's, #59's and GHSA-p47p-xrhj-3x7p's) each ran three times
+      per CI run: plain, under `-race`, and for coverage. CI went from about 4.5 to about 11
+      minutes.
+
+      **Predicted, before measuring:** anonymize dominates every pass; the JSON-escape gate leads,
+      then slash-userinfo, then the two IPv6 gates; `-race` costs 5–10× on pure regex work, so
+      the race pass takes 2–3 minutes.
+
+      **Measured** (4 cores pinned to match the runner, `-count=1`): plain 15.4 s, race 325.7 s,
+      coverage 17.4 s. Under race the gates took 301 of anonymize's 325 s: JSON-escape 215.4 s,
+      slash-userinfo 33.9, glued-run 26.3, dotted-quad 25.5. The order held and the size did
+      not: the penalty is 21–23×, not 5–10×. The plain and coverage passes were never the cost.
+
+      **The change.**
+      - The race step skips the four by name, with one anchored regexp, `SUPERSET_GATES`. They
+        are pure and single-goroutine, so the detector has nothing to find in them; concurrent
+        use of the anonymizer is race-tested where the concurrency lives, in `internal/llm`.
+      - The plain `go test` step is gone: the coverage step ran the same tests. It now runs
+        first, so a logic bug still turns a non-race step red before the race step runs, and it
+        is where the gates run in full.
+      - Two checks in the race step keep the regexp honest: it must match as many tests as it
+        names, the count read from the regexp itself; and every `*MasksASupersetOf*` test must
+        be in it. Each gate's doc comment and `CONTRIBUTING.md` state the convention. Checked
+        locally with overlays: a renamed gate, a new unlisted gate and a listed name off the
+        pattern each exit 1 with their own `::error::` line; a fifth name added to the list
+        alone passes.
+      - Rejected: `-short` in the gates and `go test -race -short`. It would also take
+        `TestReplaySpeedLeavesTheExportUnchanged` and `TestReplayAtOneXMatchesWallClock` out of
+        the race step, and both start goroutines.
+      - No other test is skipped. With the gates out, the longest under race are
+        `TestSteadyHighRateNeverEscalates` 11.3 s, `TestStrMaskMovesOnlyEscapedQuotes` 8.8 s
+        and `TestHostListFixpoint` 7.5 s; skipping them would save 10 s at most.
+
+      **After, locally, each step as written:** coverage 16.2 s, race 39.6 s with both checks.
+      `go test ./...` and `go test -race ./...` still run every test.
+
+      **On CI:** before, CI run #145 took 11 min 2 s in all; the PR's run took 1 min 48 s, with
+      the coverage step at 18 s and the race step at 55 s.
+
+      Seen, out of scope: the Codecov upload, the golangci-lint settings, the release workflow.
+
+      No release (no binary change).
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

@@ -38,26 +38,58 @@ jobs:
           # version used to build golangci-lint is lower than targeted" error.
           version: v2.12.2
 
-      - name: Test
-        run: go test ./...
-
-      # Separate from the plain test run rather than replacing it: -race is several times
-      # slower, and keeping both means a failure says whether it is a logic bug or a data
-      # race. The concurrency model is load-bearing here — one goroutine owns the template
-      # map and the LLM pool must never block ingest — so it is worth the extra minute.
-      - name: Test (race detector)
-        run: go test -race ./...
-
       # Coverage is measured here and only here: the number comes from this run, never from
       # a checked-in constant. Deliberately separate from the upload below, so a Codecov
       # outage, a rate limit, or a missing token still leaves the percentage in the log.
       # atomic covermode is what Codecov wants and the right mode for concurrent code; it
       # changes counter accounting, not the percentage.
+      # This is also the job's one test run without -race, and it runs first: every test,
+      # the anonymizer's superset gates included, runs here in full. A plain `go test` step
+      # would run the same tests again for nothing, so there is none.
       - name: Test (coverage)
         run: |
           go test -covermode=atomic -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tail -1
           echo "Total coverage: $(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')" >> "$GITHUB_STEP_SUMMARY"
+
+      # Separate from the run above rather than replacing it, so a failure says whether it is
+      # a logic bug (the coverage step goes red first) or a data race (only this one does).
+      # The concurrency model is load-bearing here — one goroutine owns the template map and
+      # the LLM pool must never block ingest — so every test that starts a goroutine runs here.
+      # The anonymizer's superset gates do not: they are pure and single-goroutine, so the
+      # detector has nothing to find in them, and under it they took 5 of this step's 5.5
+      # minutes. They ran in full in the coverage step. SUPERSET_GATES names them exactly,
+      # anchored, and two checks keep it honest before the run:
+      #   - it must match as many tests as it names, so a renamed or removed gate fails here
+      #     instead of silently running under -race again;
+      #   - every test named like a gate, *MasksASupersetOf*, must be in it, so a new gate
+      #     that was not added fails here with its name.
+      # A new superset gate follows that name pattern and is added to SUPERSET_GATES.
+      - name: Test (race detector)
+        env:
+          SUPERSET_GATES: '^(TestGluedRunMasksASupersetOfMain|TestDottedQuadMasksASupersetOfV01224|TestSlashUserinfoMasksASupersetOfV01225|TestJSONEscapeViewMasksASupersetOfV01226)$'
+        run: |
+          gates=${SUPERSET_GATES#'^('}
+          gates=$(tr '|' '\n' <<< "${gates%')$'}" | sort)
+          named=$(go test -race -list "$SUPERSET_GATES" ./...)
+          want=$(grep -c . <<< "$gates")
+          got=$(grep -c '^Test' <<< "$named" || true)
+          if [ "$got" -ne "$want" ]; then
+            echo "::error::SUPERSET_GATES names $want tests but matches $got; was a gate renamed or removed?"
+            exit 1
+          fi
+          convention=$(go test -race -list 'MasksASupersetOf' ./...)
+          convention=$(grep '^Test' <<< "$convention" | sort || true)
+          for t in $(comm -23 <(echo "$convention") <(echo "$gates")); do
+            echo "::error::$t is named like a superset gate but is not in SUPERSET_GATES; add $t there"
+            fail=1
+          done
+          for t in $(comm -13 <(echo "$convention") <(echo "$gates")); do
+            echo "::error::$t is in SUPERSET_GATES but does not follow the *MasksASupersetOf* name pattern"
+            fail=1
+          done
+          [ -z "${fail:-}" ] || exit 1
+          go test -race -skip "$SUPERSET_GATES" ./...
 
       # Reporting, never a gate: fail_ci_if_error stays false so an external service cannot
       # turn this build red, and there is no minimum-coverage threshold on purpose.

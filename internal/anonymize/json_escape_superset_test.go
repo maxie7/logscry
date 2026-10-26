@@ -221,6 +221,7 @@ var anyEscape = regexp.MustCompile(`\\[/u]`)
 // v0.12.26 masked; an input v0.12.26 masked is not refused now; an input with no '\' before '/' or 'u'
 // comes back byte for byte; and the witness and same rows, and a line with no escape that carries one of
 // our placeholders as text, come back exactly as v0.12.26 returns them.
+// Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestJSONEscapeViewMasksASupersetOfV01226(t *testing.T) {
 	corpus := jsonEscapeCorpus()
 	live := func(m *Mapper, s string) (string, error) { return m.Mask(s) }
