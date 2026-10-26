@@ -86,7 +86,9 @@
 //
 // #116 IS MORE OF RULE 12. Twilio, SendGrid, npm, GitLab, Hugging Face, Shopify and PyPI tokens matched no
 // detector either, and were sent the same way. Each family is one more vendorKeys entry, run after #114's,
-// and a Slack user token glued to a word gains the template witness #114 pinned as its residual.
+// and a Slack user token glued to a word gains the template witness #114 pinned as its residual. An AWS
+// secret access key has no prefix at all, so context is its only evidence: rule 13 reads it after its
+// name, and after its access key id's TOKEN, last of all.
 //
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
@@ -172,6 +174,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/maxie7/logscry/internal/pipeline"
@@ -1343,6 +1346,34 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	for _, k := range vendorKeys {
 		dets = append(dets, detector{tagToken, mustLongest(vendorRule(k)), 1, true, false})
 	}
+	// 13. An AWS secret access key (#116): forty characters of base64 and no prefix, which a bare run of
+	//     that alphabet cannot tell from a hash or an identifier. So CONTEXT is the evidence, and the
+	//     value alone is masked, never the name:
+	//
+	//     13a reads it after its name, aws_secret_access_key in every spelling a log or a config file
+	//     writes -- AWS_SECRET_ACCESS_KEY=, an INI or YAML key, "SecretAccessKey" in AWS's own JSON,
+	//     secretAccessKey, --aws-secret-access-key -- then '=', ':', "=>" or whitespace, quotes and their
+	//     escapes. Forty or more, the length every key carries; whitespace after the name is a
+	//     separator, and the floor keeps "aws_secret_access_key is missing" prose.
+	//
+	//     13b reads exactly forty after a TOKEN of ours and a delimiter -- a comma, ';', ':', '|' or
+	//     whitespace -- because by then detector 2 or rule 11 has put the access key id there, the pair
+	//     a credentials CSV and prose write. Exactly forty, since a bare run of the alphabet is common (a
+	//     SHA-1 is one). A regexp cannot see which rule minted the TOKEN, so this is the cost: forty such
+	//     characters after any secret are a key (TestAcceptedOverMasking). A second field of the same
+	//     shape after the first joins its group, or the re-scan would read the first's token as the
+	//     second's context and refuse the request.
+	//
+	//     BOTH RUN LAST, the argument of 11 and 12. A rule that tagged the key earlier would block one that
+	//     masks a larger value around it ("<id> <key>@corp.com" is 5's), and 13b must follow every rule
+	//     that mints a TOKEN, or that TOKEN is context only on the re-scan, which would refuse.
+	//
+	//     verify:true. Their groups are raw text and the pipeline's placeholders, so they cannot fire on
+	//     our own output; 13b's context IS our output, which no other rule's is (see ourTokenTag).
+	dets = append(dets,
+		detector{tagToken, mustLongest(awsSecretNamed), 1, true, false},
+		detector{tagToken, mustLongest(awsSecretPair), 1, true, false},
+	)
 	return dets
 }
 
@@ -1738,6 +1769,61 @@ var (
 	// the template NUM has broken the run and the count is lost, so there the run is read as a key.
 	twilioLonger = `(?:SK|AC)[0-9a-fA-F]{33,}`
 )
+
+// The AWS secret access key, rule 13 (#116). Its alphabet is base64's without the padding; the template
+// floors are measured as rule 12's are, thirty units being the fewest left over 200,000 simulated keys, and
+// 13b's is higher because a TOKEN and a comma are weaker evidence than the key's own name.
+var (
+	awsSecretChar  = `[A-Za-z0-9/+]`
+	awsSecretNamed = `(?:^|[^A-Za-z0-9])(?i:(?:aws[_-]?)?secret[_-]?access[_-]?key)` + `\\*["']?(?:\s*(?::|=>?)\s*|\s+)\\*["']?` +
+		`(` + awsSecretChar + `{40,}|` + mangledFloor(awsSecretChar, 12) + `)`
+	awsPairSep    = `\\*["']?(?:\s*[,;:|]\s*|\s+)\\*["']?`
+	awsPairField  = `(?:` + awsSecretChar + `{40}|` + mangledFloor(awsSecretChar, 15) + `)`
+	awsSecretPair = ourTokenTag + awsPairSep + `(` + awsPairField + `(?:` + awsPairSep + awsPairField + `)*)` + awsPairEnd
+	// awsPairEnd closes a pair field, so that forty means forty: the end of text, a character outside the
+	// alphabet and its padding, or a run of backslashes that does not escape '/'. An escaped '/' is the
+	// alphabet in the escape view, and a field the view reads as longer must not be forty as written, or
+	// the re-scan of the line as written would read the output as a key the view's pass rightly left.
+	awsPairEnd = `(?:$|[^A-Za-z0-9/+=\\]|\\+` + notBefore(slashEscapes()) + `)`
+)
+
+// slashEscapes are what escapeForm reads, after its run of backslashes, as '/': the one character of the
+// AWS alphabet an encoder escapes.
+func slashEscapes() []string {
+	out := []string{"/", "u002f", "u002F"}
+	for _, e := range []string{"u002f", "u002F"} {
+		tpl, _ := pipeline.Templatize(`\` + e)
+		out = append(out, strings.TrimPrefix(tpl, `\`))
+	}
+	return out
+}
+
+// notBefore matches the end of text, or one character that begins no string of lits, or one that begins
+// some of them followed by notBefore of their rest: whatever text starts with none of lits, ending the
+// match as early as it can. A backslash is never one such character, so it reads after a whole run.
+func notBefore(lits []string) string {
+	var firsts []byte
+	rests := make(map[byte][]string)
+	for _, l := range lits {
+		if _, ok := rests[l[0]]; !ok {
+			firsts = append(firsts, l[0])
+		}
+		rests[l[0]] = append(rests[l[0]], l[1:])
+	}
+	class := `\\`
+	alts := []string{`$`}
+	for _, c := range firsts {
+		class += regexp.QuoteMeta(string(c))
+		if !slices.Contains(rests[c], "") {
+			alts = append(alts, regexp.QuoteMeta(string(c))+notBefore(rests[c]))
+		}
+	}
+	return `(?:` + strings.Join(append(alts, `[^`+class+`]`), `|`) + `)`
+}
+
+// ourTokenTag is a TOKEN this package minted, 13b's context. No other rule reads one: 9c reads any of
+// our tags as a host-list member, with a raw member beside it (see taggedMember).
+const ourTokenTag = `<` + tagToken + `_\d+>`
 
 // dottedUnit is a unit of a run over class with a '.' allowed inside it: a character of class or a
 // pipeline placeholder, either one possibly after a dot. A run of it never ends on a dot, so a sentence

@@ -132,7 +132,13 @@ func TestIssue116AWSSecretAccessKey(t *testing.T) {
 	}
 
 	// Byte-identical with v0.12.28: a value an earlier rule owns stays its, and a name with nothing of the
-	// key's shape after it is prose.
+	// key's shape after it is prose. On the template NUM has broken the run and its count is lost, as it
+	// is for twilioLonger, so a value one short or one long of a key is read as one there: a cost, pinned
+	// after this loop, and the template of those rows is not compared here.
+	lengthOnly := map[string]bool{
+		"AWS_SECRET_ACCESS_KEY=" + awsSecretKey[:39]:         true,
+		"creds " + awsAccessKeyID + " " + awsSecretKey + "x": true,
+	}
 	for _, s := range []string{
 		"aws_secret_access_key is missing",
 		"AWS_SECRET_ACCESS_KEY not set for profile2",
@@ -147,9 +153,18 @@ func TestIssue116AWSSecretAccessKey(t *testing.T) {
 		tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: s}))
 		tv, _ := mapperOn(atV01228(t, baseDetectors)).Mask(tIn)
 		for _, p := range []struct{ in, want string }{{s, v}, {tIn, tv}} {
+			if p.in == tIn && lengthOnly[s] {
+				continue
+			}
 			if got := mustMask(t, New(), p.in); got != p.want {
 				t.Errorf("a shape outside #116 moved:\n in:   %q\n got:  %q\n want: %q", p.in, got, p.want)
 			}
+		}
+	}
+	for s := range lengthOnly {
+		tIn, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: s}))
+		if got := mustMask(t, New(), tIn); strings.Contains(got, "nszngilzmjK") {
+			t.Errorf("the template of a value one off a key's length is no longer read as one -- update this test:\n in:  %q\n got: %q", tIn, got)
 		}
 	}
 
@@ -198,6 +213,63 @@ func TestIssue116AWSSecretAccessKey(t *testing.T) {
 					t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", in, r)
 				}
 			})
+		}
+	}
+}
+
+// TestIssue116AWSPairFieldEndsWhereTheViewEndsIt pins 13b's end (awsPairEnd): an escape of '/' after a field
+// continues the field, as the escape view reads it, so a field the view reads as forty-one is not forty as
+// written either, and a request v0.12.28 sent is not refused by the re-scan of the line as written. Any
+// other escape ends it.
+func TestIssue116AWSPairFieldEndsWhereTheViewEndsIt(t *testing.T) {
+	for _, esc := range []string{`\/`, `\u002F`, `\u002f`, `\\u002F`} {
+		for _, in := range []string{
+			"creds " + awsAccessKeyID + " " + awsSecretKey + esc + " loaded",
+			`{"msg":"creds ` + awsAccessKeyID + "," + awsSecretKey + esc + `x"}`,
+		} {
+			want, wantErr := mapperOn(atV01228(t, baseDetectors)).Mask(in)
+			got, err := New().Mask(in)
+			if got != want || errText(err) != errText(wantErr) {
+				t.Errorf("a field the view reads as longer than forty moved:\n in:   %q\n got:  %q (%v)\n want: %q (%v)", in, got, err, want, wantErr)
+			}
+		}
+	}
+	for _, c := range []struct{ in, want string }{
+		{"creds {ID} {S}\u0022 loaded", "creds <TOKEN_1> <TOKEN_2>\u0022 loaded"},
+		{`{"msg":"creds {ID} {S}\nnext"}`, `{"msg":"creds <TOKEN_1> <TOKEN_2>\nnext"}`},
+		{`{"msg":"creds {ID},{S}\\"}`, `{"msg":"creds <TOKEN_1>,<TOKEN_2>\\"}`},
+		// thirty-nine and an escaped '/' are forty in the view, whose pass masks them
+		{`{"msg":"creds {ID} {S39}\u002F loaded"}`, `{"msg":"creds <TOKEN_1> <TOKEN_2> loaded"}`},
+	} {
+		in := strings.NewReplacer("{ID}", awsAccessKeyID, "{S39}", awsSecretKey[:39], "{S}", awsSecretKey).Replace(c.in)
+		m := New()
+		if got := mustMask(t, m, in); got != c.want {
+			t.Errorf("a pair field before an escape not masked:\n in:   %q\n got:  %q\n want: %q", in, got, c.want)
+		} else if r := m.Restore(got); r != in {
+			t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", in, r)
+		}
+	}
+}
+
+// TestSlashEscapesAreWhatTheViewReadsAsSlash holds slashEscapes to escapeForm both ways: each is read
+// whole after a backslash and resolves to '/', and no other escape the view reads resolves to '/'.
+func TestSlashEscapesAreWhatTheViewReadsAsSlash(t *testing.T) {
+	listed := make(map[string]bool)
+	for _, e := range slashEscapes() {
+		listed[e] = true
+		if loc := escapeForm.FindStringIndex(`\` + e); loc == nil || loc[0] != 0 || loc[1] != len(e)+1 || resolved(`\`+e) != '/' {
+			t.Errorf("slashEscapes lists %q, which the escape view does not read as '/'", e)
+		}
+	}
+	var forms []string
+	for _, e := range []string{"/", "u002f", "u002F", "u003a", "u003A", "u0040", "u0022", "u002b", "u003d", "n", `"`} {
+		tpl, _ := pipeline.Templatize(`\` + e)
+		forms = append(forms, e, strings.TrimPrefix(tpl, `\`))
+	}
+	for _, e := range forms {
+		loc := escapeForm.FindStringIndex(`\` + e)
+		if loc != nil && loc[0] == 0 && loc[1] == len(e)+1 && resolved(`\`+e) == '/' && !listed[e] {
+			t.Errorf("the escape view reads %q as '/', and slashEscapes misses it", e)
 		}
 	}
 }

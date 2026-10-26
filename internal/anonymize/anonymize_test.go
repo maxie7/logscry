@@ -2269,8 +2269,9 @@ func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
 				t.Errorf("the %s key's rule is detector %d (%s, group %d, verify %v), want a verify-eligible TOKEN rule with group 1",
 					v.family, i, d.tag, d.group, d.verify)
 			}
-			if i < len(dets)-len(vendor) {
-				t.Errorf("the %s key's rule is detector %d, want one of the last %d: a rule that runs earlier blocks the rules that mask such a key whole", v.family, i, len(vendor))
+			// Rule 13's two entries (#116) run after rule 12's, so rule 12 is the last len(vendor) but those two.
+			if i < len(dets)-len(vendor)-2 || i >= len(dets)-2 {
+				t.Errorf("the %s key's rule is detector %d, want one of the %d before rule 13's two: a rule that runs earlier blocks the rules that mask such a key whole", v.family, i, len(vendor))
 			}
 			if o, dup := owner[i]; dup {
 				t.Errorf("the %s and %s keys share detector %d, want one rule per family", o, v.family, i)
@@ -4311,8 +4312,13 @@ func TestMaskingIsComplete(t *testing.T) {
 // a submatch and leave their surrounding context — the scheme, the word "Bearer", the rest
 // of the path — for a later detector or for the reader.
 func TestEveryDetectorHasACompletenessRow(t *testing.T) {
+	listed := tokenContextRulesIn(t, baseDetectors)
 	for i, d := range baseDetectors {
-		if _, ok := completenessSecretFor(d); !ok {
+		var before []detector
+		if listed[i] {
+			before = baseDetectors[:i]
+		}
+		if _, ok := completenessSecretFor(d, before); !ok {
 			t.Errorf("detector %d (%s, group %d) has no completeness row; add one to completenessRows.\n pattern: %s",
 				i, d.tag, d.group, d.re.String())
 		}
@@ -4323,11 +4329,22 @@ func TestEveryDetectorHasACompletenessRow(t *testing.T) {
 // whose target group lands exactly on the declared secret. That row is the one that speaks for
 // the detector, and TestEveryUncollapsedDetectorHasATemplatizedRow asks it what this detector's
 // value looks like before deciding whether the pipeline masker collapses it.
-func completenessSecretFor(d detector) (string, bool) {
+//
+// before is nil but for a rule in tokenContextRules, whose rows are read on the text the chain before it
+// leaves (before applied): there the secret is found where the chain left it, and must be there once.
+func completenessSecretFor(d detector, before []detector) (string, bool) {
 	for _, r := range completenessRows {
 		prefix := payloadOf(r.prefix)
 		payload := prefix + r.secret + payloadOf(r.suffix)
 		start, end := len(prefix), len(prefix)+len(r.secret)
+		if before != nil {
+			payload = throughChain(before, payload)
+			if strings.Count(payload, r.secret) != 1 {
+				continue
+			}
+			start = strings.Index(payload, r.secret)
+			end = start + len(r.secret)
+		}
 		for _, loc := range d.re.FindAllStringSubmatchIndex(payload, -1) {
 			if loc[2*d.group] == start && loc[2*d.group+1] == end {
 				return r.secret, true
@@ -4335,6 +4352,63 @@ func completenessSecretFor(d detector) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// tokenContextRules are the rules whose context is a TOKEN this package minted: #116's 13b, which reads the
+// access key id's tag. Run alone over a row as written such a rule has nothing to read, so the completeness
+// and templatized guards read its rows on the text the chain before it leaves, and check it as they check
+// every other detector there.
+//
+// The list cannot grow or shrink unseen: tokenContextRulesIn holds it to the chain both ways. A detector
+// whose pattern carries ourTokenTag must be on it, so a new rule of the kind is never checked on the wrong
+// text by accident, and every rule on it must be a detector of the chain with that tag, so one that loses
+// its tag context is checked as written again. 9c reads any of our tags or a raw host (taggedMember), so it
+// matches its rows as written and is not on it.
+var tokenContextRules = []string{awsSecretPair}
+
+// tokenContextRulesIn returns the indexes of dets that tokenContextRules lists, and fails on a detector
+// with our TOKEN tag in its pattern that the list misses, or a listed rule with no such detector.
+func tokenContextRulesIn(t *testing.T, dets []detector) map[int]bool {
+	t.Helper()
+	listed := make(map[string]bool)
+	for _, p := range tokenContextRules {
+		listed[mustLongest(p).String()] = true
+	}
+	found := make(map[string]bool)
+	out := make(map[int]bool)
+	for i, d := range dets {
+		src := d.re.String()
+		has := strings.Contains(src, ourTokenTag)
+		switch {
+		case has && !listed[src]:
+			t.Errorf("detector %d (%s) reads our TOKEN tag as its context and is not in tokenContextRules; add it there.\n pattern: %s", i, d.tag, src)
+		case listed[src] && !has:
+			t.Errorf("detector %d (%s) is in tokenContextRules and reads no TOKEN tag of ours.\n pattern: %s", i, d.tag, src)
+		}
+		if listed[src] {
+			found[src] = true
+			out[i] = true
+		}
+	}
+	for p := range listed {
+		if !found[p] {
+			t.Errorf("tokenContextRules lists a rule that is no detector of the chain:\n pattern: %s", p)
+		}
+	}
+	return out
+}
+
+// throughChain is s after dets, each once and 9c to its fixpoint, as the chain runs them.
+func throughChain(dets []detector, s string) string {
+	m := mapperOn(dets)
+	for _, d := range dets {
+		if d.fixpoint {
+			s, _ = m.applyToFixpoint(s, d)
+			continue
+		}
+		s = m.apply(s, d)
+	}
+	return s
 }
 
 // TestAcceptedOverMasking pins the cost of compiling every detector leftmost-longest, in the
@@ -5029,8 +5103,13 @@ func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 		}
 	}
 
+	listed := tokenContextRulesIn(t, baseDetectors)
 	for i, d := range baseDetectors {
-		secret, ok := completenessSecretFor(d)
+		var before []detector
+		if listed[i] {
+			before = baseDetectors[:i] // a tokenContextRules rule reads the text the chain before it leaves
+		}
+		secret, ok := completenessSecretFor(d, before)
 		if !ok {
 			continue // TestEveryDetectorHasACompletenessRow already reports this
 		}
@@ -5040,8 +5119,17 @@ func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 		}
 		covered := false
 		for _, s := range spans {
-			for _, loc := range d.re.FindAllStringSubmatchIndex(s.text, -1) {
-				if loc[2*d.group] == s.start && loc[2*d.group+1] == s.end {
+			text, start, end := s.text, s.start, s.end
+			if before != nil {
+				p := s.text[s.start:s.end]
+				if text = throughChain(before, s.text); strings.Count(text, p) != 1 {
+					continue
+				}
+				start = strings.Index(text, p)
+				end = start + len(p)
+			}
+			for _, loc := range d.re.FindAllStringSubmatchIndex(text, -1) {
+				if loc[2*d.group] == start && loc[2*d.group+1] == end {
 					covered = true
 					break
 				}
