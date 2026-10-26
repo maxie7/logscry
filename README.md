@@ -430,7 +430,9 @@ domain, and every member of a multi-host list such as a replica set), bare hostn
 (JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, and a URL userinfo in any of its shapes —
 `user:pass@`, `user@`, `:pass@`, with or without a raw `@` inside it, and with a raw `/` inside it
 wherever the text can tell it from a path), and the username in
-`/home/<user>` and `/Users/<user>` paths.
+`/home/<user>` and `/Users/<user>` paths. A URL, a connection string, an email or a path is masked
+whether its `/`, `:` and `@` are written raw or JSON-escaped: `\/`, `\u002f`, `\u003a`, `\u0040`,
+and `\\/` for a string nested in another.
 
 A value that is *part of* a hostname is masked as part of that host, under `<HOST_n>`, rather than
 under its own tag: `https://550e8400-….blob.core.windows.net` comes back as one `<HOST_n>` and not
@@ -851,6 +853,66 @@ every hand-written row and 500 generated URIs, each raw and templatized, with an
 host suffix: the bytes it masks include every byte `v0.12.25` masked, for every input. Measured over
 the same ten journald boots: nothing changed. None holds a `/` and then an `@` after a `://`.
 
+**A JSON-escaped URL sent its credentials and host before `v0.12.27`.** This was a credential
+leak, published as GHSA-p47p-xrhj-3x7p. A JSON encoder that escapes `/` writes a connection string
+as `postgres:\/\/user:pass@host\/db`. PHP's `json_encode` does this by default, and so does any
+encoder for a string nested in another (`\\/`). Every URL rule anchored on a literal `://` and
+stopped at a literal `/`, so no rule matched. The username, the password and the host went to the
+model, and the fail-closed check read the line as clean. The same held for `\u002f` and `\u002F`,
+and for an encoder that also escapes `:` and `@` (`\u003a`, `\u0040`). v0.4.0 → v0.12.26,
+fifty-two tagged releases.
+
+What was sent depended on the host:
+
+| after the `@` | sent on the trigger, the source and the context lines |
+|---|---|
+| `@db` | **the username, the password and the host** |
+| `@db.acme.com`, `@db.corp.internal` | **the username**; the rest masked by accident as `<EMAIL_n>` |
+| `@10.0.0.5` | **the username and the password**; the address masked |
+
+The Template field sent the same on a plain-text line and on a logfmt bare value, where the escapes
+reach it as written, and on a logfmt message, which reaches it re-quoted as `\\/`. In a JSON line,
+a single level of escaping in the message field reaches the Template field decoded and was masked
+there. Two levels arrive as `\\/` and were sent. Every other JSON field, and a quoted value in prose,
+reaches it as `<STR>`.
+
+The fix teaches no rule the escapes. The `://` anchor is in eight rules, and `/` is a boundary in
+more. Instead, a line with an escaped `/`, `:` or `@` is masked twice: once as written, exactly as
+before, and once as a view with those escapes resolved. The view resolves:
+
+- `\/`;
+- the `\u` escapes of `/`, `:` and `@`;
+- any run of backslashes before one of those;
+- the pipeline's form of `\u002f` on the Template field, `\u<NUM>f`.
+
+Every value either pass masks is masked in the line as written, overlapping ones as one value.
+`connect postgres:\/\/user:pass@db\/app failed` goes as `connect postgres:\/\/<TOKEN_1>@<HOST_1>\/app
+failed`. The model never sees the view; the placeholder stands for the bytes the log wrote, and
+Restore returns them escaped. Masking the view alone would have masked less than before on three
+shapes, because v0.12.26 read an escape's own characters as part of a value: the `\` of
+`user:1234\/5@db`, `us\u002fer` as a username, `u002fx` as an email's local part. The union keeps
+every byte it masked. A line with no escape is masked exactly as before.
+
+What it costs, pinned:
+
+- `\/` is read everywhere, not only inside a JSON string. A path that escapes its slashes is read
+  as a path: `copy C:\/Users\/bob\/x failed` goes as `copy C:\/Users\/<USER_1>\/x failed`.
+- `\u<NUM>f` also stands for other characters whose escape has three digits and an `f`, such as
+  the Cyrillic `п` in Python's ASCII-only JSON. Those are read as `/`, which can only mask more.
+- Where the email rule had masked the `@` and the host by accident (a dotted or private host), the
+  credential, the `@` and the host are one `<TOKEN_n>`. The host has no tag of its own there.
+- Where v0.12.26 read an escape's letters as part of a value (`\u002fappuser@db.acme.com`), those
+  letters stay inside it, and the escape's backslash is left beside the placeholder.
+- One new way to skip an escalation: a line with an escape that also carries one of logscry's own
+  placeholders as text, the same one a pass then mints for a value, is refused rather than sent.
+
+Two escapes are not read, and they are listed under
+[Known limitations](#known-limitations-v1). Checked against `v0.12.26`'s `Mask`, frozen in a test,
+over every hand-written row, the earlier gates' corpus in six escaped forms, and 1,000 generated
+JSON lines, each raw and templatized, with and without an extra host suffix: the bytes it masks
+include every byte `v0.12.26` masked, for every input. Measured over the same ten journald boots:
+nothing changed. None holds an escaped `/`, `:` or `@`.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -1270,6 +1332,21 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   Percent-encode the `/` as `%2F`, as RFC 3986 requires, and each of the four is masked whole:
   `postgres://user:1234%2F5@db` goes as `postgres://<TOKEN_1>@<HOST_1>`. Affected: these four
   shapes. Not affected: every other raw `/` in a userinfo, and a percent-encoded `/`.
+- **With `--llm-anonymize`, an escaped `:` or `@` is not read on the Template field of a
+  plain-text or logfmt line.** These are credential leaks. Since `v0.12.27` a URL whose `/`, `:`
+  or `@` is JSON-escaped is masked as if it were written raw (GHSA-p47p-xrhj-3x7p). On those lines
+  the pipeline's template mask rewrites `\u003a` and `\u0040` to `\u<NUM>a` and `\u<NUM>`.
+  `\u<NUM>` is also what it makes of `\u0022`, `\u0027` and `\u0026`, the quote, apostrophe and
+  ampersand .NET escapes by default, so reading it as `@` would be a guess.
+  `dsn=postgres:\/\/user\u003apass\u0040db\/app` sends the password and the host on the Template
+  field. Affected: the Template field of a plain-text or logfmt line whose userinfo escapes `:` or
+  `@`. Not affected: the raw trigger, source and context lines, where it is masked, and a JSON
+  line, whose message field the pipeline decodes before templating.
+- **With `--llm-anonymize`, a `\u` escape of any other URL character is not read.** No known
+  encoder writes one. A host whose dots are written `\u002e` is masked up to its first one, and the
+  rest is sent: `https:\/\/api\u002eacme\u002ecom\/v1` sends `acme` and `com`. The same goes for a
+  userinfo that escapes a character other than `/`, `:` and `@`. Since v0.4.0. Not affected:
+  `\/`, and the `\u` escapes of `/`, `:` and `@`.
 - **There are two "first seen"s, on two clocks, and they can disagree.** The card's `first`
   time and `--export`'s `first_seen` are **logscry's** clock: when logscry first processed
   the template. The age the model is told ("first seen N ago") is the **source's** clock: the
