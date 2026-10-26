@@ -2173,7 +2173,7 @@ func TestIssue57PartlyRecognisedValue(t *testing.T) {
 // host) read all three keys. 3c (a bearer value, #110) reads JWT's and AWS's only: 3b runs after 3a, so
 // a bearer value with an sk- key inside it has always been 3a's whole.
 //
-// #114's vendor keys are the other way round: no reader at all. Each format family's key is the group of
+// #114's and #116's vendor keys are the other way round: no reader at all. Each format family's key is the group of
 // exactly one detector, a verify-eligible TOKEN rule with group 1 among the chain's last, one per family,
 // and no other detector carries its shape. A vendor shape that joined keyShapes would put it inside 4d, 9e
 // and rule 11, and a vendor rule moved to 3b's slot would block the rules that mask such a key whole.
@@ -2236,6 +2236,13 @@ func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
 			{"GitHub fine-grained", githubPATSecret},
 			{"Slack", slackBotSecret},
 			{"Google", googleAPISecret},
+			{"PyPI", pypiSecret},
+			{"GitLab", gitlabPATSecret},
+			{"SendGrid", sendgridSecret},
+			{"npm", npmSecret},
+			{"Hugging Face", huggingFaceSecret},
+			{"Shopify", shopifyAccessSecret},
+			{"Twilio", twilioAPIKeySID},
 		}
 		owner := map[int]string{}
 		for _, v := range vendor {
@@ -3105,16 +3112,15 @@ func TestIssue114VendorSecretFormats(t *testing.T) {
 	}
 
 	// THE RESIDUALS, pinned: the raw line is closed and the template is main's. A user or app token's
-	// secret segment is <HEX> on the template, so nothing of it is left to send; but with a word character
-	// glued after the key the hex segment has no \b to end on, NUM takes its digits instead, and the letters
-	// a-f between them are sent, as on main.
+	// secret segment is <HEX> on the template, so nothing of it is left to send. With a word character
+	// glued after a user token the hex segment had no \b to end on, NUM took its digits, and the letters
+	// a-f between them were sent; that was the third residual here, and #116 closed it
+	// (TestIssue116PrefixedVendorTokens).
 	residuals := []struct{ name, in, want, tmpl string }{
 		{"xoxp, the secret segment is <HEX>", "key " + slackUserSecret + " rejected", "key <TOKEN_1> rejected",
 			"key xox" + "p<NUM><NUM><NUM>-<HEX> rejected"},
 		{"xapp, the secret segment is <HEX>", "key " + slackAppSecret + " rejected", "key <TOKEN_1> rejected",
 			"key xa" + "pp<NUM>-A<NUM>BCDEF<NUM>GH<NUM>-<HEX> rejected"},
-		{"xoxp, a word character glued after", "key " + slackUserSecret + "_prod used", "key <TOKEN_1>_prod used",
-			"key xox" + "p<NUM><NUM><NUM><NUM>f<NUM>a<NUM>c<NUM>e<NUM>b<NUM>d<NUM>f<NUM>a<NUM>e<NUM>c<NUM>b<NUM>d<NUM>f<NUM>a<NUM>e<NUM>_prod used"},
 	}
 	for _, c := range residuals {
 		t.Run("residual/"+c.name, func(t *testing.T) {
