@@ -5404,6 +5404,226 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       No release (no binary change).
 
+- [x] **A placeholder the log carries as text is never minted for a value** — #142, found while working
+      on GHSA-p47p-xrhj-3x7p. A correctness defect, not a leak: nothing more reached the endpoint.
+      **Since v0.4.0 (2da31be), 53 tags.**
+
+      **Cause.** `placeholder` minted `<TAG_n>` from a per-tag counter and never looked at the text. A
+      line that already said `<HOST_1>` got `<HOST_1>` minted for a real value:
+      `login as <HOST_1> from db.corp.internal` went as `login as <HOST_1> from <HOST_1>` and was
+      restored as `login as db.corp.internal from db.corp.internal`.
+      - The model was told one host recurs where the log named two things.
+      - The card showed the value in the literal's place.
+      - `Explain` masks the trigger, the source, the template and each context line through one
+        Mapper, so a literal in a later field met a token already minted for an earlier one.
+      - From v0.12.27, an escaped line with such a collision was refused instead. Its pass could not
+        be read back (the 25 per mapper in GHSA-p47p-xrhj-3x7p's literal differential).
+
+      **The remedy: reserve, then skip.** Measured against the alternatives before any code.
+      - **Reserve, then skip.** Every placeholder the request carries is reserved before anything is
+        masked, and `placeholder` skips a reserved number. With nothing reserved it is the old code,
+        so only numbering moves, and only on a line that carries a placeholder. A skip set rather than
+        "start after the highest literal": beside `<HOST_99>` the first host is still `<HOST_1>`.
+      - **Two reservation points.**
+        - `Mask` reserves its own input, which covers any caller and a literal in a field masked after
+          the mint's.
+        - `Reserve`, run once per request before the first `Mask`, covers the case per-field
+          reservation cannot: "retry as `<HOST_1>`" in a context line, masked last, meeting the token
+          already minted for the trigger's host.
+      - **The llm seam.** `masker` keeps its two methods. The factory takes the request's texts
+        (`newMask(texts ...string)`), and `Explain` builds one list of field pointers that drives both
+        the reservation and the masking, so the two cannot drift.
+        - `Level` (canonicalized), `Stream` and `Count` are the rest of the prompt; none can carry a
+          placeholder.
+      - **Rejected: escaping the literal.** It changes bytes outside every placeholder, cannot be held
+        to the per-byte gate, and makes Restore un-escape.
+      - **Rejected: a per-request nonce in the format.** It breaks `ourPH`, Restore and every pinned
+        output, makes the prompt harder to read, and is probabilistic where reservation is exact.
+      - **Reserve cannot fail silently.** A placeholder a text carries that the Mapper has ALREADY
+        minted cannot be kept apart from its value any more. Reserve records the conflict, and every
+        later `Mask` on that Mapper refuses. It records rather than returns: every path to the wire
+        goes through `Mask`, whose error the caller already treats as "do not send", while a returned
+        error could be dropped and would give the factory a second result. `Mask`'s own reservation
+        uses the same check, so a direct caller that skips `Reserve` is refused rather than read back
+        wrongly. `Explain` cannot reach it, since it reserves before the first mint.
+
+      **What counts as our placeholder: `ourPHRe`, one pattern.** Restore's "a token not in `byToken`
+      is literal" rule and `spansOf` already read by it, so the text Restore keeps and the text
+      reserved are one set.
+      - Minting goes through `token(tag, n)`; `TestEveryTagMintsARestorableToken` holds every tag in
+        the detector tables to `ourPH`.
+      - Two `ourPH` matches cannot overlap (each starts at `<` and holds no other), so a scan finds
+        every occurrence whatever is glued to it. `TestOurPHFindsEveryMintedToken` checks it for
+        every tag, four numbers and twelve neighbours a side.
+      - `ourPH` is wider than what is minted (`<FOO_1>`, `<HOST_01>`). Reserving those changes
+        nothing.
+
+      **The rebuild check: unreachable through `Mask`, kept.**
+      - With the scratch passes sharing the reservation, a pass's output holds only tokens it minted
+        and text of the line, so it always rebuilds.
+      - The view cannot add a placeholder the line lacks: it resolves only to `/`, `:` and `@`, none
+        of them in `ourPH`.
+      - The check stays as an assertion of that argument, renamed `errNotRebuilt`. Mutant M4 measured
+        what it guards: with it removed, an unreadable pass PANICS in the projection (index out of
+        range), not merely misprojects.
+      - `TestUnreadableEscapedPassFailsClosed` reaches it by calling `maskEscaped` with nothing
+        reserved.
+
+      **The Template field.** `numPat` has no `\b`, so the text masker makes `<HOST_1>` into
+      `<HOST_<NUM>>`, which is no placeholder of ours.
+      - Plain text, a JSON message, a logfmt message and a bare value cannot collide.
+      - A JSON key is kept as written, so `{"<HOST_1>":…}` carries the literal to the Template field.
+        That key is also in the trigger, so the trigger's own `Mask` reserves it first.
+      - Predicted a logfmt key too, if the parser admits `<`. It does not: the line is not logfmt, and
+        the text masker gives `<HOST_<NUM>>=x`. Pinned in `placeholderTextTemplateRows`, the
+        `<HOST_<NUM>>` rows and the JSON key.
+
+      **Restore** keeps a literal and returns a minted token's value. Pinned at both levels:
+      `TestRestoreKeepsAPlaceholderCarriedAsText` (the issue's line, four replies), and
+      `TestAnonymizeRoundTripsEveryRequestField`, whose echo backend sends every masked field back and
+      requires each to restore byte for byte, over the hand rows and 500 generated requests.
+
+      **The superset gate.** `TestPlaceholderReservationMasksASupersetOfV01227`, listed in
+      `SUPERSET_GATES`.
+      - **Reference:** `maskUnreserved`, v0.12.27's `Mask` body with nothing reserved, over the same
+        code. Checked against the real archive: identical on 256,152 records (the gate corpus, both
+        literal sets, both mappers), with the renamed error's text normalised.
+      - **Corpus:** the JSON-escape gate's (which holds every earlier gate's), the #142 rows in every
+        escaped form, and `placeholderTextGenerated(1000)`, a PCG(14, 2) generator. The generator
+        puts literal placeholders of every tag before, after, between and glued to values, in prose,
+        a JSON message and logfmt, raw and in five escaped forms. Everything goes in raw, through
+        `Templatize` and through `TemplatizeLine`: 36,256 inputs per mapper.
+      - **Claims:**
+        - no literal: byte for byte, the same error;
+        - a literal, sent on v0.12.27: equal after mapping each minted token to v0.12.27's token for
+          the same value, the same tag, and the output rebuilds the input;
+        - refused on v0.12.27 by the rebuild check: sent, and masking every byte the line's own pass
+          masks, or refused by the re-scan, nothing being sent either way;
+        - the rebuild check never fires through `Mask`;
+        - no minted token is text of the input.
+      - The fourth claim was added before the mutants ran, while writing M5's prediction: the gate had
+        counted a live rebuild refusal as "refused on both", and M5 would have survived it.
+      - It moved from the red commit to the green one, as the plan had not foreseen: it needs
+        `reserve` and `errNotRebuilt`, which main lacks.
+
+      **Predictions, then results.** Each prediction was written into a scratchpad file before its
+      run.
+      - **`go test -race ./...`:** main 2,764 passed and 1 skipped, **held**; the branch 2,813 and 1,
+        **held**. +49: the red commit's 46 results, the Reserve test, and the gate with its two
+        subtests; −1 for the retired test.
+      - **Red commit on v0.12.27:** 34 leaf subtests red and 8 passing, per test, **held**. The round
+        trip failed 214 of 504 requests, predicted 250–450, **missed** low.
+      - **Template field:** **held** but for the logfmt key above.
+      - **Per-byte differential, v0.12.27 archive against the branch,** `New()` and `New("lab")`, each
+        count per mapper (the two mappers gave equal counts in every set):
+        - **the gate corpus**, 36,256 records, 3,572 carrying a literal: 94 renumbered, all 94
+          unreadable on v0.12.27 and compared by renumbering. 247 refused by the rebuild check and
+          sent now; 5 refused on both, the re-scan now standing where the rebuild check did. 0 moved
+          beyond numbering, 0 less, 0 more, 0 refused now, 0 changed without a literal, 0 minted a
+          token the input carries: **held**. Not predicted: 1 more refused on both by the re-scan,
+          v0.12.27's own;
+        - **GHSA-p47p-xrhj-3x7p's literal set**, 34,202 records: **the 25 rebuild refusals are 25 sent
+          now**, and the 5 records v0.12.27 could not read back are renumbered. 0 moved, 0 less,
+          0 refused now: **held** exactly;
+        - **every string literal of v0.12.27's 78 test files**, `+` folded (6,213 distinct), raw and
+          in six escaped forms (19,206 inputs), each raw, through `Templatize` and through
+          `TemplatizeLine`, 57,618 records:
+          - 32 rebuild refusals sent now, predicted at least 25, **held**;
+          - 10 renumbered, predicted a few dozen, **missed** low;
+          - 0 moved, 0 less, 0 refused now, **held**;
+        - **3,000 generated requests** of 3 to 7 fields each (15,044 fields, a seeded Python
+          generator), masked through one Mapper as `Explain` does, the branch reserving first:
+          - 1,535 renumbered, predicted about half, **held**;
+          - 105 refused by the rebuild check and sent now, predicted 100–300, **held**;
+          - 0 moved, 0 less, 0 refused now, 0 minted a token any field carries, **held**;
+        - **the ten journald boots** (`SYSLOG_IDENTIFIER` `ab37*` and `logscry-probe` filtered:
+          58,172 messages, 4,845 filtered), each raw, through `Templatize` and through
+          `TemplatizeLine`, 349,032 records:
+          0 changed, 0 less, 0 more, 0 refused on either side, **held**. None carries a placeholder as
+          text, so none can move, **held**.
+      - **Residue.** Clean on v0.12.27 and refused on the branch: 0 in every set, **held**. Escaped,
+        refused on v0.12.27 and sent on the branch: 247, 25, 32 and 105 in the four sets above, and 0
+        in the boots.
+      - **Wire check.** Each binary ran against a capturing endpoint (`--plain --llm-anonymize
+        --warmup-lines 0 --rate-limit 100000 --cache-ttl 1s`) whose answer echoes the masked trigger
+        and context, so the card shows what Restore made of exactly what was sent. Six lines with
+        invented values: the control, the issue's two lines, "retry as `<HOST_1>` scheduled", a
+        `[FATAL]` trigger whose context carries it, and the escaped line the old fail-closed test
+        refused.
+        - v0.12.27 4 requests and the branch 5 (the escaped line refused on v0.12.27), **held**;
+        - v0.12.27 sent `login as <HOST_1> from <HOST_1>`, and the card read
+          `login as db.corp.internal from db.corp.internal`. The DSN line's card put the credential
+          in the literal's place, and the context collision's card read
+          `retry as cache.corp.internal scheduled`: **held**. Not predicted, and worse: a context
+          line's literal also took another field's value (`login as pghost from db.corp.internal`
+          on the DSN request);
+        - the branch sent distinct placeholders throughout, and every card shows `<HOST_1>` and
+          `<TOKEN_1>` where the log had them: **held**. The escaped line went as
+          `connect postgres:\/\/<TOKEN_2>@<HOST_2>\/db as <TOKEN_1>`, predicted `<HOST_1>`:
+          **missed** on the number. The request's context carries `<HOST_1>`, and the request-wide
+          reservation skips it.
+      - **Benchmarks** (`BenchmarkMask`, `-count=10`, medians, v0.12.27 against the branch): ordinary
+        line 161.2 → 151.5 µs, one escaped DSN 239.0 → 230.9, a JSON line with several 546.5 → 522.4.
+        Predicted within ±3%: **missed**, faster by 3–6%. The branch only adds one scan, so that is
+        noise; no regression.
+
+      **Mutants, and what each turned red** (predicted, then measured):
+      - **M1, reservation off** (`placeholder` ignores it): 36:
+        - every collision row (9), every escaped row (17), the Restore row and the JSON-key Template
+          row;
+        - the four cross-field rows, the round trip, both gate subtests, and the reserved-first half
+          of the Reserve test.
+
+        `TestMaskRefusesATokenItAlreadyMinted` stays green. **Held.**
+      - **M2, per field only** (no `Reserve` in the factory): the four cross-field rows and the round
+        trip. **Held.**
+      - **M3, the reservation scan missing `USER`:** 9, the USER rows (raw and five escaped), both
+        gate subtests and the round trip. **Held.**
+      - **M4, the rebuild check removed:** `TestUnreadableEscapedPassFailsClosed`, and the gate,
+        whose reference shares `maskEscaped`. Both red by a panic. Predicted the first only:
+        **missed** by one test.
+      - **M5, scratch passes without the reservation:** the 17 escaped rows and both gate subtests.
+        **Held**, with the gap above closed first.
+      - **M6, the reservation skipping the Template:** the Template cross-field row and the round
+        trip. **Held.**
+      - **M7, GHSA-p47p-xrhj-3x7p's "no fast path", re-run:** 0. With nothing colliding, both paths
+        are a function of the same spans, so it is now an equivalent mutant. **Held.**
+      - **M8, no conflict recorded:** `TestMaskRefusesATokenItAlreadyMinted` and
+        `TestReserveAfterAMintFailsClosed`. **Held.**
+
+      **`-race`.** `-race -count=20 -timeout 60m` on every new test but the gate, and the two
+      fail-closed seam tests: green (anonymize 11.7 s, llm 69.9 s). The gate ran
+      `-race -count=2 -timeout 60m`: green, 1,024 s, sharing the CPU with the differential.
+
+      **Tests.**
+      - **Red on v0.12.27:** 34 subtests:
+        - `TestPlaceholderTextIsNeverMinted` 9;
+        - `TestEscapedPlaceholderTextIsSent` 17;
+        - `TestRestoreKeepsAPlaceholderCarriedAsText` 1;
+        - `TestTemplateFieldPlaceholderText` 1;
+        - `TestMaskRefusesATokenItAlreadyMinted` 1;
+        - `TestAnonymizeKeepsPlaceholderTextAcrossFields` 4;
+        - `TestAnonymizeRoundTripsEveryRequestField` 1.
+      - **Passing on both:** `TestOurPHFindsEveryMintedToken`, `TestUnreadableEscapedPassFailsClosed`,
+        three collision rows that collide with nothing, and three Template rows.
+      - **Green commit only:** `TestReserveAfterAMintFailsClosed` and the gate.
+      - **Existing tests changed:**
+        - `TestJSONEscapePlaceholderShapedLiteralFailsClosed` is retired: its claim is now false, and
+          its line is pinned with the opposite expectation in `TestEscapedPlaceholderTextIsSent`;
+        - the JSON-escape gate's `jsonEscapePlaceholderTextRows` block compares after renumbering,
+          not whole;
+        - the two `newMask` closures in `internal/llm`'s tests change signature.
+
+        No existing row was moved or re-indented.
+
+      **Seen and left alone, out of scope:**
+      - #137 (the control, still sent), #135, #65, #116, #36, #126;
+      - every detector, the view's decoded set, `internal/pipeline`;
+      - an email glued to an IPv6 address (`…@acme.io2001:db8::…`), which v0.12.27 and the branch both
+        refuse by the re-scan, a generator artefact that fails closed.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
