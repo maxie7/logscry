@@ -126,6 +126,7 @@ func TestTypeTags(t *testing.T) {
 		{"key " + shopifyAccessSecret + " rejected", "<TOKEN_1>"},
 		{"key " + pypiSecret + " rejected", "<TOKEN_1>"},
 		{"AWS_SECRET_ACCESS_KEY=" + awsSecretKey, "<TOKEN_1>"},
+		{"post https://" + slackHookHost + "/services/" + slackWebhookPath, "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -200,6 +201,7 @@ func TestNoOverMasking(t *testing.T) {
 		"A" + "CCEPTED",
 		"aws_secret_access_key is missing",
 		"AWS_SECRET_ACCESS_KEY not set for profile2",
+		"read the " + discordHost + "/api/webhooks docs",
 	}
 	for _, s := range survive {
 		m := New()
@@ -614,6 +616,9 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"AWS_SECRET_ACCESS_KEY=<TOKEN_1>",
 		"<TOKEN_1>,<TOKEN_2>",
 		"creds <TOKEN_1> <TOKEN_2> loaded",
+		"https://<HOST_1>/services/<TOKEN_1>",
+		slackHookHost + "/services/<TOKEN_1>",
+		"post https://<HOST_1>/api/v<NUM>/webhooks/<TOKEN_1>?wait=true",
 	}
 	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
@@ -4272,6 +4277,10 @@ var completenessRows = []completenessRow{
 	{"aws-secret/json", `{"SecretAccessKey":"`, awsSecretKey, `"}`},
 	{"aws-secret/cli-flag", "run --aws-secret-access-key ", awsSecretKey, " --region x"},
 	{"aws-secret/pair-space", "creds \x00" + awsSessionKeyID + "\x00 ", awsSecretKey2, ""},
+	// #116's webhook URLs (4f): every path segment after the vendor's prefix, the host 9a's.
+	{"webhook/slack", "post https://\x00" + slackHookHost + "\x00/services/", slackWebhookPath, " failed"},
+	{"webhook/discord", "POST https://\x00" + discordHost + "\x00/api/webhooks/", discordWebhookPath, "?wait=true 401"},
+	{"webhook/slack-no-scheme", "SLACK_WEBHOOK=" + slackHookHost + "/services/", slackWebhookPath, ""},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -4684,6 +4693,10 @@ var vendorSecretOverMaskingRows = []struct {
 	{"forty characters after any secret are the pair's", "token " + githubClassicSecret + " e20f93bfe1ac9665e30da612" + "33053f4d6c14db86",
 		"token <TOKEN_1> <TOKEN_2>"},
 	{"a long value after the name is a key", "aws_secret_access_key: " + strings.Repeat("placeholder", 4), "aws_secret_access_key: <TOKEN_1>"},
+	// A webhook's path after the prefix is all secret, so a further segment joins it: Discord's /slack and
+	// /github compatibility routes.
+	{"a route after a discord webhook joins its token", "POST https://" + discordHost + "/api/webhooks/" + discordWebhookPath + "/slack 401",
+		"POST https://<HOST_1>/api/webhooks/<TOKEN_1> 401"},
 }
 
 // dottedQuadOverMaskingRows are #49's accepted over-masking rows, at package level for the gate's
@@ -4912,6 +4925,8 @@ var templatizedRows = []templatizedRow{
 	{"vendor-key/gitlab-sentence-dot", "key \x00" + gitlabRoutable + "\x00. Retrying"},
 	{"aws-secret/named", "AWS_SECRET_ACCESS_KEY=\x00" + awsSecretKey + "\x00"},
 	{"aws-secret/pair", "creds \x00" + awsAccessKeyID + "\x00,\x00" + awsSecretKey + "\x00 loaded"},
+	{"webhook/slack", "post https://\x00" + slackHookHost + "\x00/services/\x00" + slackWebhookPath + "\x00 failed"},
+	{"webhook/discord-versioned", "POST https://\x00" + discordHost + "\x00/api/v10/webhooks/\x00" + discordWebhookPath + "\x00 401"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
@@ -5014,6 +5029,7 @@ func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
 		{"quote-edge/twilio-key-first", "\x00" + twilioAPIKeySID + "\x00 rejected"},
 		{"quote-edge/aws-secret-last", "loaded AWS_SECRET_ACCESS_KEY \x00" + awsSecretKey + "\x00"},
 		{"quote-edge/aws-pair-last", "creds \x00" + awsAccessKeyID + "\x00 \x00" + awsSecretKey + "\x00"},
+		{"quote-edge/webhook-last", "post https://\x00" + discordHost + "\x00/api/webhooks/\x00" + discordWebhookPath + "\x00"},
 	}
 	rows := append(append([]templatizedRow{}, templatizedRows...), quoteEdgeRows...)
 	for _, f := range fields {
@@ -5341,6 +5357,7 @@ func TestNoOverMaskingAfterTemplating(t *testing.T) {
 		"use h" + "f_xet_storage_v2",
 		"np" + "m_config_cache_v2",
 		"AWS_SECRET_ACCESS_KEY=abc123",
+		"see " + discordHost + "/api/v10/webhooks docs",
 	}
 	for _, s := range survive {
 		in, _ := pipeline.Templatize(s)
