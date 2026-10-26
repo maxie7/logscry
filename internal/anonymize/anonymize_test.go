@@ -908,11 +908,8 @@ func TestIssue55PasswordlessUserinfo(t *testing.T) {
 		// colon, until it was closed; it is TestIssue57PartlyRecognisedValue now.
 		// A raw '@' in the password sat here as #58 until it was closed; it is
 		// TestIssue58RawAtInUserinfo now, with the '/' case below kept as its control.
-		// A raw '/' in the password. net/url ERRORS on this one, so unlike the '@' case there is no
-		// reliable parse to widen towards and the honest candidate is to fail closed rather than
-		// mask in part. Today the username is masked as a HOST and both the password remainder and
-		// the real host are sent. #59.
-		{"raw '/' in the password (#59)", "postgres://user:p/ss@db", "p/ss"},
+		// A raw '/' in the password sat here as #59 until rule 4e masked the authority whole; it is
+		// TestIssue59SlashInUserinfo now, with the shapes it cannot reach.
 		// No scheme, so no "://" for any credential rule to anchor on. By design rather than by
 		// defect, and here so one run also shows the boundary of what the anchor reaches.
 		{"no scheme, by design", "user@db:5432/app", "user@db"},
@@ -1013,11 +1010,8 @@ func TestIssue58RawAtInUserinfo(t *testing.T) {
 	// The negative half, as ASSERTIONS that these gaps are open. Each goes red when its issue is
 	// fixed and is the reminder to update the docs that call it open.
 	open := []struct{ name, in, leak string }{
-		// A raw '/' in the password. net/url ERRORS on this one, and it errors the same way on a
-		// raw '?' and '#', which is the measurement that keeps those two out of THIS fix: bounding
-		// the userinfo at '?' and '#' would reopen "postgres://user:p?ss@db", fully masked today.
-		// All three are #59's class -- no reliable parse -- and #59's remedy, whatever it is.
-		{"raw '/' in the password (#59)", "postgres://user:p/ss@db", "p/ss"},
+		// A raw '/' in the password sat here as #59 until rule 4e masked the authority whole; it is
+		// TestIssue59SlashInUserinfo now. A raw '?' and '#' stay detector 4's, unbounded, as above.
 		// #57 with a raw '@' behind the tag sat here until it was closed; it is
 		// TestIssue57PartlyRecognisedValue now.
 		// The second host of a replica set sat here as #61 until it was closed; it is
@@ -1210,9 +1204,8 @@ func TestIssue61MultiHostAuthority(t *testing.T) {
 	open := []struct{ name, in, leak string }{
 		// A tag minted on a LATER member sat here as #67, one row per reachable tag, until it was
 		// closed; it is TestIssue67LaterMemberTag now.
-		// #59's shape with a list: the authority ended at the raw '/', so host2 is PATH to the RFC
-		// and to net/url alike, and no context design reaches it. Still #59.
-		{"raw '/' in the password, with a list (#59)", "postgres://user:p/ss@h1.acme.com,host2/db", "host2"},
+		// #59's shape with a list sat here until rule 4e took the authority whole, list included; it
+		// is a row of TestIssue59SlashInUserinfo now.
 		// An underscore in a hostname sat here as #66 until it was closed; it is
 		// TestIssue66UnderscoreInHostname now.
 	}

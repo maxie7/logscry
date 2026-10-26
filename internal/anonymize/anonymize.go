@@ -118,7 +118,14 @@
 // carries the other half of the RFC's rule as context (authorityTail) so that a tag between a
 // raw '@' and the real delimiter makes it decline rather than take a prefix. What was NOT
 // changed is '?' and '#', which the same RFC paragraph also ends the authority at: bounding
-// there was measured and reopens a leak, and those two belong with the raw '/' in #59's class.
+// there was measured and reopens a leak. They stay admitted, and the raw '/' is 4e's (#59, below).
+//
+// #59 IS THE ONE PLACE A PARSE CANNOT BE CHOSEN, and 4e does not choose one. A raw '/' in a userinfo
+// ends the authority to the RFC and to net/url, and the author meant a userinfo; nothing in the text
+// separates the two readings. So 4e, run first, masks the authority whole -- from "://" through the
+// host the author meant -- which covers what is sensitive under either. Failing closed on the shape was
+// the issue's candidate, and was measured against this: it discloses no less, legal URIs carry the
+// same shape, and each would have muted a whole escalation where 4e costs one placeholder.
 //
 // THE HOST LIST IS A FIFTH RULE, NOT A WIDER CLASS (#61). 9a masks one host and stops at the port
 // colon and the comma; a replica-set or failover authority -- host[:port](,host[:port])* -- sent
@@ -262,6 +269,10 @@ func New(extraHostSuffixes ...string) *Mapper {
 //
 // #114 WIDENS WHAT residue() SEES by the vendor formats, for #108's reason: rule 12 is verify-eligible,
 // so a raw Stripe, GitHub, Slack or Google secret that ever survives masking mutes.
+//
+// #59 WIDENS IT by one class, for #55's reason -- no pattern described the shape. 4e is verify-eligible,
+// so an authority with a raw '/' in its userinfo that ever survives masking whole mutes. The four shapes
+// 4e cannot tell from a legal URI are described by no rule, and the re-scan reads them as clean.
 func (m *Mapper) Mask(s string) (string, error) {
 	out := s
 	for _, d := range m.dets {
@@ -505,7 +516,7 @@ var defaultHostSuffixes = []string{
 // "(?:[0-9a-f]{1,4}:){1,7}:" matched "2001:db8::" and left "dead:beef" in the clear (#41).
 // Longest mode picks the complete match instead.
 //
-// It is applied to all twenty-nine rather than to the one detector known to need it, because
+// It is applied to all thirty rather than to the one detector known to need it, because
 // which detectors need it is not a property anyone can keep true by inspection: IPv4 is also
 // an alternation, and today it is saved only incidentally, by its literal "." separators and
 // its trailing \b. A single compile site is what makes the mode impossible to forget when a
@@ -520,7 +531,8 @@ var defaultHostSuffixes = []string{
 // '@' and must reach a terminator, so exactly one '@' -- the last before the authority ends --
 // lets the whole pattern match, and the group's end is forced there. 4d carries the same group and
 // the same tail, so the same argument holds; 9e's group ends its pattern, so its longest match is its
-// longest group.
+// longest group. 4e carries the host INSIDE its group, before a context of one character, and its host
+// admits no '@', so its longest match is its longest group and ends after the last '@'.
 func mustLongest(pat string) *regexp.Regexp {
 	re := regexp.MustCompile(pat)
 	re.Longest()
@@ -534,6 +546,60 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	bareHost := mustLongest(bareHostPattern(suffixes))
 
 	dets := []detector{
+		// 4e. A userinfo carrying a raw '/' (#59). It runs FIRST, ahead of 4d, and the number is 4d's
+		//     convention: it is a credential rule.
+		//
+		//     Until #59 no rule reached such a userinfo. '/' ends the authority (RFC 3986 §3.2), so every
+		//     credential class excludes it and 9a's userinfo context stops there too; the run from "://"
+		//     never found its '@', and 9a fell back to masking the first label-shaped run as the HOST:
+		//     postgres://user:p/ss@db went out as postgres://<HOST_1>:p/ss@db, the password remainder and
+		//     the real host in the clear, and residue() read it as clean. v0.4.0 onward.
+		//
+		//     NO PARSE IS CHOSEN, because none can be. net/url reads that string as host "user:p" and path
+		//     "/ss@db" and errors on the port; its author meant a userinfo and a host, and nothing in the
+		//     text separates the two. So the group is the AUTHORITY WHOLE, from after "://" through the host
+		//     and port the author meant, and that span holds what is sensitive under either reading: the
+		//     grammar's host, and its path as far as the author's authority runs. What follows is path,
+		//     query or fragment under both. Failing closed on the shape was measured against this and lost:
+		//     it discloses no less, and the shape is also carried by legal URIs, which it would mute whole.
+		//
+		//     THE SHAPE, part by part (see slashUserinfo).
+		//       either: the authority before its first '/' holds no '@' and a ':' whose right side is
+		//               not a port -- not all digits, nor the pipeline's <NUM>. Outside brackets a host
+		//               carries no ':', so that authority is no host[:port] at all;
+		//       or:     a '/' before any ':', then a ':' and an '@' -- us/er:pass@db, a legal URI whose
+		//               path happens to read as user:pass@host;
+		//       then:   the rest of the userinfo, '/', '@' and ':' admitted, the delimiting '@', and the
+		//               host[:port] after it, INSIDE the group. Leftmost-longest takes the last '@' whose
+		//               host reaches an end, #58's rule; a raw '@' after the '/' is userinfo.
+		//       end:    context: '/', '?', '#', whitespace, '>', a quote or a backtick, or the end of the
+		//               text. A quoted DSN keeps its closing quote outside the token, and a query survives.
+		//     Brackets are in no class before the '/', so an IPv6 literal's colons are never "the ':'".
+		//
+		//     THE HOST GOES INSIDE, and that was measured, not preferred. Ending the group at the '@' and
+		//     leaving the host to 9a keeps its tag and its recurrence, and sends the '@' that main's email
+		//     rule masked by accident on a dotted host (user:p/ss@db.acme.com): a byte main masked, sent.
+		//
+		//     IT RUNS FIRST, so a key in either half is inside the token (#57's reasoning) and 9e or 3c cannot
+		//     tag part of the authority before it. THIS IS NOT A REORDERING: it is disjoint from 4d, whose
+		//     group excludes '/', and absent wherever no raw '/' comes before the '@', so every legal DSN
+		//     still reaches 4, 4b, 4c, 4d and 9a exactly as before -- asserted against v0.12.25 per byte in
+		//     TestSlashUserinfoMasksASupersetOfV01225.
+		//
+		//     WHAT IT DOES NOT REACH is each shape the text cannot tell from a legal URI, pinned as sent:
+		//     a password whose head before the '/' is all digits (a port), a password-less username with a
+		//     '/' (an email in a path), an '@' before the '/' (a legal userinfo, with an '@' in its path),
+		//     and a password that starts with '/' (an empty port).
+		//
+		//     WHAT IT COSTS is pinned in TestAcceptedOverMasking: a legal URI of the second shape -- an image
+		//     reference with a tag and a digest, a colon in a path before an '@' -- or a '/' and an '@' in a
+		//     query after a port, is one token through the host; a later '@' with no whitespace before it
+		//     extends the token, across JSON fields too, as detector 4's does since #58; and the host never
+		//     carries its own tag here, so it is not seen to recur.
+		//
+		//     verify:true, as every credential rule: a recognised authority that ever survives masking mutes
+		//     the escalation. Its classes exclude '<' and '>', so it cannot fire on our own output.
+		{tagToken, mustLongest(slashUserinfo), 1, true, false},
 		// 4d. A userinfo with a key GLUED inside one of its halves (#57). It runs HERE, ahead of the key
 		//     detectors, and the out-of-sequence number is 6's and 9d's convention: it is a credential
 		//     rule, and the audit table and the issues number those 4-4d.
@@ -644,6 +710,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    matched on its own.
 		//
 		//    WHAT IS NOT BOUNDED IS '?' AND '#', and that was measured rather than left to symmetry.
+		//    (The raw '/' itself is 4e's since #59; this paragraph is why '?' and '#' did not go with it.)
 		//    The same paragraph of the same RFC ends the authority at '/', '?' or '#'; this class
 		//    excludes '/' and admits the other two, and it would have been tidy to stop admitting
 		//    them alongside admitting '@'. It reopens a leak: "postgres://user:p?ss@db" is fully
@@ -651,7 +718,7 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//    net/url cuts fragment and query BEFORE resolving the '@', so it errors on a raw '?',
 		//    '#' and '/' in a password identically -- those three are one class, the class with no
 		//    reliable parse, and it is #59's. Bounding at '?' and '#' would be the '/'-exclusion
-		//    extended to its siblings, i.e. part of #59's remedy, whatever that turns out to be.
+		//    extended to its siblings; #59's remedy, 4e, went the other way and admits them.
 		//    What admitting '@' costs instead is two over-masks, both pinned in
 		//    TestAcceptedOverMasking: a query carrying two '@'s is absorbed one parameter further,
 		//    and a credentialed URL whose QUERY carries an '@' absorbs the host into the token.
@@ -1547,6 +1614,21 @@ var gluedUserinfo = func() string {
 	inUser := glued(keyShapes, user, func(cont string) string { return `[^:/\s<>` + cont + `]` })
 	inPass := glued(keyShapes, pass, func(cont string) string { return `[^/\s<>` + cont + `]` })
 	return `://(` + inUser + `(?::` + pass + `*)?|` + user + `*:` + inPass + `)@` + authorityTail
+}()
+
+// slashUserinfo is 4e (#59): an authority a raw '/' interrupts, matched whole. See 4e for each part.
+// notPort is a unit a port cannot hold: anything but a digit, or a pipeline placeholder other than
+// <NUM>, which is a digit run. The names are pipelinePH's.
+var slashUserinfo = func() string {
+	auth := `(?:[^:/@\[\]\s<>]|` + pipelinePH + `)`
+	unit := `(?:[^/@\[\]\s<>]|` + pipelinePH + `)`
+	notPort := `(?:[^0-9/@\[\]\s<>]|<(?:TS|UUID|IP|HEX|STR)>)`
+	rest := `(?:[^\s<>]|` + pipelinePH + `)`
+	host := `(?:[^@/?#\s<>"'` + "`" + `]|` + pipelinePH + `)*`
+	end := `(?:[/?#\s>"'` + "`" + `]|$)`
+	password := auth + `*:` + unit + `*` + notPort + unit + `*/` + rest + `*`
+	username := auth + `+/` + rest + `*:` + rest + `*`
+	return `://((?:` + password + `|` + username + `)@` + host + `)` + end
 }()
 
 // gluedHost is 9e: a host run with a glued key inside it, after one "://", '@' or ','. The host class
