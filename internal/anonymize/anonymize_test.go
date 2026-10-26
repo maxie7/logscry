@@ -125,6 +125,7 @@ func TestTypeTags(t *testing.T) {
 		{"key " + huggingFaceSecret + " rejected", "<TOKEN_1>"},
 		{"key " + shopifyAccessSecret + " rejected", "<TOKEN_1>"},
 		{"key " + pypiSecret + " rejected", "<TOKEN_1>"},
+		{"AWS_SECRET_ACCESS_KEY=" + awsSecretKey, "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -197,6 +198,8 @@ func TestNoOverMasking(t *testing.T) {
 		"py" + "pi-simple-index",
 		"sh" + "pss_rotation",
 		"A" + "CCEPTED",
+		"aws_secret_access_key is missing",
+		"AWS_SECRET_ACCESS_KEY not set for profile2",
 	}
 	for _, s := range survive {
 		m := New()
@@ -608,6 +611,9 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"key py" + "pi-AgE<TOKEN_1> used",
 		"key xox" + "p<NUM><NUM><NUM><NUM><TOKEN_1> used",
 		"TWILIO_API_KEY=<TOKEN_1>",
+		"AWS_SECRET_ACCESS_KEY=<TOKEN_1>",
+		"<TOKEN_1>,<TOKEN_2>",
+		"creds <TOKEN_1> <TOKEN_2> loaded",
 	}
 	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
@@ -4257,6 +4263,14 @@ var completenessRows = []completenessRow{
 	{"vendor-key/pypi-closing-quote", `rejected "`, pypiSecret, `" twice`},
 	{"vendor-key/npm-underscore-before", "token_", npmSecret, " used"},
 	{"vendor-key/twilio-underscore-after", "key ", twilioAPIKeySID, "_prod used"},
+	// #116's AWS secret access key: the value after its name (13a), then the value after its access key id
+	// (13b), whose context is the id's TOKEN, so the guards read its rows on the text the chain before it
+	// leaves (see tokenContextRules).
+	{"aws-secret/named", "AWS_SECRET_ACCESS_KEY=", awsSecretKey, ""},
+	{"aws-secret/pair", "creds \x00" + awsAccessKeyID + "\x00,", awsSecretKey, " loaded"},
+	{"aws-secret/json", `{"SecretAccessKey":"`, awsSecretKey, `"}`},
+	{"aws-secret/cli-flag", "run --aws-secret-access-key ", awsSecretKey, " --region x"},
+	{"aws-secret/pair-space", "creds \x00" + awsSessionKeyID + "\x00 ", awsSecretKey2, ""},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -4582,7 +4596,7 @@ var gluedRunOverMaskingRows = []struct {
 // vendorSecretOverMaskingRows are #116's accepted over-masking rows, at package level for the gate's sake
 // as #134's are. A body's floor is the format's shortest length and nothing more, and GitLab's body is
 // inferred and permissive on purpose, so a long enough name after a prefix is a key: a kebab-case name of
-// twenty after a GitLab prefix, a camelCase word of thirty-four after "hf_".
+// twenty after a GitLab prefix, a camelCase word of thirty-four after "hf_". The AWS rows say theirs.
 var vendorSecretOverMaskingRows = []struct {
 	name string
 	in   string
@@ -4590,6 +4604,12 @@ var vendorSecretOverMaskingRows = []struct {
 }{
 	{"a long kebab-case name after a gitlab prefix is a key", "flag gl" + "pat-rotation-policy-enabled on", "flag <TOKEN_1> on"},
 	{"a long camelCase word after hf_ is a key", "load h" + "f_" + "modelRepositoryDownloadCacheManager ok", "load <TOKEN_1> ok"},
+	// The AWS secret access key's costs. 13b reads any TOKEN as its context, since a regexp cannot see which
+	// rule minted it, so exactly forty characters of the key's alphabet after any secret are a key: here a
+	// SHA-1 after a GitHub token. And a value of forty or more after the name is a key, whatever it is.
+	{"forty characters after any secret are the pair's", "token " + githubClassicSecret + " e20f93bfe1ac9665e30da612" + "33053f4d6c14db86",
+		"token <TOKEN_1> <TOKEN_2>"},
+	{"a long value after the name is a key", "aws_secret_access_key: " + strings.Repeat("placeholder", 4), "aws_secret_access_key: <TOKEN_1>"},
 }
 
 // dottedQuadOverMaskingRows are #49's accepted over-masking rows, at package level for the gate's
@@ -4816,6 +4836,8 @@ var templatizedRows = []templatizedRow{
 	{"vendor-key/twilio", "key \x00" + twilioAPIKeySID + "\x00 rejected"},
 	{"vendor-key/sendgrid-env-var-end", "SENDGRID_API_KEY=\x00" + sendgridSecret + "\x00"},
 	{"vendor-key/gitlab-sentence-dot", "key \x00" + gitlabRoutable + "\x00. Retrying"},
+	{"aws-secret/named", "AWS_SECRET_ACCESS_KEY=\x00" + awsSecretKey + "\x00"},
+	{"aws-secret/pair", "creds \x00" + awsAccessKeyID + "\x00,\x00" + awsSecretKey + "\x00 loaded"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
@@ -4916,6 +4938,8 @@ func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
 		{"quote-edge/hugging-face-key-first", "\x00" + huggingFaceDigits + "\x00 rejected"},
 		{"quote-edge/shopify-key-last", "rejected key \x00" + shopifyAccessSecret + "\x00"},
 		{"quote-edge/twilio-key-first", "\x00" + twilioAPIKeySID + "\x00 rejected"},
+		{"quote-edge/aws-secret-last", "loaded AWS_SECRET_ACCESS_KEY \x00" + awsSecretKey + "\x00"},
+		{"quote-edge/aws-pair-last", "creds \x00" + awsAccessKeyID + "\x00 \x00" + awsSecretKey + "\x00"},
 	}
 	rows := append(append([]templatizedRow{}, templatizedRows...), quoteEdgeRows...)
 	for _, f := range fields {
@@ -5228,6 +5252,7 @@ func TestNoOverMaskingAfterTemplating(t *testing.T) {
 		"code S" + "K1a",
 		"use h" + "f_xet_storage_v2",
 		"np" + "m_config_cache_v2",
+		"AWS_SECRET_ACCESS_KEY=abc123",
 	}
 	for _, s := range survive {
 		in, _ := pipeline.Templatize(s)
