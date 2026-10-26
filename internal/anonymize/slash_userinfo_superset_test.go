@@ -104,6 +104,7 @@ var noSlashBeforeAt = regexp.MustCompile(`://\S*/\S*@`)
 // input v0.12.25 masked is not refused now; an input with no '/' and then '@' after a "://" comes back
 // byte for byte; and the shapes 4e must not reach, and the ones it cannot, come back exactly as
 // v0.12.25 returns them, raw and templatized.
+// Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestSlashUserinfoMasksASupersetOfV01225(t *testing.T) {
 	corpus := slashUserinfoCorpus()
 	for _, c := range []struct {
