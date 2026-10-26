@@ -170,9 +170,21 @@ func TestIssue116WebhookURLs(t *testing.T) {
 		})
 	}
 
-	// residue() reads 4f, so a raw webhook path mutes the escalation; v0.12.28 read these as clean.
+	// A path run into another URL's scheme: 9a reads the scheme glued to what precedes it, so 4f ends the
+	// path at the last '/' before it and the segment carrying the scheme stays sent, as on v0.12.28; the
+	// ids before it are masked. Named in README's Known limitations.
+	{
+		last := slackWebhookPath[strings.LastIndexByte(slackWebhookPath, '/')+1:]
+		in := webhookFill.Replace("url https://{SH}/services/{SP}x_https://api.acme.com/v1")
+		if got, want := mustMask(t, New(), in), "url https://<HOST_1>/services/<TOKEN_1>/"+last+"x_https://<HOST_2>/v1"; got != want {
+			t.Errorf("a path run into another URL's scheme moved -- update this test and README's Known limitations:\n in:   %q\n got:  %q\n want: %q", in, got, want)
+		}
+	}
+
+	// residue() reads 4f, so a raw webhook path mutes the escalation; v0.12.28 read these as clean. Its
+	// context is the raw host, so a path behind a HOST tag is no longer one it can read.
 	for _, in := range []string{
-		"https://<HOST_1>/services/" + slackWebhookPath,
+		"https://" + slackHookHost + "/services/" + slackWebhookPath,
 		slackHookHost + "/services/" + slackWebhookPath,
 		"post https://" + discordHost + "/api/webhooks/" + discordWebhookPath,
 	} {

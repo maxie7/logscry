@@ -19,7 +19,7 @@ var slackKeyV01228 = `(?:xox[abprs]|xapp)(?:-[0-9][A-Za-z0-9-]*` + vendorAlnum +
 	caseOrRun(`(?:[A-Za-z0-9-]|`+pipelinePH+`)`, vendorAlnum) + `)`
 
 // issue116Rules are the patterns #116 added to the chain, each as the chain compiles it: rule 12's seven
-// families and rule 13's two.
+// families, rule 13's two and 4f.
 func issue116Rules() map[string]bool {
 	added := map[string]bool{}
 	for _, k := range vendorKeys {
@@ -30,6 +30,7 @@ func issue116Rules() map[string]bool {
 	}
 	added[mustLongest(awsSecretNamed).String()] = true
 	added[mustLongest(awsSecretPair).String()] = true
+	added[mustLongest(webhookPath).String()] = true
 	return added
 }
 
@@ -52,18 +53,18 @@ func atV01228(t *testing.T, dets []detector) []detector {
 		}
 		out = append(out, d)
 	}
-	if len(added) != 9 || len(out) != len(dets)-len(added) || replaced != 1 {
-		t.Fatalf("the reference dropped %d of %d entries and replaced %d, want #116's 9 and the Slack entry",
+	if len(added) != 10 || len(out) != len(dets)-len(added) || replaced != 1 {
+		t.Fatalf("the reference dropped %d of %d entries and replaced %d, want #116's 10 and the Slack entry",
 			len(dets)-len(out), len(added), replaced)
 	}
 	return out
 }
 
 // issue116Trigger finds what any of #116's rules could read in the input: a vendor prefix, a Slack one, an
-// AWS secret's name, or a TOKEN placeholder as text. 13b also reads a TOKEN the chain minted, so an input
+// AWS secret's name, a webhook host, or a TOKEN placeholder as text. 13b also reads a TOKEN the chain minted, so an input
 // v0.12.28 masked a TOKEN in is read too (see issue116Reads). An input with none of them must come back
 // from the chain byte for byte as v0.12.28 returned it.
-var issue116Trigger = regexp.MustCompile(`SK|AC|SG\.|npm_|gl(?:pat|oas|dt|rtr|rt|cbt|ptt|ft|imt|agent|wt|soat|ffct)|hf_|shp(?:at|ca|pa|ss)_|pypi-|xox[abprs]|xapp|(?i:secret[_-]?access[_-]?key)|<` + tagToken + `_`)
+var issue116Trigger = regexp.MustCompile(`SK|AC|SG\.|npm_|gl(?:pat|oas|dt|rtr|rt|cbt|ptt|ft|imt|agent|wt|soat|ffct)|hf_|shp(?:at|ca|pa|ss)_|pypi-|xox[abprs]|xapp|(?i:secret[_-]?access[_-]?key|hooks\.slack\.com|discord(?:app)?\.com)|<` + tagToken + `_`)
 
 // issue116Reads reports whether #116's rules could read in, given v0.12.28's output for it.
 func issue116Reads(in, refOut string) bool {
@@ -169,6 +170,91 @@ func awsSecretGenerated(n int) []string {
 	return out
 }
 
+// webhookFrames put 4f's values where TestIssue116WebhookURLs does, filled by webhookFill, with the near
+// misses and the shapes that stay sent beside them.
+var webhookFrames = []string{
+	"posting to https://{SH}/services/{SP} failed", "POST https://{SH}/services/{SP}?wait=true 404", "url https://{SH}/services/{SP}#x",
+	"url https://{SH}/services/{SP}/ ok", `url "https://{SH}/services/{SP}"`, `{"webhook":"https://{SH}/services/{SP}"}`,
+	"level=error url=https://{SH}/services/{SP} status=404", `level=error msg="post https://{SH}/services/{SP} failed" module=x`,
+	"url https://{SH}:443/services/{SP} failed", "SLACK_WEBHOOK={SH}/services/{SP}", "url https://{SHU}/services/{SP}",
+	"posted to https://{SH}/services/{SP}. Retrying", "https://user:pw@{SH}/services/{SP}", "POST https://{DH}/api/webhooks/{DP} 401",
+	"POST https://{DAH}/api/webhooks/{DP} 401", "POST https://{DH}/api/v10/webhooks/{DP} 401", "POST https://canary.{DH}/api/webhooks/{DP} 401",
+	"POST https://{DH}:8443/api/webhooks/{DP} 401", "POST https://{DH}/api/webhooks/{DP}?thread_id=123&wait=true 401",
+	`{"level":"error","msg":"webhook https://{DH}/api/webhooks/{DP} failed"}`, "url {DH}/api/webhooks/{DP}",
+	"GET https://{DH}/api/webhooks/{DID} 401", "POST https://{DH}/api/webhooks/{DP}/slack 401", "cb https://{SH}/services/{SP}@corp.com x",
+	"https://{SH}/ ok", "https://{SH}/services/ ok", "https://{DH}/api/webhooks/ ok", "https://{DH}/api/channels/{DID}/messages",
+	"https://example.com/services/{SP}", "https://{SH}.evil.example/services/{SP}", "https://x{SH}/services/{SP}",
+	"https://not{DH}/api/webhooks/{DP}", `{"url":"https://{SH}/services/{SP}","email":"bob@corp.com"}`,
+	"https://{SH}/workflows/T2O3Z5XAN/A0123/456/abc", "https://hooks.slack-gov.com/services/{SP}",
+	"redirect=https%3A%2F%2F{SH}%2Fservices%2FT2O3Z5XAN%2FBMMNZ56PB9%2Fx",
+	"POST https://{DH}/api/webhooks/{DP} " + awsAccessKeyID + " " + awsSecretKey, "hook https://{SH}/services/{SP} key " + npmSecret,
+}
+
+// webhookGenerated builds n lines from its own fixed PCG seed: a webhook URL on each host, with or without
+// a scheme, a port, a version or a subdomain, a path of one to four segments of the path's alphabet or
+// none, and a query, a fragment, a slash, a dot, an '@' or a quote after it, in the same frames and
+// between the same real values as the other generators.
+func webhookGenerated(n int) []string {
+	r := rand.New(rand.NewPCG(116, 2))
+	const seg = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+	rs := func(a string, k int) string {
+		var b strings.Builder
+		for range k {
+			b.WriteByte(a[r.IntN(len(a))])
+		}
+		return b.String()
+	}
+	pick := func(xs []string) string { return xs[r.IntN(len(xs))] }
+	url := func() string {
+		var b strings.Builder
+		b.WriteString(pick([]string{"https://", "https://", "http://", "", "x_https://"}))
+		slack := r.IntN(2) == 0
+		if slack {
+			b.WriteString(pick([]string{"hooks.sl" + "ack.com", "HOOKS.SL" + "ACK.COM", "hooks.sl" + "ack.co", "xhooks.sl" + "ack.com"}))
+		} else {
+			b.WriteString(pick([]string{"", "", "canary.", "ptb.", "x"}) + pick([]string{"disc" + "ord.com", "disc" + "ordapp.com"}))
+		}
+		if r.IntN(4) == 0 {
+			b.WriteString(":" + pick([]string{"443", "8443", "1"}))
+		}
+		if slack {
+			b.WriteString(pick([]string{"/services/", "/services/", "/workflows/", "/services"}))
+		} else {
+			b.WriteString(pick([]string{"/api/webhooks/", "/api/webhooks/", "/api/v10/webhooks/", "/api/v9/webhooks/", "/api/channels/", "/api/webhooks"}))
+		}
+		for k := r.IntN(5); k > 0; k-- {
+			b.WriteString(rs(seg, 1+r.IntN(70)))
+			if k > 1 {
+				b.WriteString("/")
+			}
+		}
+		b.WriteString(pick([]string{"", "", "?wait=true", "#x", "/", ".", "@corp.com", `"`, "/slack"}))
+		return b.String()
+	}
+	values := []string{
+		"postgres://svcuser:pwsecret@pghost/db", "bob@corp.com", "db.corp.internal", "10.0.0.5",
+		stripeLiveSecret, npmSecret, "https://api.acme.com/v1", "AK" + "IA" + "T996RXGVAO6Q4JYL",
+	}
+	frames := []string{
+		"%s", "post %s failed", `{"level":"error","msg":"%s"}`, `{"url":"%s"}`, `level=error msg="%s" module=x`, "WEBHOOK=%s",
+		"POST %s 404",
+	}
+	out := make([]string, 0, n)
+	for range n {
+		var b strings.Builder
+		for k := 1 + r.IntN(2); k > 0; k-- {
+			if r.IntN(3) == 0 {
+				b.WriteString(pick(values))
+			} else {
+				b.WriteString(url())
+			}
+			b.WriteString(pick([]string{" ", " ", ",", "@", "/", ""}))
+		}
+		out = append(out, strings.Replace(pick(frames), "%s", strings.TrimSpace(b.String()), 1))
+	}
+	return out
+}
+
 // vendorSecretGenerated builds n lines from a fixed PCG seed: each #116 format with a random body around
 // its floor (and Twilio's ceiling), names that start like one, and v0.12.28's keys, alone or glued to
 // word characters, between real values -- a DSN, an email, a private host, an address, an AWS key id, a
@@ -261,8 +347,8 @@ func vendorSecretGenerated(n int) []string {
 }
 
 // vendorSecretCorpus is every input the gate runs: the reservation gate's corpus, which holds every
-// earlier gate's, then #116's keys in every frame, its over-masking rows, the AWS frames and both
-// generators, each raw,
+// earlier gate's, then #116's keys in every frame, its over-masking rows, the AWS and webhook frames and
+// the three generators, each raw,
 // through Templatize, through TemplatizeLine and in each escaped form, deduplicated.
 func vendorSecretCorpus() []string {
 	var out []string
@@ -291,6 +377,10 @@ func vendorSecretCorpus() []string {
 		rows = append(rows, aws.Replace(f))
 	}
 	rows = append(rows, awsSecretGenerated(1000)...)
+	for _, f := range webhookFrames {
+		rows = append(rows, webhookFill.Replace(f))
+	}
+	rows = append(rows, webhookGenerated(1000)...)
 	for _, s := range rows {
 		tpl, _ := pipeline.Templatize(s)
 		line, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: s}))
@@ -314,10 +404,11 @@ func vendorSecretCorpus() []string {
 //     request is refused, where v0.12.28 sent the key;
 //   - every byte v0.12.28 masked is masked;
 //   - an input with nothing #116's rules could read comes back byte for byte;
-//   - where no new value was minted the output is v0.12.28's after renumbering (#142's), but that on an
-//     escaped line a value may now be a TOKEN: a #116 key inside it joins the escape view's union as a
+//   - where no new value was minted the output is v0.12.28's after renumbering (#142's), but that a HOST
+//     inside a path 4f reads is its TOKEN (below), and that on an escaped line a value may now be a TOKEN: a #116 key inside it joins the escape view's union as a
 //     TOKEN span, and a union that is not exactly one span of the view is a TOKEN (see valueTag). Where a
-//     new value was minted, every value v0.12.28 minted that is minted still has its tag;
+//     new value was minted, every value v0.12.28 minted that is minted still has its tag, but a HOST
+//     inside a path 4f reads: 9b read a private name there, and it is the webhook path's TOKEN now;
 //   - no placeholder minted for a value is text of the input.
 //
 // Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
@@ -333,13 +424,17 @@ func TestVendorSecretChainMasksASupersetOfV01228(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			ref := atV01228(t, c.dets)
 			var rules []detector
+			var webhook detector
 			added := issue116Rules()
 			for _, d := range c.dets {
 				if added[d.re.String()] {
 					rules = append(rules, d)
 				}
+				if d.re.String() == mustLongest(webhookPath).String() {
+					webhook = d
+				}
 			}
-			refused, refusedNew, more, renum, retagged, newValue := 0, 0, 0, 0, 0, 0
+			refused, refusedNew, more, renum, retagged, newValue, pathHost := 0, 0, 0, 0, 0, 0, 0
 			for _, in := range corpus {
 				refM, live := mapperOn(ref), mapperOn(c.dets)
 				refOut, refErr := refM.Mask(in)
@@ -396,6 +491,8 @@ func TestVendorSecretChainMasksASupersetOfV01228(t *testing.T) {
 						}
 					case retaggedAsToken(live, refM, in, out, refOut):
 						retagged++
+					case pathHostAsToken(webhook, live, refM, in, out, refOut):
+						pathHost++
 					default:
 						t.Errorf("no new value, and more than the numbering moved:\n in:         %q\n ref:        %q\n got:        %q\n renumbered: %q", in, refOut, out, got)
 					}
@@ -403,7 +500,12 @@ func TestVendorSecretChainMasksASupersetOfV01228(t *testing.T) {
 				}
 				newValue++
 				for v, rt := range refM.byValue {
-					if lt, ok := live.byValue[v]; ok && lt[:strings.LastIndexByte(lt, '_')] != rt[:strings.LastIndexByte(rt, '_')] {
+					lt, ok := live.byValue[v]
+					switch {
+					case !ok || lt[:strings.LastIndexByte(lt, '_')] == rt[:strings.LastIndexByte(rt, '_')]:
+					case strings.HasPrefix(lt, "<"+tagToken+"_") && strings.HasPrefix(rt, "<"+tagHost+"_") && inWebhookPath(webhook, in, v):
+						pathHost++ // 9b read a name in a webhook's path as a host; 4f reads the path
+					default:
 						t.Errorf("%q was %s on v0.12.28 and is %s now:\n in: %q", v, rt, lt, in)
 					}
 				}
@@ -415,10 +517,45 @@ func TestVendorSecretChainMasksASupersetOfV01228(t *testing.T) {
 				}
 			}
 			t.Logf("%d inputs: %d with a new value (%d mask more bytes), %d renumbered only, %d escaped and retagged TOKEN, "+
-				"%d refused on both, %d sent on v0.12.28 with a #116 value and refused now",
-				len(corpus), newValue, more, renum, retagged, refused, refusedNew)
+				"%d refused on both, %d sent on v0.12.28 with a #116 value and refused now, %d hosts in a webhook path now its TOKEN",
+				len(corpus), newValue, more, renum, retagged, refused, refusedNew, pathHost)
 		})
 	}
+}
+
+// inWebhookPath reports whether v lies inside a path 4f (d) reads in in, as written or in its escape view.
+func inWebhookPath(d detector, in, v string) bool {
+	view, _ := escapeView(in)
+	for _, x := range []string{in, view} {
+		for _, loc := range d.re.FindAllStringSubmatchIndex(x, -1) {
+			if loc[2*d.group] >= 0 && strings.Contains(x[loc[2*d.group]:loc[2*d.group+1]], v) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pathHostAsToken reports whether out is refOut with each placeholder standing for the same value, every
+// tag that moved having moved from HOST to TOKEN on a value inside a path 4f reads.
+func pathHostAsToken(webhook detector, live, ref *Mapper, in, out, refOut string) bool {
+	ok := true
+	got := ourPHRe.ReplaceAllStringFunc(out, func(tok string) string {
+		v, minted := live.byToken[tok]
+		if !minted {
+			return tok
+		}
+		r, seen := ref.byValue[v]
+		switch {
+		case !seen:
+			ok = false
+		case r[:strings.LastIndexByte(r, '_')] == tok[:strings.LastIndexByte(tok, '_')]:
+		case !strings.HasPrefix(tok, "<"+tagToken+"_") || !strings.HasPrefix(r, "<"+tagHost+"_") || !inWebhookPath(webhook, in, v):
+			ok = false
+		}
+		return r
+	})
+	return ok && got == refOut
 }
 
 // reads116 reports whether one of #116's rules reads s, as written or in its escape view: run on v0.12.28's

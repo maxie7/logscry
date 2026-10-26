@@ -88,7 +88,9 @@
 // detector either, and were sent the same way. Each family is one more vendorKeys entry, run after #114's,
 // and a Slack user token glued to a word gains the template witness #114 pinned as its residual. An AWS
 // secret access key has no prefix at all, so context is its only evidence: rule 13 reads it after its
-// name, and after its access key id's TOKEN, last of all.
+// name, and after its access key id's TOKEN, last of all. A Slack or Discord webhook URL carries its
+// credential in the path, which no rule read beside 9a's host: 4f masks the path after the vendor's
+// prefix, just before 9a, while the host is still raw.
 //
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
@@ -1102,6 +1104,29 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		{tagHost, mustLongest(ipv4LabelHost), 1, false, false},
 		// 8. IPv4 — validated octets, and a leading \b so v1.2.3.4 (a version) is left alone.
 		{tagIP, mustLongest(`\b` + ipv4Pattern + `\b`), 0, true, false},
+		// 4f. The path of a Slack or Discord incoming webhook URL (#116). Whoever holds the URL can post
+		//     to the channel: the credential is in the path, after a prefix each vendor documents --
+		//     hooks.slack.com/services/T…/B…/<secret>, and discord.com/api/webhooks/<id>/<token>, with
+		//     discordapp.com, a version (/api/v10/) or a subdomain (canary., ptb.). 9a masked the host
+		//     and nothing read the path, so the ids and the secret were sent whole, raw and on the
+		//     template, and residue() read the line as clean. v0.4.0 onward.
+		//
+		//     THE HOST AND THE PREFIX ARE THE EVIDENCE, so there is no floor: every segment after the
+		//     prefix is the credential, ids included, and the group is one TOKEN over all of them. A dot
+		//     inside a segment is path, so a name there (…/db.corp.internal, 9b's HOST until now) is part
+		//     of it. It stops where a path cannot go on -- '?', '#', a quote, whitespace, one of our tags,
+		//     a dot that ends it -- so a query (?wait=true, ?thread_id=) and a sentence dot stay. The
+		//     host is not masked here: 9a masks it as it always has, and with no scheme it stays.
+		//
+		//     IT RUNS HERE, BEFORE 9a, the one #116 rule that does not run last: after 9a the host is a
+		//     HOST tag, and a context of any host before /services/ would have lost the precision. Every
+		//     rule before it sees v0.12.28's input, and the rules after it read the authority (9a, 9c)
+		//     or could only have matched inside the path, which is masked whole now. 4e runs first, so
+		//     a URL it takes into a userinfo is its TOKEN, as it was.
+		//
+		//     verify:true. Its group is raw text and the pipeline's placeholders, so it cannot fire on
+		//     our own output, and its context is a raw host, which 9a has masked on any URL it reads.
+		{tagToken, mustLongest(webhookPath), 1, true, false},
 		// 9a. Host inside a URL/URI authority — masked regardless of TLD. The optional
 		//     userinfo run skips a (possibly already-masked) credential to reach the host.
 		//     Placeholder-tolerant: without it the host stopped at its first <NUM> and
@@ -1768,6 +1793,22 @@ var (
 	// twilioLonger is a hex run too long to be a SID: not a key, so a hash that starts with AC stays. On
 	// the template NUM has broken the run and the count is lost, so there the run is read as a key.
 	twilioLonger = `(?:SK|AC)[0-9a-fA-F]{33,}`
+)
+
+// webhookPath is 4f (#116): a Slack or Discord webhook host, its port and the documented path prefix
+// as context, then the path's segments as the group. The port and a version are placeholder-tolerant,
+// as the context of every rule must survive the template.
+//
+// webhookEnd closes the path where it cannot go on, but never before "://": 9a reads a scheme glued to
+// what precedes it (schemeAnchor, #52), so a path run into another URL would carry that URL's scheme
+// away and leave its host to be sent. Such a path stays as v0.12.28 sent it. A '/' the escape view
+// resolves counts as one, so the line as written and its view agree.
+var (
+	webhookPort = `(?::(?:[0-9]|<NUM>)+)?`
+	webhookEnd  = `(?:$|[^A-Za-z0-9_:-]|:(?:$|[^/\\]|\\+` + notBefore(slashEscapes()) + `))`
+	webhookPath = `(?:^|[^A-Za-z0-9-])(?i:hooks\.slack\.com` + webhookPort + `/services|discord(?:app)?\.com` + webhookPort +
+		`/api(?:/v(?:[0-9]+|<NUM>))?/webhooks)/(` + webhookSegment + `(?:/` + webhookSegment + `)*)` + webhookEnd
+	webhookSegment = `(?:[A-Za-z0-9_-]|` + pipelinePH + `)` + dottedUnit(`[A-Za-z0-9_-]`) + `*`
 )
 
 // The AWS secret access key, rule 13 (#116). Its alphabet is base64's without the padding; the template
