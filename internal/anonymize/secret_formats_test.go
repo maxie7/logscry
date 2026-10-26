@@ -413,3 +413,86 @@ func TestIssue116EveryGitLabPrefixIsAKey(t *testing.T) {
 		}
 	}
 }
+
+// TestIssue116FloorsFromBothSides holds each #116 floor from both sides, which the mutants showed the rows
+// above do not for every family: on the raw line a body at its floor is a key and one character short is
+// sent as v0.12.28 sent it, and on the template a run of n units with a placeholder is a key (rule 12's
+// cost) and one of n-1 is left as v0.12.28 left it. It also pins what stays sent beside a masked key,
+// named in README's Known limitations, and a private name inside a webhook's path.
+func TestIssue116FloorsFromBothSides(t *testing.T) {
+	ref := func(in string) string {
+		out, _ := mapperOn(atV01228(t, baseDetectors)).Mask(in)
+		return out
+	}
+	sg := strings.SplitN(strings.TrimPrefix(sendgridSecret, "S"+"G."), ".", 2)
+	pypiBody := strings.TrimPrefix(pypiSecret, "py"+"pi-AgE")
+	for _, c := range []struct{ name, frame, at, short string }{
+		{"twilio", "key {K} used", twilioAPIKeySID, twilioAPIKeySID[:len(twilioAPIKeySID)-1]},
+		{"sendgrid, first segment", "key {K} used", sendgridSecret, "S" + "G." + sg[0][1:] + "." + sg[1]},
+		{"sendgrid, second segment", "key {K} used", sendgridSecret, "S" + "G." + sg[0] + "." + sg[1][1:]},
+		{"npm", "key {K} used", npmSecret, npmSecret[:len(npmSecret)-1]},
+		{"gitlab", "key {K} used", gitlabPATSecret, gitlabPATSecret[:len(gitlabPATSecret)-1]},
+		{"hugging face", "key {K} used", huggingFaceSecret, huggingFaceSecret[:len(huggingFaceSecret)-1]},
+		{"shopify", "key {K} used", shopifyAccessSecret, shopifyAccessSecret[:len(shopifyAccessSecret)-1]},
+		{"pypi", "key {K} used", "py" + "pi-AgE" + pypiBody[:82], "py" + "pi-AgE" + pypiBody[:81]},
+		{"aws, after the name", "AWS_SECRET_ACCESS_KEY={K}", awsSecretKey, awsSecretKey[:39]},
+		{"aws, after the key id", "creds " + awsAccessKeyID + " {K} loaded", awsSecretKey, awsSecretKey[:39]},
+	} {
+		t.Run("raw/"+c.name, func(t *testing.T) {
+			at := strings.ReplaceAll(c.frame, "{K}", c.at)
+			if got := mustMask(t, New(), at); strings.Contains(got, c.at[len(c.at)-12:]) || !strings.Contains(got, "<"+tagToken+"_") {
+				t.Errorf("a key at its floor is not masked:\n in:  %q\n got: %q", at, got)
+			}
+			short := strings.ReplaceAll(c.frame, "{K}", c.short)
+			if got, want := mustMask(t, New(), short), ref(short); got != want {
+				t.Errorf("a body one short of its floor moved:\n in:   %q\n got:  %q\n want: %q", short, got, want)
+			}
+		})
+	}
+	for _, c := range []struct{ name, frame, at, short string }{
+		{"twilio", "code {K} used", "S" + "K1ab", "S" + "K1a"},
+		{"sendgrid", "key {K} used", "S" + "G.abcdefghijk1", "S" + "G.abcdefghij1"},
+		{"npm", "key {K} used", "np" + "m_abcdefghijk1", "np" + "m_abcdefghij1"},
+		{"gitlab", "flag {K} on", "gl" + "pat-abcdef1", "gl" + "pat-abcde1"},
+		{"hugging face", "key {K} used", "h" + "f_abcdefghijk1", "h" + "f_abcdefghij1"},
+		{"shopify", "key {K} used", "sh" + "pat_ab1", "sh" + "pat_a1"},
+		{"pypi", "key {K} used", "py" + "pi-AgE" + "abcdefghijklmnopqrstuvw1", "py" + "pi-AgE" + "abcdefghijklmnopqrstuv1"},
+		{"aws, after the name", "AWS_SECRET_ACCESS_KEY={K}", "abcdefghijk1", "abcdefghij1"},
+		{"aws, after the key id", "creds " + awsAccessKeyID + " {K} loaded", "abcdefghijklmn1", "abcdefghijklm1"},
+	} {
+		t.Run("template/"+c.name, func(t *testing.T) {
+			at := strings.ReplaceAll(c.frame, "{K}", c.at)
+			tAt, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: at}))
+			if got := mustMask(t, New(), tAt); strings.Contains(got, c.at[len(c.at)-4:len(c.at)-1]) {
+				t.Errorf("a template run at its floor is not masked:\n in:  %q\n got: %q", tAt, got)
+			}
+			short := strings.ReplaceAll(c.frame, "{K}", c.short)
+			tShort, _ := pipeline.TemplatizeLine(pipeline.Normalize(model.LogLine{Raw: short}))
+			if got, want := mustMask(t, New(), tShort), ref(tShort); got != want {
+				t.Errorf("a template run one unit short of its floor moved:\n in:   %q\n got:  %q\n want: %q", tShort, got, want)
+			}
+		})
+	}
+
+	// WHAT STAYS SENT beside a masked key, named in README's Known limitations: an AWS session token,
+	// which has no name in the list and no key id before it, and a Twilio Auth Token, thirty-two hex
+	// characters with no prefix.
+	session := "IQoJb3JpZ2lu" + strings.Repeat("X9fKp2Lm/Qr+Tz8w", 12) + "=="
+	for _, in := range []string{
+		"AWS_SESSION_TOKEN=" + session,
+		"creds " + awsAccessKeyID + " " + awsSecretKey + " " + session,
+		"TWILIO_AUTH_TOKEN=9f3c2e7b1d84f60e5a9c2b7d1f8e3a6b",
+	} {
+		got := mustMask(t, New(), in)
+		if !strings.Contains(got, "X9fKp2Lm") && !strings.Contains(got, "9f3c2e7b1d84f60e5a9c2b7d1f8e3a6b") {
+			t.Errorf("a pinned shape moved -- update this test and README's Known limitations:\n in:  %q\n got: %q", in, got)
+		}
+	}
+
+	// A private name inside a webhook's path is the path's, not 9b's HOST beside it: the dot between them
+	// is not sent.
+	in := "POST https://" + discordHost + "/api/webhooks/" + discordWebhookPath + "/slack/db.corp.internal 404"
+	if got, want := mustMask(t, New(), in), "POST https://<HOST_1>/api/webhooks/<TOKEN_1> 404"; got != want {
+		t.Errorf("a private name inside a webhook path:\n in:   %q\n got:  %q\n want: %q", in, got, want)
+	}
+}
