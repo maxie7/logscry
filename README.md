@@ -853,7 +853,7 @@ every hand-written row and 500 generated URIs, each raw and templatized, with an
 host suffix: the bytes it masks include every byte `v0.12.25` masked, for every input. Measured over
 the same ten journald boots: nothing changed. None holds a `/` and then an `@` after a `://`.
 
-**A JSON-escaped URL sent its credentials and host before `TODO-VERSION`.** This was a credential
+**A JSON-escaped URL sent its credentials and host before `v0.12.27`.** This was a credential
 leak, published as GHSA-p47p-xrhj-3x7p. A JSON encoder that escapes `/` writes a connection string
 as `postgres:\/\/user:pass@host\/db`. PHP's `json_encode` does this by default, and so does any
 encoder for a string nested in another (`\\/`). Every URL rule anchored on a literal `://` and
@@ -1333,7 +1333,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `postgres://user:1234%2F5@db` goes as `postgres://<TOKEN_1>@<HOST_1>`. Affected: these four
   shapes. Not affected: every other raw `/` in a userinfo, and a percent-encoded `/`.
 - **With `--llm-anonymize`, an escaped `:` or `@` is not read on the Template field of a
-  plain-text or logfmt line.** These are credential leaks. Since `TODO-VERSION` a URL whose `/`, `:`
+  plain-text or logfmt line.** These are credential leaks. Since `v0.12.27` a URL whose `/`, `:`
   or `@` is JSON-escaped is masked as if it were written raw (GHSA-p47p-xrhj-3x7p). On those lines
   the pipeline's template mask rewrites `\u003a` and `\u0040` to `\u<NUM>a` and `\u<NUM>`.
   `\u<NUM>` is also what it makes of `\u0022`, `\u0027` and `\u0026`, the quote, apostrophe and

@@ -5358,7 +5358,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       detector 4's JSON-field absorption, `internal/pipeline`, and a `\"`-quoted DSN's backslash
       going into 4e's token.
 
-      Targets TODO-VERSION
+      Targets v0.12.27
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
