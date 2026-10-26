@@ -4469,7 +4469,7 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// after "sk_test_", where '_' would have ended a snake_case name in short pieces.
 		{"a long camelCase name after a stripe prefix is a key", "run sk" + "_test_createCustomerWithCardAndRefund ok", "run <TOKEN_1> ok"},
 	}
-	for _, c := range append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...) {
+	for _, c := range append(append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...), jsonEscapeOverMaskingRows...) {
 		t.Run(c.name, func(t *testing.T) {
 			m := New()
 			if got := mustMask(t, m, c.in); got != c.want {

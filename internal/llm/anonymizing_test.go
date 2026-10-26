@@ -189,3 +189,78 @@ func TestAnonymizeSlashUserinfoOnTheWire(t *testing.T) {
 		t.Errorf("Summary not restored:\n got:  %q\n want: %q", resp.Summary, want)
 	}
 }
+
+// TestAnonymizeJSONEscapesOnTheWire is GHSA-p47p-xrhj-3x7p at the seam: a URL whose '/', ':' or '@' a JSON
+// encoder escaped sent its username, password and host from every field Explain masks. Each subtest puts an
+// escaped DSN, with its own invented values, in one field and an ordinary line in the rest; none of its
+// values may reach the wire, and the Summary comes back with the line as the log wrote it.
+func TestAnonymizeJSONEscapesOnTheWire(t *testing.T) {
+	plain := model.LogLine{Source: "stdin", Raw: "FATAL worker stopped"}
+	for _, c := range []struct {
+		name string
+		req  llm.ExplainRequest
+		sent []string
+	}{
+		{"trigger", llm.ExplainRequest{
+			Trigger:  model.LogLine{Source: "stdin", Raw: `{"level":"fatal","dsn":"postgres:\/\/svcalpha:pwalpha9q@pgalpha\/app"}`},
+			Template: `{"dsn":<STR>,"level":<STR>}`,
+		}, []string{"svcalpha", "pwalpha", "pgalpha"}},
+		{"source", llm.ExplainRequest{
+			Trigger:  model.LogLine{Source: `exec:psql postgres:\u002f\u002fsvcbravo:pwbravo9q@pgbravo\u002fapp`, Raw: plain.Raw},
+			Template: "FATAL worker stopped",
+		}, []string{"svcbravo", "pwbravo", "pgbravo"}},
+		{"context", llm.ExplainRequest{
+			Trigger:  plain,
+			Context:  []string{`[stdin] {"msg":"retry","dsn":"postgres:\\/\\/svccharlie:pwcharlie9q@pgcharlie\\/app"}`},
+			Template: "FATAL worker stopped",
+		}, []string{"svccharlie", "pwcharlie", "pgcharlie"}},
+		// A JSON message holding two levels of escaping arrives on the Template field with one left,
+		// re-quoted: "\\/".
+		{"template", llm.ExplainRequest{
+			Trigger:  plain,
+			Template: `{"level":<STR>,"msg":"connect postgres:\\/\\/svcdelta:pwdelta<NUM>q@pgdelta\\/app failed"}`,
+		}, []string{"svcdelta", "pwdelta", "pgdelta"}},
+		{"template, u002f", llm.ExplainRequest{
+			Trigger:  plain,
+			Template: `connect postgres:\u<NUM>f\u<NUM>fsvcecho:pwecho<NUM>q@pgecho\u<NUM>fapp failed`,
+		}, []string{"svcecho", "pwecho", "pgecho"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv, body, calls := recordingServer(t, `{"summary":"ok","likely_cause":"ok","suggestion":"ok"}`)
+			c.req.Count = 1
+			if _, err := backendTo(srv, true).Explain(context.Background(), c.req); err != nil {
+				t.Fatalf("Explain errored, so the escalation was skipped: %v", err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("provider called %d times, want 1", calls.Load())
+			}
+			sent := *body.Load()
+			for _, s := range c.sent {
+				if strings.Contains(sent, s) {
+					t.Errorf("literal %q leaked onto the wire:\n%s", s, sent)
+				}
+			}
+		})
+	}
+	// The model never sees the view: a placeholder stands for the bytes the log wrote, so Restore puts the
+	// escaped '/' of a password back as "\/".
+	t.Run("restore", func(t *testing.T) {
+		srv, body, _ := recordingServer(t, `{"summary":"login to <TOKEN_1> failed","likely_cause":"ok","suggestion":"ok"}`)
+		resp, err := backendTo(srv, true).Explain(context.Background(), llm.ExplainRequest{
+			Trigger:  model.LogLine{Source: "stdin", Raw: `connect postgres:\/\/svcfox:pw\/fox9q@pgfox\/app failed`},
+			Template: `connect postgres:\/\/svcfox:pw\/fox<NUM>q@pgfox\/app failed`,
+			Count:    1,
+		})
+		if err != nil {
+			t.Fatalf("Explain errored, so the escalation was skipped: %v", err)
+		}
+		for _, s := range []string{"svcfox", "fox9q", "pgfox"} {
+			if strings.Contains(*body.Load(), s) {
+				t.Errorf("literal %q leaked onto the wire:\n%s", s, *body.Load())
+			}
+		}
+		if want := `login to svcfox:pw\/fox9q@pgfox failed`; resp.Summary != want {
+			t.Errorf("Summary not restored:\n got:  %q\n want: %q", resp.Summary, want)
+		}
+	})
+}
