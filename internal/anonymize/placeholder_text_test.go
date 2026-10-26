@@ -215,3 +215,31 @@ func TestUnreadableEscapedPassFailsClosed(t *testing.T) {
 		t.Errorf("the refusal carries log content: %v", err)
 	}
 }
+
+// TestReserveAfterAMintFailsClosed is Reserve's own conflict. Told, after it minted <HOST_1> for a host,
+// that the request carries "<HOST_1>" as text, a Mapper can no longer keep the two apart: the host has
+// gone out under it. Reserve cannot undo that, so every later Mask refuses, even on a line that carries no
+// placeholder at all. Reserved before the first Mask, as Explain does it, the same texts mask apart.
+func TestReserveAfterAMintFailsClosed(t *testing.T) {
+	late := New()
+	if _, err := late.Mask("connect db.corp.internal refused"); err != nil {
+		t.Fatalf("Mask refused: %v", err)
+	}
+	late.Reserve("retry as <HOST_1>")
+	if out, err := late.Mask("peer 10.0.0.5 down"); err == nil {
+		t.Errorf("Reserve found <HOST_1> already minted, yet the next Mask sent %q", out)
+	} else if strings.Contains(err.Error(), "retry") || strings.Contains(err.Error(), "10.0.0.5") {
+		t.Errorf("the refusal carries log content: %v", err)
+	}
+
+	early := New()
+	early.Reserve("connect db.corp.internal refused", "retry as <HOST_1>")
+	for _, c := range []struct{ in, want string }{
+		{"connect db.corp.internal refused", "connect <HOST_2> refused"},
+		{"retry as <HOST_1>", "retry as <HOST_1>"},
+	} {
+		if out, err := early.Mask(c.in); err != nil || out != c.want {
+			t.Errorf("reserved first: Mask(%q) = %q, %v; want %q", c.in, out, err, c.want)
+		}
+	}
+}

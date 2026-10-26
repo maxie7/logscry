@@ -71,7 +71,7 @@ func TestEveryTerminalPathCarriesTheRequestsFlag(t *testing.T) {
 			name:    "the anonymizer fails closed",
 			handler: answer,
 			wrap: func(inner Backend) Backend {
-				return &anonymizing{inner: inner, newMask: func() masker { return failingMasker{} }}
+				return &anonymizing{inner: inner, newMask: func(...string) masker { return failingMasker{} }}
 			},
 			want: model.ExplainFailed,
 		},

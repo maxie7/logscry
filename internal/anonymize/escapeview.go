@@ -80,9 +80,15 @@ type maskedSpan struct {
 	view bool
 }
 
-// errPlaceholderAsText is maskEscaped's refusal when a pass cannot be read back: the line carries, as
-// text, a placeholder that pass then minted for a value.
-var errPlaceholderAsText = errors.New("anonymize: a line with an escape carries, as text, a placeholder minted for one of its values")
+// errNotRebuilt is maskEscaped's refusal when a pass cannot be read back from its output. Until #142 that
+// happened when the line carried, as text, a placeholder the pass then minted for a value. Mask reserves
+// every placeholder its input carries and the scratch passes share the reservation, so a pass's output
+// holds only tokens it minted and text of the line, and always rebuilds: the view cannot add a placeholder
+// the line lacks, because it resolves only to '/', ':' and '@', none of them in ourPH. The check stays as an
+// assertion of that argument. An escape resolved to a character ourPH reads could break it, and spans read
+// back wrong would be projected onto the wrong bytes, or past the end of the line: with the check removed,
+// such a line panics in the projection (measured).
+var errNotRebuilt = errors.New("anonymize: a masking pass could not be read back from its output")
 
 // maskEscaped masks a line with an escape in it. The chain runs twice, each time on a scratch Mapper: on s,
 // exactly as v0.12.26 masks it, and on its view. What each pass masked is read back from its output, the
@@ -100,20 +106,24 @@ var errPlaceholderAsText = errors.New("anonymize: a line with an escape carries,
 // tie. Values are minted in the order the view's pass minted them, then the order the line's pass did, so
 // an escaped line is numbered as its unescaped form is.
 //
+// Each scratch Mapper shares m's reservation, so neither pass mints a placeholder the request carries as
+// text (#142).
+//
 // It fails closed three ways: a pass that stops at the host-list cap, a pass whose output and mapping do
-// not rebuild its input -- a placeholder that pass minted, already in the line as text -- and a value the
-// re-scan finds in the output or in its view.
+// not rebuild its input (an assertion since #142, see errNotRebuilt), and a value the re-scan finds in the
+// output or in its view.
 func (m *Mapper) maskEscaped(s, view string, offs []int) (string, error) {
 	var spans []maskedSpan
 	for pass, in := range []string{s, view} {
-		sc := &Mapper{dets: m.dets, byValue: make(map[string]string), byToken: make(map[string]string), counts: make(map[string]int)}
+		sc := &Mapper{dets: m.dets, byValue: make(map[string]string), byToken: make(map[string]string), counts: make(map[string]int),
+			reserved: m.reserved}
 		out, err := sc.chain(in)
 		if err != nil {
 			return "", err
 		}
 		got, ok := sc.spansOf(in, out)
 		if !ok {
-			return "", errPlaceholderAsText
+			return "", errNotRebuilt
 		}
 		for _, sp := range got {
 			if pass == 1 {
@@ -225,8 +235,8 @@ func valueTag(members []maskedSpan, a, b int) (tag string, order, first int) {
 
 // spansOf reads back what one pass of the chain masked: out against the scratch Mapper m, which holds that
 // pass's mapping and nothing else. A placeholder m never minted is text of the line and is kept. It reports
-// false when the two do not rebuild in, which happens only when in carries, as text, a placeholder m
-// minted.
+// false when the two do not rebuild in, which needs in to carry, as text, a placeholder m minted -- since
+// #142, one m was not told to reserve.
 func (m *Mapper) spansOf(in, out string) ([]maskedSpan, bool) {
 	var spans []maskedSpan
 	var rebuilt strings.Builder

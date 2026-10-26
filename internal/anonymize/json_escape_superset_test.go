@@ -205,7 +205,9 @@ func jsonEscapeCorpus() []string {
 // jsonEscapePlaceholderTextRows carry one of our placeholders as text and no escape, beside a value the
 // chain mints that same placeholder for. A line with no escape is masked on v0.12.26's path, so each comes
 // back exactly as v0.12.26 returns it; on the two-pass path its spans could not be read back, and it would
-// be refused. Their bytes cannot be read back from the output, so the gate compares them whole.
+// be refused. Their bytes cannot be read back from v0.12.26's output, so the gate compares them whole.
+// Since #142 the value's placeholder skips the number the text carries, so the gate maps the live output's
+// numbering back onto the reference's (renumbered) before it compares.
 var jsonEscapePlaceholderTextRows = []string{
 	"login as <HOST_1> from db.corp.internal",
 	"replay of postgres://svcuser:pwsecret@pghost/db: <TOKEN_1> rejected",
@@ -220,7 +222,8 @@ var anyEscape = regexp.MustCompile(`\\[/u]`)
 // input, through New() and a Mapper with an extra suffix: the bytes masked now include every byte
 // v0.12.26 masked; an input v0.12.26 masked is not refused now; an input with no '\' before '/' or 'u'
 // comes back byte for byte; and the witness and same rows, and a line with no escape that carries one of
-// our placeholders as text, come back exactly as v0.12.26 returns them.
+// our placeholders as text, come back exactly as v0.12.26 returns them, the latter up to the numbering
+// #142 moved.
 // Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestJSONEscapeViewMasksASupersetOfV01226(t *testing.T) {
 	corpus := jsonEscapeCorpus()
@@ -279,9 +282,10 @@ func TestJSONEscapeViewMasksASupersetOfV01226(t *testing.T) {
 				}
 			}
 			for _, in := range jsonEscapePlaceholderTextRows {
-				refOut, refErr := maskAtV01226(mapperOn(c.dets), in)
-				out, err := mapperOn(c.dets).Mask(in)
-				if out != refOut || (err == nil) != (refErr == nil) {
+				ref, now := mapperOn(c.dets), mapperOn(c.dets)
+				refOut, refErr := maskAtV01226(ref, in)
+				out, err := now.Mask(in)
+				if got, ok := renumbered(now, ref, out); !ok || got != refOut || (err == nil) != (refErr == nil) {
 					t.Errorf("a line with no escape left v0.12.26's path:\n in:  %q\n ref: %q (%v)\n got: %q (%v)", in, refOut, refErr, out, err)
 				}
 			}

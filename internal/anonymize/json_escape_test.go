@@ -434,24 +434,6 @@ func TestJSONEscapedTwinsMaskWhatTheUnescapedRowMasks(t *testing.T) {
 	}
 }
 
-// TestJSONEscapePlaceholderShapedLiteralFailsClosed is the one new way Mask can refuse. A line with an
-// escape is masked twice, as written and as its view, and the spans each pass masked are read back from
-// its output; a line that carries, as literal text, a placeholder that pass then mints for a value cannot
-// be read back, and the escalation is skipped rather than sent.
-func TestJSONEscapePlaceholderShapedLiteralFailsClosed(t *testing.T) {
-	in := `connect postgres:\/\/svcuser:pwsecret@pghost\/db as <TOKEN_1>`
-	out, err := New().Mask(in)
-	if err == nil {
-		t.Fatalf("an escaped line holding a minted placeholder as text was masked, not refused:\n in:  %q\n out: %q", in, out)
-	}
-	if !strings.Contains(err.Error(), "placeholder") {
-		t.Errorf("the refusal does not say why: %v", err)
-	}
-	if strings.Contains(err.Error(), "pwsecret") {
-		t.Errorf("the refusal carries log content: %v", err)
-	}
-}
-
 // BenchmarkMask measures the fast path and the escaped one: a line with no escape is masked as v0.12.26
 // masks it, and a line with one runs the chain twice, as written and as its view.
 func BenchmarkMask(b *testing.B) {

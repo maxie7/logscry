@@ -155,10 +155,17 @@
 // either pass masks is masked in the line as written (see maskEscaped). No detector changed, and a line
 // with no escape takes exactly the path it took before.
 //
+// A PLACEHOLDER THE LOG CARRIES AS TEXT IS NEVER MINTED (#142). The counter used to hand <HOST_1> to a
+// host on a line that already said "<HOST_1>", so the model read one value where the log had two things
+// and Restore put the value in the literal's place. Every placeholder the request carries is reserved
+// before anything is masked (see Reserve), and the minting skips it; only numbering moves, and only on
+// such a line.
+//
 // The one deliberate exception is the pipeline's own placeholders: see pipelinePH.
 package anonymize
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -170,10 +177,12 @@ import (
 // each escalation gets its own, discarded once the response is restored. Nothing here is
 // ever persisted or shared across requests.
 type Mapper struct {
-	dets    []detector
-	byValue map[string]string // original → placeholder, for stability within a request
-	byToken map[string]string // placeholder → original, for Restore
-	counts  map[string]int    // per-tag running counter, so IPs number independently of hosts
+	dets     []detector
+	byValue  map[string]string // original → placeholder, for stability within a request
+	byToken  map[string]string // placeholder → original, for Restore
+	counts   map[string]int    // per-tag running counter, so IPs number independently of hosts
+	reserved map[string]bool   // placeholders the request carries as text, never minted (#142)
+	conflict bool              // a text carried a placeholder already minted; every later Mask refuses
 }
 
 // New builds a Mapper. extraHostSuffixes extends the bare-hostname allowlist (detector 9b)
@@ -285,19 +294,65 @@ func New(extraHostSuffixes ...string) *Mapper {
 //
 // GHSA-p47p-xrhj-3x7p WIDENS IT to what an escape hides. On a line with an escaped '/', ':' or '@' the
 // re-scan reads the output and the output with those escapes resolved, so a verify-eligible value an
-// escape hid from the line as written mutes. That fix adds ONE NEW WAY TO REFUSE: such a line is masked
-// in two passes whose spans are read back from their output, and a line that carries, as text, a
-// placeholder one of those passes then mints for a value cannot be read back, so the escalation is
-// skipped rather than sent with a guess. Escapes the view does not resolve -- the template of the "u"
-// escape of ':' or '@', and any other "u" escape of a URL character -- are described by no rule, and
+// escape hid from the line as written mutes. Such a line is masked in two passes whose spans are read
+// back from their output. Until #142 a line that carried, as text, a placeholder one of those passes then
+// minted could not be read back and was refused; nothing the line carries is minted now (see Reserve),
+// and the rebuild check stays as an assertion. Escapes the view does not resolve -- the template of the
+// "u" escape of ':' or '@', and any other "u" escape of a URL character -- are described by no rule, and
 // the re-scan reads them as clean.
+//
+// #142 IS NOT ABOUT WHAT IS SENT. Mask reserves every placeholder s carries as text before it masks, so
+// none is minted for a value, and Restore, which keeps a token it never issued, returns it as the log
+// wrote it. A placeholder s carries that this Mapper ALREADY minted cannot be reserved any more, and Mask
+// refuses, as does every later Mask on it: see Reserve, which a caller masking several texts runs first.
 func (m *Mapper) Mask(s string) (string, error) {
+	m.reserve(s)
+	if m.conflict {
+		return "", errMintedAsText
+	}
 	view, offs := escapeView(s)
 	if offs == nil {
 		return m.maskText(s)
 	}
 	return m.maskEscaped(s, view, offs)
 }
+
+// Reserve records every placeholder of ours that texts carry as text, so that no Mask on this Mapper mints
+// it for a value (#142). A Mapper masks every field of one request, and Mask reserves only its own input,
+// which is too late for a literal in a later field: "retry as <HOST_1>" in a context line would meet the
+// <HOST_1> already minted for the trigger's host. So Reserve BELONGS BEFORE THE FIRST Mask, with every text
+// the request will show the model; llm.NewAnonymizing's mapper does exactly that.
+//
+// It cannot fail silently. A placeholder texts carry that this Mapper has already minted can no longer be
+// kept apart from the value it stands for -- that value has gone out under it -- so Reserve records the
+// conflict instead, and every later Mask returns an error: the request is refused rather than sent and
+// read back wrongly. The conflict sticks because the mapping it spoils does.
+//
+// "Our placeholder" is what ourPHRe matches, the pattern Restore reads by, so the text Restore keeps as
+// literal and the text reserved are one set. It is wider than what placeholder mints (<FOO_1>, <HOST_01>);
+// reserving those changes nothing, since nothing mints them.
+func (m *Mapper) Reserve(texts ...string) {
+	for _, s := range texts {
+		m.reserve(s)
+	}
+}
+
+// reserve is Reserve for one text.
+func (m *Mapper) reserve(s string) {
+	for _, tok := range ourPHRe.FindAllString(s, -1) {
+		if _, minted := m.byToken[tok]; minted {
+			m.conflict = true
+		}
+		if m.reserved == nil {
+			m.reserved = make(map[string]bool)
+		}
+		m.reserved[tok] = true
+	}
+}
+
+// errMintedAsText is Mask's refusal once a text carried, as text, a placeholder this Mapper had already
+// minted for a value (see Reserve).
+var errMintedAsText = errors.New("anonymize: a text carries, as text, a placeholder already minted for a value in this request")
 
 // maskText masks a line with no escape in it: the chain, then the re-scan. It is Mask as v0.12.26 shipped
 // it, for every line without one.
@@ -342,6 +397,9 @@ func (m *Mapper) chain(s string) (string, error) {
 // Mask produces no nested mapping today (TestRestoreHasNoNestedMapping), so for every input it
 // can produce this returns what the old loop did: every token we mint matches ourPH whole, and
 // two ourPH matches cannot overlap, so the scan visits exactly the occurrences ReplaceAll did.
+//
+// A placeholder the log carried as text is returned as that text. Since #142 none is ever minted (see
+// Reserve), so it is not in byToken, and the rule above keeps it.
 func (m *Mapper) Restore(s string) string {
 	if len(m.byToken) == 0 {
 		return s
@@ -473,15 +531,31 @@ func (m *Mapper) applyToFixpoint(s string, d detector) (string, error) {
 // placeholder returns the stable token for one original value, minting a new one on first
 // sight and reusing it thereafter — so a host that appears three times is <HOST_1> all
 // three times, and the model can see it recur.
+//
+// A number whose token the request carries as text is skipped (#142), so the tag's next free
+// number is taken: beside a literal <HOST_2> the first host is still <HOST_1>. With nothing
+// reserved the numbering is what it always was.
 func (m *Mapper) placeholder(tag, original string) string {
 	if p, ok := m.byValue[original]; ok {
 		return p
 	}
-	m.counts[tag]++
-	p := fmt.Sprintf("<%s_%d>", tag, m.counts[tag])
+	var p string
+	for {
+		m.counts[tag]++
+		if p = token(tag, m.counts[tag]); !m.reserved[p] {
+			break
+		}
+	}
 	m.byValue[original] = p
 	m.byToken[p] = original
 	return p
+}
+
+// token is the text of placeholder n of tag, the one form this package mints. ourPH matches it
+// whole for every tag (TestEveryTagMintsARestorableToken), which is what lets Restore find it and
+// reservation see it as text.
+func token(tag string, n int) string {
+	return fmt.Sprintf("<%s_%d>", tag, n)
 }
 
 // residue re-runs the verify-eligible detectors and returns the tag of the first sensitive
