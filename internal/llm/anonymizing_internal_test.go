@@ -33,7 +33,7 @@ func (failingMasker) Restore(s string) string     { return s }
 // masker is injected via the unexported seam, which is why this test lives in-package.
 func TestFailClosedSkipsInnerBackend(t *testing.T) {
 	spy := &spyBackend{}
-	a := &anonymizing{inner: spy, newMask: func() masker { return failingMasker{} }}
+	a := &anonymizing{inner: spy, newMask: func(...string) masker { return failingMasker{} }}
 
 	req := ExplainRequest{Trigger: model.LogLine{Raw: "sensitive 10.0.0.5"}}
 	_, err := a.Explain(context.Background(), req)

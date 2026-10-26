@@ -67,7 +67,7 @@ jobs:
       # A new superset gate follows that name pattern and is added to SUPERSET_GATES.
       - name: Test (race detector)
         env:
-          SUPERSET_GATES: '^(TestGluedRunMasksASupersetOfMain|TestDottedQuadMasksASupersetOfV01224|TestSlashUserinfoMasksASupersetOfV01225|TestJSONEscapeViewMasksASupersetOfV01226)$'
+          SUPERSET_GATES: '^(TestGluedRunMasksASupersetOfMain|TestDottedQuadMasksASupersetOfV01224|TestSlashUserinfoMasksASupersetOfV01225|TestJSONEscapeViewMasksASupersetOfV01226|TestPlaceholderReservationMasksASupersetOfV01227)$'
         run: |
           gates=${SUPERSET_GATES#'^('}
           gates=$(tr '|' '\n' <<< "${gates%')$'}" | sort)

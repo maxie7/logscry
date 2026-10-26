@@ -18,8 +18,10 @@ import (
 // flag off the exact unwrapped backend runs and the payload is byte-for-byte what it was
 // before this feature existed.
 type anonymizing struct {
-	inner   Backend
-	newMask func() masker // one fresh mapper per request; injected so a test can force a failure
+	inner Backend
+	// newMask builds one fresh mapper per request, told every text the request will show the model;
+	// injected so a test can force a failure.
+	newMask func(texts ...string) masker
 }
 
 // masker is the reversible per-request mapping anonymizing depends on. anonymize.Mapper
@@ -31,10 +33,17 @@ type masker interface {
 
 // NewAnonymizing wraps inner so that every outgoing ExplainRequest is masked and every
 // ExplainResponse restored. extraHostSuffixes extends the bare-hostname allowlist.
+//
+// Each request's mapper reserves every placeholder its texts carry before the first Mask (#142),
+// so a literal "<HOST_1>" in a context line is never the token minted for the trigger's host.
 func NewAnonymizing(inner Backend, extraHostSuffixes ...string) Backend {
 	return &anonymizing{
-		inner:   inner,
-		newMask: func() masker { return anonymize.New(extraHostSuffixes...) },
+		inner: inner,
+		newMask: func(texts ...string) masker {
+			m := anonymize.New(extraHostSuffixes...)
+			m.Reserve(texts...)
+			return m
+		},
 	}
 }
 
@@ -54,10 +63,26 @@ func (a *anonymizing) Name() string { return a.inner.Name() + "+anonymized" }
 // One mapper serves the whole request, so a value that appears in both the trigger and the
 // context gets the same placeholder and the model can see it recur. The mapper holds the
 // only copy of the token→original map, in memory, and is discarded when Explain returns.
+//
+// The fields are one list, built before the mapper, because the mapper must see all of them
+// before it masks any (#142): a placeholder a later field carries as text is reserved before an
+// earlier field's value can be given it. Level, Stream and Count are the rest of the prompt, and
+// none can carry one: a level is canonicalized to a known name.
 func (a *anonymizing) Explain(ctx context.Context, req ExplainRequest) (ExplainResponse, error) {
-	m := a.newMask()
-
 	masked := req // copy; the caller's request keeps its real values
+	if len(req.Context) > 0 {
+		masked.Context = append([]string(nil), req.Context...)
+	}
+	fields := []*string{&masked.Trigger.Raw, &masked.Trigger.Source, &masked.Template}
+	for i := range masked.Context {
+		fields = append(fields, &masked.Context[i])
+	}
+	texts := make([]string, len(fields))
+	for i, f := range fields {
+		texts[i] = *f
+	}
+	m := a.newMask(texts...)
+
 	if req.OnPartial != nil {
 		// Restore over each PROGRESSIVE update too, or the card would show <IP_1> until the
 		// answer finished. A placeholder split across chunks is not a hazard here: a partial
@@ -67,22 +92,10 @@ func (a *anonymizing) Explain(ctx context.Context, req ExplainRequest) (ExplainR
 			req.OnPartial(a.restore(m, p))
 		}
 	}
-	var err error
-	if masked.Trigger.Raw, err = m.Mask(req.Trigger.Raw); err != nil {
-		return ExplainResponse{}, maskErr(err)
-	}
-	if masked.Trigger.Source, err = m.Mask(req.Trigger.Source); err != nil {
-		return ExplainResponse{}, maskErr(err)
-	}
-	if masked.Template, err = m.Mask(req.Template); err != nil {
-		return ExplainResponse{}, maskErr(err)
-	}
-	if len(req.Context) > 0 {
-		masked.Context = make([]string, len(req.Context))
-		for i, line := range req.Context {
-			if masked.Context[i], err = m.Mask(line); err != nil {
-				return ExplainResponse{}, maskErr(err)
-			}
+	for _, f := range fields {
+		var err error
+		if *f, err = m.Mask(*f); err != nil {
+			return ExplainResponse{}, maskErr(err)
 		}
 	}
 

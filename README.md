@@ -418,8 +418,10 @@ provider (OpenAI, Groq, …) those raw lines leave your network; logscry prints 
 notice at startup when that is the case.
 
 `--llm-anonymize` masks the outgoing payload and restores the model's answer on the way
-back, so the terminal and the cards always show the real values while the provider sees a
-type-tagged placeholder (`<IP_1>`, `<HOST_2>`) in place of every value logscry recognizes.
+back, so the terminal and the cards show what the log wrote while the provider sees a
+type-tagged placeholder (`<IP_1>`, `<HOST_2>`) in place of every value logscry recognizes. A
+placeholder the log itself carries as text is never given to a value, so it reaches the provider
+and the card as written; before `v0.12.28` it could be.
 The tag is kept on purpose: the model still needs to know it is reasoning about *an IP* or
 *a host that recurs*. The mapping is per-request and in memory only — never written to
 disk, never reused.
@@ -903,8 +905,9 @@ What it costs, pinned:
   credential, the `@` and the host are one `<TOKEN_n>`. The host has no tag of its own there.
 - Where v0.12.26 read an escape's letters as part of a value (`\u002fappuser@db.acme.com`), those
   letters stay inside it, and the escape's backslash is left beside the placeholder.
-- One new way to skip an escalation: a line with an escape that also carries one of logscry's own
-  placeholders as text, the same one a pass then mints for a value, is refused rather than sent.
+- One new way to skip an escalation, until `v0.12.28`: a line with an escape that also carried one
+  of logscry's own placeholders as text, the same one a pass then minted for a value, was refused
+  rather than sent. Such a line is sent now, with the placeholder kept as text (below).
 
 Two escapes are not read, and they are listed under
 [Known limitations](#known-limitations-v1). Checked against `v0.12.26`'s `Mask`, frozen in a test,
@@ -912,6 +915,31 @@ over every hand-written row, the earlier gates' corpus in six escaped forms, and
 JSON lines, each raw and templatized, with and without an extra host suffix: the bytes it masks
 include every byte `v0.12.26` masked, for every input. Measured over the same ten journald boots:
 nothing changed. None holds an escaped `/`, `:` or `@`.
+
+**A line carrying one of logscry's own placeholders as text was read back with the wrong value
+before `v0.12.28`.** This was a correctness defect, not a leak: nothing more reached the model
+endpoint. The placeholder counter never looked at the text, so a line that already said `<HOST_1>`
+had `<HOST_1>` minted for a real value too. `login as <HOST_1> from db.corp.internal` went as
+`login as <HOST_1> from <HOST_1>`.
+- **The model** was told one host recurs where the log named two things.
+- **The card** showed the real value in the literal's place: `login as db.corp.internal from
+  db.corp.internal`.
+
+Explain masks the trigger, the source, the template and each context line through one mapping, so
+a `<HOST_1>` in a context line took the trigger's host the same way. The Template field carries
+such text only from a JSON key; everywhere else the pipeline makes its digits `<NUM>`.
+v0.4.0 → v0.12.27, fifty-three tagged releases. From `v0.12.27`, a line with a JSON escape and
+such a collision was refused rather than sent.
+
+Every placeholder a request carries as text is now reserved before anything in it is masked, and
+the counter skips it: that line goes as `login as <HOST_1> from <HOST_2>`, and the card shows
+`login as <HOST_1> from db.corp.internal`. Restore already returned a placeholder it never issued
+as the text it was. If a mapping is ever told about such text after it minted the same placeholder,
+the request is refused rather than read back wrongly. Checked against `v0.12.27`, frozen in a test,
+over every earlier gate's corpus and 1,000 generated lines that carry placeholders in every
+position and escaped form: the same bytes are masked as before, for every input. Only the
+numbering moves, and only on a line that carries a placeholder. Over the same ten journald boots
+nothing changed, and none carries one.
 
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
