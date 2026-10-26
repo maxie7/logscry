@@ -5397,6 +5397,9 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **After, locally, each step as written:** coverage 16.2 s, race 39.6 s with both checks.
       `go test ./...` and `go test -race ./...` still run every test.
 
+      **On CI:** before, CI run #145 took 11 min 2 s in all; the PR's run took 1 min 48 s, with
+      the coverage step at 18 s and the race step at 55 s.
+
       Seen, out of scope: the Codecov upload, the golangci-lint settings, the release workflow.
 
       No release (no binary change).
