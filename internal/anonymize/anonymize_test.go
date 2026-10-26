@@ -4203,6 +4203,10 @@ var completenessRows = []completenessRow{
 	{"ipv6/dotted-quad/glued-upper-case", "PEER", ":::FFFF:192.0.2.1", "'"},
 	{"ipv6/dotted-quad/glued-port", "peer", ":::ffff:192.0.2.1:443", " refused"},
 	{"ipv6/dotted-quad/glued-after-hex", "sr", "c:::ffff:192.0.2.1", ")"},
+	// #59: a raw '/' in a userinfo half. Rule 4e masks the authority whole, host and port included,
+	// so the declared secret runs to the path.
+	{"url-credentials/raw-slash-in-password", "dsn=postgres://", "svcuser:hun/ter2@db.acme.com", "/prod"},
+	{"url-credentials/raw-slash-in-username", "dsn=postgres://", "svc/user:hunter2@db:5432", "/app"},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -4472,7 +4476,7 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// after "sk_test_", where '_' would have ended a snake_case name in short pieces.
 		{"a long camelCase name after a stripe prefix is a key", "run sk" + "_test_createCustomerWithCardAndRefund ok", "run <TOKEN_1> ok"},
 	}
-	for _, c := range append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...) {
+	for _, c := range append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...) {
 		t.Run(c.name, func(t *testing.T) {
 			m := New()
 			if got := mustMask(t, m, c.in); got != c.want {
@@ -4731,6 +4735,9 @@ var templatizedRows = []templatizedRow{
 	{"ipv6/dotted-quad/compatible", "bind \x00::192.0.2.1\x00 port"},
 	{"ipv6/dotted-quad/full-letter-groups", "peer \x00a:b:c:d:e:f:192.0.2.1\x00 down"},
 	{"ipv6/dotted-quad/glued-mapped", "peer\x00:::ffff:192.0.2.1\x00 down"},
+	// #59: a raw '/' in the password, a digit in each half and in the host. 4e's authority is one
+	// placeholder on the template too.
+	{"url-credentials/raw-slash/middle-digit", "FATAL db postgres://\x00svc7user:hun2/ter@db01.corp.internal:5432\x00/prod lost"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the

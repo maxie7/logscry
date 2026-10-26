@@ -158,3 +158,34 @@ func TestDefaultOffSendsRawValues(t *testing.T) {
 		}
 	}
 }
+
+// TestAnonymizeSlashUserinfoOnTheWire is #59 at the seam: a userinfo carrying a raw '/' is masked
+// whole, through the host, in every field, and the request is SENT -- the remedy adds no way for an
+// escalation to be skipped. Main sent the password remainder and the host here, under a username
+// tagged as a host. The answer comes back with the real authority on the card.
+func TestAnonymizeSlashUserinfoOnTheWire(t *testing.T) {
+	srv, body, calls := recordingServer(t, `{"summary":"login to <TOKEN_1> failed","likely_cause":"ok","suggestion":"ok"}`)
+	b := backendTo(srv, true)
+	req := llm.ExplainRequest{
+		Trigger:  model.LogLine{Source: "stdin", Raw: "FATAL connect postgres://svcuser:pa/ss9q@pgprimary7/app failed"},
+		Context:  []string{"retrying postgres://svc/user:hunter9q@pgreplica7:5432/app"},
+		Template: "FATAL connect postgres://svcuser:pa/ss<NUM>q@pgprimary<NUM>/app failed",
+		Count:    1,
+	}
+	resp, err := b.Explain(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Explain errored, so the escalation was skipped: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("provider called %d times, want 1", calls.Load())
+	}
+	sent := *body.Load()
+	for _, s := range []string{"svcuser", "pa/ss", "ss9q", "pgprimary", "user:hunter", "hunter9q", "pgreplica"} {
+		if strings.Contains(sent, s) {
+			t.Errorf("literal %q leaked onto the wire:\n%s", s, sent)
+		}
+	}
+	if want := "login to svcuser:pa/ss9q@pgprimary7 failed"; resp.Summary != want {
+		t.Errorf("Summary not restored:\n got:  %q\n want: %q", resp.Summary, want)
+	}
+}
