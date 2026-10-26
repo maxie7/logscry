@@ -428,7 +428,8 @@ What it masks: IPv4/IPv6, email addresses, hosts inside URLs and connection stri
 domain, and every member of a multi-host list such as a replica set), bare hostnames on **private/infra suffixes** (`.internal`, `.local`, `.svc`,
 `.lan`, `.corp`, …; extend with `--llm-anonymize-suffix`), UUIDs, known-shape secrets
 (JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, and a URL userinfo in any of its shapes —
-`user:pass@`, `user@`, `:pass@`, with or without a raw `@` inside it), and the username in
+`user:pass@`, `user@`, `:pass@`, with or without a raw `@` inside it, and with a raw `/` inside it
+wherever the text can tell it from a path), and the username in
 `/home/<user>` and `/Users/<user>` paths.
 
 A value that is *part of* a hostname is masked as part of that host, under `<HOST_n>`, rather than
@@ -812,6 +813,44 @@ with and without an extra host suffix: the bytes it masks include every byte `v0
 for every input. Measured over the same ten journald boots: nothing changed. None holds an
 address ending in a dotted quad.
 
+**A raw `/` in a URL userinfo sent the password and the host before `v0.12.26`.** This was a
+credential leak. RFC 3986 ends the authority at the first `/`, so no credential rule reached the
+`@` after one, and the URL-host rule masked the username as if it were the host:
+`postgres://user:p/ss@db/app` reached the model as `postgres://<HOST_1>:p/ss@db/app`, which sends the
+password and the real host, and the fail-closed check read the line as clean. v0.4.0 → v0.12.25,
+fifty-one tagged releases. What was sent depended on the authority:
+
+| after the last `@` | raw `/` in the password | raw `/` in the username |
+|---|---|---|
+| `@db` | **password and host sent** | **the username's tail, the password and the host sent** |
+| `@db.acme.com` | the password up to the `/` sent; the rest masked by accident as `<EMAIL_n>` | the username's tail sent; the rest masked by accident as `<EMAIL_n>` |
+| `@10.0.0.5:5432` | **password sent**; the address masked | **the username's tail and the password sent**; the address masked |
+| an empty username, `redis://:p/ss@redis:6379/0` | **the whole URI sent** | — |
+
+The fix is one more rule, run first, that masks the authority whole as one token, from after `://`
+through the host and port the author meant: `postgres://user:p/ss@db/app` goes as
+`postgres://<TOKEN_1>/app`, on both paths, and a query or a closing quote after the host stays
+outside the token. No parse is chosen, because none can be: `net/url` reads that string as the host
+`user:p` and the path `/ss@db`, its author meant a userinfo and a host, and nothing in the text
+separates the two. The token covers what is sensitive under either reading. Failing closed on the
+shape was the candidate the issue named, and it was measured against this and not taken: it
+discloses no less, and legal URIs carry the same shape, so each of those would have skipped a whole
+escalation where this costs one placeholder. The rule matches only when the authority up to its first
+`/` cannot be a `host[:port]` (a `:` whose right side is not a port), or when a `/` comes before the
+`:` of `user:pass@`. Every other URI masks exactly as before. What it costs, pinned: the host has no
+`<HOST_n>` of its own inside the token, so it is not seen to recur (leaving it outside was measured
+to send the `@` that a dotted host's accidental email mask had covered); a legal URI of the second
+shape is one token through its host (`docker://quay.io/ns/img:1.2@sha256:abc123` →
+`docker://<TOKEN_1>`, `https://h/a:b@c`); so is a `/` and an `@` in a query after a port; and a
+later `@` with no space before it extends the token, across JSON fields too, as the credential rule
+already does for a raw `@`. **#59 is closed for every shape the text can identify. Four shapes are
+sent by design**, because each one is also a legal URI that the text cannot tell apart from it. They
+are credential leaks all the same, and they are listed under
+[Known limitations](#known-limitations-v1). Checked against the chain as `v0.12.25` built it, over
+every hand-written row and 500 generated URIs, each raw and templatized, with and without an extra
+host suffix: the bytes it masks include every byte `v0.12.25` masked, for every input. Measured over
+the same ten journald boots: nothing changed. None holds a `/` and then an `@` after a `://`.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -828,7 +867,8 @@ Of the audit's own four, the half of #48 that ordering could not reach, #54, clo
 `v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`; of #55's three, the
 partly-recognised half, #57, in `v0.12.10`; and the glued key the work on it found unseen on
 the raw line, #108, in `v0.12.11`; and the bearer remainder the work on *that* found, #110,
-in `v0.12.12`.
+in `v0.12.12`; and the last of #55's three, the raw `/`, #59, in `v0.12.26`, for every shape
+the text can identify.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
 - ~~**#48** — a UUID inside a hostname silences both host detectors.~~ **Closed in
@@ -896,12 +936,14 @@ Each time the audit's own count was right and its scope was narrower than the se
   was smaller than the value, `host[:port](,host[:port])*`; the rest of the list is a companion
   rule now, because widening the host rule itself was measured to open a leak on a comma-separated
   list of URLs.
-- **#59** — **a raw `/` in a password: partial mask, host sent, and no reliable parse.**
-  `postgres://user:p/ss@db` masks the *username* as a host and sends both `p/ss` and `db`.
-  Unlike the `@` case there is no correct parse to widen towards — `net/url` errors on it, and
-  the RFC says the authority ends at the first `/`, so the string does not mean what its author
-  meant. The honest candidate here is to **fail closed** rather than mask in part: a partial mask
-  that leaks a host is worse than a skipped escalation.
+- ~~**#59** — a raw `/` in a password: partial mask, host sent, and no reliable parse.~~ **Closed
+  in `v0.12.26`**, for every shape the text can identify. See the paragraph above.
+  `postgres://user:p/ss@db` masked the *username* as a host and sent both `p/ss` and `db`. There
+  is still no correct parse to widen towards, and the remedy does not pick one: the authority is
+  masked whole, which covers what is sensitive under either reading. The candidate named here,
+  failing closed, was measured and not taken: it disclosed no less, and it would have skipped legal
+  URIs that carry the same shape. Four shapes that are also legal URIs are sent by design; they are
+  listed under [Known limitations](#known-limitations-v1).
 
 The full interference table, including the pairs that turned out to be harmless and why, is in
 `BACKLOG.md`.
@@ -1212,6 +1254,22 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `route fe80::/64` as `route fe<NUM><IP_1>/<NUM>` (sending `fe`). Since v0.8.5. Affected: the
   Template field only. Not affected: the raw trigger and context lines, where all three shapes are
   masked whole, and every address the template mask collapses to `<IP>`.
+- **With `--llm-anonymize`, four shapes of a raw `/` in a URL userinfo are still sent, by
+  design.** These are credential leaks. Since `v0.12.26` the authority is masked whole when the
+  text shows that the `/` is inside a userinfo (#59). In these four shapes it cannot: each is also a
+  legal URI, a host and a path, and masking it would mean masking every URL path that holds an `@`.
+  They are sent exactly as before, since v0.4.0, and the fail-closed check reads them as clean:
+
+  | shape | reaches the model as | sent | the legal URI it cannot be told from |
+  |---|---|---|---|
+  | a password that is all digits before the `/`: `postgres://user:1234/5@db` | `postgres://<HOST_1>:1234/5@db` | the password and the host | host `user`, port `1234`, path `/5@db` |
+  | a username with a `/` and no password: `postgres://us/er@db` | `postgres://<HOST_1>/er@db` | the username's tail and the host | host `us`, path `/er@db`, as in `https://h/users/bob@corp.com` |
+  | an `@` before the `/`: `postgres://user:p@s/s@db` | `postgres://<TOKEN_1>@<HOST_1>/s@db` | the password's tail and the host | userinfo `user:p`, host `s`, path `/s@db` |
+  | a password that starts with `/`: `postgres://user:/ss@db` | `postgres://<HOST_1>:/ss@db` | the password and the host | host `user`, an empty port, path `/ss@db` |
+
+  Percent-encode the `/` as `%2F`, as RFC 3986 requires, and each of the four is masked whole:
+  `postgres://user:1234%2F5@db` goes as `postgres://<TOKEN_1>@<HOST_1>`. Affected: these four
+  shapes. Not affected: every other raw `/` in a userinfo, and a percent-encoded `/`.
 - **There are two "first seen"s, on two clocks, and they can disagree.** The card's `first`
   time and `--export`'s `first_seen` are **logscry's** clock: when logscry first processed
   the template. The age the model is told ("first seen N ago") is the **source's** clock: the

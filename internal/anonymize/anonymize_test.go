@@ -908,11 +908,8 @@ func TestIssue55PasswordlessUserinfo(t *testing.T) {
 		// colon, until it was closed; it is TestIssue57PartlyRecognisedValue now.
 		// A raw '@' in the password sat here as #58 until it was closed; it is
 		// TestIssue58RawAtInUserinfo now, with the '/' case below kept as its control.
-		// A raw '/' in the password. net/url ERRORS on this one, so unlike the '@' case there is no
-		// reliable parse to widen towards and the honest candidate is to fail closed rather than
-		// mask in part. Today the username is masked as a HOST and both the password remainder and
-		// the real host are sent. #59.
-		{"raw '/' in the password (#59)", "postgres://user:p/ss@db", "p/ss"},
+		// A raw '/' in the password sat here as #59 until rule 4e masked the authority whole; it is
+		// TestIssue59SlashInUserinfo now, with the shapes it cannot reach.
 		// No scheme, so no "://" for any credential rule to anchor on. By design rather than by
 		// defect, and here so one run also shows the boundary of what the anchor reaches.
 		{"no scheme, by design", "user@db:5432/app", "user@db"},
@@ -1013,11 +1010,8 @@ func TestIssue58RawAtInUserinfo(t *testing.T) {
 	// The negative half, as ASSERTIONS that these gaps are open. Each goes red when its issue is
 	// fixed and is the reminder to update the docs that call it open.
 	open := []struct{ name, in, leak string }{
-		// A raw '/' in the password. net/url ERRORS on this one, and it errors the same way on a
-		// raw '?' and '#', which is the measurement that keeps those two out of THIS fix: bounding
-		// the userinfo at '?' and '#' would reopen "postgres://user:p?ss@db", fully masked today.
-		// All three are #59's class -- no reliable parse -- and #59's remedy, whatever it is.
-		{"raw '/' in the password (#59)", "postgres://user:p/ss@db", "p/ss"},
+		// A raw '/' in the password sat here as #59 until rule 4e masked the authority whole; it is
+		// TestIssue59SlashInUserinfo now. A raw '?' and '#' stay detector 4's, unbounded, as above.
 		// #57 with a raw '@' behind the tag sat here until it was closed; it is
 		// TestIssue57PartlyRecognisedValue now.
 		// The second host of a replica set sat here as #61 until it was closed; it is
@@ -1210,9 +1204,8 @@ func TestIssue61MultiHostAuthority(t *testing.T) {
 	open := []struct{ name, in, leak string }{
 		// A tag minted on a LATER member sat here as #67, one row per reachable tag, until it was
 		// closed; it is TestIssue67LaterMemberTag now.
-		// #59's shape with a list: the authority ended at the raw '/', so host2 is PATH to the RFC
-		// and to net/url alike, and no context design reaches it. Still #59.
-		{"raw '/' in the password, with a list (#59)", "postgres://user:p/ss@h1.acme.com,host2/db", "host2"},
+		// #59's shape with a list sat here until rule 4e took the authority whole, list included; it
+		// is a row of TestIssue59SlashInUserinfo now.
 		// An underscore in a hostname sat here as #66 until it was closed; it is
 		// TestIssue66UnderscoreInHostname now.
 	}
@@ -4203,6 +4196,10 @@ var completenessRows = []completenessRow{
 	{"ipv6/dotted-quad/glued-upper-case", "PEER", ":::FFFF:192.0.2.1", "'"},
 	{"ipv6/dotted-quad/glued-port", "peer", ":::ffff:192.0.2.1:443", " refused"},
 	{"ipv6/dotted-quad/glued-after-hex", "sr", "c:::ffff:192.0.2.1", ")"},
+	// #59: a raw '/' in a userinfo half. Rule 4e masks the authority whole, host and port included,
+	// so the declared secret runs to the path.
+	{"url-credentials/raw-slash-in-password", "dsn=postgres://", "svcuser:hun/ter2@db.acme.com", "/prod"},
+	{"url-credentials/raw-slash-in-username", "dsn=postgres://", "svc/user:hunter2@db:5432", "/app"},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -4472,7 +4469,7 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// after "sk_test_", where '_' would have ended a snake_case name in short pieces.
 		{"a long camelCase name after a stripe prefix is a key", "run sk" + "_test_createCustomerWithCardAndRefund ok", "run <TOKEN_1> ok"},
 	}
-	for _, c := range append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...) {
+	for _, c := range append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...) {
 		t.Run(c.name, func(t *testing.T) {
 			m := New()
 			if got := mustMask(t, m, c.in); got != c.want {
@@ -4731,6 +4728,9 @@ var templatizedRows = []templatizedRow{
 	{"ipv6/dotted-quad/compatible", "bind \x00::192.0.2.1\x00 port"},
 	{"ipv6/dotted-quad/full-letter-groups", "peer \x00a:b:c:d:e:f:192.0.2.1\x00 down"},
 	{"ipv6/dotted-quad/glued-mapped", "peer\x00:::ffff:192.0.2.1\x00 down"},
+	// #59: a raw '/' in the password, a digit in each half and in the host. 4e's authority is one
+	// placeholder on the template too.
+	{"url-credentials/raw-slash/middle-digit", "FATAL db postgres://\x00svc7user:hun2/ter@db01.corp.internal:5432\x00/prod lost"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
