@@ -813,7 +813,7 @@ with and without an extra host suffix: the bytes it masks include every byte `v0
 for every input. Measured over the same ten journald boots: nothing changed. None holds an
 address ending in a dotted quad.
 
-**A raw `/` in a URL userinfo sent the password and the host before `TODO-VERSION`.** This was a
+**A raw `/` in a URL userinfo sent the password and the host before `v0.12.26`.** This was a
 credential leak. RFC 3986 ends the authority at the first `/`, so no credential rule reached the
 `@` after one, and the URL-host rule masked the username as if it were the host:
 `postgres://user:p/ss@db/app` reached the model as `postgres://<HOST_1>:p/ss@db/app`, which sends the
@@ -867,7 +867,7 @@ Of the audit's own four, the half of #48 that ordering could not reach, #54, clo
 `v0.12.7`, and the anchor gap filed beside them, #52, in `v0.12.8`; of #55's three, the
 partly-recognised half, #57, in `v0.12.10`; and the glued key the work on it found unseen on
 the raw line, #108, in `v0.12.11`; and the bearer remainder the work on *that* found, #110,
-in `v0.12.12`; and the last of #55's three, the raw `/`, #59, in `TODO-VERSION`, for every shape
+in `v0.12.12`; and the last of #55's three, the raw `/`, #59, in `v0.12.26`, for every shape
 the text can identify.
 Each time the audit's own count was right and its scope was narrower than the sentence sounded.
 
@@ -937,7 +937,7 @@ Each time the audit's own count was right and its scope was narrower than the se
   rule now, because widening the host rule itself was measured to open a leak on a comma-separated
   list of URLs.
 - ~~**#59** — a raw `/` in a password: partial mask, host sent, and no reliable parse.~~ **Closed
-  in `TODO-VERSION`**, for every shape the text can identify. See the paragraph above.
+  in `v0.12.26`**, for every shape the text can identify. See the paragraph above.
   `postgres://user:p/ss@db` masked the *username* as a host and sent both `p/ss` and `db`. There
   is still no correct parse to widen towards, and the remedy does not pick one: the authority is
   masked whole, which covers what is sensitive under either reading. The candidate named here,
@@ -1255,7 +1255,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   Template field only. Not affected: the raw trigger and context lines, where all three shapes are
   masked whole, and every address the template mask collapses to `<IP>`.
 - **With `--llm-anonymize`, four shapes of a raw `/` in a URL userinfo are still sent, by
-  design.** These are credential leaks. Since `TODO-VERSION` the authority is masked whole when the
+  design.** These are credential leaks. Since `v0.12.26` the authority is masked whole when the
   text shows that the `/` is inside a userinfo (#59). In these four shapes it cannot: each is also a
   legal URI, a host and a path, and masking it would mean masking every URL path that holds an `@`.
   They are sent exactly as before, since v0.4.0, and the fail-closed check reads them as clean:

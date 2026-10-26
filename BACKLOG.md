@@ -5135,7 +5135,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Seen and left alone, out of scope:** #137, #135, #65, #116, #36, the IPv6 detectors,
       detector 4's JSON-field absorption, every other detector, `internal/pipeline`.
 
-      Targets TODO-VERSION
+      Targets v0.12.26
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
@@ -5721,7 +5721,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       | 15–16 | multi-colon | masked, span unchanged | only the first colon was ever structural |
       | 17 | a half recognised only in PART | `.prod` sent, residue clean | **#57, now FIXED** |
       | 18 | raw `@` in a half | the TRUE HOST sent | **FIXED (#58)** |
-      | 19 | raw `/` in a half | host and remainder sent | **masked whole since `TODO-VERSION` (#59); four shapes by design** |
+      | 19 | raw `/` in a half | host and remainder sent | **masked whole since `v0.12.26` (#59); four shapes by design** |
       | 20–22 | no scheme; unexpressible shapes | — | computed, not run |
 
       **Row 17 is not a leftover of #55 and is filed on its own terms, as #57.** An earlier detector
