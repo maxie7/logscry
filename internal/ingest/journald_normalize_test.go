@@ -134,3 +134,24 @@ func quoteJSON(s string) string {
 	}
 	return string(append(out, '"'))
 }
+
+// TestJournaldDefaultPriorityReadsALevelAfterAPrefix is #31 end to end. A Spring Boot service
+// printing its default console layout to stdout is recorded at PRIORITY 6, so the text is all
+// there is, and its level sits after the service's own timestamp. A deliberate priority still
+// wins over that column exactly as it wins over a leading token.
+func TestJournaldDefaultPriorityReadsALevelAfterAPrefix(t *testing.T) {
+	t.Run("at the default priority the column is read", func(t *testing.T) {
+		got := journaldLine(t, entryAt(t, "6",
+			"2026-07-13T10:00:00.123Z ERROR 4242 --- [demo] [           main] c.e.demo.Application     : payment declined"))
+		if got.Level != "ERROR" {
+			t.Errorf("Level = %q, want ERROR", got.Level)
+		}
+	})
+	t.Run("an error priority beats a disagreeing column", func(t *testing.T) {
+		got := journaldLine(t, entryAt(t, "3",
+			"2026-07-13T10:00:00.123Z  INFO 4242 --- [demo] [           main] c.e.demo.Application     : unit stopped"))
+		if got.Level != "ERROR" {
+			t.Errorf("Level = %q, want the journal's ERROR", got.Level)
+		}
+	})
+}
