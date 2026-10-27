@@ -1026,7 +1026,7 @@ where the masking pass could not reach it and the re-scan found it. Nothing is s
 `v0.12.28` sent the secret. Measured over the same ten journald boots: nothing changed, and none
 carries one of these formats.
 
-**Part of a vendor key or an AWS secret access key was sent before `TODO-VERSION`.** This was a
+**Part of a vendor key or an AWS secret access key was sent before `v0.12.30`.** This was a
 credential leak, partial: GHSA-8qq6-vx8j-rx37. The vendor-token rule and the AWS secret rule run
 last, and stop at a placeholder. When an earlier rule had already masked a piece inside a key, they
 masked at most one side of that piece, and the rest of the key went to the model endpoint. The
