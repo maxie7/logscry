@@ -6297,7 +6297,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       (java.util.logging's `SEVERE`, `CONFIG` and `FINE`, nginx's `alert` and `emerg`, .NET's
       `fail:`, PostgreSQL's `LOG` and `DEBUGn`).
 
-      Targets TODO-VERSION
+      Targets v0.12.31
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
