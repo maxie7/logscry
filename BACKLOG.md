@@ -6066,6 +6066,109 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.30
 
+- [x] **The superset gates run in parallel in CI's coverage step** — #148. `internal/anonymize`'s
+      coverage-step time had grown with every superset gate, to 194.6 s on main (v0.12.30).
+
+      **The issue's premise was wrong.** It blamed each gate for rebuilding every earlier gate's
+      corpus. Building costs almost nothing: all seven builds together take 1.36 s (0.020 s for
+      the IPv6 gates' corpus, 0.569 s for the newest, which nests every other), of the gates' 192 s.
+      The cost is the masking: each gate masks every earlier gate's inputs again, against its own
+      reference, through both mappers — ≈253 s of CPU across the fourteen mapper subtests. Sharing
+      the corpus would save under a second.
+
+      **Predicted, before measuring:** build ≤ 10 s of the total, masking > 90 % (**held**: 1.36 s,
+      99 %); inputs ≈4.5k, 4.5k, 5.7k, 30k, 40k, 90k, 120k (**held** for the first three, **missed**
+      high for the rest); duplicates 10–20 % in the IPv6 and #59 corpora (**held**, 13–14 %), < 1 %
+      in #142's (**missed**: 18 %, its rows are appended without deduplication), 0 elsewhere
+      (**held**); each gate's inputs inside every later gate's (**held**).
+
+      **Measured on main** (cores 0–3 pinned, two physical cores with HT like the runner's four
+      vCPUs, `-count=1`). Counts only; the digest is a sha256 over the sorted input hashes.
+
+      | Gate | Inputs | Distinct | Duplicates | Build | Mask, per mapper |
+      |---|---|---|---|---|---|
+      | `TestGluedRunMasksASupersetOfMain` (#134) | 4,814 | 4,178 | 636 | 0.020 s | 0.72 / 0.74 s |
+      | `TestDottedQuadMasksASupersetOfV01224` (#49) | 4,814 | 4,178 | 636 | 0.020 s | 0.73 / 0.72 s |
+      | `TestSlashUserinfoMasksASupersetOfV01225` (#59) | 5,890 | 5,041 | 849 | 0.026 s | 0.98 / 0.99 s |
+      | `TestJSONEscapeViewMasksASupersetOfV01226` (GHSA-p47p-xrhj-3x7p) | 22,613 | 22,613 | 0 | 0.064 s | 6.81 / 6.79 s |
+      | `TestPlaceholderReservationMasksASupersetOfV01227` (#142) | 36,431 | 29,697 | 6,734 | 0.220 s | 14.51 / 14.27 s |
+      | `TestVendorSecretChainMasksASupersetOfV01228` (#116) | 60,928 | 60,928 | 0 | 0.445 s | 40.29 / 39.99 s |
+      | `TestVendorKeyUnionMasksASupersetOfV01229` (GHSA-8qq6-vx8j-rx37) | 69,516 | 69,516 | 0 | 0.569 s | 62.86 / 62.92 s, in parallel |
+
+      Every distinct input of a gate is an input of every later gate. A second build is element for
+      element the first.
+
+      **Each gate's reference.** None is fully frozen: each is today's code with one feature removed
+      or one piece pinned.
+
+      | Gate | Reference | Kind |
+      |---|---|---|
+      | #134 | the live chain with every IP rule before 7 removed and 7 on the pinned v0.12.23 pattern; live `Mask` | hybrid: frozen IP rules, live rest |
+      | #49 | the live chain with 7b removed, 7 and 7a on the pinned v0.12.24 patterns; live `Mask` | hybrid: frozen IP rules, live rest |
+      | #59 | the live chain minus 4e (`withoutSlashUserinfo`); live `Mask` | live minus one feature |
+      | GHSA-p47p-xrhj-3x7p | the pinned v0.12.26 body (`maskAtV01226`) over the live chain and its live `apply`, `applyToFixpoint` and `residue` | hybrid: frozen body, live chain |
+      | #142 | `maskUnreserved`: live `escapeView`, `maskText` and `maskEscaped`, nothing reserved | live minus one feature |
+      | #116 | the live chain minus #116's ten entries, Slack on the pinned v0.12.28 pattern; live `Mask` | hybrid: frozen Slack, live rest |
+      | GHSA-8qq6-vx8j-rx37 | the same Mapper with the late pass off | live minus one feature |
+
+      **No gate is implied by another, and all seven stay.** An implication counts only if each step
+      is a frozen, proven relation over the same inputs. Because every reference carries live code,
+      a relation between two references moves with the code, and none is proven. #134 by #49, over
+      the same corpus, would need "the chain on v0.12.24's IP rules masks a superset of the chain on
+      v0.12.23's" over today's other rules. That was #134's own claim while v0.12.24 was the live
+      chain; it has not been checked since. For #59, GHSA-p47p-xrhj-3x7p, #142 and #116, every later
+      reference carries the earlier feature, so no later gate compares against the chain without it.
+      `SUPERSET_GATES` is unchanged.
+
+      **The change.** Every gate and both of its mapper subtests call `t.Parallel()`, so the
+      fourteen units share the four cores. Each subtest masks with fresh Mappers and only reads
+      the corpus its gate built, as the GHSA-8qq6-vx8j-rx37 gate's two did already. No corpus
+      builder, assertion or claim moved. Rejected:
+      - **A corpus built once per test binary:** under a second saved, and it would add state shared
+        between gates that now run concurrently.
+      - **Deduplicating inputs:** ≈6 s of CPU saved, but it changes the inputs each gate runs and the
+        counts each gate logs.
+      - **One late-off `Mask` per input shared across gates:** ≈18 % fewer `Mask` calls, for a
+        rewrite of every gate's loop and ≈140k Mappers held in memory.
+      - **Retiring gates:** none is implied (above).
+
+      **After** (same machine, same pinning). Predicted: coverage-step `internal/anonymize` 85–115 s,
+      peak RSS 150–400 MB on main and 300 MB–1 GB on the branch, race step within ±10 %.
+      - **Coverage step as written:** `internal/anonymize` **194.6 s → 120.1 s**; the step 195.0 →
+        121.2 s; total coverage 93.2 % on both. **Missed** by 5 s: HT gave the four threads ≈2.1× one
+        thread's throughput, not the ≈2.6× assumed. Run concurrently, the newest gate's subtests took
+        86.5 s each, against 62.9 s with only two threads busy.
+      - **Peak RSS** of the coverage test binary: 47.9 MiB on main, 90.3 MiB on the branch. **Missed**
+        low on both.
+      - **Race step as written**, guard checks included, test cache cleaned: `internal/anonymize`
+        40.2 s → 40.7 s, the step 48.4 → 48.9 s (**held**). The gates are still skipped there.
+      - Every gate's fourteen logged count lines are identical on main and the branch (line numbers
+        aside), and so are the package's 2,679 test results. Each gate's input count and multiset
+        digest is identical too.
+
+      **Mutants** (through `-overlay`, never in the tree):
+      - **A dropped input**, the last of #59's corpus: a throwaway test holding each gate's corpus to
+        main's count and digest goes red for #59 and every later gate (5,889 of 5,890; 22,606 of
+        22,613 once the escaped forms are counted; and so on).
+      - **A corpus shared by mistake across mappers**, the default subtest writing templates into the
+        corpus the other reads: red under a one-off `go test -race -run` of the #59 gate ("race
+        detected during execution of test"). The same command on the branch is green. The plain run
+        stays green, so CI's coverage step does not catch this one: the gates never run under the
+        race detector, by design (#143).
+
+      **Doc comments.** The four gates whose comments said "through New()" (#59, GHSA-p47p-xrhj-3x7p,
+      #142, #116) run `Mask` with the late pass off: `mapperOn` leaves `late` nil, and no gate file
+      sets it. Their comments now say so, and point to `TestVendorKeyUnionMasksASupersetOfV01229`,
+      which compares the late pass against that same Mapper. A throwaway run of gates #134 to #116
+      with `mapperOn` setting `late` was green: no claim fails for `New()`'s `Mask`. Only #116's
+      counts moved, since its reference Mapper picks up the late pass too. The race-step comment in
+      `ci.yml` and CONTRIBUTING no longer call the gates single-goroutine.
+
+      **Seen and left alone:** the `/verify` skill's text still calls the gates single-goroutine;
+      the Codecov upload; the release workflow.
+
+      No release (no binary change).
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
