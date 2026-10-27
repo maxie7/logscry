@@ -431,9 +431,22 @@ domain, and every member of a multi-host list such as a replica set), bare hostn
 `.lan`, `.corp`, …; extend with `--llm-anonymize-suffix`), UUIDs, known-shape secrets
 (JWTs, `AKIA…` keys, `Bearer`/`sk-` tokens, and a URL userinfo in any of its shapes —
 `user:pass@`, `user@`, `:pass@`, with or without a raw `@` inside it, and with a raw `/` inside it
-wherever the text can tell it from a path), and the username in
-`/home/<user>` and `/Users/<user>` paths. A URL, a connection string, an email or a path is masked
-whether its `/`, `:` and `@` are written raw or JSON-escaped: `\/`, `\u002f`, `\u003a`, `\u0040`,
+wherever the text can tell it from a path), vendor tokens by their published prefix, and the
+username in `/home/<user>` and `/Users/<user>` paths. The vendor tokens:
+
+- since `v0.12.15`: Stripe `sk_live_…`, `sk_test_…`, `rk_live_…`, `rk_test_…` and `whsec_…`;
+  GitHub `ghp_…`, `gho_…`, `ghu_…`, `ghs_…`, `ghr_…` and `github_pat_…`; Slack `xoxb-…`, `xoxp-…`,
+  `xoxa-…`, `xoxr-…`, `xoxs-…` and `xapp-…`; Google `AIza…`;
+- since `v0.12.29`: Twilio `SK…` and `AC…` SIDs; SendGrid `SG.…`; npm `npm_…`; GitLab `glpat-…`
+  and every other prefix GitLab documents (`gloas-`, `gldt-`, `glrt-`, `glcbt-`, …); Hugging Face
+  `hf_…`; Shopify `shpat_…`, `shpca_…`, `shppa_…` and `shpss_…`; PyPI `pypi-…`.
+
+Since `v0.12.29` it also masks an AWS secret access key written after its name
+(`AWS_SECRET_ACCESS_KEY=…`, `aws_secret_access_key = …`, `"SecretAccessKey": "…"`,
+`--aws-secret-access-key …`) or after its access key id, and the path of a Slack or Discord webhook
+URL (`hooks.slack.com/services/…`, `discord.com/api/webhooks/…`), whose host is masked as any
+URL's. A URL, a connection string, an email or a path is masked whether its `/`, `:` and `@` are
+written raw or JSON-escaped: `\/`, `\u002f`, `\u003a`, `\u0040`,
 and `\\/` for a string nested in another.
 
 A value that is *part of* a hostname is masked as part of that host, under `<HOST_n>`, rather than
@@ -941,6 +954,78 @@ position and escaped form: the same bytes are masked as before, for every input.
 numbering moves, and only on a line that carries a placeholder. Over the same ten journald boots
 nothing changed, and none carries one.
 
+**Vendor tokens, an AWS secret access key and a webhook URL's path were sent whole before
+`v0.12.29`.** This was a credential leak. No rule had the shape of a Twilio, SendGrid, npm,
+GitLab, Hugging Face, Shopify or PyPI token, of an AWS secret access key, or of the path of a Slack or
+Discord webhook URL. Each went to the model endpoint, and the fail-closed check read the line as
+clean. v0.4.0 → v0.12.28, fifty-four tagged releases.
+
+| what | sent on the trigger, the source and the context lines | sent on the Template field |
+|---|---|---|
+| Twilio `SK…` SID | **the SID** | its letters |
+| Twilio `AC…` SID | **the SID** | its letters when glued to a word; nothing alone (`<HEX>`) |
+| SendGrid `SG.…` | **the key** | its letters, `_`, `-` and `.` |
+| npm `npm_…` | **the token** | its letters |
+| GitLab `glpat-…` and the other prefixes | **the token** | its letters, `_`, `-` and `.` |
+| Hugging Face `hf_…` | **the token** | its letters: **the token**, when it has no digit |
+| Shopify `shpat_…`, `shpca_…`, `shppa_…`, `shpss_…` | **the token** | its letters |
+| PyPI `pypi-…` | **the token** | its letters, `_` and `-` |
+| AWS secret access key, beside its name or its key id | **the key** | its letters, `/` and `+` |
+| Slack webhook URL | **the team id, the bot id and the secret**; the host masked | the same, but their digits |
+| Discord webhook URL | **the webhook id and token**; the host masked | the token, but its digits |
+| Slack user token glued to a word (`xoxp-…_prod`) | masked since `v0.12.15` | its hex letters |
+
+On a JSON line only the message field reaches the Template field as text; every other value is
+`<STR>` there.
+
+The fix adds rules. Of the old ones only the Slack family changes, by one more way to read a glued
+user token on the Template field.
+- Seven vendor families join the vendor-token rule of `v0.12.15`. Each is read from the vendor's
+  published prefix, alphabet and shortest length, and where a vendor publishes no format, from the
+  structure of observed tokens. GitLab's body is inferred (below).
+- Each family is read on the Template field too, where digits are `<NUM>`: a run of its alphabet
+  with a placeholder in it, above a floor. A Slack user token glued to a word gets the same.
+- An AWS secret access key has no prefix, so context is its only evidence. Two shapes are read:
+  - forty or more characters of its alphabet after `aws_secret_access_key` in its env, INI, YAML,
+    JSON and command-line spellings;
+  - exactly forty after its access key id.
+- A webhook URL's host and the documented path prefix are the evidence for the path. Every segment
+  after the prefix, ids included, is masked as one `<TOKEN_n>`. The host is masked as before:
+  `post https://hooks.slack.com/services/…` goes as `post https://<HOST_1>/services/<TOKEN_1>`.
+
+Every new rule but the webhook rule runs after every older rule, so the older rules see the line they
+saw before. The webhook rule runs just before the URL-host rule, while the host is still raw; the
+rules after it see the path masked.
+
+What it costs, pinned:
+
+- A long enough word after a prefix is a token: a kebab-case name of twenty characters after a
+  GitLab prefix, a camelCase word of thirty-four after `hf_`.
+- On the Template field a short run with a digit after a prefix is a token:
+  - three units after `SK`, `AC` or a Shopify prefix;
+  - seven after a GitLab prefix;
+  - twelve after `SG.`, `npm_` or `hf_`;
+  - twenty-four after `pypi-AgE`.
+
+  A hex run longer than a SID after `SK`, and an uppercase hash glued after `AC`, are SIDs there.
+- Forty characters of the AWS alphabet after any `<TOKEN_n>` are a key, because the rule cannot tell
+  which secret the placeholder stands for: a SHA-1 after a GitHub token is masked.
+- After an AWS secret's name:
+  - a value of forty or more characters is a key, whatever it is;
+  - on the Template field, so is a value one character off forty, beside the name or the key id.
+- Every path segment after a webhook prefix is part of the token. That includes Discord's `/slack`
+  and `/github` routes, and a private name inside the path (`…/db.corp.internal`), which is no longer
+  a `<HOST_n>` of its own.
+
+What stays sent is listed under [Known limitations](#known-limitations-v1). The check: the chain as
+`v0.12.28` built it, frozen in a test, over every earlier gate's corpus, every new row (raw,
+templatized and in five escaped forms) and 4,000 generated lines. For every input, the bytes masked
+include every byte `v0.12.28` masked. In that corpus, ninety-one generated lines per mapper that
+`v0.12.28` sent are refused now. Each carried one of these secrets packed against another value,
+where the masking pass could not reach it and the re-scan found it. Nothing is sent where
+`v0.12.28` sent the secret. Measured over the same ten journald boots: nothing changed, and none
+carries one of these formats.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -975,13 +1060,6 @@ Each time the audit's own count was right and its scope was narrower than the se
   pre-pass identifying the authority first; what closed it is a rule more specific than the
   address rule on exactly the span they share, an address joined to hostname labels, which no
   ordering argument rules out.
-- **#116** — AWS secret access keys, Twilio (`SK…`, `AC…`), SendGrid (`SG.…`), npm (`npm_…`),
-  GitLab (`glpat-…`), Hugging Face (`hf_…`), Shopify (`shpat_…`) and PyPI (`pypi-…`) tokens match
-  no detector and are sent whole on the raw line; on the template only their digits are lost. In a
-  Slack incoming-webhook or Discord webhook URL the host is masked and the secret path segment is
-  sent. And a Slack user token (`xoxp-…`) with a word character glued right after it is masked on
-  the raw line but sends its secret segment's letters on the template. Not affected: the Stripe,
-  GitHub, Slack and Google formats #114 covers, in every other placement.
 - **#137** — an IPv6 address that the two boundary-bounded rules own is still sent when something
   other than a boundary follows it. Glued to the token before it by `:`, an address that begins with
   `::` goes in part: `peer:::ffff:0:0-y` sends `ffff:0:0-y`. An address ending in a dotted quad goes
@@ -1375,6 +1453,31 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   rest is sent: `https:\/\/api\u002eacme\u002ecom\/v1` sends `acme` and `com`. The same goes for a
   userinfo that escapes a character other than `/`, `:` and `@`. Since v0.4.0. Not affected:
   `\/`, and the `\u` escapes of `/`, `:` and `@`.
+- **With `--llm-anonymize`, an AWS secret access key with nothing beside it to identify it is
+  sent.** These are credential leaks. The key has no prefix: forty characters of base64, which a bare
+  run cannot tell from a hash or an identifier. Since `v0.12.29` it is masked after its name or
+  after its access key id. It is sent:
+  - alone, or beside anything else (`key …`);
+  - after a name outside the list: `secret_key=`, `AWS_SECRET_KEY=`, Terraform's `secret_key`;
+  - beside its key id when the field is not exactly forty characters, or when something other than
+    a comma, `;`, `:`, `|` or whitespace separates them.
+
+  The session token of temporary credentials (`AWS_SESSION_TOKEN=…`) is sent too. Since v0.4.0.
+- **With `--llm-anonymize`, GitLab tokens are masked by an inferred shape.** GitLab documents the
+  prefixes, and a minimum of twenty characters for a personal access token, but not the body's
+  alphabet or length for the others. A body shorter than twenty characters is sent.
+  `_gitlab_session=` is a session cookie, not a token, and is not masked.
+- **With `--llm-anonymize`, only Twilio's SIDs are masked.** A Twilio Auth Token and an API key's
+  secret have no prefix: thirty-two hex characters, sent as any hash is. A SID with a hex letter
+  glued straight after it (`SK…deadline`) is a hex run longer than a SID, and is sent on the raw
+  line. Since v0.4.0.
+- **With `--llm-anonymize`, three kinds of webhook URL are sent.** Their path goes in the clear:
+  - Slack's workflow and trigger webhooks (`hooks.slack.com/workflows/…`, `…/triggers/…`);
+  - GovSlack's `hooks.slack-gov.com`;
+  - a webhook URL percent-encoded inside another (`redirect=https%3A%2F%2Fhooks…`).
+
+  A webhook path run straight into another URL's scheme (`…/services/T…/B…/<secret>x_https://…`)
+  sends its last segment, which carries the scheme the URL-host rule reads. Since v0.4.0.
 - **There are two "first seen"s, on two clocks, and they can disagree.** The card's `first`
   time and `--export`'s `first_seen` are **logscry's** clock: when logscry first processed
   the template. The age the model is told ("first seen N ago") is the **source's** clock: the

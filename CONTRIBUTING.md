@@ -29,17 +29,22 @@ gofmt -l .          # must print nothing
 go vet ./...
 golangci-lint run
 go test ./...
-go test -race ./...
+SUPERSET_GATES=$(sed -n "s/^ *SUPERSET_GATES: '\(.*\)'$/\1/p" .github/workflows/ci.yml)
+go test -race -skip "$SUPERSET_GATES" ./...
 go build ./...
 ```
 
 `make build`, `make test`, `make lint`, and `make fmt` wrap the common ones.
 
-Both test commands above run every test. CI differs in one place: the anonymizer's superset
-gates, pure single-goroutine tests that take minutes under the race detector, run in full in its
-coverage step and are skipped by name in its race step. A new superset gate must follow their
-name pattern, `Test…MasksASupersetOf…`, and be added to `SUPERSET_GATES` in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml); CI fails until it is.
+The two test commands are CI's two test steps, and together they are the full check. `go test
+./...` runs every test, the anonymizer's superset gates included, as CI's coverage step does. The
+race step skips the gates by name: they are pure single-goroutine tests, so the race detector can
+find nothing in them. A bare `go test -race ./...` runs them anyway and exceeds `go test`'s default
+10-minute timeout per package: `internal/anonymize` stops with a timeout panic, not an assertion.
+For anyone who wants the full race run anyway, `go test -race -timeout 90m ./...` takes about 45
+minutes on 4 cores. A new superset gate must follow their name pattern, `Test…MasksASupersetOf…`,
+and be added to `SUPERSET_GATES` in [`.github/workflows/ci.yml`](.github/workflows/ci.yml); CI
+fails until it is.
 
 ## Commits
 

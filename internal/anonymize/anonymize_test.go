@@ -115,6 +115,18 @@ func TestTypeTags(t *testing.T) {
 		{"key " + githubPATSecret + " rejected", "<TOKEN_1>"},
 		{"key " + slackBotSecret + " rejected", "<TOKEN_1>"},
 		{"key " + googleAPISecret + " rejected", "<TOKEN_1>"},
+		// #116: a Twilio, SendGrid, npm, GitLab, Hugging Face, Shopify or PyPI token is a key. Before the fix
+		// these came back unchanged, the key in the clear; the exact outputs are pinned in
+		// TestIssue116PrefixedVendorTokens.
+		{"key " + twilioAPIKeySID + " rejected", "<TOKEN_1>"},
+		{"key " + sendgridSecret + " rejected", "<TOKEN_1>"},
+		{"key " + npmSecret + " rejected", "<TOKEN_1>"},
+		{"key " + gitlabPATSecret + " rejected", "<TOKEN_1>"},
+		{"key " + huggingFaceSecret + " rejected", "<TOKEN_1>"},
+		{"key " + shopifyAccessSecret + " rejected", "<TOKEN_1>"},
+		{"key " + pypiSecret + " rejected", "<TOKEN_1>"},
+		{"AWS_SECRET_ACCESS_KEY=" + awsSecretKey, "<TOKEN_1>"},
+		{"post https://" + slackHookHost + "/services/" + slackWebhookPath, "<TOKEN_1>"},
 	}
 	for _, c := range cases {
 		m := New()
@@ -178,6 +190,18 @@ func TestNoOverMasking(t *testing.T) {
 		"the xox" + "b- prefix",
 		"xox" + "b-2024-rollout-plan",
 		"AI" + "za_test_1",
+		// #116: a word that shares a vendor prefix stays by the floor, the alphabet or the lead
+		// (TestIssue116PrefixedVendorTokens).
+		"np" + "m_config_cache",
+		"h" + "f_hub_download",
+		"S" + "G.web-tier-01",
+		"gl" + "rt-runner-token",
+		"py" + "pi-simple-index",
+		"sh" + "pss_rotation",
+		"A" + "CCEPTED",
+		"aws_secret_access_key is missing",
+		"AWS_SECRET_ACCESS_KEY not set for profile2",
+		"read the " + discordHost + "/api/webhooks docs",
 	}
 	for _, s := range survive {
 		m := New()
@@ -577,6 +601,24 @@ func TestPlaceholdersAreInert(t *testing.T) {
 		"key <TOKEN_1>_prod used",
 		"GOOGLE_API_KEY=<TOKEN_1>",
 		"https://<HOST_1>/maps/api/geocode/json?address=x&key=<TOKEN_1>",
+		// #116's new outputs fed back: our own tag behind each new prefix, raw and as the template leaves it.
+		// A vendor body reads a pipeline placeholder as evidence, never ours.
+		"key S" + "K<TOKEN_1> used",
+		"key S" + "G.<TOKEN_1> used",
+		"key np" + "m_<TOKEN_1> used",
+		"key gl" + "pat-<TOKEN_1> used",
+		"key gl" + "pat<NUM><TOKEN_1> used",
+		"key h" + "f_<TOKEN_1> used",
+		"key sh" + "pat_<TOKEN_1> used",
+		"key py" + "pi-AgE<TOKEN_1> used",
+		"key xox" + "p<NUM><NUM><NUM><NUM><TOKEN_1> used",
+		"TWILIO_API_KEY=<TOKEN_1>",
+		"AWS_SECRET_ACCESS_KEY=<TOKEN_1>",
+		"<TOKEN_1>,<TOKEN_2>",
+		"creds <TOKEN_1> <TOKEN_2> loaded",
+		"https://<HOST_1>/services/<TOKEN_1>",
+		slackHookHost + "/services/<TOKEN_1>",
+		"post https://<HOST_1>/api/v<NUM>/webhooks/<TOKEN_1>?wait=true",
 	}
 	withSuffixes := buildDetectors([]string{"k8s", "acme1", "eu-1", "v1.2", "deadbeef", "2corp"})
 	for _, s := range inert {
@@ -2142,7 +2184,7 @@ func TestIssue57PartlyRecognisedValue(t *testing.T) {
 // host) read all three keys. 3c (a bearer value, #110) reads JWT's and AWS's only: 3b runs after 3a, so
 // a bearer value with an sk- key inside it has always been 3a's whole.
 //
-// #114's vendor keys are the other way round: no reader at all. Each format family's key is the group of
+// #114's and #116's vendor keys are the other way round: no reader at all. Each format family's key is the group of
 // exactly one detector, a verify-eligible TOKEN rule with group 1 among the chain's last, one per family,
 // and no other detector carries its shape. A vendor shape that joined keyShapes would put it inside 4d, 9e
 // and rule 11, and a vendor rule moved to 3b's slot would block the rules that mask such a key whole.
@@ -2205,6 +2247,13 @@ func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
 			{"GitHub fine-grained", githubPATSecret},
 			{"Slack", slackBotSecret},
 			{"Google", googleAPISecret},
+			{"PyPI", pypiSecret},
+			{"GitLab", gitlabPATSecret},
+			{"SendGrid", sendgridSecret},
+			{"npm", npmSecret},
+			{"Hugging Face", huggingFaceSecret},
+			{"Shopify", shopifyAccessSecret},
+			{"Twilio", twilioAPIKeySID},
 		}
 		owner := map[int]string{}
 		for _, v := range vendor {
@@ -2225,8 +2274,9 @@ func TestGluedKeyRulesReadTheKeyDetectors(t *testing.T) {
 				t.Errorf("the %s key's rule is detector %d (%s, group %d, verify %v), want a verify-eligible TOKEN rule with group 1",
 					v.family, i, d.tag, d.group, d.verify)
 			}
-			if i < len(dets)-len(vendor) {
-				t.Errorf("the %s key's rule is detector %d, want one of the last %d: a rule that runs earlier blocks the rules that mask such a key whole", v.family, i, len(vendor))
+			// Rule 13's two entries (#116) run after rule 12's, so rule 12 is the last len(vendor) but those two.
+			if i < len(dets)-len(vendor)-2 || i >= len(dets)-2 {
+				t.Errorf("the %s key's rule is detector %d, want one of the %d before rule 13's two: a rule that runs earlier blocks the rules that mask such a key whole", v.family, i, len(vendor))
 			}
 			if o, dup := owner[i]; dup {
 				t.Errorf("the %s and %s keys share detector %d, want one rule per family", o, v.family, i)
@@ -3074,16 +3124,15 @@ func TestIssue114VendorSecretFormats(t *testing.T) {
 	}
 
 	// THE RESIDUALS, pinned: the raw line is closed and the template is main's. A user or app token's
-	// secret segment is <HEX> on the template, so nothing of it is left to send; but with a word character
-	// glued after the key the hex segment has no \b to end on, NUM takes its digits instead, and the letters
-	// a-f between them are sent, as on main.
+	// secret segment is <HEX> on the template, so nothing of it is left to send. With a word character
+	// glued after a user token the hex segment had no \b to end on, NUM took its digits, and the letters
+	// a-f between them were sent; that was the third residual here, and #116 closed it
+	// (TestIssue116PrefixedVendorTokens).
 	residuals := []struct{ name, in, want, tmpl string }{
 		{"xoxp, the secret segment is <HEX>", "key " + slackUserSecret + " rejected", "key <TOKEN_1> rejected",
 			"key xox" + "p<NUM><NUM><NUM>-<HEX> rejected"},
 		{"xapp, the secret segment is <HEX>", "key " + slackAppSecret + " rejected", "key <TOKEN_1> rejected",
 			"key xa" + "pp<NUM>-A<NUM>BCDEF<NUM>GH<NUM>-<HEX> rejected"},
-		{"xoxp, a word character glued after", "key " + slackUserSecret + "_prod used", "key <TOKEN_1>_prod used",
-			"key xox" + "p<NUM><NUM><NUM><NUM>f<NUM>a<NUM>c<NUM>e<NUM>b<NUM>d<NUM>f<NUM>a<NUM>e<NUM>c<NUM>b<NUM>d<NUM>f<NUM>a<NUM>e<NUM>_prod used"},
 	}
 	for _, c := range residuals {
 		t.Run("residual/"+c.name, func(t *testing.T) {
@@ -4200,6 +4249,38 @@ var completenessRows = []completenessRow{
 	// so the declared secret runs to the path.
 	{"url-credentials/raw-slash-in-password", "dsn=postgres://", "svcuser:hun/ter2@db.acme.com", "/prod"},
 	{"url-credentials/raw-slash-in-username", "dsn=postgres://", "svc/user:hunter2@db:5432", "/app"},
+	// #116. One canonical row per new format family first, in vendorKeys' order, then the rest of each
+	// family and the edges. A Twilio SK SID is that family's canonical row: an AC SID alone is one hex run,
+	// which the pipeline collapses.
+	{"vendor-key/pypi", "key ", pypiSecret, " rejected"},
+	{"vendor-key/gitlab", "key ", gitlabPATSecret, " rejected"},
+	{"vendor-key/sendgrid", "key ", sendgridSecret, " rejected"},
+	{"vendor-key/npm", "key ", npmSecret, " rejected"},
+	{"vendor-key/hugging-face", "key ", huggingFaceSecret, " rejected"},
+	{"vendor-key/shopify", "key ", shopifyAccessSecret, " rejected"},
+	{"vendor-key/twilio", "key ", twilioAPIKeySID, " rejected"},
+	{"vendor-key/gitlab-routable", "key ", gitlabRoutable, " rejected"},
+	{"vendor-key/gitlab-runner", "key ", gitlabRunnerSecret, " rejected"},
+	{"vendor-key/hugging-face-digits", "key ", huggingFaceDigits, " rejected"},
+	{"vendor-key/shopify-shared", "key ", shopifySharedSecret, " rejected"},
+	{"vendor-key/twilio-account", "key ", twilioAccountSID, " rejected"},
+	{"vendor-key/sendgrid-env-var-end", "SENDGRID_API_KEY=", sendgridSecret, ""},
+	{"vendor-key/gitlab-sentence-dot", "key ", gitlabRoutable, ". Retrying"},
+	{"vendor-key/pypi-closing-quote", `rejected "`, pypiSecret, `" twice`},
+	{"vendor-key/npm-underscore-before", "token_", npmSecret, " used"},
+	{"vendor-key/twilio-underscore-after", "key ", twilioAPIKeySID, "_prod used"},
+	// #116's AWS secret access key: the value after its name (13a), then the value after its access key id
+	// (13b), whose context is the id's TOKEN, so the guards read its rows on the text the chain before it
+	// leaves (see tokenContextRules).
+	{"aws-secret/named", "AWS_SECRET_ACCESS_KEY=", awsSecretKey, ""},
+	{"aws-secret/pair", "creds \x00" + awsAccessKeyID + "\x00,", awsSecretKey, " loaded"},
+	{"aws-secret/json", `{"SecretAccessKey":"`, awsSecretKey, `"}`},
+	{"aws-secret/cli-flag", "run --aws-secret-access-key ", awsSecretKey, " --region x"},
+	{"aws-secret/pair-space", "creds \x00" + awsSessionKeyID + "\x00 ", awsSecretKey2, ""},
+	// #116's webhook URLs (4f): every path segment after the vendor's prefix, the host 9a's.
+	{"webhook/slack", "post https://\x00" + slackHookHost + "\x00/services/", slackWebhookPath, " failed"},
+	{"webhook/discord", "POST https://\x00" + discordHost + "\x00/api/webhooks/", discordWebhookPath, "?wait=true 401"},
+	{"webhook/slack-no-scheme", "SLACK_WEBHOOK=" + slackHookHost + "/services/", slackWebhookPath, ""},
 }
 
 // TestMaskingIsComplete is the property TestRoundTrip cannot express: the sensitive value is
@@ -4240,8 +4321,13 @@ func TestMaskingIsComplete(t *testing.T) {
 // a submatch and leave their surrounding context — the scheme, the word "Bearer", the rest
 // of the path — for a later detector or for the reader.
 func TestEveryDetectorHasACompletenessRow(t *testing.T) {
+	listed := tokenContextRulesIn(t, baseDetectors)
 	for i, d := range baseDetectors {
-		if _, ok := completenessSecretFor(d); !ok {
+		var before []detector
+		if listed[i] {
+			before = baseDetectors[:i]
+		}
+		if _, ok := completenessSecretFor(d, before); !ok {
 			t.Errorf("detector %d (%s, group %d) has no completeness row; add one to completenessRows.\n pattern: %s",
 				i, d.tag, d.group, d.re.String())
 		}
@@ -4252,11 +4338,22 @@ func TestEveryDetectorHasACompletenessRow(t *testing.T) {
 // whose target group lands exactly on the declared secret. That row is the one that speaks for
 // the detector, and TestEveryUncollapsedDetectorHasATemplatizedRow asks it what this detector's
 // value looks like before deciding whether the pipeline masker collapses it.
-func completenessSecretFor(d detector) (string, bool) {
+//
+// before is nil but for a rule in tokenContextRules, whose rows are read on the text the chain before it
+// leaves (before applied): there the secret is found where the chain left it, and must be there once.
+func completenessSecretFor(d detector, before []detector) (string, bool) {
 	for _, r := range completenessRows {
 		prefix := payloadOf(r.prefix)
 		payload := prefix + r.secret + payloadOf(r.suffix)
 		start, end := len(prefix), len(prefix)+len(r.secret)
+		if before != nil {
+			payload = throughChain(before, payload)
+			if strings.Count(payload, r.secret) != 1 {
+				continue
+			}
+			start = strings.Index(payload, r.secret)
+			end = start + len(r.secret)
+		}
 		for _, loc := range d.re.FindAllStringSubmatchIndex(payload, -1) {
 			if loc[2*d.group] == start && loc[2*d.group+1] == end {
 				return r.secret, true
@@ -4264,6 +4361,63 @@ func completenessSecretFor(d detector) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// tokenContextRules are the rules whose context is a TOKEN this package minted: #116's 13b, which reads the
+// access key id's tag. Run alone over a row as written such a rule has nothing to read, so the completeness
+// and templatized guards read its rows on the text the chain before it leaves, and check it as they check
+// every other detector there.
+//
+// The list cannot grow or shrink unseen: tokenContextRulesIn holds it to the chain both ways. A detector
+// whose pattern carries ourTokenTag must be on it, so a new rule of the kind is never checked on the wrong
+// text by accident, and every rule on it must be a detector of the chain with that tag, so one that loses
+// its tag context is checked as written again. 9c reads any of our tags or a raw host (taggedMember), so it
+// matches its rows as written and is not on it.
+var tokenContextRules = []string{awsSecretPair}
+
+// tokenContextRulesIn returns the indexes of dets that tokenContextRules lists, and fails on a detector
+// with our TOKEN tag in its pattern that the list misses, or a listed rule with no such detector.
+func tokenContextRulesIn(t *testing.T, dets []detector) map[int]bool {
+	t.Helper()
+	listed := make(map[string]bool)
+	for _, p := range tokenContextRules {
+		listed[mustLongest(p).String()] = true
+	}
+	found := make(map[string]bool)
+	out := make(map[int]bool)
+	for i, d := range dets {
+		src := d.re.String()
+		has := strings.Contains(src, ourTokenTag)
+		switch {
+		case has && !listed[src]:
+			t.Errorf("detector %d (%s) reads our TOKEN tag as its context and is not in tokenContextRules; add it there.\n pattern: %s", i, d.tag, src)
+		case listed[src] && !has:
+			t.Errorf("detector %d (%s) is in tokenContextRules and reads no TOKEN tag of ours.\n pattern: %s", i, d.tag, src)
+		}
+		if listed[src] {
+			found[src] = true
+			out[i] = true
+		}
+	}
+	for p := range listed {
+		if !found[p] {
+			t.Errorf("tokenContextRules lists a rule that is no detector of the chain:\n pattern: %s", p)
+		}
+	}
+	return out
+}
+
+// throughChain is s after dets, each once and 9c to its fixpoint, as the chain runs them.
+func throughChain(dets []detector, s string) string {
+	m := mapperOn(dets)
+	for _, d := range dets {
+		if d.fixpoint {
+			s, _ = m.applyToFixpoint(s, d)
+			continue
+		}
+		s = m.apply(s, d)
+	}
+	return s
 }
 
 // TestAcceptedOverMasking pins the cost of compiling every detector leftmost-longest, in the
@@ -4469,7 +4623,7 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// after "sk_test_", where '_' would have ended a snake_case name in short pieces.
 		{"a long camelCase name after a stripe prefix is a key", "run sk" + "_test_createCustomerWithCardAndRefund ok", "run <TOKEN_1> ok"},
 	}
-	for _, c := range append(append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...), jsonEscapeOverMaskingRows...) {
+	for _, c := range append(append(append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...), jsonEscapeOverMaskingRows...), vendorSecretOverMaskingRows...) {
 		t.Run(c.name, func(t *testing.T) {
 			m := New()
 			if got := mustMask(t, m, c.in); got != c.want {
@@ -4520,6 +4674,29 @@ var gluedRunOverMaskingRows = []struct {
 	{"the colon that glues an address goes with it", "peer:::1 down", "peer<IP_1> down"},
 	{"a netstat port goes with the unspecified address", "tcp6 0 0 :::22 :::* LISTEN", "tcp6 0 0 <IP_1> <IP_2>:* LISTEN"},
 	{"a ':::' operator is one placeholder", "xs ::: ys", "xs <IP_1> ys"},
+}
+
+// vendorSecretOverMaskingRows are #116's accepted over-masking rows, at package level for the gate's sake
+// as #134's are. A body's floor is the format's shortest length and nothing more, and GitLab's body is
+// inferred and permissive on purpose, so a long enough name after a prefix is a key: a kebab-case name of
+// twenty after a GitLab prefix, a camelCase word of thirty-four after "hf_". The AWS rows say theirs.
+var vendorSecretOverMaskingRows = []struct {
+	name string
+	in   string
+	want string
+}{
+	{"a long kebab-case name after a gitlab prefix is a key", "flag gl" + "pat-rotation-policy-enabled on", "flag <TOKEN_1> on"},
+	{"a long camelCase word after hf_ is a key", "load h" + "f_" + "modelRepositoryDownloadCacheManager ok", "load <TOKEN_1> ok"},
+	// The AWS secret access key's costs. 13b reads any TOKEN as its context, since a regexp cannot see which
+	// rule minted it, so exactly forty characters of the key's alphabet after any secret are a key: here a
+	// SHA-1 after a GitHub token. And a value of forty or more after the name is a key, whatever it is.
+	{"forty characters after any secret are the pair's", "token " + githubClassicSecret + " e20f93bfe1ac9665e30da612" + "33053f4d6c14db86",
+		"token <TOKEN_1> <TOKEN_2>"},
+	{"a long value after the name is a key", "aws_secret_access_key: " + strings.Repeat("placeholder", 4), "aws_secret_access_key: <TOKEN_1>"},
+	// A webhook's path after the prefix is all secret, so a further segment joins it: Discord's /slack and
+	// /github compatibility routes.
+	{"a route after a discord webhook joins its token", "POST https://" + discordHost + "/api/webhooks/" + discordWebhookPath + "/slack 401",
+		"POST https://<HOST_1>/api/webhooks/<TOKEN_1> 401"},
 }
 
 // dottedQuadOverMaskingRows are #49's accepted over-masking rows, at package level for the gate's
@@ -4731,6 +4908,25 @@ var templatizedRows = []templatizedRow{
 	// #59: a raw '/' in the password, a digit in each half and in the host. 4e's authority is one
 	// placeholder on the template too.
 	{"url-credentials/raw-slash/middle-digit", "FATAL db postgres://\x00svc7user:hun2/ter@db01.corp.internal:5432\x00/prod lost"},
+	// #116 through the composition, one row per new format family and the rest of each family's prefixes.
+	// Every digit is <NUM> on the template, so the placeholder is the evidence; a GitLab body's '-' before a
+	// digit goes with it as NUM's sign, and a routable token's ".01." is ".<NUM>.".
+	{"vendor-key/pypi", "key \x00" + pypiSecret + "\x00 rejected"},
+	{"vendor-key/gitlab", "key \x00" + gitlabPATSecret + "\x00 rejected"},
+	{"vendor-key/gitlab-routable", "key \x00" + gitlabRoutable + "\x00 rejected"},
+	{"vendor-key/gitlab-runner", "key \x00" + gitlabRunnerSecret + "\x00 rejected"},
+	{"vendor-key/sendgrid", "key \x00" + sendgridSecret + "\x00 rejected"},
+	{"vendor-key/npm", "key \x00" + npmSecret + "\x00 rejected"},
+	{"vendor-key/hugging-face-digits", "key \x00" + huggingFaceDigits + "\x00 rejected"},
+	{"vendor-key/shopify", "key \x00" + shopifyAccessSecret + "\x00 rejected"},
+	{"vendor-key/shopify-shared", "key \x00" + shopifySharedSecret + "\x00 rejected"},
+	{"vendor-key/twilio", "key \x00" + twilioAPIKeySID + "\x00 rejected"},
+	{"vendor-key/sendgrid-env-var-end", "SENDGRID_API_KEY=\x00" + sendgridSecret + "\x00"},
+	{"vendor-key/gitlab-sentence-dot", "key \x00" + gitlabRoutable + "\x00. Retrying"},
+	{"aws-secret/named", "AWS_SECRET_ACCESS_KEY=\x00" + awsSecretKey + "\x00"},
+	{"aws-secret/pair", "creds \x00" + awsAccessKeyID + "\x00,\x00" + awsSecretKey + "\x00 loaded"},
+	{"webhook/slack", "post https://\x00" + slackHookHost + "\x00/services/\x00" + slackWebhookPath + "\x00 failed"},
+	{"webhook/discord-versioned", "POST https://\x00" + discordHost + "\x00/api/v10/webhooks/\x00" + discordWebhookPath + "\x00 401"},
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
@@ -4824,6 +5020,16 @@ func TestLogfmtTemplatizedMaskingIsComplete(t *testing.T) {
 		{"quote-edge/slack-key-first", "\x00" + slackBotSecret + "\x00 rejected"},
 		{"quote-edge/google-key-first", "\x00" + googleAPISecret + "\x00 rejected"},
 		{"quote-edge/github-key-last", "rejected key \x00" + githubClassicSecret + "\x00"},
+		{"quote-edge/pypi-key-last", "rejected key \x00" + pypiSecret + "\x00"},
+		{"quote-edge/gitlab-routable-last", "rejected key \x00" + gitlabRoutable + "\x00"},
+		{"quote-edge/sendgrid-key-first", "\x00" + sendgridSecret + "\x00 rejected"},
+		{"quote-edge/npm-key-last", "rejected key \x00" + npmSecret + "\x00"},
+		{"quote-edge/hugging-face-key-first", "\x00" + huggingFaceDigits + "\x00 rejected"},
+		{"quote-edge/shopify-key-last", "rejected key \x00" + shopifyAccessSecret + "\x00"},
+		{"quote-edge/twilio-key-first", "\x00" + twilioAPIKeySID + "\x00 rejected"},
+		{"quote-edge/aws-secret-last", "loaded AWS_SECRET_ACCESS_KEY \x00" + awsSecretKey + "\x00"},
+		{"quote-edge/aws-pair-last", "creds \x00" + awsAccessKeyID + "\x00 \x00" + awsSecretKey + "\x00"},
+		{"quote-edge/webhook-last", "post https://\x00" + discordHost + "\x00/api/webhooks/\x00" + discordWebhookPath + "\x00"},
 	}
 	rows := append(append([]templatizedRow{}, templatizedRows...), quoteEdgeRows...)
 	for _, f := range fields {
@@ -4913,8 +5119,13 @@ func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 		}
 	}
 
+	listed := tokenContextRulesIn(t, baseDetectors)
 	for i, d := range baseDetectors {
-		secret, ok := completenessSecretFor(d)
+		var before []detector
+		if listed[i] {
+			before = baseDetectors[:i] // a tokenContextRules rule reads the text the chain before it leaves
+		}
+		secret, ok := completenessSecretFor(d, before)
 		if !ok {
 			continue // TestEveryDetectorHasACompletenessRow already reports this
 		}
@@ -4924,8 +5135,17 @@ func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 		}
 		covered := false
 		for _, s := range spans {
-			for _, loc := range d.re.FindAllStringSubmatchIndex(s.text, -1) {
-				if loc[2*d.group] == s.start && loc[2*d.group+1] == s.end {
+			text, start, end := s.text, s.start, s.end
+			if before != nil {
+				p := s.text[s.start:s.end]
+				if text = throughChain(before, s.text); strings.Count(text, p) != 1 {
+					continue
+				}
+				start = strings.Index(text, p)
+				end = start + len(p)
+			}
+			for _, loc := range d.re.FindAllStringSubmatchIndex(text, -1) {
+				if loc[2*d.group] == start && loc[2*d.group+1] == end {
 					covered = true
 					break
 				}
@@ -5129,6 +5349,15 @@ func TestNoOverMaskingAfterTemplating(t *testing.T) {
 		"xox" + "b-2024-rollout-plan",
 		"set xox" + "b-1 retries",
 		"AI" + "za_test_1",
+		// #116: under each new family's template floor, or no placeholder after the prefix.
+		"S" + "G.web-tier-01",
+		"gl" + "pat-v2",
+		"sh" + "pat_v2",
+		"code S" + "K1a",
+		"use h" + "f_xet_storage_v2",
+		"np" + "m_config_cache_v2",
+		"AWS_SECRET_ACCESS_KEY=abc123",
+		"see " + discordHost + "/api/v10/webhooks docs",
 	}
 	for _, s := range survive {
 		in, _ := pipeline.Templatize(s)

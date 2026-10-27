@@ -84,6 +84,14 @@
 // owns a value around such a key already masked it whole, so a rule run last reads only the text none of
 // them claims -- prose, a query value, a JSON value, an env var -- and changes nothing they mask.
 //
+// #116 IS MORE OF RULE 12. Twilio, SendGrid, npm, GitLab, Hugging Face, Shopify and PyPI tokens matched no
+// detector either, and were sent the same way. Each family is one more vendorKeys entry, run after #114's,
+// and a Slack user token glued to a word gains the template witness #114 pinned as its residual. An AWS
+// secret access key has no prefix at all, so context is its only evidence: rule 13 reads it after its
+// name, and after its access key id's TOKEN, last of all. A Slack or Discord webhook URL carries its
+// credential in the path, which no rule read beside 9a's host: 4f masks the path after the vendor's
+// prefix, just before 9a, while the host is still raw.
+//
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
 // Mask records nests; that inertness is what keeps a home path in a Go stack trace from tripping
@@ -168,6 +176,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/maxie7/logscry/internal/pipeline"
@@ -1095,6 +1104,29 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		{tagHost, mustLongest(ipv4LabelHost), 1, false, false},
 		// 8. IPv4 — validated octets, and a leading \b so v1.2.3.4 (a version) is left alone.
 		{tagIP, mustLongest(`\b` + ipv4Pattern + `\b`), 0, true, false},
+		// 4f. The path of a Slack or Discord incoming webhook URL (#116). Whoever holds the URL can post
+		//     to the channel: the credential is in the path, after a prefix each vendor documents --
+		//     hooks.slack.com/services/T…/B…/<secret>, and discord.com/api/webhooks/<id>/<token>, with
+		//     discordapp.com, a version (/api/v10/) or a subdomain (canary., ptb.). 9a masked the host
+		//     and nothing read the path, so the ids and the secret were sent whole, raw and on the
+		//     template, and residue() read the line as clean. v0.4.0 onward.
+		//
+		//     THE HOST AND THE PREFIX ARE THE EVIDENCE, so there is no floor: every segment after the
+		//     prefix is the credential, ids included, and the group is one TOKEN over all of them. A dot
+		//     inside a segment is path, so a name there (…/db.corp.internal, 9b's HOST until now) is part
+		//     of it. It stops where a path cannot go on -- '?', '#', a quote, whitespace, one of our tags,
+		//     a dot that ends it -- so a query (?wait=true, ?thread_id=) and a sentence dot stay. The
+		//     host is not masked here: 9a masks it as it always has, and with no scheme it stays.
+		//
+		//     IT RUNS HERE, BEFORE 9a, the one #116 rule that does not run last: after 9a the host is a
+		//     HOST tag, and a context of any host before /services/ would have lost the precision. Every
+		//     rule before it sees v0.12.28's input, and the rules after it read the authority (9a, 9c)
+		//     or could only have matched inside the path, which is masked whole now. 4e runs first, so
+		//     a URL it takes into a userinfo is its TOKEN, as it was.
+		//
+		//     verify:true. Its group is raw text and the pipeline's placeholders, so it cannot fire on
+		//     our own output, and its context is a raw host, which 9a has masked on any URL it reads.
+		{tagToken, mustLongest(webhookPath), 1, true, false},
 		// 9a. Host inside a URL/URI authority — masked regardless of TLD. The optional
 		//     userinfo run skips a (possibly already-masked) credential to reach the host.
 		//     Placeholder-tolerant: without it the host stopped at its first <NUM> and
@@ -1307,9 +1339,10 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	for _, k := range keyShapes {
 		dets = append(dets, detector{tagToken, mustLongest(looseKey(k.loose, k.lead)), 1, true, false})
 	}
-	// 12. A vendor key (#114): Stripe, GitHub classic and fine-grained, Slack and Google, one rule per
-	//     format family in vendorKeys' order. None was any detector's shape, so each was sent whole, raw
-	//     and on the template, and residue() read the line as clean.
+	// 12. A vendor key (#114, #116): Stripe, GitHub classic and fine-grained, Slack and Google; PyPI,
+	//     GitLab, SendGrid, npm, Hugging Face, Shopify and Twilio, one rule per format family in
+	//     vendorKeys' order. None was any detector's shape, so each was sent whole, raw and on the template,
+	//     and residue() read the line as clean.
 	//
 	//     IT RUNS LAST, after rule 11, and the argument is #108's. A vendor key no strict detector tags is
 	//     masked whole by every rule that owns a value around it -- a userinfo half (4), a host or a list
@@ -1327,11 +1360,45 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	//     One rule per format family rather than one for all, so each family has its own canonical
 	//     completeness and templatized rows; GitHub is two, because its formats differ in alphabet and floor.
 	//
+	//     #116's families run after #114's, so v0.12.28's chain is a prefix of this one, and among them a
+	//     family whose body can hold another's prefix runs first: the long base64url bodies (PyPI, GitLab,
+	//     SendGrid), then the alphanumeric ones, then Twilio, whose two-letter prefix is in every alphabet.
+	//     A rule that tagged an "hf_" or an "SK" inside a PyPI token first would leave the rest of it beside
+	//     the tag, where the PyPI rule, which stops at our '<', could not reach it.
+	//
 	//     verify:true, as every key rule: a raw vendor key that ever survives masking mutes the escalation.
 	//     Its group is raw text and the pipeline's placeholders only, so it cannot fire on our own output.
 	for _, k := range vendorKeys {
-		dets = append(dets, detector{tagToken, mustLongest(looseKey(k.loose, k.lead)), 1, true, false})
+		dets = append(dets, detector{tagToken, mustLongest(vendorRule(k)), 1, true, false})
 	}
+	// 13. An AWS secret access key (#116): forty characters of base64 and no prefix, which a bare run of
+	//     that alphabet cannot tell from a hash or an identifier. So CONTEXT is the evidence, and the
+	//     value alone is masked, never the name:
+	//
+	//     13a reads it after its name, aws_secret_access_key in every spelling a log or a config file
+	//     writes -- AWS_SECRET_ACCESS_KEY=, an INI or YAML key, "SecretAccessKey" in AWS's own JSON,
+	//     secretAccessKey, --aws-secret-access-key -- then '=', ':', "=>" or whitespace, quotes and their
+	//     escapes. Forty or more, the length every key carries; whitespace after the name is a
+	//     separator, and the floor keeps "aws_secret_access_key is missing" prose.
+	//
+	//     13b reads exactly forty after a TOKEN of ours and a delimiter -- a comma, ';', ':', '|' or
+	//     whitespace -- because by then detector 2 or rule 11 has put the access key id there, the pair
+	//     a credentials CSV and prose write. Exactly forty, since a bare run of the alphabet is common (a
+	//     SHA-1 is one). A regexp cannot see which rule minted the TOKEN, so this is the cost: forty such
+	//     characters after any secret are a key (TestAcceptedOverMasking). A second field of the same
+	//     shape after the first joins its group, or the re-scan would read the first's token as the
+	//     second's context and refuse the request.
+	//
+	//     BOTH RUN LAST, the argument of 11 and 12. A rule that tagged the key earlier would block one that
+	//     masks a larger value around it ("<id> <key>@corp.com" is 5's), and 13b must follow every rule
+	//     that mints a TOKEN, or that TOKEN is context only on the re-scan, which would refuse.
+	//
+	//     verify:true. Their groups are raw text and the pipeline's placeholders, so they cannot fire on
+	//     our own output; 13b's context IS our output, which no other rule's is (see ourTokenTag).
+	dets = append(dets,
+		detector{tagToken, mustLongest(awsSecretNamed), 1, true, false},
+		detector{tagToken, mustLongest(awsSecretPair), 1, true, false},
+	)
 	return dets
 }
 
@@ -1624,15 +1691,34 @@ type keyShape struct{ pat, cont, loose, lead string }
 // key, so the rules that own a value around one -- 4, 9a, 9c, 9b, 5, 10, 3a -- already mask it whole,
 // and only text none of them claims is left for rule 12.
 var vendorKeys = []vendorKey{
-	{stripeKey, `A-Za-z0-9`},
-	{githubKey, `A-Za-z0-9`},
-	{githubPAT, `A-Za-z0-9`},
-	{slackKey, `A-Za-z0-9`},
-	{googleKey, `A-Za-z0-9`},
+	{stripeKey, `A-Za-z0-9`, ``},
+	{githubKey, `A-Za-z0-9`, ``},
+	{githubPAT, `A-Za-z0-9`, ``},
+	{slackKey, `A-Za-z0-9`, ``},
+	{googleKey, `A-Za-z0-9`, ``},
+	{pypiKey, `A-Za-z0-9`, ``},
+	{gitlabKey, `A-Za-z0-9`, ``},
+	{sendgridKey, `A-Za-z0-9`, ``},
+	{npmKey, `A-Za-z0-9`, ``},
+	{huggingFaceKey, `A-Za-z0-9`, ``},
+	{shopifyKey, `A-Za-z0-9`, ``},
+	{twilioKey, `A-Za-z0-9`, twilioLonger},
 }
 
-// vendorKey is one key as vendorKeys lists it.
-type vendorKey struct{ loose, lead string }
+// vendorKey is one key as vendorKeys lists it. longer, when set, is a run that starts as the key does and
+// is too long to be one: the one format with a published ceiling (see twilioKey).
+type vendorKey struct{ loose, lead, longer string }
+
+// vendorRule is rule 12 for one key: looseKey, with the key's longer run beside it outside the group.
+// Leftmost-longest prefers the longer run where there is one, and a match without the group masks
+// nothing, so the key's alternative never takes that run's start. An assertion after the key could not
+// do it: RE2 has none, and a character consumed after one key is the lead the next one needs.
+func vendorRule(k vendorKey) string {
+	if k.longer == "" {
+		return looseKey(k.loose, k.lead)
+	}
+	return `(?:^|[^` + k.lead + `])(?:(` + k.loose + `)|` + k.longer + `)`
+}
 
 // The vendor formats, each from its published structure. A raw body's floor is the shortest published
 // length, with no upper bound: a vendor that lengthens its keys still matches, and a longer run of the
@@ -1652,11 +1738,39 @@ type vendorKey struct{ loose, lead string }
 //     so a kebab-case word after a literal "xoxb-" is the same alphabet, and the witness is #51's run.
 //   - Google: AIza and exactly 35 base64url characters.
 //
+// #116's, after #114's:
+//
+//   - PyPI: pypi- and a base64url macaroon that "will not be shorter than 85 characters" (PyPI's secret
+//     documentation). Its first three are AgE, the serialization header (version 2, then the location
+//     field), which is what tells a token from an 85-character kebab-case name after "pypi-".
+//   - GitLab: thirteen documented prefixes (glpat-, gloas-, gldt-, glrt-, glrtr-, glcbt-, glptt-, glft-,
+//     glimt-, glagent-, glwt-, glsoat-, glffct-). GitLab documents a length, twenty, and no alphabet, so
+//     the body is INFERRED, permissive on purpose: base64url and '.', twenty or more, no ceiling, which
+//     takes a legacy token, a routable one ("<payload>.<version>.<length and CRC>") and a JWT payload.
+//     It never ends on a '.', so a sentence dot stays outside.
+//   - SendGrid: SG., 22 base64url, '.', 43 base64url. SendGrid publishes no format; this is the observed
+//     structure, sixty-nine characters in all.
+//   - npm: npm_ and base62 (GitHub's 2021 token-format post: the last six characters a CRC32). The length
+//     is unpublished; 36 is observed.
+//   - Hugging Face: hf_ and 34 letters observed, no published format. Digits are admitted, the wider
+//     choice: a token that ever carries one would otherwise be sent.
+//   - Shopify: shpat_, shpca_, shppa_ (access tokens) and shpss_ (the app's shared secret), 32 more
+//     characters (Shopify's 2020 changelog: tokens went from 32 to 38 with the prefix). Observed as hex,
+//     read as base62, the wider choice; no ceiling, since Shopify has lengthened them before.
+//   - Twilio: SK (an API key SID) and AC (an account SID), two letters and exactly 32 hex digits, either
+//     case (Twilio's SID documentation). The one published ceiling, and it is needed: AC is itself hex,
+//     and a 64-hex uppercase constant starting with it occurs in Go's own source.
+//
 // The template floors are measured, not guessed: over 200,000 simulated bodies per format the fewest
 // units left on the Template field were 13 for a hex whsec_, 14 for a 24-character sk_, 27 for ghp_, 69
 // for github_pat_ and 25 for AIza, and every one of those templates matched whole. Each floor sits far
 // enough below its minimum that mangledFloor's two branches meet it (see there), and far enough above
-// a short identifier with a digit in it ("ghp_v2", "AIza_test_1") that one stays.
+// a short identifier with a digit in it ("ghp_v2", "AIza_test_1") that one stays. #116's, measured the
+// same way: 68 for PyPI, 12 for a twenty-character GitLab body, 54 for SendGrid, 26 for npm, 24 for a
+// base62 Hugging Face or Shopify body, 4 for a hex Shopify one and 2 or 3 for a Twilio SID, whose 32 hex
+// digits can leave one or two letters. Twilio's floor is 3, not 2: at 2, "AC" with a placeholder and one
+// hex letter read 54 identifiers in the Go module cache as keys, and what 3 leaves is a SID with at most
+// two letters, its digits already <NUM> (2 in 200,000).
 var (
 	stripeKey = `(?:(?:sk|rk)_(?:live|test)_(?:` + vendorAlnum + `{24,}|` + mangledFloor(vendorAlnum, 8) + `)` +
 		`|whsec_(?:` + vendorAlnum + `{32,}|` + mangledFloor(vendorAlnum, 8) + `))`
@@ -1664,6 +1778,107 @@ var (
 	githubPAT = `github_pat_(?:[A-Za-z0-9_]{82,}|` + mangledFloor(`[A-Za-z0-9_]`, 24) + `)`
 	googleKey = `AIza(?:[A-Za-z0-9_-]{35,}|` + mangledFloor(`[A-Za-z0-9_-]`, 12) + `)`
 )
+
+// #116's formats, in vendorKeys' order. A GitLab body's '-' before a digit is NUM's sign on the template,
+// so the prefix can end in <NUM> there; the dotted bodies take a '.' inside a run (see dottedUnit).
+var (
+	pypiKey   = `pypi-AgE(?:[A-Za-z0-9_-]{82,}|` + mangledFloor(`[A-Za-z0-9_-]`, 24) + `)`
+	gitlabKey = `gl(?:pat|oas|dt|rtr|rt|cbt|ptt|ft|imt|agent|wt|soat|ffct)(?:-[A-Za-z0-9_.-]{19,}[A-Za-z0-9_-]|-` +
+		dottedFloor(`[A-Za-z0-9_-]`, 7) + `|<NUM>` + dottedUnit(`[A-Za-z0-9_-]`) + `{6,})`
+	sendgridKey    = `SG\.(?:[A-Za-z0-9_-]{22,}\.[A-Za-z0-9_-]{43,}|` + dottedFloor(`[A-Za-z0-9_-]`, 12) + `)`
+	npmKey         = `npm_(?:` + vendorAlnum + `{36,}|` + mangledFloor(vendorAlnum, 12) + `)`
+	huggingFaceKey = `hf_(?:` + vendorAlnum + `{34,}|` + mangledFloor(vendorAlnum, 12) + `)`
+	shopifyKey     = `shp(?:at|ca|pa|ss)_(?:` + vendorAlnum + `{32,}|` + mangledFloor(vendorAlnum, 3) + `)`
+	twilioKey      = `(?:SK|AC)(?:[0-9a-fA-F]{32}|` + mangledFloor(`[0-9a-fA-F]`, 3) + `)`
+	// twilioLonger is a hex run too long to be a SID: not a key, so a hash that starts with AC stays. On
+	// the template NUM has broken the run and the count is lost, so there the run is read as a key.
+	twilioLonger = `(?:SK|AC)[0-9a-fA-F]{33,}`
+)
+
+// webhookPath is 4f (#116): a Slack or Discord webhook host, its port and the documented path prefix
+// as context, then the path's segments as the group. The port and a version are placeholder-tolerant,
+// as the context of every rule must survive the template.
+//
+// webhookEnd closes the path where it cannot go on, but never before "://": 9a reads a scheme glued to
+// what precedes it (schemeAnchor, #52), so a path run into another URL would carry that URL's scheme
+// away and leave its host to be sent. Such a path stays as v0.12.28 sent it. A '/' the escape view
+// resolves counts as one, so the line as written and its view agree.
+var (
+	webhookPort = `(?::(?:[0-9]|<NUM>)+)?`
+	webhookEnd  = `(?:$|[^A-Za-z0-9_:-]|:(?:$|[^/\\]|\\+` + notBefore(slashEscapes()) + `))`
+	webhookPath = `(?:^|[^A-Za-z0-9-])(?i:hooks\.slack\.com` + webhookPort + `/services|discord(?:app)?\.com` + webhookPort +
+		`/api(?:/v(?:[0-9]+|<NUM>))?/webhooks)/(` + webhookSegment + `(?:/` + webhookSegment + `)*)` + webhookEnd
+	webhookSegment = `(?:[A-Za-z0-9_-]|` + pipelinePH + `)` + dottedUnit(`[A-Za-z0-9_-]`) + `*`
+)
+
+// The AWS secret access key, rule 13 (#116). Its alphabet is base64's without the padding; the template
+// floors are measured as rule 12's are, thirty units being the fewest left over 200,000 simulated keys, and
+// 13b's is higher because a TOKEN and a comma are weaker evidence than the key's own name.
+var (
+	awsSecretChar  = `[A-Za-z0-9/+]`
+	awsSecretNamed = `(?:^|[^A-Za-z0-9])(?i:(?:aws[_-]?)?secret[_-]?access[_-]?key)` + `\\*["']?(?:\s*(?::|=>?)\s*|\s+)\\*["']?` +
+		`(` + awsSecretChar + `{40,}|` + mangledFloor(awsSecretChar, 12) + `)`
+	awsPairSep    = `\\*["']?(?:\s*[,;:|]\s*|\s+)\\*["']?`
+	awsPairField  = `(?:` + awsSecretChar + `{40}|` + mangledFloor(awsSecretChar, 15) + `)`
+	awsSecretPair = ourTokenTag + awsPairSep + `(` + awsPairField + `(?:` + awsPairSep + awsPairField + `)*)` + awsPairEnd
+	// awsPairEnd closes a pair field, so that forty means forty: the end of text, a character outside the
+	// alphabet and its padding, or a run of backslashes that does not escape '/'. An escaped '/' is the
+	// alphabet in the escape view, and a field the view reads as longer must not be forty as written, or
+	// the re-scan of the line as written would read the output as a key the view's pass rightly left.
+	awsPairEnd = `(?:$|[^A-Za-z0-9/+=\\]|\\+` + notBefore(slashEscapes()) + `)`
+)
+
+// slashEscapes are what escapeForm reads, after its run of backslashes, as '/': the one character of the
+// AWS alphabet an encoder escapes.
+func slashEscapes() []string {
+	out := []string{"/", "u002f", "u002F"}
+	for _, e := range []string{"u002f", "u002F"} {
+		tpl, _ := pipeline.Templatize(`\` + e)
+		out = append(out, strings.TrimPrefix(tpl, `\`))
+	}
+	return out
+}
+
+// notBefore matches the end of text, or one character that begins no string of lits, or one that begins
+// some of them followed by notBefore of their rest: whatever text starts with none of lits, ending the
+// match as early as it can. A backslash is never one such character, so it reads after a whole run.
+func notBefore(lits []string) string {
+	var firsts []byte
+	rests := make(map[byte][]string)
+	for _, l := range lits {
+		if _, ok := rests[l[0]]; !ok {
+			firsts = append(firsts, l[0])
+		}
+		rests[l[0]] = append(rests[l[0]], l[1:])
+	}
+	class := `\\`
+	alts := []string{`$`}
+	for _, c := range firsts {
+		class += regexp.QuoteMeta(string(c))
+		if !slices.Contains(rests[c], "") {
+			alts = append(alts, regexp.QuoteMeta(string(c))+notBefore(rests[c]))
+		}
+	}
+	return `(?:` + strings.Join(append(alts, `[^`+class+`]`), `|`) + `)`
+}
+
+// ourTokenTag is a TOKEN this package minted, 13b's context. No other rule reads one: 9c reads any of
+// our tags as a host-list member, with a raw member beside it (see taggedMember).
+const ourTokenTag = `<` + tagToken + `_\d+>`
+
+// dottedUnit is a unit of a run over class with a '.' allowed inside it: a character of class or a
+// pipeline placeholder, either one possibly after a dot. A run of it never ends on a dot, so a sentence
+// dot after a key stays outside it.
+func dottedUnit(class string) string {
+	return `(?:\.?(?:` + class + `|` + pipelinePH + `))`
+}
+
+// dottedFloor is mangledFloor over dottedUnit, the same two branches: its placeholder may follow a dot,
+// as on a routable GitLab token's ".<NUM>." or between SendGrid's two segments.
+func dottedFloor(class string, n int) string {
+	c, ph, unit := `(?:\.?`+class+`)`, `\.?`+pipelinePH, dottedUnit(class)
+	return fmt.Sprintf(`(?:%s{%d,}%s%s*|%s*%s%s{%d,})`, c, n-1, ph, unit, c, ph, unit, n-1)
+}
 
 // vendorAlnum is the base62 alphabet of the Stripe and GitHub classic bodies.
 const vendorAlnum = `[A-Za-z0-9]`
@@ -1676,8 +1891,14 @@ const vendorAlnum = `[A-Za-z0-9]`
 // witness is caseOrRun's, as after sk<NUM>: the placeholder stands for any count of digits, and it is also
 // every "xoxb-1". A user or app token's hex segment arrives as <HEX>, with no secret byte left in the
 // template, so that template is main's.
-var slackKey = `(?:xox[abprs]|xapp)(?:-[0-9][A-Za-z0-9-]*` + vendorAlnum + `{16}[A-Za-z0-9-]*|<NUM>` +
-	caseOrRun(`(?:[A-Za-z0-9-]|`+pipelinePH+`)`, vendorAlnum) + `)`
+//
+// Glued to a word character the hex segment has no \b to end on, so HEX does not take it: NUM takes its
+// digits and the letters a-f between them were sent (#114's residual, #116). The second witness reads
+// that: after the IDs' <NUM>s, three more of <NUM> or '-' and then a run of hex letters and placeholders.
+// A user token's three IDs and the segment's own sign or '-' always give four, the fewest units over
+// 200,000 simulated templates being six; the unglued "-<HEX>" has no letter after it and stays main's.
+var slackKey = `(?:xox[abprs]|xapp)(?:-[0-9][A-Za-z0-9-]*` + vendorAlnum + `{16}[A-Za-z0-9-]*|<NUM>(?:` +
+	caseOrRun(`(?:[A-Za-z0-9-]|`+pipelinePH+`)`, vendorAlnum) + `|(?:<NUM>|-){3,}[a-f](?:[a-f-]|<NUM>)*))`
 
 // mangledFloor is mangled with a floor of n units, a unit being a character of class or a whole pipeline
 // placeholder: a run with a placeholder in it and at least n-1 units on one side of its FIRST placeholder.
