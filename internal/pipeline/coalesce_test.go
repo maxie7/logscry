@@ -292,12 +292,12 @@ func TestIssue89SourcePositionLines(t *testing.T) {
 			`time="2026-07-13T12:00:00+02:00" level=info msg="starting" func=main.main file="main.go:42"`,
 			`time="2026-07-13T12:00:00+02:00" level=error msg="db unreachable" func=main.connect file="db.go:17"`,
 			[2]string{"INFO", "ERROR"}},
-		// A level after a prefix is #31's, so neither line gets one: the split is what this
-		// row pins.
+		// The second line's level follows its timestamp and file.go:N: prefix, and is read
+		// since #31; the first carries none. The split is what this row pins.
 		{"log Lshortfile",
 			"2026/07/13 12:00:00 main.go:42: starting",
 			"2026/07/13 12:00:00 db.go:17: ERROR: db unreachable",
-			[2]string{"", ""}},
+			[2]string{"", "ERROR"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

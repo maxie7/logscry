@@ -6169,6 +6169,136 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       No release (no binary change).
 
+- [x] **A plaintext level after the line's own header is read** — #31, found during #24's work.
+      The plaintext detector was `^`-anchored: `ERROR: …`, `[ERROR] …` and `level=error …` were
+      levels only at position 0. A logger that writes its own timestamp, pid, thread or logger
+      columns first got no level from any source. journald is the only source that supplies one
+      from metadata, so on stdin, subprocess, Docker and journald's default priority a new
+      `ERROR` in Spring Boot's default console layout scored 0.45 and stayed silent.
+
+      **The formats**, each a framework's documented default, all read now:
+
+      | Format | Level sits after | Case and delimiter |
+      |---|---|---|
+      | Spring Boot console (`%5p`) | ISO timestamp | UPPER, space-padded |
+      | Logback without a configuration, Log4j2's `DefaultConfiguration` | time, `[thread]` | UPPER, `%-5level` |
+      | Python `%(asctime)s - %(name)s - %(levelname)s`, and `asctime levelname` | timestamp, `- name -` | UPPER |
+      | Celery `worker_log_format` | `[timestamp:` | UPPER, then `/process` |
+      | gunicorn `error_fmt` | `[ts] [pid]` | `[ERROR]` |
+      | loguru's default | timestamp, `\|` | UPPER, padded |
+      | Go `log` (LstdFlags, Lmsgprefix, Lshortfile) and slog's default handler | date + time, `file.go:N:` | UPPER, `:` or `[…]` or bare |
+      | Ruby `Logger::Formatter`, Rails production's | `E, [ts #pid]` | UPPER, `%5s` |
+      | nginx error log | date + time | `[error]`, lower |
+      | PostgreSQL `log_line_prefix` `'%m [%p] '` | ts, zone, `[pid]` | `ERROR:` |
+      | klog / glog | glued to the date | `E0713 …`, one letter |
+      | the issue's `ERROR - …` | nothing | bare first word, then ` - ` |
+
+      java.util.logging's second line (`WARNING: …`) and Python's `basicConfig()` default
+      (`ERROR:root:…`) were already read at position 0, and are pinned unchanged.
+
+      **The rule.** When the leading-token rule finds nothing, `headerLevel` walks the first
+      physical line, split at whitespace and `[ ] ( ) | : /`:
+      - The first level **column** is the level. A column is upper-case, or closed by `]` or `:`
+        in any case. Its left side is the line's start, whitespace, `[`, `(` or `|`, never `:`.
+        A bare level that is the line's first word needs ` - `, `:`, `]` or `|` after it.
+      - **Header tokens** are passed over: anything holding a digit, printable punctuation, a
+        bracketed group that closes, a month, weekday or AM/PM, an upper-case zone straight
+        after a time, Ruby's severity initial (`E,`), a source position (`db.go:17:`), and a
+        word set off by ` - ` or ` | `.
+      - Anything else is prose and ends the walk with no level. A control byte does too.
+      - klog's whole header, `Lmmdd hh:mm:ss.uuuuuu threadid file:line] `, has its own anchored
+        pattern.
+      - The message stays the raw line, so no template hash moves.
+
+      **Why not the issue's candidates.** Measured on the ten boots, over lines with no level on
+      main:
+      - A case-insensitive level word anywhere hits **4,647** lines, nearly all prose.
+      - A delimited upper-case word anywhere hits **508**. 88 are quoted tokens in JSON arrays,
+        and it reads `Retrying after ERROR from upstream` as ERROR.
+      - A bounded prefix adds nothing to the walk, which ends at the first prose word: no hit
+        starts at byte 64 or later.
+      - Stripping a known timestamp alone misses `file.go:N:`, `(TAG)`, `|` columns and Python's
+        name column. The walk is that idea generalised to columns.
+
+      **What it costs.** A level word that is the first word after header material only is read:
+      `42 ERROR rows skipped`, `[cache] WARN threshold`, `foo - ERROR`, `[see error]`. A line
+      that starts with an ordinary word is never read.
+
+      **Three decisions, each measured** (ten boots, dry-run replay, 59 escalations on main):
+      - **Chromium's in-bracket level is left unread.** `[pid:tid:time:ERROR:file.cc(N)]` glues
+        its level on with `:`. The planning pass counted 245 such lines, 230 at ERROR. Built in
+        and replayed, reading it takes escalations to **141 (+82)**, all browser and
+        desktop-app chatter. That is a scoring decision, not a detector one, so it is named in
+        README and nothing is filed.
+      - **A bare first-word level needs a delimiter.** Without one, `PANIC button pressed`,
+        `FATAL attraction` and `CRITICAL path updated` would each be fatal-class or ERROR and
+        escalate on novelty. Predicted 0 lines different between the two variants on the
+        boots. **Held**: 0 lines, 0 escalations.
+      - **A control byte ends the walk.** The first version let an ANSI escape pass as a
+        letterless separator, so a coloured `[WARN …]` or `[CRITICAL …]` behind it was read:
+        307 lines from one desktop dock (287 WARN, 20 CRITICAL) and **+15** escalations (59 →
+        74). That contradicted the plan, which left ANSI lines unread. The issue's comment
+        proposes stripping ANSI as its own change.
+
+      **Precision, predicted before the Go harness ran.** Ten boots with `ab37*` and
+      `logscry-probe` removed, 58,172 entries, main@26cdbba against the branch. Each entry goes
+      through `Decode`, `Normalize` and `TemplatizeLine`.
+      - **Levels.** Predicted 113 lines, all from no level: 62 WARN, 51 INFO, none error-class.
+        The first run gave 420: **missed**, because the prediction pass had skipped
+        byte-array MESSAGEs, which is where the ANSI lines live (above). With control bytes
+        ending the walk, **held exactly**:
+        - no level → WARN, 62: a source position then `Warning:`/`WARNING:` (BudgiePanel 52,
+          snapd 10);
+        - no level → INFO, 51: a pipe column (jetbrains-toolbox 21, python3 10) and a
+          parenthesised tag (cron 20);
+        - no level → ERROR-class: 0. An existing level changed: 0.
+      - **Hashes:** 0 moved (**held**). Template counts per boot are unchanged (2,568 to 3,165
+        per line).
+      - **Escalations:** 59 → 59. Every export is byte-identical on all ten boots (**held**).
+        Every gained level is INFO or WARN on stdout, so a new line scores 0.65 at most, and no
+        gained template reaches more than 2 lines in any 10 s window, against a burst gate of 25.
+      - **klog:** predicted 0 lines, measured 0 (**held**). Four lines with a near-miss shape stay
+        unread. No capture holds a kubelet-class `E` line, so escalation volume on a Kubernetes
+        node is unmeasured.
+      - **#27:** 400 benign Spring Boot INFO templates are read as INFO and give 0 escalations,
+        0 suppressed and 0 cached (**held**). `TestNoveltyAloneNeverEscalates` is unedited.
+      - **Prose:** all 28 rows stay unread on main and on the branch (**held**).
+
+      **Precedence** is untouched. `Normalize`'s source-supplied level still wins, and the walk
+      runs only inside `normalizePlain`, before the logfmt override. Docker supplies no level.
+      `TestNormalizeSourceLevelWinsOverTheText`, `TestNormalizeDetectsLevelWhenTheSourceSuppliesNone`,
+      `TestJournaldDefaultPriorityDefersToTheText` and
+      `TestJournaldNonDefaultPriorityStillWinsOverTheText` pass unedited.
+
+      **Tests.** Red first: `TestIssue31LevelAfterAPrefix`, 26 rows, one per format, each with
+      its exact level and the raw line as message, all failing on main. Alongside it:
+      - `TestJournaldDefaultPriorityReadsALevelAfterAPrefix`, red at priority 6, with the
+        precedence row at 3;
+      - `TestLeveledInfoTemplatesStayQuiet`, #27's scenario, red on the level;
+      - `TestProseMentioningALevelStaysUnread` (28 rows), `TestShapesLeftUnread` (9) and
+        `TestLevelAtLineStartIsUnchanged` (3), which pass on main.
+
+      One existing row flipped, and it was this defect's own pin: #89's `log Lshortfile` row
+      expected no level on `… db.go:17: ERROR: …`, with a comment naming #31. It now expects
+      ERROR.
+
+      Seven mutants each turn a row red: a `:` on the left allowed (Chromium, Apache), any-case
+      bare levels, no name column, no source position, no first-word delimiter, control bytes
+      as separators, unclosed brackets opening a group. The new tests pass at `-race -count=20`.
+      The full suite gives 3,550 results on main and 3,624 on the branch. No existing result
+      changed outcome; the 74 new ones pass.
+
+      **What a user sees.** Lines from these formats show their level. A new ERROR from such a
+      service escalates on novelty + ERROR (1.05), as a leading `ERROR:` always did. No
+      template, and no export record whose line kept its level, changes.
+
+      **Seen and left alone, out of scope:** JSON level fields; logfmt (#83); #36; #126; the
+      scoring weights; `internal/anonymize`; stripping ANSI escapes; the level vocabulary
+      (java.util.logging's `SEVERE`, `CONFIG` and `FINE`, nginx's `alert` and `emerg`, .NET's
+      `fail:`, PostgreSQL's `LOG` and `DEBUGn`).
+
+      Targets v0.12.31
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
