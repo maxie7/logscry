@@ -442,6 +442,8 @@ func BenchmarkMask(b *testing.B) {
 		{"one escaped dsn", `{"level":"error","dsn":"postgres:\/\/svcuser:pwsecret@pghost:5432\/app"}`},
 		{"json line with several escaped urls", `{"msg":"fetch https:\/\/api.acme.com\/v1 failed","peer":"https:\/\/10.0.0.5:8443\/x",` +
 			`"dsn":"postgres:\/\/svcuser:pwsecret@pghost\/app","home":"\/home\/bob\/x"}`},
+		{"a line with vendor keys", "auth failed: stripe=" + stripeLiveSecret + " github=" + githubClassicSecret + " google=" +
+			googleAPISecret + " creds " + awsAccessKeyID + " " + awsSecretKey},
 	} {
 		b.Run(c.name, func(b *testing.B) {
 			for b.Loop() {
