@@ -154,7 +154,7 @@ Selection flags: `--docker-all`, `--docker-label k=v`, `--docker-name <regex>`, 
 
 ## 5. Processing & templating spec (`internal/pipeline`)
 
-1. **Detect format:** if the line parses as JSON, extract `level`/`severity` and `msg`/`message`; otherwise treat as plain text and run light heuristics for a leading level token.
+1. **Detect format:** if the line parses as JSON, extract `level`/`severity` and `msg`/`message`; otherwise treat as plain text and run light heuristics for a level token at the start of the line or following the line's own header columns (timestamp, pid, thread, source position, logger name; issue #31). A level is never read out of prose.
 2. **Template (signature):** produce a masked form by replacing variable substrings with typed placeholders:
    - integers/floats → `<NUM>`
    - hex / UUIDs → `<HEX>` / `<UUID>`

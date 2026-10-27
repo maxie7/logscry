@@ -228,7 +228,9 @@ close: the longest of 70,783 journal entries was 4.2 KiB.
 You can't call an LLM on every log line in real time — cost, latency, and noise all
 forbid it. The interesting part is the pipeline that avoids doing so:
 
-1. **Normalize** each line (JSON, logfmt or plain text) into a level and a message.
+1. **Normalize** each line (JSON, logfmt or plain text) into a level and a message. A
+   plain-text level is read at the start of the line or after the line's own timestamp and
+   columns, never out of prose.
 2. **Template** it — mask the variable parts (`<NUM>`, `<IP>`, `<UUID>`, …) down to a
    signature, so `user 4821 failed` and `user 9933 failed` become one pattern. A JSON or
    logfmt line is templated on its keys: field names stay, the message (and logfmt's
@@ -355,17 +357,44 @@ included. At 6 the journal is telling us where a line came from, not how bad it 
 that is the one priority logscry does not treat as a level, falling back to reading the
 message instead. Everywhere else the priority still wins.
 
-> **What reading the message does and does not recover.** The fallback finds a level at
-> the *start* of a line — `ERROR: ...`, `[ERROR] ...`, `level=error ...` — and, under any of
-> `level`, `lvl`, `severity`, or `log.level`, inside a JSON payload or anywhere in a logfmt
-> line (`time="…" level=error msg="…"`, the shape dockerd, containerd and Go's slog write). A
-> line counts as logfmt only if all of it is `key=value` pairs. It does **not** find a level
-> in the middle of prose, which is the usual console format for a JVM or Spring
-> service (`2026-01-15 10:23:45.123 ERROR 12345 --- [http-nio-8080] com.example.Foo : ...`)
-> — the level sits after the service's own timestamp and is missed. Configure such a
-> service to log JSON and it is read correctly. Levels at priority **5** (notice) and **7**
-> (debug) are also left alone: both are non-default, so both are taken at their word, and a
-> unit logging at either still loses a level its text reports.
+> **What reading the message does and does not recover.** The same reading applies to every
+> source, since stdin, subprocess and Docker supply no level of their own. It finds a level:
+>
+> - at the *start* of a line: `ERROR: ...`, `[ERROR] ...`, `level=error ...`, `ERROR - ...`;
+> - after the line's own header columns (a timestamp, a pid, a `[thread]`, a source position, a
+>   logger name). That covers the default plain-text layouts of Spring Boot
+>   (`2026-01-15 10:23:45.123 ERROR 12345 --- [http-nio-8080] com.example.Foo : ...`), Logback,
+>   Log4j2, Python's `asctime` formats, Celery, gunicorn, loguru, Go's `log` and `slog`, Ruby's
+>   `Logger` (Rails), nginx (`[error]`), PostgreSQL and klog (`E0713 10:00:00.123456 ...`). The
+>   line is not shortened, so its template is the one it always had;
+> - under any of `level`, `lvl`, `severity`, or `log.level`, inside a JSON payload or anywhere
+>   in a logfmt line (`time="…" level=error msg="…"`, the shape dockerd, containerd and Go's
+>   slog write). A line counts as logfmt only if all of it is `key=value` pairs.
+>
+> It does **not** read a level out of prose: a line that starts with an ordinary word gets
+> none, whatever follows, and a bare upper-case level as a line's first word needs a separator
+> after it (`ERROR - disk full` has a level, `PANIC button pressed` has none). The rule still
+> takes a few prose shapes for a level: a level word that is the first word after numbers,
+> brackets or a timestamp (`42 ERROR rows skipped`, `[cache] WARN threshold`), after a
+> `word - ` column, or closing a bracket (`[see error]`).
+>
+> Left unread, deliberately:
+>
+> - **Chromium's level**, glued inside its bracket by colons
+>   (`[pid:tid:time:ERROR:file.cc(N)] ...`). On a desktop it is browser chatter: on ten boots of
+>   one laptop, reading it would take dry-run escalations from 59 to 141. Whether such lines
+>   should count is a scoring decision, not a parsing one.
+> - **ANSI-coloured lines.** An escape sequence ends the header, so a coloured level is not
+>   read, even inside a bracket.
+> - **Level words logscry does not know:** java.util.logging's `SEVERE`, `CONFIG` and `FINE`,
+>   nginx's `alert` and `emerg`, .NET's `fail:` and `dbug:`, PostgreSQL's `LOG` and `DEBUG1`–`5`.
+> - **A level after a word that is not a column:** a syslog file's host name
+>   (`Jul 13 10:00:00 web app[42]: ERROR: ...`), Apache's `[core:error]`, a quoted `"ERROR"`, or
+>   a lower-case `error` with nothing to set it apart.
+>
+> Configure such a service to log JSON and it is read correctly. Levels at priority **5**
+> (notice) and **7** (debug) are also left alone: both are non-default, so both are taken at
+> their word, and a unit logging at either still loses a level its text reports.
 
 Lines are tagged `journald:<unit>` (`journald:nginx`, `journald:kernel`), and `--journald`
 composes with the other sources — `logscry --journald --docker-all` follows both.
