@@ -20,6 +20,12 @@ func versionString() string {
 	return resolveVersion(version, bi)
 }
 
+// versionLine is what --version prints: the version, then the Go toolchain that built the
+// binary, so a report says which standard library it carries without `go version -m`.
+func versionLine(v, goVersion string) string {
+	return "logscry " + v + " (" + goVersion + ")"
+}
+
 // resolveVersion picks the version: an ldflags override first, then the module version
 // from BuildInfo (ignoring the "(devel)" placeholder that a plain `go build`/`go run`
 // outside a tagged commit stamps), then "dev". bi may be nil when BuildInfo is

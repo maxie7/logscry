@@ -317,7 +317,7 @@ Key flags:
 | `--llm-anonymize` | off | Mask sensitive values before sending to the LLM (see below) |
 | `--llm-stream` | off | Fill card fields in as the model completes them (see below) |
 | `--plain` | auto | Plain line output instead of the TUI |
-| `--version` | — | Print the version and exit |
+| `--version` | — | Print the version and the Go toolchain that built it, and exit |
 
 `--explain-dry-run` is the way to calibrate thresholds and to run in CI: it surfaces
 every would-be escalation and, crucially, builds no backend and no worker pool — so no

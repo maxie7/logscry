@@ -6356,6 +6356,12 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         `GOTOOLCHAIN=go1.26.1` it fails with 23 errors and 2 warnings. Pretending the toolchain
         is on 1.25 turns all 25 into warnings.
 
+      **The toolchain is visible: `--version` prints it.** It prints `logscry v0.12.32
+      (go1.26.10)`, from `runtime.Version()`. That needs no step at release time and holds for
+      every build path: a release, `make build` and `go install`. It is not a GoReleaser release
+      footer, because a release's body is replaced by a pasted one and the footer would be lost.
+      The bug form's version placeholder shows the new shape.
+
       **Not chosen: Dependabot.** It cannot bump a `toolchain` line (dependabot/dependabot-core#13520
       is an open request), and a `gomod` config would also open dependency-bump PRs, which are out of
       scope here.
