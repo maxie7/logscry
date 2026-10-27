@@ -5624,6 +5624,288 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.28
 
+- [x] **Vendor tokens, an AWS secret access key and a webhook URL's path are masked** — #116, filed
+      from #114's measurements. A credential leak. **Since v0.4.0 (2da31be), 54 tags.**
+
+      **Cause.** With `--llm-anonymize`, no rule had the shape of these values, and `residue()` re-runs
+      only the rules there are, so it read each line as clean (#55's blindness):
+      - a Twilio, SendGrid, npm, GitLab, Hugging Face, Shopify or PyPI token went whole on the
+        trigger, the source and the context lines, and on the Template field minus its digits;
+      - an AWS secret access key, beside its name or its key id, the same;
+      - a Slack or Discord webhook URL went with its host masked by 9a and its path, the credential,
+        whole;
+      - #114's residual: a Slack user token with a word character glued after it was masked on the raw
+        line and sent its hex letters on the Template field.
+
+      **Three classes, three rule sets.** Every rule is TOKEN, group 1, verify:true, compiled through
+      `mustLongest`, and each group admits raw text and `pipelinePH` only, so none fires on our own
+      output. Every rule but 4f runs after every older rule, so the chain v0.12.28 built is a prefix
+      of the new one and every older rule sees the line it saw (the anti-correlation #51 and #114
+      measured cannot arise).
+      - **Rule 12 gains seven families**, appended after Google, each with a raw body and a template
+        form (`mangledFloor`: a run of its alphabet with a placeholder in it, above a floor in units):
+
+        | family | prefix | raw body | source | template floor |
+        |---|---|---|---|---|
+        | Twilio | `SK`, `AC` | exactly 32 hex, then no hex | Twilio, "What is a SID": two letters and 32 hex digits | 3 |
+        | SendGrid | `SG.` | 22+ `[A-Za-z0-9_-]`, `.`, 43+ | none published; the observed 3+22+1+43 structure | 12 |
+        | npm | `npm_` | 36+ base62 | GitHub blog, 2021-09-23: prefix, base62, CRC32 tail; 36 observed | 12 |
+        | GitLab | the 13 documented prefixes (`glpat-`, `gloas-`, `gldt-`, `glrt-`, `glrtr-`, `glcbt-`, `glptt-`, `glft-`, `glimt-`, `glagent-`, `glwt-`, `glsoat-`, `glffct-`) | 20+ `[A-Za-z0-9_.-]`, not ending on `.` | **inferred, not documented** (below) | 7 |
+        | Hugging Face | `hf_` | 34+ alnum | none published; observed tokens are 34 letters, digits admitted as the wider choice | 12 |
+        | Shopify | `shpat_`, `shpca_`, `shppa_`, `shpss_` | 32+ alnum, no ceiling | Shopify changelog, 2020 (32 → 38 with the prefix); alphabet observed as hex, alnum the wider choice | 3 |
+        | PyPI | `pypi-AgE` | 82+ `[A-Za-z0-9_-]` after `AgE` | docs.pypi.org/api/secrets: "not shorter than 85 characters"; `AgE` is the v2 macaroon header | 24 |
+
+        - **GitLab's body is inferred.** GitLab documents the prefixes (docs.gitlab.com/security/tokens)
+          and that a personal access token "must be 20 characters long". The Cells design doc gives
+          the routable shape `<prefix><base64-payload>.<token-version>.<base64-payload-length><crc32>`,
+          at most 333 bytes, and a GitLab merge request puts routable PATs between `glpat-` plus 37 and
+          316 characters. Neither is a published alphabet, so the body is deliberately permissive:
+          base64url plus `.`, floor 20, no ceiling. Precision was measured like every other family.
+        - **Twilio's ceiling is needed.** `AC` is itself hex, so an uppercase hash beginning `AC` is a
+          SID without one: 2 + 2 such 64-hex constants in GOROOT and the Go 1.27.1 module cache.
+          Twilio publishes 34 in all, and exactly 32 drops them.
+        - **The xoxp residual.** `slackKey`'s `<NUM>` branch gains a third witness beside `caseOrRun`:
+          a run of lowercase hex letters and placeholders after the ids' `<NUM>`s. The unglued template
+          `xoxp<NUM><NUM><NUM>-<HEX>` stays v0.12.28's: `-` and `<HEX>` are not units.
+        - Order among the new families: pypi, gitlab, sendgrid, npm, hf, shopify, twilio, so no new
+          family tags inside another's body (`hf_` inside a PyPI macaroon).
+      - **Rule 13, the AWS secret access key**, appended last of all, because context is its only
+        evidence:
+        - **13a, named:** `(?i:(?:aws[_-]?)?secret[_-]?access[_-]?key)` after a non-alnum lead, an
+          optional escaped quote, `:`, `=`, `=>` or whitespace, then 40+ of `[A-Za-z0-9/+]`, or the
+          template form with floor 12. That covers the env, INI, YAML, JSON (`"SecretAccessKey"`,
+          STS's and IAM's own spelling), camelCase and CLI-flag spellings, and JSON in JSON.
+        - **13b, the pair:** our own `<TOKEN_n>` (detector 2 or rule 11 has tagged the AKIA/ASIA id by
+          then), a `,`, `;`, `:`, `|` or whitespace, then exactly 40 (template floor 15), repeated
+          for a chained field. Exactly 40, because the body test alone passes 2,111 runs in the module
+          cache. Its end (`awsPairEnd`) never falls before an escaped `/`, built from `slashEscapes()`,
+          which `TestSlashEscapesAreWhatTheViewReadsAsSlash` holds to `escapeForm` both ways: there
+          the escape view reads the run as longer than forty, and the two passes must agree.
+        - **What is masked:** the value only. `AWS_SECRET_ACCESS_KEY=<TOKEN_1>`; `<TOKEN_1>,<TOKEN_2>`.
+        - **Why last, not beside detector 2:** a rule that tags the secret before 5 turns
+          `AKIA… <secret>@corp.com` from v0.12.28's email mask into a host sent, and 13b must follow
+          every TOKEN-minting rule, or rule 12's tokens become context only on the re-scan.
+      - **Rule 4f, the webhook path**, just before 9a: the lead `(?:^|[^A-Za-z0-9-])`, then
+        `hooks.slack.com/services` or `discord(app)?.com/api(/v<n>)?/webhooks`, an optional port,
+        `/`, then group 1, every segment after the prefix (Slack, api.slack.com/messaging/webhooks;
+        Discord, the Webhook resource: `/webhooks/{webhook.id}/{webhook.token}`, under `/api` and
+        `/api/v10`).
+        - **No floor:** the host plus the documented prefix is the evidence. The ids and the token
+          are one credential and one `<TOKEN_n>`; the host stays 9a's `<HOST_n>`.
+        - **It ends** at `?`, `#`, a quote, whitespace or a tag, so `?wait=true` stays. A segment
+          admits inner dots, so a private name in the path is the path's TOKEN, not a `.` sent beside
+          9b's HOST. It never ends before `:` and `/`, raw or escaped (`webhookEnd`): a path run into
+          a glued scheme (`…x_https://…`) leaves its last segment, which carries that scheme, to 9a.
+        - **Why before 9a:** after 9a the host is `<HOST_n>`, and a context of "any host + `/services/`"
+          loses the precision. The rules ahead of 4f see v0.12.28's input. 9a and 9c read the
+          authority only; 9b, 6, 10, 11 and 12 could only match inside the path, which 4f masks whole.
+          4e runs first, so a URL 4e takes is 4e's TOKEN as before.
+
+      **Residue.** Every new rule is verify-eligible like rule 12, so a value that survives masking
+      refuses the request. Each needs a prefix, a name, our TOKEN tag or a host plus path, and a floor;
+      `mangledFloor` needs a placeholder and n units. A line with none of these cannot fire, and a
+      masked value cannot re-match (no group admits `<`). Measured: 0 clean lines refused, below.
+
+      **Template floors.** 200,000 simulated bodies per format through the real `pipeline.Templatize`
+      (PCG 116), the fewest units left, predicted then measured:
+
+      | format | predicted | measured | floor |
+      |---|---|---|---|
+      | Twilio | 9–12 | 3 (1 of 200k has ≤ 2), **missed** | 3 |
+      | SendGrid | 40–50 | 54, **missed** | 12 |
+      | npm | 25–29 | 26, **held** | 12 |
+      | GitLab, a 20-character body | 12–15 | 12, **held** | 7 |
+      | Hugging Face | 22–26 | 24, **held** | 12 |
+      | Shopify alnum | 18–22 | 24 (hex 4), **missed** | 3 |
+      | PyPI | ≥ 60 | 68, **held** | 24 |
+      | AWS | 27–31 | 30, **held** | 12 named, 15 pair |
+      | xoxp glued, hex letters | 9–13 | 6, **missed** | the witness |
+
+      Twilio's floor was first 2: the module cache's templates gave 55 matches (predicted 5–50,
+      **missed**), and at 3 they gave 0 (predicted 0–1, **held**). What 3 leaves sent: a SID with at
+      most two hex letters, 2 of 200,000 bodies.
+
+      **Precision, counts only** (no match printed). Planning probes with the lead
+      `(?:^|[^A-Za-z0-9])`, over every `.go` file in the module cache (18,658), the ten boots
+      (`SYSLOG_IDENTIFIER` `ab37*` and `logscry-probe` filtered: 58,172 messages, 4,845 filtered; each
+      message and its whole JSON line) and the 81 test files; GOROOT/src (7,710) and the Go 1.27.1
+      cache (12,178) beside them:
+      - SK, SendGrid, npm, every GitLab prefix, `hf_`, Shopify, PyPI, both webhooks: predicted 0,
+        **0 everywhere, held**;
+      - `AC` + 32+ hex, either case: predicted 5–30, 0 in the cache and 2 + 2 hashes elsewhere,
+        **missed** low; hence the ceiling;
+      - the AWS name + 40: predicted 0–10, 0, **held** (the name occurs 8 times, never before a key);
+      - the AWS pair: predicted 0–5, 0, **held**;
+      - positive controls, built in the probe: 12 of 12.
+
+      The corpus is honest but weak here: no `hf_`, `SG.`, `npm_`, `gl*-`, `shp*_` or `pypi-` occurs in
+      it, so 0 says the prefixes do not occur, not that the bodies discriminate. The body test alone
+      passes 1,128 exact-32-hex runs, 104,282 runs of 34+ alnum, 512,954 of 20+ base64url and 2,111
+      exact-40 AWS-alphabet runs: precision rests on the prefix, or for AWS on the context, and the
+      must-stay rows and pinned costs are where that is held. The final rules, through `New()`, raw
+      and templatized: 0 in every corpus, predicted 0, **held**.
+
+      **The superset gate.** `TestVendorSecretChainMasksASupersetOfV01228`, listed in `SUPERSET_GATES`.
+      - **Reference:** `atV01228(t, dets)` drops exactly the ten #116 entries by pattern and puts back
+        v0.12.28's Slack entry from a frozen `slackKeyV01228`; it fails unless every other entry is
+        the same and in order. Checked against `git archive v0.12.28` by a
+        tag/pattern/group/verify/fixpoint fingerprint, default and `lab`: identical (61 lines).
+      - **Corpus:** `placeholderTextCorpus()` (every earlier gate's), every new frame and row, and
+        three generators, `vendorSecretGenerated(2000)`, `awsSecretGenerated(1000)` and
+        `webhookGenerated(1000)` (PCG 116,0 / 116,1 / 116,2): each format in prose, env vars, JSON,
+        YAML, logfmt and URLs, glued to word characters and between real values. Every row goes in
+        raw, through `Templatize` and through `TemplatizeLine`, each in the five `jsonEscapeForms`.
+      - **Claims:** every byte v0.12.28 masked is masked; nothing v0.12.28 sent is refused unless a
+        #116 rule reads v0.12.28's output (it sent a value #116 masks); nothing it refused is sent;
+        an input nothing #116 reads comes back byte for byte; elsewhere the output is v0.12.28's after
+        #142's renumbering, but that a HOST inside a 4f path is its TOKEN, and that on an escaped line
+        the union may make a value a TOKEN; no minted token is text of the input.
+      - **Measured** per mapper (default and `lab` the same), predicted for the final class:
+
+        | | predicted | measured |
+        |---|---|---|
+        | inputs | 64–70k | 60,928, **missed** low |
+        | with a new value, all masking more | 20–24k | 17,005, **missed** low |
+        | renumbered only | 0 | 0, **held** |
+        | escaped, a value retagged TOKEN | 1–3 | 11, **missed**: 10 escaped webhook lines and one npm token beside an email |
+        | a HOST inside a webhook path, now TOKEN | — | 2 |
+        | refused on both | 0 | 0, **held** |
+        | sent on v0.12.28 with a #116 value, refused now | 79–100 | 91, **held** |
+        | errors | 0 | 0, **held** |
+
+      - **The 91 refusals**, by the rule that reads v0.12.28's output: rule 12, 31 (a key glued after
+        another, whose lead the first token turned into `>`); 13b, 48 (34 escaped lines whose pair
+        context the view's union made; 14 plain, a field ending where the next id's `<TOKEN` begins,
+        whose `<` 13b's end consumes); 4f, 12 (glued URLs, whose end consumes the next URL's lead).
+        Every one is a line where v0.12.28 sent a #116 secret; each fails closed.
+      - **What the gate found during the green commits:** 13b's end reading the `\` of an escaped `/`
+        as an end while the view read 41 (`awsPairEnd`); a webhook path carrying 9a's scheme away
+        from a glued URL, sending its host (`webhookEnd`); the `.` between 4f's TOKEN and 9b's HOST
+        sent (`webhookSegment`'s inner dots).
+
+      **Per-byte differential, main against the branch,** `New()` and `New("lab")`, predicted first:
+      - **the ten boots,** 58,172 messages × raw, `TemplatizeLine`, the whole JSON line raw and
+        through `Templatize`: 0 changed, predicted 0, **held**;
+      - **the module cache,** 18,658 files, 6,109,597 lines, raw and templatized: 0 changed of any
+        kind, predicted 0–9 (13b 0–5, 13a 0–2, 4f 0–2), **held** at the low end;
+      - **main's test literals,** `+`-folded, raw, `Templatize`, `TemplatizeLine`: 1 widened per form,
+        #114's glued xoxp row, predicted 0–5, **held**; 0 narrowed, 0 errors;
+      - **the branch's literals:** 14 raw, 22 templatized, 22 through `TemplatizeLine` per mapper,
+        every one at a #116 value or a pinned cost; 0 narrowed, 0 refused;
+      - **residue,** clean on main and refused on the branch: 0 in every set, predicted 0, **held**.
+
+      **Wire check.** v0.12.28 built from `git archive` and the branch, each against a capturing
+      endpoint (`--plain --llm-anonymize --warmup-lines 0 --rate-limit 100000 --cache-ttl 1s`), 56
+      `[FATAL]` lines written by Python with invented values: 55 placements (eleven formats × four,
+      the glued xoxp, five AWS spellings, three Slack and two Discord URLs) and the control
+      `[FATAL] peer ::ffff:10.0.0.5-x down` (#137). Run twice, the same:
+      - requests 56 per binary, predicted 56, **held**; refused on the branch 0, **held**;
+      - v0.12.28 sent something of 55 of 55 placements, **held**, whole in 54, predicted 53,
+        **missed** by one: the escaped Slack URL's JSON message reaches the Template field decoded;
+      - the branch sent 0 whole and 0 fragments, in any field, **held**;
+      - the control's `.0.0.5-x` went on both, **held**.
+
+      **Mutants, and what each turned red** (88, predicted then measured; 73 red on the first run,
+      the 15 survivors each red after `TestIssue116FloorsFromBothSides`, written for them; 0 build
+      failures):
+      - **raw floor −1:** Twilio, AWS named and AWS pair red at once; SendGrid (both segments), npm,
+        GitLab, Hugging Face, Shopify and PyPI survived (predicted red, **missed**), then red by the
+        floors test;
+      - **raw floor +1:** every family red at once (5–7 tests each), but PyPI, red by the floors test;
+      - **template floor −1:** Twilio, Shopify and AWS pair red at once; the other six survived
+        (predicted "maybe none", **held**), then red by the floors test;
+      - **each prefix removed:** red, every one: SK 7 tests, AC 3, `SG.`/`npm_`/`pypi-`/`AgE` 8 each,
+        `hf_` 9, `shpat_` 8, `shpss_` 6, `shpca_`/`shppa_` 1 (the GitLab and Shopify prefix test),
+        `glpat-` 9, `glrt-` 6, `glft-` 2, each other GitLab prefix 1; each webhook host 1–6;
+      - **a family's prefix requirement removed:** 9–18 each, #114's, #108's and #51's tests among
+        them;
+      - **the AWS context removed:** 13a 7, 13b 7, both completeness guards among them;
+      - **4f anchored on the host only:** 9; **4f moved after 9a:** 6;
+      - **13a, 13b or 4f not appended:** 10, 10, 9; **verify:false:** each rule's own test;
+      - **Twilio's ceiling removed:** the 64-hex must-stays; **the old `awsPairEnd`:** the
+        escaped-slash test; **`webhookEnd` removed:** the webhook test; **segments without dots:**
+        the floors test;
+      - **the template form removed:** every family 4–5 tests, the templatized guard among them; the
+        xoxp witness 1; 13a, 13b and 4f 4–5 each;
+      - **13b off the exemption list:** both completeness guards, predicted, **held**.
+
+      **Cost: ×1.28.** `BenchmarkMask`, medians of 6, main against the branch: an ordinary line ×1.28,
+      one escaped DSN ×1.32, a JSON line with several escaped URLs ×1.31 (predicted ×1.27–1.35,
+      **held**; class 2 alone ×1.25 / ×1.28 / ×1.27, class 1 ×1.20 / ×1.25 / ×1.24). Acceptable
+      because of where `Mask` runs: its only caller is `anonymizing.Explain`
+      (`internal/llm/anonymizing.go`), once per field of one escalation, which `pool.explain` sends
+      and `score.decide` admits through the rate limiter (`RatePerMin`, default 10). Ingest never
+      calls it, so the cost is per escalation, not per ingested line.
+
+      **`-race`.** `-race -count=20 -timeout 60m` on every new test but the gate: green, 140 of 140
+      runs, 129.1 s (predicted green under 10 minutes, **held**). The gate, `-race -count=2 -timeout
+      90m`: green, the same counts in all four runs, 3,031 s (subtests 757, 760, 765 and 730 s;
+      predicted 1,500–3,000 s, **missed** by 31 s), partly sharing the CPU. The full suite is CI's two
+      steps (process change, below), each run as ci.yml writes it, 4 cores pinned, test cache cleaned,
+      every package `ok` on both trees:
+      - **race step** (gates skipped, no `-timeout`): `internal/anonymize` 25.0 s on main and 36.2 s
+        on the branch (predicted 30–90 and 40–110 s, **missed** low); the step 41.7 and 44.4 s;
+      - **coverage step** (every test, gates included, no race): `internal/anonymize` 38.4 s on main
+        and 127.8 s on the branch (predicted 20–40 and 60–150 s, **held**); the step 39.9 and
+        129.2 s, about ninety seconds of it the new gate; coverage 93.0% → 93.1%.
+
+      **Process change: the full local check is CI's two steps.** A bare `go test -race ./...` runs
+      the superset gates under the race detector and exceeds `go test`'s default 10-minute timeout
+      per package. Seen here: run with the default timeout, the race suite reported 2,732 passing
+      tests on main and 2,874 on the branch, against 2,813 and 3,475 (each with 1 skip) without
+      `-race`. The counter read test events only, so the timeout panic in `internal/anonymize`
+      showed up as missing tests (inferred; the raw output was not kept). The gates are pure and
+      single-goroutine, so the detector can find nothing in them, and they are no longer run under
+      `-race` locally. CONTRIBUTING's verify loop and the `/verify` skill now give the coverage
+      command and the race command with `SUPERSET_GATES` skipped, read from ci.yml. A full race run
+      is optional: `go test -race -timeout 90m ./...`, about 45 minutes on 4 cores. That figure is
+      estimated, not measured: the new gate's ~90 s plain × #143's 21–23× race penalty, plus the
+      older gates' ~590 s.
+
+      **Tests.**
+      - **Red on main**, top-level, predicted then measured: class 1, 7 predicted, 8 measured
+        (**missed**: `TestNoDetectorGroupLandsOnOurOwnOutput` reads the completeness rows); class 2, 7,
+        **held**; class 3, 6–7, 7, **held**.
+      - **New:** `TestIssue116PrefixedVendorTokens`, `TestIssue116EveryGitLabPrefixIsAKey`,
+        `TestIssue116AWSSecretAccessKey`, `TestIssue116AWSPairFieldEndsWhereTheViewEndsIt`,
+        `TestSlashEscapesAreWhatTheViewReadsAsSlash`, `TestIssue116WebhookURLs`,
+        `TestIssue116FloorsFromBothSides` and the gate; rows at the ends of the completeness,
+        templatized, quote-edge, type-tag, inert and over-masking tables.
+      - **Existing test logic changed:**
+        - **the completeness guards and 13b.** `TestEveryDetectorHasACompletenessRow` and
+          `TestEveryUncollapsedDetectorHasATemplatizedRow` read each row against one detector alone;
+          13b's context is our own TOKEN tag, which no raw row carries. A listed rule
+          (`tokenContextRules`) is read on the text the detectors before it leave (`dets[:i]`), with
+          its secret required exactly once. The list cannot change silently: a detector whose pattern
+          carries `ourTokenTag` must be listed, a listed rule must carry it, and a listed pattern must
+          be a detector of the chain. The 13b-off-the-list mutant turns both guards red;
+        - `TestGluedKeyRulesReadTheKeyDetectors`' "last N" bound allows the two rule-13 entries
+          after rule 12, and its vendor list gains the seven families at its end;
+        - `TestIssue114VendorSecretFormats`' glued-xoxp residual row is deleted, its comment names the
+          new witness, and the row is pinned masked in
+          `TestIssue116PrefixedVendorTokens`;
+        - `TestAcceptedOverMasking` runs the new over-masking var;
+        - in the class-2 red test, two must-stays (39 characters after the name, 41 in a pair) were
+          wrong on the Template field, where the count is lost: they are pinned costs; in the class-3
+          red test, a residue row used a `<HOST_1>` context where the context is the raw host.
+
+        No existing row was moved or re-indented.
+
+      **What stays sent**, in README's Known limitations: a bare AWS key, a name outside the list,
+      a pair field not forty; the session token; a GitLab body under twenty and `_gitlab_session=`
+      (a cookie); Twilio's Auth Token and API key secret, and a SID glued to a hex letter; Slack's
+      workflow and trigger webhooks, GovSlack, a percent-encoded webhook, and the last segment of a
+      path run into a glued scheme. No class went to a separate issue: none needed narrowing below
+      real tokens to meet the precision measured.
+
+      **Seen and left alone, out of scope:**
+      - #137 (the control, still sent), #135, #65, #126, #36;
+      - every detector these formats do not need, the view's decoded set, the reservation,
+        `internal/pipeline`;
+      - other GitLab custom prefixes, Discord bot tokens, a generic `secret_key=`.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
