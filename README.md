@@ -437,11 +437,11 @@ username in `/home/<user>` and `/Users/<user>` paths. The vendor tokens:
 - since `v0.12.15`: Stripe `sk_live_…`, `sk_test_…`, `rk_live_…`, `rk_test_…` and `whsec_…`;
   GitHub `ghp_…`, `gho_…`, `ghu_…`, `ghs_…`, `ghr_…` and `github_pat_…`; Slack `xoxb-…`, `xoxp-…`,
   `xoxa-…`, `xoxr-…`, `xoxs-…` and `xapp-…`; Google `AIza…`;
-- since `TODO-VERSION`: Twilio `SK…` and `AC…` SIDs; SendGrid `SG.…`; npm `npm_…`; GitLab `glpat-…`
+- since `v0.12.29`: Twilio `SK…` and `AC…` SIDs; SendGrid `SG.…`; npm `npm_…`; GitLab `glpat-…`
   and every other prefix GitLab documents (`gloas-`, `gldt-`, `glrt-`, `glcbt-`, …); Hugging Face
   `hf_…`; Shopify `shpat_…`, `shpca_…`, `shppa_…` and `shpss_…`; PyPI `pypi-…`.
 
-Since `TODO-VERSION` it also masks an AWS secret access key written after its name
+Since `v0.12.29` it also masks an AWS secret access key written after its name
 (`AWS_SECRET_ACCESS_KEY=…`, `aws_secret_access_key = …`, `"SecretAccessKey": "…"`,
 `--aws-secret-access-key …`) or after its access key id, and the path of a Slack or Discord webhook
 URL (`hooks.slack.com/services/…`, `discord.com/api/webhooks/…`), whose host is masked as any
@@ -955,7 +955,7 @@ numbering moves, and only on a line that carries a placeholder. Over the same te
 nothing changed, and none carries one.
 
 **Vendor tokens, an AWS secret access key and a webhook URL's path were sent whole before
-`TODO-VERSION`.** This was a credential leak. No rule had the shape of a Twilio, SendGrid, npm,
+`v0.12.29`.** This was a credential leak. No rule had the shape of a Twilio, SendGrid, npm,
 GitLab, Hugging Face, Shopify or PyPI token, of an AWS secret access key, or of the path of a Slack or
 Discord webhook URL. Each went to the model endpoint, and the fail-closed check read the line as
 clean. v0.4.0 → v0.12.28, fifty-four tagged releases.
@@ -1455,7 +1455,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `\/`, and the `\u` escapes of `/`, `:` and `@`.
 - **With `--llm-anonymize`, an AWS secret access key with nothing beside it to identify it is
   sent.** These are credential leaks. The key has no prefix: forty characters of base64, which a bare
-  run cannot tell from a hash or an identifier. Since `TODO-VERSION` it is masked after its name or
+  run cannot tell from a hash or an identifier. Since `v0.12.29` it is masked after its name or
   after its access key id. It is sent:
   - alone, or beside anything else (`key …`);
   - after a name outside the list: `secret_key=`, `AWS_SECRET_KEY=`, Terraform's `secret_key`;
