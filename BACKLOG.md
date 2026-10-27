@@ -6299,6 +6299,54 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.31
 
+- [x] **Release binaries are built with the latest 1.26 patch release** — #151. `go.mod` said
+      `go 1.26.1` and had no `toolchain` line, and both workflows take their Go from `go.mod`
+      through setup-go's `go-version-file`. Every release binary was built with go1.26.1:
+      `go version -m` on the v0.12.31 linux/amd64 asset says so. Each 1.26 patch release since
+      then shipped standard-library security fixes that never reached a release.
+
+      **govulncheck v1.9.0, symbol-level findings by module** (one per OSV):
+
+      | toolchain | stdlib | github.com/docker/docker |
+      |---|---|---|
+      | go1.26.1, what v0.12.31 shipped | **23**, fixed in go1.26.2 to go1.26.10 | 2, no fixed version |
+      | go1.26.4, the local Go | **15**, fixed in go1.26.5 to go1.26.10 | 2, no fixed version |
+      | go1.26.10, this branch | **0** | 2, no fixed version |
+
+      The 23 are in `net/http` (9), `crypto/x509` (5), `crypto/tls` (4), `net/textproto` (2),
+      `net/url`, `net` and `encoding/asn1`, which is the path to a remote LLM endpoint. The two
+      docker/docker findings are the old module's unpatched advisories, which #152 migrates away
+      from.
+
+      **The mechanism: a `toolchain go1.26.10` line, and the `go` line stays `go 1.26.1`.**
+      - setup-go v6 reads the `toolchain` line first and the `go` line only when there is none.
+        This was checked in its source (`parseGoVersionFile`, the same in v6.0.0 and v6.5.0),
+        not taken from a comment thread. It then exports `GOTOOLCHAIN=local`, so no later step,
+        whether lint, GoReleaser or `go test`, can switch to another Go.
+      - The `go` line is the minimum to build, and the code needs nothing newer than 1.26.1.
+        Raising it to 1.26.10 would turn it into a security floor that moves with every patch.
+        It would also refuse any distro Go set to `GOTOOLCHAIN=local` that backports fixes
+        without a new patch number.
+      - `go install …@latest` runs with no main module, so it ignores the `toolchain` line and
+        builds with the user's own Go, 1.26.1 or newer. The README's install section says so.
+      - Inside the repo, with `GOTOOLCHAIN=auto`, a Go from 1.26.1 to 1.26.9 switches up to
+        go1.26.10, and a 1.27 Go is used as it is. The local lint stays on the 1.26 line:
+        golangci-lint v2.12.2 is built with Go 1.26 and panics on 1.27's standard library.
+      - A `Check toolchain` step in `ci.yml` and `release.yml` compares `go env GOVERSION` with
+        the `toolchain` line and fails the job when they differ. A future setup-go that reads
+        `go.mod` differently, or a stray `GOTOOLCHAIN`, then stops the job instead of shipping
+        another Go. Run locally, it passes on go1.26.10 and fails on go1.26.4 with
+        `GOTOOLCHAIN=local`.
+
+      **Not chosen: Dependabot.** It cannot bump a `toolchain` line (dependabot/dependabot-core#13520
+      is an open request), and a `gomod` config would also open dependency-bump PRs, which are out of
+      scope here.
+
+      **Seen and left alone, out of scope:** #152; Go 1.27; every dependency; `.goreleaser.yaml`;
+      the Makefile.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

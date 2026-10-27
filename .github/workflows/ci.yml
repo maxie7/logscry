@@ -17,11 +17,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # setup-go reads go.mod's `toolchain` line (falling back to the `go` line only when there is
+      # none) and then exports GOTOOLCHAIN=local, so no later step can switch to another Go.
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+
+      # The toolchain is checked, not assumed: the Go this job actually runs must be the one the
+      # toolchain line names. release.yml runs the same check, so what is tested is what ships.
+      - name: Check toolchain
+        run: |
+          want=$(sed -n 's/^toolchain //p' go.mod)
+          got=$(go env GOVERSION)
+          if [ -z "$want" ] || [ "$got" != "$want" ]; then
+            echo "::error::running $got, but go.mod's toolchain line says '${want}'"
+            exit 1
+          fi
 
       - name: Build
         run: go build ./...

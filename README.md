@@ -87,6 +87,10 @@ pipeline — the archives ship with keyless GitHub build provenance:
 go install github.com/maxie7/logscry/cmd/logscry@latest
 ```
 
+This builds with your own Go, 1.26.1 or newer, so the binary carries that toolchain's standard
+library. The release archives are built with the toolchain `go.mod`'s `toolchain` line names, the
+latest 1.26 patch release.
+
 **From source** — for contributors, or to build a specific commit:
 
 ```sh
