@@ -1026,6 +1026,51 @@ where the masking pass could not reach it and the re-scan found it. Nothing is s
 `v0.12.28` sent the secret. Measured over the same ten journald boots: nothing changed, and none
 carries one of these formats.
 
+**Part of a vendor key or an AWS secret access key was sent before `TODO-VERSION`.** This was a
+credential leak, partial: GHSA-8qq6-vx8j-rx37. The vendor-token rule and the AWS secret rule run
+last, and stop at a placeholder. When an earlier rule had already masked a piece inside a key, they
+masked at most one side of that piece, and the rest of the key went to the model endpoint. The
+fail-closed check read the remainder as clean. Affected: Stripe, GitHub classic and fine-grained,
+Slack and Google keys from `v0.12.15`; the families `v0.12.29` added and the AWS secret access key
+in `v0.12.29` only. Twilio SIDs were never split.
+
+The pieces that were masked first, measured over every earlier rule:
+
+- an `sk-` key with a run of sixteen inside a dashed or underscored body (`AIza…-sk-…`);
+- on the Template field, a digit, a prefix and a digit (`…4sk7…`, `…5xoxb7…`), which the pipeline
+  writes `<NUM>sk<NUM>`, read as an `sk` or Slack key;
+- another family's key inside a key's body, an access key id, a private host suffix (`.lan`,
+  `.svc`), a JWT, a UUID and a home directory.
+
+On random keys, raw lines were not affected, and on the Template field 3 to 21 keys in 80,000 per
+family were split (none for Shopify). Every family but Twilio was split when the body held one of
+those pieces, raw or on the Template field.
+
+The fix reads the vendor-token rule and the AWS secret rule once more, each alone, on the text as
+the log wrote it, and masks the union with what the other rules masked: a key with a piece masked
+inside it is one `<TOKEN_n>`. No rule moved and none changed. The AWS secret is read after its key
+id itself rather than after the key id's placeholder, which also closes a secret sent after an id
+longer than a real one whose text an earlier rule had masked under its own tag (found on
+the way, and part of the same advisory).
+
+What it costs, pinned:
+
+- the key absorbs what the masked piece ran into: `…_prod` after a Stripe key on the Template
+  field goes with the key;
+- a value that overlaps a key the other rules split, such as a UUID inside it, is part of the
+  key's `<TOKEN_n>`; a key inside a host or an email that was masked whole stays that value's;
+- five lines of the check's corpus that were sent with part of a key are now refused whole, the
+  safe direction. Each is an AWS secret's value on the Template field whose key is now one
+  `<TOKEN_n>` followed by a space and a long run of the AWS alphabet. The fail-closed check reads
+  that as a secret after a placeholder (forty characters after any `<TOKEN_n>`, a cost of the fix
+  above). The masking itself cannot mask that run: it reads the text as the log wrote it, where
+  the run follows raw text, and only its own output puts a placeholder there.
+
+The check: the same chain with the extra reading off, over every earlier gate's corpus, every new
+row and 2,000 generated keys with a piece inside, each raw, templatized and in five escaped forms.
+For every input, the bytes masked include every byte the chain alone masked, and no byte of a key
+is sent. Measured over the same ten journald boots: nothing changed.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that

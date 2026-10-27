@@ -5906,6 +5906,166 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.29
 
+- [x] **A vendor key or an AWS secret access key with a tag inside it is masked whole** —
+      GHSA-8qq6-vx8j-rx37, a private advisory. A credential leak, partial. **Since v0.12.15 for
+      Stripe, GitHub classic and fine-grained, Slack and Google (15 tags); v0.12.29 only for #116's
+      families and the AWS secret access key. Twilio: never.**
+
+      **Cause.** Rule 12 and rule 13 run last, for #114's reason: run earlier, a key inside a larger
+      value that 5, 9a or 9b masks whole would be taken out of it. They stop at our `<`, as every
+      group does. When an earlier rule had minted a tag inside a key's body, they masked at most one
+      side of it, and the rest of the key was sent; `residue()` read the remainder as clean (#46's
+      shape, a rule blocked by a placeholder). Which rules tag inside which family was measured on
+      v0.12.29, every detector before the family's own entry, traced through the chain (Table 1) and
+      run alone (Table 2, which adds rule 11's JWT and 8, hidden by the chain's context). Natural
+      keys are 20,000 random bodies per family in four placements, per 80,000 on the Template field
+      (raw: 0 for every family); embedded keys hold one of 35 shapes an earlier rule tags, spliced
+      into the body, R raw and T on the Template field:
+
+      | family | natural, Template field | embedded |
+      |---|---|---|
+      | Stripe | 3b 3, rule 11 sk 3 | rule 11 AWS RT, 3b T |
+      | GitHub classic | 3b 12, rule 11 sk 6 | rule 11 AWS RT, 3b T |
+      | GitHub fine-grained | 3b 9, rule 11 sk 3 | rule 11 AWS RT, Stripe RT, GitHub classic RT, 3b T, rule 11 sk T |
+      | Slack | 3b 3 | rule 11 AWS RT, 3b RT, 6 R |
+      | Google | 3b 6 | rule 11 AWS, Slack, Stripe, 3b, GitHub classic and fine-grained, rule 11 sk RT; 6 R |
+      | PyPI | 3b 21 | the same and Google RT |
+      | GitLab | 3b 9 | the same, 9b, 1 and PyPI RT |
+      | SendGrid | 3b 6 | 9b, GitLab and the same RT; npm and Twilio T |
+      | npm, Hugging Face, Shopify | 3, 6 (rule 11 sk), 0 | rule 11 AWS RT; Slack, Google, 3b T |
+      | Twilio | 0 | none: no shape fits a hex body |
+      | AWS secret, after its name (13a) | 3b 6 | Twilio, rule 11 AWS, 10 RT; Slack, Google, 3b T |
+      | AWS secret, after its id (13b) | 3b 9, Twilio 3 | the same and 9e T |
+
+      3b is the main inner tagger on the Template field, not rule 11 as predicted: its `\b` holds
+      after `<NUM>`'s `>`, so `<NUM>sk<NUM>…` is its sk key. Per tag, the same generator on every
+      release from v0.12.14: #114's five families split from v0.12.15 with the same counts through
+      v0.12.28; #116's families and rule 13 only once their rules exist, v0.12.29 (before, their keys
+      went whole, #116's defect); Twilio at no tag.
+
+      **Found on the way and closed here:** an AWS secret access key after an id longer than a real
+      one (`AKIA` and seventeen or more) was sent whole when an earlier rule had minted the id's text
+      first under its own tag. 10 does for a home directory of that name; `placeholder` hands that
+      `<USER_n>` back to rule 11, and 13b reads only after our TOKEN. Live on v0.12.29 in one of ten
+      contexts probed; no real-length id reaches it (detector 2 tags it before 10 runs). Pinned by
+      `TestAWSSecretAfterAnOverlongIDMintedElsewhereIsMasked`, red on v0.12.29.
+
+      **The remedy: the last rules read again, alone, and unioned.** `lateDetectors` are rule 12's
+      families and 13a as the chain compiles them, and 13b after the access key id itself
+      (`awsPairAfter(awsIDContext)`, the id built from the consts detector 2 and rule 11 compile
+      from) where the chain's 13b reads `awsPairAfter(ourTokenTag)`. `Mask` reads each on the text as
+      written, and on its view when it has an escape; a span of theirs the chain left a byte of
+      unmasked joins the chain's spans in `maskUnion`, GHSA-p47p-xrhj-3x7p's union with one pass
+      when the line has no escape. Overlapping spans are one value, TOKEN by `valueTag`'s rule,
+      minted where the chain minted a span of it. No detector changed and none moved;
+      `TestLateRulesAreTheChainsLastRules` holds the late rules to the chain's last entries both ways.
+      - **Each alone, not as a chain:** run in sequence, the Slack family tags inside a Google, PyPI
+        or GitLab body in the late pass too (M8).
+      - **13b alone, on the id:** the first prototype ran detector 2, rule 11's AWS key and 13b on a
+        scratch Mapper, as the chain does. Its own 2 and rule 11 tagged an id-shaped run inside the
+        secret first, and 3,000 raw, 9,934 template and 1,986 escaped embedded keys stayed split.
+        Read after the id, every cell is 0, and the scratch Mapper went. The over-long id above is
+        closed by the same change: the id is read, not its placeholder.
+      - **The covered filter:** a late span every byte of which the chain masks is dropped, so a key
+        inside a host label or an email stays that value's, and a key v0.12.29 masked as two
+        adjacent TOKENs (three Template-field rows, pinned) is left as written (M7).
+      - **A search resumes at 13b's group end:** its match consumes the character after the pair,
+        which may be the next id's lead.
+
+      **Alternatives, measured on prototypes before any code:**
+      - (b) the vendor keys as uncaptured alternatives in every earlier rule: 87,610 keys still
+        split (13a and 13b in every form, GitLab and SendGrid where the inner match starts before
+        the key), 26 lines v0.12.29 sent refused, 19 existing tests red, and ×6.2–×8.7 per line;
+      - (c) rule 12 at 3b's slot or at the chain's front: 183 and 193 failures in #114's and #116's
+        tests; `.prod`, a host list's members, `@example.com` and `worker-` sent. #114's
+        anti-correlation holds;
+      - (e) refusing a split line: would mute every one of 582,379 split keys in the measure set,
+        where the union costs one placeholder.
+
+      **Measured, predicted first:**
+      - the measure set, 5,484,900 records (14 families, natural and embedded, raw, Templatize,
+        TemplatizeLine, three escapes): 582,379 split on v0.12.29, 0 on the branch, **held**;
+        refused 0, every output rebuilds;
+      - the branch with the late pass off against the v0.12.29 archive's `Mask`, `New()` and
+        `New("lab")`, the same 5,484,900: 0 differences, **held**;
+      - **the gate**, `TestVendorKeyUnionMasksASupersetOfV01229`, 69,516 inputs per mapper: 4,073
+        split on v0.12.29 and masked whole now (predicted thousands, **held**), 675 values merged into
+        a key's TOKEN (hundreds, **held**), 48 refused on v0.12.29 and sent now (0–100, **held**),
+        **5 split and refused now** (predicted 0, **missed**: below);
+      - 3,000 four-field requests through one Mapper, per mapper: 640 moved, every one with a field
+        split or refused on v0.12.29, 0 otherwise, **held**; 2 refused now, 4 sent now;
+      - **per-byte differential**, main against the branch, `New()` and `New("lab")`: the ten
+        boots, 57,862 messages × raw, `TemplatizeLine`, the JSON line raw and through `Templatize`:
+        0 changed, 0 refused, predicted 0, **held**; main's test literals, `+`-folded, × raw,
+        `Templatize`, `TemplatizeLine`: 0 changed, predicted 0–5, **held**; the branch's: 45
+        changed, every one a new row, predicted 60–200, **missed** low; 0 refused now in either;
+      - **residue**, clean on main and refused on the branch: the boots 0, the literals 0, the gate
+        5 (below), the requests 2;
+      - **wire check:** v0.12.29 built from `git archive` and the branch against a capturing endpoint
+        (`--plain --llm-anonymize --warmup 0s --warmup-lines 0 --rate-limit 100000 --cache-ttl
+        1s`), 18 `[FATAL]` lines written by Python with invented keys, one per family with a measured
+        split, 13a and 13b with a home directory, the over-long id, and the control
+        `[FATAL] peer ::ffff:10.0.0.5-x down` (#137). 18 requests each, **held**. v0.12.29 sent key
+        text for 16 of 17 (13 with six or more characters, three the prefix and two characters on
+        the Template field); predicted 17, **missed**: the PyPI line with a Slack prefix inside is
+        masked as two adjacent TOKENs on v0.12.29 too, the pinned row, and was the wrong line to
+        send. The branch sent none, in any field, and refused none, **held**. The control went on
+        both, **held**;
+      - BenchmarkMask, main against the branch, medians of 10: ordinary line ×1.19, one escaped DSN
+        ×1.19, a JSON line with several escaped URLs ×1.18, a line with vendor keys ×1.29; predicted
+        ×1.10–1.30 and ×1.2–1.4, **held**.
+
+      **What it costs, pinned:**
+      - a value that overlaps a key the chain split, a UUID or another family's key inside it, is
+        part of the key's TOKEN (675 values in the gate); a key inside a value the chain masked
+        whole stays that value's;
+      - the key absorbs what the inner tag ran into: `…_prod` glued after a Stripe key on the
+        Template field goes with it;
+      - **five lines are refused whole that v0.12.29 sent with part of a key**: one generated
+        line of #116's corpus, a 13a value on the Template field, in its raw and four escaped
+        forms. The union masks the key as one TOKEN, and the TOKEN is then followed by a space and a
+        run of fifteen units of the AWS alphabet: on the re-scan, that is 13b's shape, forty
+        characters after any TOKEN of ours (#116's cost), and the line is refused. The union cannot
+        mask that run instead. It is computed from passes over the text as written, where the run
+        follows raw text, not a TOKEN, so no pass reads it as a secret; only the output puts a TOKEN
+        before it, and masking it would mean a pass over our own output, which no rule's group may
+        land on. The safe direction: nothing of the line is sent now.
+
+      **Gate and CI time.** `TestVendorKeyUnionMasksASupersetOfV01229` measures `New()`'s late rules
+      against the same Mapper with them off (v0.12.29's `Mask`, checked above against the archive),
+      over `vendorSecretCorpus()` (every earlier gate's corpus), this change's rows and 2,000
+      generated keys with a shape inside, each raw, through Templatize and TemplatizeLine and in five
+      escaped forms. The bytes a late rule reads come from the chain's own entries (`keyRulesOf`), not
+      from `lateDetectors`: the first gate took them from the code under test and passed M3, M5, M6
+      and M8. Listed in `SUPERSET_GATES`. CI's coverage step, `internal/anonymize`, four cores, cache
+      cleaned: **128.7 s on main, 245.3 s on the branch with the gate's mappers in sequence, 189.5 s
+      with them in parallel** (predicted 185–200, **held**). The two mappers share nothing mutable:
+      the corpus is built once and only read, and each input has its own Mappers. Input for the next
+      change, which retires superseded gates and shares the corpus: this gate and #116's each build
+      `vendorSecretCorpus()`, about a minute per mapper each.
+
+      **Mutants, and what each turned red** (8, predicted then measured):
+      - M1 late pass off in `New()`: the rows, the over-long id rows, the wire test, the gate;
+      - M2 the late span wins, no union: the rows (the inner tag past the key), the gate;
+      - M3 Google missing from the late pass: the rows, the drift test, the wire test, the gate;
+      - M4 the late pass skipped on a template: the rows, the wire test, the gate;
+      - M5 no late pass on the view: the escaped 13a row, the gate;
+      - M6 13b's late rule after our TOKEN: the rows, the over-long id rows, the drift test, the gate;
+      - M7 the covered filter removed: #114's and #116's tests, the rows, the gate;
+      - M8 rule 12 in sequence in the late pass: the vendor-in-vendor rows, the gate.
+
+      **Tests.** `vendor_key_union_test.go`: a row per family with a measured split, raw and on the
+      Template field, in prose, an env var, a query value and a JSON message, each with its exact
+      output, no fragment sent, a Restore round trip, the output re-masked unchanged and a clean
+      `residue()`; the inner tag past the key; vendor in vendor; an escaped 13a; 13b beside its id;
+      rows masked whole on v0.12.29 that stay as they were; the over-long id rows; the drift test.
+      `internal/llm`: the wire. BenchmarkMask gains a line with vendor keys. No existing row moved.
+
+      **Seen and left alone, out of scope:** #137 (the control, still sent), #135, #65, #126, #36;
+      retiring gates; every detector's own pattern; `internal/pipeline`.
+
+      Targets TODO-VERSION
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
