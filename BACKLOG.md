@@ -6338,6 +6338,24 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         another Go. Run locally, it passes on go1.26.10 and fails on go1.26.4 with
         `GOTOOLCHAIN=local`.
 
+      **Keeping it current: a `govulncheck` job in `ci.yml`**, on every push and pull request and
+      weekly (`schedule:`, with the build job skipped on that trigger). It runs on the build's
+      toolchain, so it scans the standard library that ships. It is a job of its own, so a red
+      result is visibly not the code under review.
+      - Only symbol-level findings count, one per OSV.
+      - **Fails:** a fixed version we can take. For the standard library that is one on the
+        toolchain's own minor line, and the remedy is `go mod edit -toolchain=go1.26.N`. For a
+        module, any fixed version.
+      - **Warns only:** no fixed version, or a standard-library fix that exists only on a newer
+        minor. Go 1.27 is not an option while golangci-lint is built with 1.26. CI never goes red
+        over an advisory nobody can act on. Today the job warns twice, for docker/docker.
+      - govulncheck failing to run fails the step: a check that did not run is not a pass.
+      - JSON mode exits 0 whatever it finds, so the verdict is jq's. Every finding also goes
+        into the step summary.
+      - Run as written in `ci.yml`: on go1.26.10 it is green with 2 warnings. Under
+        `GOTOOLCHAIN=go1.26.1` it fails with 23 errors and 2 warnings. Pretending the toolchain
+        is on 1.25 turns all 25 into warnings.
+
       **Not chosen: Dependabot.** It cannot bump a `toolchain` line (dependabot/dependabot-core#13520
       is an open request), and a `gomod` config would also open dependency-bump PRs, which are out of
       scope here.

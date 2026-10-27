@@ -7,12 +7,17 @@ on:
   # Manual "Run workflow" button. A squash-merge through the web UI does not always
   # spawn a run on main; this avoids pushing an empty commit just to re-trigger CI.
   workflow_dispatch:
+  # Weekly, for the govulncheck job only: a Go patch release with security fixes turns this red
+  # within a week even when nothing is pushed.
+  schedule:
+    - cron: '23 6 * * 1'
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -117,3 +122,78 @@ jobs:
           files: coverage.out
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
+
+  # A known vulnerability that the code reaches and that has a fix we can take fails this job;
+  # one with no fix only warns. It is its own job, so a red result here is visibly not the code
+  # under review. It runs on the same toolchain as the build, so it scans the standard library
+  # that ships.
+  #   - Only symbol-level findings count: the vulnerable function is reachable from logscry.
+  #   - Fails: a fixed version we can take. For the standard library, that is one on the
+  #     toolchain's own minor line (Go 1.27 is not an option while golangci-lint is built with
+  #     1.26), and the remedy is `go mod edit -toolchain=go1.26.N`. For a module, any fixed
+  #     version.
+  #   - Warns: no fixed version, or a standard-library fix only on a newer minor. Today that is
+  #     github.com/docker/docker's two advisories, which #152 migrates away from.
+  #   - govulncheck failing to run (vuln.go.dev unreachable, say) fails the step. A check that
+  #     did not run is not a pass; re-run it.
+  # JSON mode exits 0 whatever it finds, so the verdict is jq's alone. Every finding also goes
+  # into the step summary.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check toolchain
+        run: |
+          want=$(sed -n 's/^toolchain //p' go.mod)
+          got=$(go env GOVERSION)
+          if [ -z "$want" ] || [ "$got" != "$want" ]; then
+            echo "::error::running $got, but go.mod's toolchain line says '${want}'"
+            exit 1
+          fi
+
+      - name: govulncheck
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -format json ./... > vuln.json
+          goversion=$(go env GOVERSION)
+          line=$(sed -E 's/^go([0-9]+\.[0-9]+).*/v\1./' <<< "$goversion")
+          findings=$(jq -r --arg line "$line" '
+            select(.finding.trace[0].function != null) | .finding
+            | (.fixed_version // "") as $fix
+            | (if $fix == "" then "unfixed"
+               elif .trace[0].module == "stdlib" and ($fix | startswith($line) | not) then "unfixed"
+               else "fixable" end) as $verdict
+            | [$verdict, .osv, .trace[0].module, (if $fix == "" then "none" else $fix end)]
+            | @tsv' vuln.json | sort -u)
+          {
+            echo "### govulncheck on $goversion: symbol-level findings"
+            echo
+            echo "| OSV | module | fixed in | verdict |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          fail=0
+          while IFS=$'\t' read -r verdict osv module fix; do
+            [ -n "$verdict" ] || continue
+            echo "| $osv | $module | $fix | $verdict |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$verdict" = fixable ]; then
+              if [ "$module" = stdlib ]; then
+                echo "::error::$osv: the standard library is fixed in go${fix#v}; raise go.mod's toolchain line with go mod edit -toolchain=go${fix#v} or newer"
+              else
+                echo "::error::$osv: $module is fixed in $fix"
+              fi
+              fail=1
+            else
+              if [ "$fix" = none ]; then
+                echo "::warning::$osv: $module has no fixed version"
+              else
+                echo "::warning::$osv: the standard library is fixed only in go${fix#v}, off the go${line#v}x line"
+              fi
+            fi
+          done <<< "$findings"
+          exit $fail
