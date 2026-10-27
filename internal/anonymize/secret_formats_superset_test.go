@@ -395,8 +395,9 @@ func vendorSecretCorpus() []string {
 }
 
 // TestVendorSecretChainMasksASupersetOfV01228 is the gate #116's fix stands on. For every input, through
-// Mask -- the escape view and the reservation included -- with New()'s chain and one with an extra
-// suffix, against the same chain at v0.12.28 (atV01228):
+// Mask -- the escape view and the reservation included, the late pass off (the late rules are
+// TestVendorKeyUnionMasksASupersetOfV01229's) -- with New()'s chain and one with an extra suffix, against
+// the same chain at v0.12.28 (atV01228):
 //   - nothing v0.12.28 sent is refused unless one of #116's rules reads v0.12.28's output -- it sent a
 //     value #116 masks -- and nothing it refused is sent. There the re-scan can find a #116 key the pass
 //     could not reach -- one glued after another, whose lead a token has turned into our '>', or a pair
@@ -411,8 +412,12 @@ func vendorSecretCorpus() []string {
 //     inside a path 4f reads: 9b read a private name there, and it is the webhook path's TOKEN now;
 //   - no placeholder minted for a value is text of the input.
 //
+// It and its two Mappers run in parallel with the other superset gates: the corpus is built once, in the
+// gate, and only read, and each input has its own Mappers.
+//
 // Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestVendorSecretChainMasksASupersetOfV01228(t *testing.T) {
+	t.Parallel()
 	corpus := vendorSecretCorpus()
 	for _, c := range []struct {
 		name string
@@ -422,6 +427,7 @@ func TestVendorSecretChainMasksASupersetOfV01228(t *testing.T) {
 		{"extra suffix", buildDetectors([]string{"lab"})},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			ref := atV01228(t, c.dets)
 			var rules []detector
 			var webhook detector

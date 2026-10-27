@@ -219,13 +219,17 @@ var jsonEscapePlaceholderTextRows = []string{
 var anyEscape = regexp.MustCompile(`\\[/u]`)
 
 // TestJSONEscapeViewMasksASupersetOfV01226 is the gate GHSA-p47p-xrhj-3x7p's fix stands on. For every
-// input, through New() and a Mapper with an extra suffix: the bytes masked now include every byte
+// input, through Mask with New()'s chain and one with an extra suffix, the late pass off (the late rules
+// are TestVendorKeyUnionMasksASupersetOfV01229's): the bytes masked now include every byte
 // v0.12.26 masked; an input v0.12.26 masked is not refused now; an input with no '\' before '/' or 'u'
 // comes back byte for byte; and the witness and same rows, and a line with no escape that carries one of
 // our placeholders as text, come back exactly as v0.12.26 returns them, the latter up to the numbering
 // #142 moved.
+// It and its two Mappers run in parallel with the other superset gates: the corpus is built once, in the
+// gate, and only read, and each input has its own Mappers.
 // Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestJSONEscapeViewMasksASupersetOfV01226(t *testing.T) {
+	t.Parallel()
 	corpus := jsonEscapeCorpus()
 	live := func(m *Mapper, s string) (string, error) { return m.Mask(s) }
 	for _, c := range []struct {
@@ -236,6 +240,7 @@ func TestJSONEscapeViewMasksASupersetOfV01226(t *testing.T) {
 		{"extra suffix", buildDetectors([]string{"lab"})},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			more, escaped := 0, 0
 			for _, in := range corpus {
 				refOut, refMasked, refErr := maskedBytesWith(t, maskAtV01226, c.dets, in)

@@ -329,8 +329,11 @@ var dottedQuadAfterColon = regexp.MustCompile(`:(?:[0-9]{1,3}\.){3}[0-9]|:<IP>`)
 // byte v0.12.23 masked; an input with no ":::" and no dotted quad after a ':' must come back byte
 // for byte as it did; and an input v0.12.23 masked without an error must not be refused now. 7a's
 // safety argument is in its chain entry. This is the check of it.
+// It and its two Mappers run in parallel with the other superset gates: the corpus is built once, in the
+// gate, and only read, and each input has its own Mappers.
 // Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestGluedRunMasksASupersetOfMain(t *testing.T) {
+	t.Parallel()
 	assertMasksASuperset(t, refV01223, func(in string) bool {
 		return !strings.Contains(in, ":::") && !dottedQuadAfterColon.MatchString(in)
 	})
@@ -339,8 +342,11 @@ func TestGluedRunMasksASupersetOfMain(t *testing.T) {
 // TestDottedQuadMasksASupersetOfV01224 is the gate #49's rules stand on, against the release before
 // them: 7b and 7a's dotted-quad alternative may mask more than v0.12.24, never less, and an input
 // with no dotted quad after a ':' comes back byte for byte.
+// It and its two Mappers run in parallel with the other superset gates: the corpus is built once, in the
+// gate, and only read, and each input has its own Mappers.
 // Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestDottedQuadMasksASupersetOfV01224(t *testing.T) {
+	t.Parallel()
 	assertMasksASuperset(t, refV01224, func(in string) bool {
 		return !dottedQuadAfterColon.MatchString(in)
 	})
@@ -358,6 +364,7 @@ func assertMasksASuperset(t *testing.T, ref supersetReference, untouched func(st
 		{"extra suffix", buildDetectors([]string{"lab"})},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			refDets := referenceDetectors(t, c.dets, ref)
 			more := 0
 			for _, in := range corpus {
