@@ -211,10 +211,11 @@ func escapedForms(s string) []string {
 //   - one ref refused is refused, or sent with every byte a late rule reads masked;
 //   - no placeholder minted for a value is text of the input.
 //
-// The two Mappers run in parallel, which halves the gate's time on CI's four cores.
+// It and its two Mappers run in parallel with the other superset gates.
 //
 // Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestVendorKeyUnionMasksASupersetOfV01229(t *testing.T) {
+	t.Parallel()
 	corpus := vendorKeyUnionCorpus()
 	for _, c := range []struct {
 		name string

@@ -38,7 +38,8 @@ go build ./...
 
 The two test commands are CI's two test steps, and together they are the full check. `go test
 ./...` runs every test, the anonymizer's superset gates included, as CI's coverage step does. The
-race step skips the gates by name: they are pure single-goroutine tests, so the race detector can
+race step skips the gates by name: they are pure. Each gate and its two subtests run in parallel,
+every input gets fresh Mappers, and the corpus a gate built is only read, so the race detector can
 find nothing in them. A bare `go test -race ./...` runs them anyway and exceeds `go test`'s default
 10-minute timeout per package: `internal/anonymize` stops with a timeout panic, not an assertion.
 For anyone who wants the full race run anyway, `go test -race -timeout 90m ./...` takes about 45

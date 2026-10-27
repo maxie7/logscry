@@ -100,12 +100,16 @@ func slashUserinfoCorpus() []string {
 var noSlashBeforeAt = regexp.MustCompile(`://\S*/\S*@`)
 
 // TestSlashUserinfoMasksASupersetOfV01225 is the gate #59's rule stands on. For every input, through
-// New() and a Mapper with an extra suffix, the bytes masked now include every byte v0.12.25 masked; an
+// Mask with New()'s chain and one with an extra suffix, the late pass off (the late rules are
+// TestVendorKeyUnionMasksASupersetOfV01229's), the bytes masked now include every byte v0.12.25 masked; an
 // input v0.12.25 masked is not refused now; an input with no '/' and then '@' after a "://" comes back
 // byte for byte; and the shapes 4e must not reach, and the ones it cannot, come back exactly as
 // v0.12.25 returns them, raw and templatized.
+// It and its two Mappers run in parallel with the other superset gates: the corpus is built once, in the
+// gate, and only read, and each input has its own Mappers.
 // Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestSlashUserinfoMasksASupersetOfV01225(t *testing.T) {
+	t.Parallel()
 	corpus := slashUserinfoCorpus()
 	for _, c := range []struct {
 		name string
@@ -115,6 +119,7 @@ func TestSlashUserinfoMasksASupersetOfV01225(t *testing.T) {
 		{"extra suffix", buildDetectors([]string{"lab"})},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			ref := withoutSlashUserinfo(t, c.dets)
 			more := 0
 			for _, in := range corpus {

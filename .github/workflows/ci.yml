@@ -56,9 +56,10 @@ jobs:
       # a logic bug (the coverage step goes red first) or a data race (only this one does).
       # The concurrency model is load-bearing here — one goroutine owns the template map and
       # the LLM pool must never block ingest — so every test that starts a goroutine runs here.
-      # The anonymizer's superset gates do not: they are pure and single-goroutine, so the
-      # detector has nothing to find in them, and under it they took 5 of this step's 5.5
-      # minutes. They ran in full in the coverage step. SUPERSET_GATES names them exactly,
+      # The anonymizer's superset gates do not: they are pure. Each gate and its two subtests
+      # run in parallel, every input gets fresh Mappers, and the corpus a gate built is only
+      # read, so the detector has nothing to find in them; under it they took 5 of this step's
+      # 5.5 minutes. They ran in full in the coverage step. SUPERSET_GATES names them exactly,
       # anchored, and two checks keep it honest before the run:
       #   - it must match as many tests as it names, so a renamed or removed gate fails here
       #     instead of silently running under -race again;

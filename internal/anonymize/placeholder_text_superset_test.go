@@ -138,7 +138,8 @@ func placeholderTextCorpus() []string {
 }
 
 // TestPlaceholderReservationMasksASupersetOfV01227 is the gate #142's fix stands on. For every input,
-// through New() and a Mapper with an extra suffix, against maskUnreserved:
+// through Mask with New()'s chain and one with an extra suffix, the late pass off (the late rules are
+// TestVendorKeyUnionMasksASupersetOfV01229's), against maskUnreserved:
 //   - an input that carries no placeholder of ours as text comes back byte for byte, with the same error;
 //   - one that does, and that v0.12.27 sent, comes back with the same bytes masked as the same values
 //     under the same tags: only the numbering moved;
@@ -148,8 +149,12 @@ func placeholderTextCorpus() []string {
 //     check refused first: there the re-scan may refuse now, and nothing is sent either way;
 //   - no placeholder minted for a value is text of the input.
 //
+// It and its two Mappers run in parallel with the other superset gates: the corpus is built once, in the
+// gate, and only read, and each input has its own Mappers.
+//
 // Listed in ci.yml's SUPERSET_GATES; a new superset gate must follow this name pattern and be added there.
 func TestPlaceholderReservationMasksASupersetOfV01227(t *testing.T) {
+	t.Parallel()
 	corpus := placeholderTextCorpus()
 	for _, c := range []struct {
 		name string
@@ -159,6 +164,7 @@ func TestPlaceholderReservationMasksASupersetOfV01227(t *testing.T) {
 		{"extra suffix", buildDetectors([]string{"lab"})},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			carrying, renum, sentNow, stillRefused := 0, 0, 0, 0
 			for _, in := range corpus {
 				ref, live := mapperOn(c.dets), mapperOn(c.dets)
