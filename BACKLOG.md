@@ -6369,7 +6369,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Seen and left alone, out of scope:** #152; Go 1.27; every dependency; `.goreleaser.yaml`;
       the Makefile.
 
-      Targets TODO-VERSION
+      Targets v0.12.32
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
