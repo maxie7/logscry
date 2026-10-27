@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,12 +73,14 @@ func resolved(esc string) byte {
 }
 
 // maskedSpan is one value a pass over a line masked: its bytes [a, b) in the line as written, the tag and
-// number of the placeholder that pass minted for it, and whether the pass read the view.
+// number of the placeholder that pass minted for it, and whether the pass read the view. A late rule's span
+// (lateSpans) has no number: the late pass mints nothing.
 type maskedSpan struct {
 	a, b int
 	tag  string
 	n    int
 	view bool
+	late bool
 }
 
 // errNotRebuilt is maskEscaped's refusal when a pass cannot be read back from its output. Until #142 that
@@ -113,8 +116,22 @@ var errNotRebuilt = errors.New("anonymize: a masking pass could not be read back
 // not rebuild its input (an assertion since #142, see errNotRebuilt), and a value the re-scan finds in the
 // output or in its view.
 func (m *Mapper) maskEscaped(s, view string, offs []int) (string, error) {
+	return m.maskUnion(s, view, offs, nil)
+}
+
+// maskUnion is maskEscaped with the late rules' spans (GHSA-8qq6-vx8j-rx37), on a line with an escape or
+// without one, when offs is nil and the chain runs once. A late span joins the chain's only where the chain
+// left a byte of it unmasked: a key the chain masked whole, or inside a larger value it masked, is left as
+// the chain wrote it. One that joins makes its value a TOKEN, by valueTag's rule, and is not counted in the
+// minting order, so a value is minted where the chain minted a span of it, and a value only a late rule
+// read is minted last.
+func (m *Mapper) maskUnion(s, view string, offs []int, late []maskedSpan) (string, error) {
+	texts := []string{s}
+	if offs != nil {
+		texts = append(texts, view)
+	}
 	var spans []maskedSpan
-	for pass, in := range []string{s, view} {
+	for pass, in := range texts {
 		sc := &Mapper{dets: m.dets, byValue: make(map[string]string), byToken: make(map[string]string), counts: make(map[string]int),
 			reserved: m.reserved}
 		out, err := sc.chain(in)
@@ -129,6 +146,17 @@ func (m *Mapper) maskEscaped(s, view string, offs []int) (string, error) {
 			if pass == 1 {
 				sp.a, sp.b, sp.view = offs[sp.a], offs[sp.b], true
 			}
+			spans = append(spans, sp)
+		}
+	}
+	covered := make([]bool, len(s))
+	for _, sp := range spans {
+		for i := sp.a; i < sp.b; i++ {
+			covered[i] = true
+		}
+	}
+	for _, sp := range late {
+		if slices.Contains(covered[sp.a:sp.b], false) {
 			spans = append(spans, sp)
 		}
 	}
@@ -198,7 +226,7 @@ func (m *Mapper) maskEscaped(s, view string, offs []int) (string, error) {
 // number when only a span of the line does, 2 otherwise.
 func valueTag(members []maskedSpan, a, b int) (tag string, order, first int) {
 	for _, sp := range members {
-		if sp.view && sp.a == a && sp.b == b {
+		if sp.view && !sp.late && sp.a == a && sp.b == b {
 			tag = sp.tag
 			break
 		}
@@ -219,7 +247,7 @@ func valueTag(members []maskedSpan, a, b int) (tag string, order, first int) {
 	}
 	order, first = 2, 0
 	for _, sp := range members {
-		if sp.tag != tag {
+		if sp.tag != tag || sp.late {
 			continue
 		}
 		o := 1

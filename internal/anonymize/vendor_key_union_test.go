@@ -227,3 +227,46 @@ func redactKey(s, key string) string {
 	}
 	return s
 }
+
+// TestLateRulesAreTheChainsLastRules holds the late pass to the chain, both ways: the chain's last entries are
+// rule 12's and rule 13's, one for each late rule and in its order, the same source, group, tag and verify;
+// the entry before them is rule 11's sk key, so no rule-12 or rule-13 entry lies outside them; the chain's 13b
+// is awsPairAfter(ourTokenTag) and the late one is awsPairAfter(awsIDContext); and that id is built from the
+// consts detector 2 and rule 11's AWS key compile from.
+func TestLateRulesAreTheChainsLastRules(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		dets []detector
+	}{
+		{"default", baseDetectors},
+		{"extra suffix", buildDetectors([]string{"lab"})},
+	} {
+		chain := c.dets[len(c.dets)-len(lateDetectors):]
+		for i, d := range lateDetectors {
+			want := chain[i].re.String()
+			if i == len(lateDetectors)-1 {
+				if want != awsPairAfter(ourTokenTag) {
+					t.Errorf("%s: the chain's last entry is not awsPairAfter(ourTokenTag)", c.name)
+				}
+				want = awsPairAfter(awsIDContext)
+			}
+			if d.re.String() != want || d.group != chain[i].group || d.tag != chain[i].tag || d.verify != chain[i].verify {
+				t.Errorf("%s: late rule %d is not the chain's entry %d", c.name, i, len(c.dets)-len(lateDetectors)+i)
+			}
+		}
+		if got := c.dets[len(c.dets)-len(lateDetectors)-1].re.String(); got != looseKey(keyShapes[2].loose, keyShapes[2].lead) {
+			t.Errorf("%s: the entry before the late rules is not rule 11's sk key, so the two lists differ in length", c.name)
+		}
+		var strict, loose bool
+		for _, d := range c.dets {
+			strict = strict || d.re.String() == awsKey
+			loose = loose || d.re.String() == looseKey(awsLoose, awsLead)
+		}
+		if !strict || !loose || keyShapes[1].pat != awsKey || keyShapes[1].loose != awsLoose || keyShapes[1].lead != awsLead {
+			t.Errorf("%s: detector 2 or rule 11's AWS key is not compiled from awsKey, awsLoose and awsLead", c.name)
+		}
+	}
+	if !strings.HasPrefix(awsKey, `\b`+awsPrefix+`(?:`+awsChar) || !strings.HasPrefix(awsLoose, awsPrefix+`(?:`+awsChar) {
+		t.Errorf("detector 2's key and the late 13b's id are not built from the same prefix and alphabet")
+	}
+}

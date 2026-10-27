@@ -92,6 +92,14 @@
 // credential in the path, which no rule read beside 9a's host: 4f masks the path after the vendor's
 // prefix, just before 9a, while the host is still raw.
 //
+// GHSA-8qq6-vx8j-rx37 IS RULES 12 AND 13 READ AGAIN. Run last and stopping at our '<', they masked at most
+// one side of a tag an earlier rule had minted inside a key -- 3b's sk key after a '-', a NUM pair around
+// "sk" on the template, another family's key, an access key id, a private suffix, a home directory -- and
+// the rest of the key was sent. Run earlier, they would take a key out of a larger value that 5, 9a or
+// 9b masks whole, which is why #114 put them last. So they stay last and each is read once more, alone, on
+// the text as written (lateDetectors). A span of theirs the chain left a byte of unmasked is unioned with
+// the chain's spans, as an escaped line's two passes are, and the value they make is one TOKEN.
+//
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
 // Mask records nests; that inertness is what keeps a home path in a Go stack trace from tripping
@@ -192,6 +200,7 @@ type Mapper struct {
 	counts   map[string]int    // per-tag running counter, so IPs number independently of hosts
 	reserved map[string]bool   // placeholders the request carries as text, never minted (#142)
 	conflict bool              // a text carried a placeholder already minted; every later Mask refuses
+	late     []detector        // read again on the text as written and unioned (GHSA-8qq6-vx8j-rx37); nil skips it
 }
 
 // New builds a Mapper. extraHostSuffixes extends the bare-hostname allowlist (detector 9b)
@@ -209,6 +218,7 @@ func New(extraHostSuffixes ...string) *Mapper {
 		byValue: make(map[string]string),
 		byToken: make(map[string]string),
 		counts:  make(map[string]int),
+		late:    lateDetectors,
 	}
 }
 
@@ -314,16 +324,89 @@ func New(extraHostSuffixes ...string) *Mapper {
 // none is minted for a value, and Restore, which keeps a token it never issued, returns it as the log
 // wrote it. A placeholder s carries that this Mapper ALREADY minted cannot be reserved any more, and Mask
 // refuses, as does every later Mask on it: see Reserve, which a caller masking several texts runs first.
+//
+// GHSA-8qq6-vx8j-rx37 IS NOT A NARROWING. What a key with a tag inside it left was #46's shape, a rule
+// blocked by a placeholder, and the re-scan still reads that leftover as clean. It no longer meets it: the
+// late rules read each key whole on the text as written, and maskUnion masks the union of their spans and
+// the chain's. A line on which the chain masks every byte the late rules read comes back as the chain alone
+// writes it (TestVendorKeyUnionMasksASupersetOfV01229). The union's TOKEN is our TOKEN to 13b on the re-scan,
+// so forty characters of the AWS alphabet after a key it masks whole mute the escalation.
 func (m *Mapper) Mask(s string) (string, error) {
 	m.reserve(s)
 	if m.conflict {
 		return "", errMintedAsText
 	}
 	view, offs := escapeView(s)
-	if offs == nil {
+	late := m.lateSpans(s, view, offs)
+	if offs == nil && late == nil {
 		return m.maskText(s)
 	}
-	return m.maskEscaped(s, view, offs)
+	return m.maskUnion(s, view, offs, late)
+}
+
+// lateDetectors are the rules that run last, each read again on its own on the text as written
+// (GHSA-8qq6-vx8j-rx37): rule 12's families and 13a as the chain compiles them, and 13b with the access key
+// id it follows in place of our TOKEN, since the late pass mints none. TestLateRulesAreTheChainsLastRules
+// holds them to the chain's.
+var lateDetectors = func() []detector {
+	var late []detector
+	for _, k := range vendorKeys {
+		late = append(late, detector{tagToken, mustLongest(vendorRule(k)), 1, true, false})
+	}
+	return append(late,
+		detector{tagToken, mustLongest(awsSecretNamed), 1, true, false},
+		detector{tagToken, mustLongest(awsPairAfter(awsIDContext)), 1, true, false},
+	)
+}()
+
+// lateSpans returns the values m's late rules read in s and, when s has an escape, in its view, projected
+// onto s. Each rule reads alone, so a key inside another family's key cannot block that key here as it
+// does in the chain; overlapping spans are one value in maskUnion.
+func (m *Mapper) lateSpans(s, view string, offs []int) []maskedSpan {
+	var spans []maskedSpan
+	texts := []string{s}
+	if offs != nil {
+		texts = append(texts, view)
+	}
+	for pass, in := range texts {
+		for _, d := range m.late {
+			for _, g := range groupSpans(d, in) {
+				sp := maskedSpan{a: g[0], b: g[1], tag: d.tag, late: true}
+				if pass == 1 {
+					sp.a, sp.b, sp.view = offs[g[0]], offs[g[1]], true
+				}
+				spans = append(spans, sp)
+			}
+		}
+	}
+	return spans
+}
+
+// groupSpans returns the spans of s that d's group captures. A match that runs past its group -- 13b's, by
+// the character that closes a pair -- is searched again from the group's end, since that character may be
+// the lead the next pair's id needs. No id starts with it, so the start of the text there reads as that
+// lead does, and a search from the group's end finds what the chain's 13b, whose context is our TOKEN and
+// needs no lead, finds.
+func groupSpans(d detector, s string) [][2]int {
+	var spans [][2]int
+	for p := 0; ; {
+		next := -1
+		for _, loc := range d.re.FindAllStringSubmatchIndex(s[p:], -1) {
+			a, b := loc[2*d.group], loc[2*d.group+1]
+			if a < 0 {
+				continue // this alternative did not capture the group
+			}
+			spans = append(spans, [2]int{p + a, p + b})
+			if loc[1] > b {
+				next = p + b
+				break
+			}
+		}
+		if next < 0 {
+			return spans
+		}
+		p = next
+	}
 }
 
 // Reserve records every placeholder of ours that texts carry as text, so that no Mask on this Mapper mints
@@ -1402,6 +1485,12 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 	return dets
 }
 
+// awsPairAfter is 13b after context: an AWS secret access key's fields, each after a delimiter, as one group.
+// The chain's 13b reads them after our TOKEN; the late pass's, after the access key id itself.
+func awsPairAfter(context string) string {
+	return context + awsPairSep + `(` + awsPairField + `(?:` + awsPairSep + awsPairField + `)*)` + awsPairEnd
+}
+
 // pipelinePH matches a placeholder minted by the PIPELINE's template masker
 // (internal/pipeline: TS/UUID/IP/HEX/NUM/STR).
 //
@@ -1572,6 +1661,7 @@ const jwtChar = `[A-Za-z0-9_-]`
 const (
 	awsPrefix = `(?:AKIA|ASIA)`
 	awsChar   = `[0-9A-Z]`
+	awsLead   = `0-9A-Z`
 	skPrefix  = `sk-`
 	skChar    = `[A-Za-z0-9]`
 	skChars   = `A-Za-z0-9_-`
@@ -1659,6 +1749,14 @@ var (
 	jwtKey = `\b` + jwtBody
 	awsKey = `\b` + awsPrefix + `(?:` + awsChar + `{16}\b|` + mangled(awsChar) + `)`
 	skKey  = `\b` + skLoose
+
+	// awsLoose is rule 11's AWS key (keyShapes), and awsIDContext is that key after its lead, uncaptured: an
+	// access key id as the late 13b reads it, where the chain's 13b reads the TOKEN detector 2 or rule 11 minted
+	// for it. Every id detector 2 tags is one of these -- its \b before the prefix is a character outside the
+	// lead or the start, and sixteen then \b is sixteen or more -- so the late 13b reads after every id the
+	// chain's reads after.
+	awsLoose     = awsPrefix + `(?:` + awsChar + `{16,}|` + mangled(awsChar) + `)`
+	awsIDContext = `(?:^|[^` + awsLead + `])` + awsLoose
 )
 
 // keyShapes pairs each key with the raw characters it could have continued with, as a class body.
@@ -1674,7 +1772,7 @@ var (
 // separators, so x_sk-... is a key glued to '_'.
 var keyShapes = []keyShape{
 	{jwtKey, `A-Za-z0-9_-`, jwtBody, `A-Za-z0-9`},
-	{awsKey, `0-9A-Z`, awsPrefix + `(?:` + awsChar + `{16,}|` + mangled(awsChar) + `)`, `0-9A-Z`},
+	{awsKey, `0-9A-Z`, awsLoose, awsLead},
 	{skKey, skChars, skLoose, `A-Za-z0-9`},
 }
 
@@ -1820,7 +1918,7 @@ var (
 		`(` + awsSecretChar + `{40,}|` + mangledFloor(awsSecretChar, 12) + `)`
 	awsPairSep    = `\\*["']?(?:\s*[,;:|]\s*|\s+)\\*["']?`
 	awsPairField  = `(?:` + awsSecretChar + `{40}|` + mangledFloor(awsSecretChar, 15) + `)`
-	awsSecretPair = ourTokenTag + awsPairSep + `(` + awsPairField + `(?:` + awsPairSep + awsPairField + `)*)` + awsPairEnd
+	awsSecretPair = awsPairAfter(ourTokenTag)
 	// awsPairEnd closes a pair field, so that forty means forty: the end of text, a character outside the
 	// alphabet and its padding, or a run of backslashes that does not escape '/'. An escaped '/' is the
 	// alphabet in the escape view, and a field the view reads as longer must not be forty as written, or
