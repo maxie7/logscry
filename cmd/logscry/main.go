@@ -39,6 +39,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -69,7 +70,7 @@ func run(ctx context.Context, args []string) (err error) {
 	}
 	// --version reports and exits before any source, backend, or TUI is constructed.
 	if cfg.Version {
-		fmt.Println("logscry", versionString())
+		fmt.Println(versionLine(versionString(), runtime.Version()))
 		return nil
 	}
 	// Opened before the terminal is taken over, so a bad --export path is a plain startup

@@ -26,10 +26,22 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          # Same source of truth as ci.yml: the toolchain that releases is the toolchain
-          # that is tested.
+          # Same source of truth as ci.yml: go.mod's `toolchain` line, so the toolchain that
+          # releases is the toolchain that is tested. setup-go then exports GOTOOLCHAIN=local, so
+          # GoReleaser's builds cannot switch to another Go.
           go-version-file: go.mod
           cache: true
+
+      # The same check as ci.yml's: a binary built with any Go other than the one the toolchain
+      # line names is not released.
+      - name: Check toolchain
+        run: |
+          want=$(sed -n 's/^toolchain //p' go.mod)
+          got=$(go env GOVERSION)
+          if [ -z "$want" ] || [ "$got" != "$want" ]; then
+            echo "::error::running $got, but go.mod's toolchain line says '${want}'"
+            exit 1
+          fi
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7

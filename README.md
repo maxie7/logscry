@@ -87,6 +87,10 @@ pipeline — the archives ship with keyless GitHub build provenance:
 go install github.com/maxie7/logscry/cmd/logscry@latest
 ```
 
+This builds with your own Go, 1.26.1 or newer, so the binary carries that toolchain's standard
+library. The release archives are built with the toolchain `go.mod`'s `toolchain` line names, the
+latest 1.26 patch release.
+
 **From source** — for contributors, or to build a specific commit:
 
 ```sh
@@ -313,7 +317,7 @@ Key flags:
 | `--llm-anonymize` | off | Mask sensitive values before sending to the LLM (see below) |
 | `--llm-stream` | off | Fill card fields in as the model completes them (see below) |
 | `--plain` | auto | Plain line output instead of the TUI |
-| `--version` | — | Print the version and exit |
+| `--version` | — | Print the version and the Go toolchain that built it, and exit |
 
 `--explain-dry-run` is the way to calibrate thresholds and to run in CI: it surfaces
 every would-be escalation and, crucially, builds no backend and no worker pool — so no

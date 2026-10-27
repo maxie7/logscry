@@ -48,3 +48,25 @@ func TestResolveVersion(t *testing.T) {
 		})
 	}
 }
+
+// TestVersionLine pins what --version prints: the version, then the Go toolchain in brackets.
+func TestVersionLine(t *testing.T) {
+	tests := []struct {
+		name      string
+		version   string
+		goVersion string
+		want      string
+	}{
+		{"release", "v9.9.9", "go1.2.3", "logscry v9.9.9 (go1.2.3)"},
+		{"fallback version", "dev", "go1.2.3", "logscry dev (go1.2.3)"},
+		{"experiment suffix kept", "v9.9.9-dirty", "go1.2.3 X:nodwarf5", "logscry v9.9.9-dirty (go1.2.3 X:nodwarf5)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := versionLine(tt.version, tt.goVersion); got != tt.want {
+				t.Errorf("versionLine(%q, %q) = %q, want %q", tt.version, tt.goVersion, got, tt.want)
+			}
+		})
+	}
+}
