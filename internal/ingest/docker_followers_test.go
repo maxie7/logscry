@@ -274,3 +274,56 @@ func TestFollowerSetReleasesEveryFollowersContext(t *testing.T) {
 		})
 	}
 }
+
+// TestFollowerSetRetireDoesNotCancel is #100's die from a reconnect's replay: the follower is
+// marked stopped but keeps reading, since the daemon ends a stopped container's stream by
+// itself. A later start is kept for its exit, as after stop, and start reports a launch only
+// when it made one.
+func TestFollowerSetRetireDoesNotCancel(t *testing.T) {
+	ff := newFakeFollows()
+	s := newFollowerSet(context.Background(), ff.follow)
+	if !s.start("c1", "app") {
+		t.Error("the first start reported no launch")
+	}
+	old := ff.next(t)
+	s.retire("c1")
+	if old.ctx.Err() != nil {
+		t.Fatal("retire cancelled the follower")
+	}
+	if s.start("c1", "app") {
+		t.Error("a start beside a running follower reported a launch")
+	}
+	ff.none(t, 50*time.Millisecond)
+
+	old.release <- markAt(5)
+	next := ff.next(t)
+	if next.mark != markAt(5) {
+		t.Errorf("successor from %+v, want the exit mark %+v", next.mark, markAt(5))
+	}
+	next.release <- markAt(6)
+	waitReturns(t, s)
+}
+
+// TestFollowerSetMarksCarryAcrossSets: each connection to the daemon has its own set, which
+// takes the marks of the one before once that one has exited, so a container followed across
+// a reconnect resumes where its last follower stopped.
+func TestFollowerSetMarksCarryAcrossSets(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ff := newFakeFollows()
+	first := newFollowerSet(ctx, ff.follow)
+	first.start("c1", "app")
+	old := ff.next(t)
+	cancel() // the connection is lost
+	old.release <- markAt(5)
+	waitReturns(t, first)
+
+	second := newFollowerSet(context.Background(), ff.follow)
+	second.marks = first.marks
+	second.start("c1", "app")
+	next := ff.next(t)
+	if next.mark != markAt(5) {
+		t.Errorf("re-attach from %+v, want the last follower's mark %+v", next.mark, markAt(5))
+	}
+	next.release <- markAt(6)
+	waitReturns(t, second)
+}

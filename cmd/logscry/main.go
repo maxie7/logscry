@@ -106,6 +106,15 @@ func run(ctx context.Context, args []string) (err error) {
 		}
 	}()
 
+	// A running source's notices (the Docker source reconnecting, #100) never wait for the
+	// reader of errs, so one that found no room was dropped; how many is said here, at exit.
+	var notices *ingest.Notices
+	defer func() {
+		if n := notices.Dropped(); n > 0 {
+			fmt.Fprintf(os.Stderr, "logscry: ingest: %d notice(s) dropped: they came faster than they were shown\n", n)
+		}
+	}()
+
 	sources, stdinOnly := sources(cfg)
 	replay, _ := sources[0].(*ingest.ReplaySource) // nil unless --replay: it is then the only source
 
@@ -120,19 +129,19 @@ func run(ctx context.Context, args []string) (err error) {
 	}
 
 	lines := make(chan model.LogLine, 1024)
-	// Room for the journald notice below, one error per source, the truncation notice and the
-	// replay notice, so no sender ever blocks.
-	errs := make(chan error, len(sources)+3)
+	var errs chan error
+	errs, notices = backgroundNotices(len(sources))
 	if notice := journaldNotice(cfg); notice != nil {
 		errs <- notice
 	}
 	cuts = ingest.NewTruncations(func() { errs <- errTruncated })
-	ingestCtx := ingest.WithTruncations(ctx, cuts)
+	ingestCtx := ingest.WithNotices(ingest.WithTruncations(ctx, cuts), notices)
 	go func() {
 		defer close(lines)
 		defer close(errs)
 		// Before errs closes: a reader can outlive its source after a cancel, and still cut.
 		defer cuts.Stop()
+		defer notices.Stop()
 		// A source error is reported the moment that source ends, and the other sources
 		// keep running (#97): one failing source must not hide behind, or stop, the rest.
 		// Run does not report what a cancelled context (Ctrl-C) stopped. In TUI mode the
@@ -180,6 +189,23 @@ func run(ctx context.Context, args []string) (err error) {
 		return runPlainAt(ctx, grouped, errs, sc, escalations, explanations, exp, cfg.ExplainDryRun, replay != nil)
 	}
 	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, exp, cfg)
+}
+
+// noticeRoom is how many of a running source's notices errs holds unread before the next is
+// dropped (see ingest.Notices).
+const noticeRoom = 8
+
+// backgroundNotices returns the background-notice channel, which --plain prints to stderr and
+// the TUI shows in its status line, and the Notices a running source sends on it.
+//
+// It has room for the journald notice, one error per source, the truncation notice and the
+// replay notice, each sent at most once, so none of those sends ever blocks; and noticeRoom
+// besides for the notices, which are never waited for at all. Neither reader drains errs
+// continuously: --plain reads it on the goroutine that writes stdout, and the TUI on its event
+// loop, which waits on the terminal. A source that waited for either would stall with it.
+func backgroundNotices(sources int) (chan error, *ingest.Notices) {
+	errs := make(chan error, sources+3+noticeRoom)
+	return errs, ingest.NewNotices(errs, noticeRoom)
 }
 
 // errTruncated is the notice for the first line cut at ingest.MaxLineBytes. It goes down the

@@ -29,20 +29,22 @@ type DockerSelector struct {
 
 // DockerSource follows logs from Docker containers, auto-attaching to new ones.
 // It is a single long-running Source: its Lines call blocks until ctx is
-// cancelled or the daemon's event stream fails, managing one log follower per
-// matching container internally. The fan-in (Run) closes the shared channel only
-// when every Source ends, so Docker — being long-lived and dynamic — must be one
-// Source, not one per container.
+// cancelled, managing one log follower per matching container internally. The
+// fan-in (Run) closes the shared channel only when every Source ends, so Docker —
+// being long-lived and dynamic — must be one Source, not one per container.
 type DockerSource struct {
 	Selector DockerSelector
 	// Tail is how many trailing lines to fetch per container on first attach. A
 	// restarted container is re-attached from the last line read instead.
 	Tail string
+
+	// retryMin and retryMax bound the wait between reconnect attempts (see Lines).
+	retryMin, retryMax time.Duration
 }
 
 // NewDockerSource returns a Source that follows Docker container logs.
 func NewDockerSource(sel DockerSelector) *DockerSource {
-	return &DockerSource{Selector: sel, Tail: "100"}
+	return &DockerSource{Selector: sel, Tail: "100", retryMin: time.Second, retryMax: 30 * time.Second}
 }
 
 // Name implements Source.
@@ -51,13 +53,17 @@ func (s *DockerSource) Name() string { return "docker" }
 // Lines implements Source. It creates a Docker client, subscribes to container
 // start/die events, attaches a follower to every already-running container that
 // matches the selector, and thereafter attaches/detaches followers as containers
-// come and go. It blocks until ctx is cancelled (a clean stop → nil) or the
-// event/client machinery fails.
+// come and go. It blocks until ctx is cancelled (a clean stop → nil), or until the
+// first connection to the daemon fails before it has listed the containers.
 //
-// Without its event stream the source can no longer see a container start or stop,
-// so an events error ends it: it stops its followers, waits for them, and returns the
-// error (#97). The containers it was following stop streaming too; it does not
-// reconnect.
+// Without its event stream the source can no longer see a container start or stop, so
+// once the stream fails it reconnects (#100) rather than ending (#97). It stops every
+// follower and waits for them, as #97 did, then re-subscribes with since set to the last
+// event it handled, so that the daemon replays the gap from its buffer, re-lists the
+// running containers and re-attaches each from its mark, so that nothing is read twice.
+// A failed attempt is retried after retryMin, doubling up to retryMax, for as long as ctx
+// lives. Each loss and each attempt, and the reconnect, is said through the Notices ctx
+// carries: the source never stops following Docker without a word.
 //
 // A container's log survives a restart, so a re-attach to an ID logscry has read
 // from resumes after the last line read (see dockerMark) rather than fetching the
@@ -75,19 +81,105 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 	}
 	defer cli.Close()
 
-	// The followers' parent, and the events subscription's and the list's. Lines cancels it
-	// on an events error, so that waiting for the followers ends, and on every return, so
-	// that a list error does not leave the events request open until the caller's ctx
-	// ends (#98): cli.Close closes only idle connections.
-	lctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	notices := noticesFrom(ctx)
+	minDelay, maxDelay := s.retryMin, s.retryMax
+	if minDelay <= 0 {
+		minDelay, maxDelay = time.Second, 30*time.Second
+	}
 
+	st := &dockerState{marks: map[string]dockerMark{}}
+	delay := minDelay
+	// attempt counts the failed connections since the stream was last up: the notices'
+	// "attempt N". 0 is the first connection, which has nothing to resume.
+	attempt := 0
+	for {
+		var up time.Time
+		err := s.connect(ctx, cli, m, st, attempt > 0, out, func(attached int) {
+			up = time.Now()
+			if attempt > 0 {
+				notices.Send(fmt.Errorf("docker: events reconnected, %d container(s) re-attached", attached))
+			}
+		})
+		if ctx.Err() != nil {
+			return nil
+		}
+		if attempt == 0 && up.IsZero() {
+			// The first connection failed: nothing is followed and there is nothing to
+			// resume, and a wrong DOCKER_HOST or a daemon too old is better said at once
+			// than retried. The source ends, as before #100.
+			return fmt.Errorf("docker: %w", err)
+		}
+		if !up.IsZero() {
+			// The stream was up and is lost: a new outage. The wait starts over only if the
+			// stream had stayed up for a full retryMax, so that a connection that drops as
+			// soon as it is made cannot make the source notify and retry every retryMin.
+			attempt = 0
+			if time.Since(up) >= maxDelay {
+				delay = minDelay
+			}
+		}
+		attempt++
+		notices.Send(fmt.Errorf("docker: events lost, reconnecting (attempt %d, next in %s): %w", attempt, delay, err))
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil
+		case <-t.C:
+		}
+		delay = min(delay*2, maxDelay)
+	}
+}
+
+// dockerState is what outlives a connection to the daemon.
+type dockerState struct {
+	// marks is where each container's followers stopped reading (see followerSet). Only one
+	// connection's followers run at a time, so it needs no lock of its own.
+	marks map[string]dockerMark
+	// event is the newest event handled, and how many were handled at its stamp: where a
+	// re-subscription's replay starts, and which of the replayed events were already seen.
+	event streamMark
+	// subscribed is when the first connection subscribed, by this host's clock: the replay's
+	// start until an event has been handled.
+	subscribed time.Time
+}
+
+// since is where a re-subscription asks the daemon's replay to start.
+func (st *dockerState) since() time.Time {
+	if st.event.at.IsZero() {
+		return st.subscribed
+	}
+	return st.event.at
+}
+
+// connect runs one connection to the daemon. It subscribes to events (from st.since() if
+// resumed, so that the daemon replays what happened since), lists the running containers
+// and attaches to those that match, then calls connected with how many it attached and
+// follows events until ctx is cancelled (→ nil) or the stream fails. Every follower it
+// started has exited by the time it returns, and their marks are in st.
+//
+// An error before the list has succeeded returns without calling connected.
+func (s *DockerSource) connect(ctx context.Context, cli *client.Client, m matcher, st *dockerState,
+	resumed bool, out chan<- model.LogLine, connected func(attached int),
+) error {
+	// The followers' parent, and the events subscription's and the list's. It is cancelled
+	// on every return: so that the followers stop and waiting for them ends, and so that a
+	// list error does not leave the events request open (#98): cli.Close closes only idle
+	// connections.
+	sctx, cancel := context.WithCancel(ctx)
 	// Per-follower errors are expected on shutdown and when a container disappears, so
 	// they degrade silently rather than crash the whole Docker source.
-	followers := newFollowerSet(lctx, func(fctx context.Context, id, name string, mark dockerMark) dockerMark {
+	followers := newFollowerSet(sctx, func(fctx context.Context, id, name string, mark dockerMark) dockerMark {
 		read, _ := s.followContainer(fctx, cli, id, name, mark, out)
 		return read
 	})
+	// The marks are shared with the previous connection's set, which has exited: no two
+	// sets ever run at once, so no container is followed twice across a reconnect.
+	followers.marks = st.marks
+	defer func() {
+		cancel()
+		followers.wait()
+	}()
 	start, stop := followers.start, followers.stop
 
 	// Subscribe to events BEFORE listing so containers started in the gap between
@@ -95,28 +187,64 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 	ef := make(client.Filters).
 		Add("type", string(events.ContainerEventType)).
 		Add("event", string(events.ActionStart), string(events.ActionDie))
-	sub := cli.Events(lctx, client.EventsListOptions{Filters: ef})
-	msgs, errs := sub.Messages, sub.Err
-
-	// Attach to already-running matching containers.
-	lf := make(client.Filters).Add("status", "running")
-	list, err := cli.ContainerList(lctx, client.ContainerListOptions{Filters: lf})
-	if err != nil {
-		return fmt.Errorf("docker: list: %w", err)
+	opts := client.EventsListOptions{Filters: ef}
+	// What the replay holds is the gap's history: events stamped before this instant, by
+	// this host's clock, which on the daemon's own host is the daemon's.
+	subscribed := time.Now()
+	if resumed {
+		since := st.since()
+		// "<sec>.<nsec>" passes through the client's GetTimestamp unchanged.
+		opts.Since = fmt.Sprintf("%d.%09d", since.Unix(), since.Nanosecond())
+	} else if st.subscribed.IsZero() {
+		st.subscribed = subscribed
 	}
-	for _, c := range list.Items {
-		name := containerName(c.Names)
-		if m.matches(c.ID, name, c.Labels) {
-			start(c.ID, name)
+	sub := cli.Events(sctx, opts)
+	msgs, errs := sub.Messages, sub.Err
+	if resumed {
+		// Events returns once the daemon has answered, so a refused subscription is already
+		// here. (A first connection lets the list say it, as before #100.)
+		select {
+		case err := <-errs:
+			return fmt.Errorf("events: %w", err)
+		default:
 		}
 	}
 
+	// Attach to already-running matching containers.
+	lf := make(client.Filters).Add("status", "running")
+	list, err := cli.ContainerList(sctx, client.ContainerListOptions{Filters: lf})
+	if err != nil {
+		return fmt.Errorf("list: %w", err)
+	}
+	attached := 0
+	for _, c := range list.Items {
+		name := containerName(c.Names)
+		if m.matches(c.ID, name, c.Labels) && start(c.ID, name) {
+			attached++
+		}
+	}
+	connected(attached)
+
+	// The replay starts at the newest event handled, inclusively, so the events handled at
+	// that stamp come back first: they are skipped, as readDockerStream skips the lines at
+	// a log's mark, since the daemon replays its buffer in the order it delivered it.
+	prev, skip := st.event, st.event.n
 	for {
 		select {
 		case <-ctx.Done():
-			followers.wait()
 			return nil
 		case msg := <-msgs:
+			t := time.Unix(0, msg.TimeNano)
+			if resumed && !prev.at.IsZero() {
+				if t.Before(prev.at) {
+					continue
+				}
+				if t.Equal(prev.at) && skip > 0 {
+					skip--
+					continue
+				}
+			}
+			st.event.advance(t)
 			switch msg.Action {
 			case events.ActionStart:
 				name := msg.Actor.Attributes["name"]
@@ -124,15 +252,20 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 					start(msg.Actor.ID, name)
 				}
 			case events.ActionDie:
-				stop(msg.Actor.ID)
+				if resumed && t.Before(subscribed) {
+					// A die from the gap. The container has stopped, so the daemon sends its
+					// log and ends the stream by itself; cancelling would cut a follower the
+					// replayed start has just launched before it reads anything.
+					followers.retire(msg.Actor.ID)
+				} else {
+					stop(msg.Actor.ID)
+				}
 			}
 		case err := <-errs:
-			cancel()
-			followers.wait()
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("docker: events: %w", err)
+			return fmt.Errorf("events: %w", err)
 		}
 	}
 }
@@ -149,7 +282,7 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 // was not stopped (a duplicate event, or the overlap between subscribing and listing at
 // startup) attaches nothing and leaves nothing pending, as before.
 type followerSet struct {
-	ctx    context.Context // every follower's parent: cancelled at shutdown or when the source ends
+	ctx    context.Context // every follower's parent: cancelled at shutdown or when its connection ends
 	follow func(ctx context.Context, id, name string, mark dockerMark) dockerMark
 
 	mu      sync.Mutex
@@ -171,18 +304,20 @@ func newFollowerSet(ctx context.Context, follow func(ctx context.Context, id, na
 	return &followerSet{ctx: ctx, follow: follow, running: map[string]*follower{}, marks: map[string]dockerMark{}}
 }
 
-// start attaches a follower to id unless one is already running. If the running one has
-// been stopped, the start is kept and its successor is launched when it exits.
-func (s *followerSet) start(id, name string) {
+// start attaches a follower to id unless one is already running, and reports whether it
+// did. If the running one has been stopped, the start is kept and its successor is launched
+// when it exits.
+func (s *followerSet) start(id, name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if f, ok := s.running[id]; ok {
 		if f.stopped {
 			f.restart, f.restartName = true, name
 		}
-		return
+		return false
 	}
 	s.launchLocked(id, name)
+	return true
 }
 
 // launchLocked starts a follower for id from its stored mark. s.mu must be held.
@@ -206,7 +341,7 @@ func (s *followerSet) launchLocked(id, name string) {
 		// start sees either a running follower or its final mark — and a successor
 		// launched here reads that mark. Its wg.Add comes before this goroutine's Done,
 		// so the count cannot reach zero in between. Once the set's ctx is cancelled (at
-		// shutdown, or as the source ends on an events error) no successor is launched.
+		// shutdown, or as its connection to the daemon ends) no successor is launched.
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.marks[id] = m
@@ -224,6 +359,17 @@ func (s *followerSet) stop(id string) {
 	if f, ok := s.running[id]; ok {
 		f.stopped = true
 		f.cancel()
+	}
+}
+
+// retire marks id's follower stopped without cancelling it: a die seen for a container
+// whose stream the daemon ends by itself. A later start is kept and served when it exits,
+// as after stop.
+func (s *followerSet) retire(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f, ok := s.running[id]; ok {
+		f.stopped = true
 	}
 }
 

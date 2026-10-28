@@ -8,7 +8,7 @@
 # logscry
 
 <p align="center">
-  <img src="https://img.shields.io/github/go-mod/go-version/maxie7/logscry?label=minimum%20Go" alt="Minimum Go version">
+  <img src="https://img.shields.io/github/go-mod/go-version/maxie7/logscry?label=go%20%E2%89%A5" alt="Minimum Go version">
   <img src="https://img.shields.io/github/license/maxie7/logscry" alt="License: Apache-2.0">
   <a href="https://github.com/maxie7/logscry/releases/latest"><img src="https://img.shields.io/github/v/release/maxie7/logscry" alt="Latest release"></a>
   <a href="https://github.com/maxie7/logscry/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/maxie7/logscry/ci.yml?label=CI" alt="CI status"></a>
@@ -1412,7 +1412,7 @@ is still synthetic.
 
 | Status | When |
 |---|---|
-| `0` | The run finished: its sources ended, or it was stopped with Ctrl-C or `SIGTERM`. A source that failed along the way (`-- ./app` exiting non-zero, a broken Docker events stream) is reported on stderr or in the status bar, not in the status, and so is a line cut at 64 KiB (see [How it works](#how-it-works)). |
+| `0` | The run finished: its sources ended, or it was stopped with Ctrl-C or `SIGTERM`. A source that failed along the way (`-- ./app` exiting non-zero, a Docker daemon that cannot be reached at startup) is reported on stderr or in the status bar, not in the status, and so are a line cut at 64 KiB (see [How it works](#how-it-works)) and a Docker events stream that breaks and is reconnected. |
 | `1` | logscry could not run as asked (a bad flag or config file, `-h`, no log source, an export file it could not open, a TUI that failed), **or** the export lost records (see [When the file cannot keep up](#when-the-file-cannot-keep-up)). |
 
 The status is the same in `--plain` and the TUI: it describes the run and the file, not the
@@ -1573,14 +1573,30 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   read took. A template seen from sources with different clocks (a remote `DOCKER_HOST`
   beside local journald) is off by their skew. Before #72 the age subtracted one clock from
   the other.
-- **If Docker's event stream breaks, logscry stops following Docker.** logscry learns about
-  container starts, restarts and stops from the daemon's event stream. If that stream ends or
-  fails, the Docker source ends: the containers already being followed stop streaming too,
-  and the error is shown at once, on stderr with `--plain` and in the status bar in the TUI.
-  Other sources (`--journald`, a subprocess) keep running. logscry does not reconnect: restart
-  it to follow Docker again, which reads each container's `--docker-tail` lines again on first
-  attach. A plausible trigger is a remote `DOCKER_HOST` behind a proxy or SSH tunnel that
-  closes the idle events connection. Reconnecting is filed as #100.
+- **If Docker's event stream breaks, logscry reconnects, and a few things can still be
+  missed.** logscry learns about container starts, restarts and stops from the daemon's event
+  stream. When that stream ends or fails (Docker Desktop restarting, a laptop waking up, a
+  remote `DOCKER_HOST` behind a proxy or SSH tunnel that closes the idle connection), logscry
+  says `docker: events lost, reconnecting (attempt N, next in Ds): <cause>`, on stderr with
+  `--plain` and in the status bar in the TUI. It retries after 1 s, doubling to 30 s, for as long
+  as it runs, and says `docker: events reconnected, M container(s) re-attached` once the daemon
+  answers. It asks the daemon to replay the events it missed, re-lists the running containers,
+  and resumes each from the last line it read: no line arrives twice, and lines logged during
+  the gap arrive late rather than not at all. Other sources keep running throughout. If these
+  notices come faster than they can be shown (a paused pager, a stalled terminal), the surplus
+  is dropped rather than waited for, and the count is printed at exit. What can still be missed:
+  - **A container that starts and exits during a long gap.** The daemon keeps only its last 256
+    events, of every kind (healthchecks and `docker exec` included), so on a busy host that may
+    be well under a minute. A container still running when logscry reconnects is always found.
+  - **A `--rm` container that starts and exits during the gap**, however short: its log is
+    removed with it.
+  - **Lines written while the daemon itself is down or restarting.** They may never reach the
+    container's log, and logscry can only read the log.
+  - **With a remote `DOCKER_HOST` whose clock is off**, a container that started and exited
+    during the gap: logscry tells the gap's events from new ones by its own clock.
+
+  A daemon that cannot be reached when logscry starts is not retried: the error is shown at
+  once and the Docker source ends.
 - **`--docker-tail` defaults to 100 lines** of history per container on first attach. An
   event further back than that won't appear until it recurs — use `--docker-tail all` for
   the full backlog. A restarted container is not read from its tail again: logscry resumes
