@@ -8,7 +8,7 @@
 # logscry
 
 <p align="center">
-  <img src="https://img.shields.io/github/go-mod/go-version/maxie7/logscry?label=minimum%20Go" alt="Minimum Go version">
+  <img src="https://img.shields.io/github/go-mod/go-version/maxie7/logscry?label=go%20%E2%89%A5" alt="Minimum Go version">
   <img src="https://img.shields.io/github/license/maxie7/logscry" alt="License: Apache-2.0">
   <a href="https://github.com/maxie7/logscry/releases/latest"><img src="https://img.shields.io/github/v/release/maxie7/logscry" alt="Latest release"></a>
   <a href="https://github.com/maxie7/logscry/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/maxie7/logscry/ci.yml?label=CI" alt="CI status"></a>
