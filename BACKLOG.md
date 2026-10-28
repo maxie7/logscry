@@ -6371,6 +6371,107 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.32
 
+- [x] **The Docker client comes from github.com/moby/moby, and github.com/docker/docker leaves the
+      dependency graph** — #152. logscry uses only the Docker client: list, inspect, logs, events
+      and stdcopy. It took them from `github.com/docker/docker v28.5.2+incompatible`. That module
+      carries daemon-side advisories (docker cp races, the archive endpoint, plugin privilege
+      validation, AuthZ) with no patched version: Moby v29 moved the client to
+      `github.com/moby/moby/client` and the API types and stdcopy to `github.com/moby/moby/api`,
+      and the old module gets no further releases. govulncheck warned on two of them in CI, and
+      Dependabot listed them together with an OpenTelemetry advisory that came in through the
+      same module.
+
+      **The mapping** (client v0.6.2 and api v1.56.1, the latest of each; checked in their source):
+
+      | docker/docker v28.5.2 | moby/moby |
+      |---|---|
+      | `client.NewClientWithOpts(FromEnv, WithAPIVersionNegotiation())` | `client.New(client.FromEnv)`: negotiation is the default; both old names are deprecated, the option a no-op |
+      | `filters.NewArgs()` + `Add` | `make(client.Filters).Add(…)`: the same JSON on the wire |
+      | `Events(ctx, events.ListOptions)` → `(msgs, errs)` | `Events(ctx, client.EventsListOptions)` → `EventsResult{Messages, Err}`: the same goroutine, one error then close |
+      | `ContainerList` → `[]container.Summary` | `ContainerList(…, client.ContainerListOptions)` → `.Items` |
+      | `ContainerInspect(ctx, id)` → `.Config.Tty` | `ContainerInspect(ctx, id, client.ContainerInspectOptions{})` → `.Container.Config.Tty` |
+      | `container.LogsOptions` | `client.ContainerLogsOptions`, the same fields; `Since` goes through a byte-identical `GetTimestamp` |
+      | `pkg/stdcopy.StdCopy` | `api/pkg/stdcopy.StdCopy`, the same body |
+
+      The Docker source does not change. Three things change on the wire or around it, all with
+      the new module:
+      - **The negotiated API version.** The client's maximum goes from 1.51 to 1.56. On Docker
+        29.9.2 (API 1.56, minimum 1.40) main talks `/v1.51/` and this branch `/v1.56/`. Every
+        field logscry reads is the same at both.
+      - **`tail=all` is no longer sent.** The client leaves the parameter out for `""` and
+        `"all"`, and the daemon reads a missing tail as no limit, as it read `all`. So a
+        re-attach and `--docker-tail all` fetch exactly what they did.
+      - **A minimum daemon: Docker Engine 19.03 (API 1.40).** The old client negotiated down to
+        any daemon; the new one refuses below 1.40 and keeps its own version, so an older daemon
+        now fails at `docker: list`. Against a fake daemon at API 1.39, main followed at
+        `/v1.39/`; the branch printed `docker: list: Error response from daemon: client version
+        1.56 is too new. Maximum supported API version is 1.39` at once, and exited 0, as every
+        source error does (#97). README's Quick start now names the requirement.
+
+      **The dependency graph.** `go mod why -m github.com/docker/docker`: "main module does not
+      need module github.com/docker/docker", and it is in neither `go.mod` nor `go.sum`.
+      - **Left `go.mod`:** `github.com/docker/docker`, `containerd/log`, `moby/sys/atomicwriter`,
+        `moby/term`, `morikuni/aec`, `pkg/errors`, `golang.org/x/time`, `gotest.tools/v3`, and
+        `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp`. The last was there only
+        because an `+incompatible` module's graph is not pruned; it carries the OpenTelemetry
+        advisory GHSA-8wmf-6v46-5gfg (≤ 1.44.0). With it the whole OTLP exporter chain leaves
+        `go.sum` too: `otlptrace`, `proto/otlp`, grpc, genproto, grpc-gateway, protobuf and
+        backoff, besides logrus and `x/net`. `go.sum` goes from 154 lines to 120.
+      - **Arrived:** `github.com/moby/moby/client v0.6.2` and `github.com/moby/moby/api v1.56.1`.
+      - **Raised, because the client requires it:** `docker/go-connections` v0.7.0 → v0.8.2.
+        Nothing else moved. otel and otelhttp stay at v1.44.0 and v0.69.0 (the new client still
+        wraps its transport in otelhttp).
+      - **Binary size** grows a little: 13,338,872 → 13,429,529 bytes with `go build` (+0.68 %),
+        9,257,122 → 9,322,658 with the release flags `CGO_ENABLED=0 -ldflags "-s -w"` (+0.71 %).
+
+      **govulncheck v1.9.0 on go1.26.10**, CI's command and verdict:
+
+      | | symbol level | all levels |
+      |---|---|---|
+      | main | 2 warnings, GO-2026-4883 and GO-2026-4887, docker/docker, no fixed version | 5 OSVs, all docker/docker |
+      | this branch | **0** | **0** |
+
+      **Live, main against the branch on Docker 29.9.2**, both binaries side by side with
+      `--docker-all --plain --explain-dry-run`. Each reached the daemon through its own proxy that
+      recorded only request lines. The run: the demo's `docker compose up -d`, a non-TTY probe
+      container, a TTY probe container started mid-run, the non-TTY one restarted and then
+      stopped, and finally both proxies killed. Short runs then covered `--docker-name '^api$'
+      --docker-tail 3`, `--docker-label com.docker.compose.service=worker --docker-tail all`, and
+      an unreachable `DOCKER_HOST`. Predicted before running:
+
+      | prediction | result |
+      |---|---|
+      | Requests identical but for the version and `tail=all` | **Held.** 14 requests each: a ping, the events filter `{"event":{"die":true,"start":true},"type":{"container":true}}`, the list, 6 inspects, 6 logs. Only `/v1.51/` vs `/v1.56/` differs, plus `tail=all` (main) vs no tail (branch) on the re-attach and with `--docker-tail all`. The re-attach's `since` is byte-identical. |
+      | The same containers attached | **Held.** 4 from the list (api, worker, the non-TTY probe, and a third-party container already running on the host); the TTY probe from its start event. |
+      | The same lines per container | **Held**, every container: api 50, worker 44, non-TTY probe 40, TTY probe 38, the third-party container 95. Each container's sequence is identical, except that the non-TTY probe's stdout and stderr interleave differently: their relative order is undefined, since each stream is read by its own goroutine. Each stream's own sequence is identical. |
+      | stdout/stderr tagging | **Held.** The worker's and the non-TTY probe's FATALs give `stderr, level FATAL`, and the TTY probe's FATAL gives `level FATAL` alone: a pty merges the streams. Identical on both. |
+      | No pattern begins with a timestamp | **Held** for the demo and the probes. 65 patterns per binary begin with one, all from the third-party container, whose application writes its own timestamp after Docker's (which was stripped). |
+      | A restart re-reads nothing, a stop ends the follower | **Held.** The probe's 40 lines include both of its runs; a tail re-read would have added about 25. |
+      | The same escalations | **Held**: the worker's postgres FATAL and the two probes' FATALs, on both. |
+      | A closed events stream is reported and ends the source | **Held.** Both print `ingest: docker: events: unexpected EOF` and exit 0 on their own. |
+      | `--docker-name` / `--docker-label` / `--docker-tail` | **Held.** Only `docker:api`, 11 lines each from `tail=3`; only `docker:worker`, 61 lines each, the whole log. |
+      | An unreachable daemon | **Held.** Both print `docker: list: Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?` |
+      | `moby/term` and `x/time` stay in `go.mod` | **Wrong.** The client imports them only from packages logscry does not use. |
+      | The binary shrinks slightly | **Wrong.** It grows by about 0.7 %. |
+
+      **Tests.** They pass with import and type changes, plus two others the new module forces:
+      - The api module no longer exports `stdcopy.NewStdWriter`. The tests carry `newStdWriter`,
+        which writes the daemon's 8-byte frame header (stream byte, big-endian length) and the
+        payload in one Write, as the removed writer did. Four call sites change by one identifier.
+      - The seven re-attach expectations of `tail=all` now expect the absent tail, through a named
+        `wireTailAll`. The fake daemon already read a missing tail as everything.
+
+      CI's two test steps give 3,627 passes and 1 skip without `-race`, and 3,606 and 1 with it,
+      on main and on the branch alike. Every test result is identical between the two.
+
+      **Seen and left alone, out of scope:** #100; the RDI's `container.LogsOptions` and
+      `.Config.Tty` in §4, which name the old SDK's types; the anonymizer's test strings
+      `github.com/docker/docker/client.(*Client).ContainerList` (sample text the anonymizer must
+      not mask, not a dependency); the new client pings once more when negotiation fails;
+      every other dependency.
+
+      Targets v0.12.33
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

@@ -5,6 +5,7 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
 
 	"github.com/maxie7/logscry/internal/model"
 )
@@ -93,11 +94,11 @@ func TestNewMatcherErrors(t *testing.T) {
 // parsed off, and no header bytes leak into the message.
 func TestStreamLogsDemuxesNonTTY(t *testing.T) {
 	var buf bytes.Buffer
-	sw := stdcopy.NewStdWriter(&buf, stdcopy.Stdout)
+	sw := newStdWriter(&buf, stdcopy.Stdout)
 	if _, err := sw.Write([]byte("2024-03-04T05:06:07.000000000Z hello out\n")); err != nil {
 		t.Fatal(err)
 	}
-	ew := stdcopy.NewStdWriter(&buf, stdcopy.Stderr)
+	ew := newStdWriter(&buf, stdcopy.Stderr)
 	if _, err := ew.Write([]byte("2024-03-04T05:06:08.000000000Z hello err\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -185,6 +186,26 @@ func TestReadDockerStreamMarksOnlyWhatItDelivered(t *testing.T) {
 	})
 }
 
+// stdWriter writes the daemon's multiplexed format, which stdcopy.StdCopy reads: each Write
+// is one frame, an 8-byte header (byte 0 the stream, bytes 4-7 the payload length, big
+// endian) and then the payload. The api module no longer exports the daemon's writer
+// (stdcopy.NewStdWriter), so the tests carry their own.
+type stdWriter struct {
+	w  io.Writer
+	st stdcopy.StdType
+}
+
+func newStdWriter(w io.Writer, st stdcopy.StdType) io.Writer { return &stdWriter{w, st} }
+
+// Write sends header and payload in one Write, and counts payload bytes only.
+func (sw *stdWriter) Write(p []byte) (int, error) {
+	frame := make([]byte, 8, 8+len(p))
+	frame[0] = byte(sw.st)
+	binary.BigEndian.PutUint32(frame[4:], uint32(len(p)))
+	n, err := sw.w.Write(append(frame, p...))
+	return max(n-8, 0), err
+}
+
 // stampedFrame returns ONE multiplexed frame on stream st holding n short lines, each with
 // its own daemon stamp a microsecond apart from base, plus those stamps.
 func stampedFrame(t *testing.T, st stdcopy.StdType, prefix string, n int, base time.Time) ([]byte, []time.Time) {
@@ -196,7 +217,7 @@ func stampedFrame(t *testing.T, st stdcopy.StdType, prefix string, n int, base t
 		fmt.Fprintf(&payload, "%s %s %d\n", stamps[i].Format(rfc3339NanoFixed), prefix, i+1)
 	}
 	var frame bytes.Buffer
-	if _, err := stdcopy.NewStdWriter(&frame, st).Write(payload.Bytes()); err != nil {
+	if _, err := newStdWriter(&frame, st).Write(payload.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	return frame.Bytes(), stamps
