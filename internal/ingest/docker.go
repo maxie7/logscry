@@ -12,11 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/client"
 
 	"github.com/maxie7/logscry/internal/model"
 )
@@ -70,7 +68,8 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 		return err
 	}
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	// The client negotiates the API version with the daemon on its first request.
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return fmt.Errorf("docker: client: %w", err)
 	}
@@ -93,20 +92,19 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 
 	// Subscribe to events BEFORE listing so containers started in the gap between
 	// list and subscribe are not missed.
-	ef := filters.NewArgs()
-	ef.Add("type", string(events.ContainerEventType))
-	ef.Add("event", string(events.ActionStart))
-	ef.Add("event", string(events.ActionDie))
-	msgs, errs := cli.Events(lctx, events.ListOptions{Filters: ef})
+	ef := make(client.Filters).
+		Add("type", string(events.ContainerEventType)).
+		Add("event", string(events.ActionStart), string(events.ActionDie))
+	sub := cli.Events(lctx, client.EventsListOptions{Filters: ef})
+	msgs, errs := sub.Messages, sub.Err
 
 	// Attach to already-running matching containers.
-	lf := filters.NewArgs()
-	lf.Add("status", "running")
-	list, err := cli.ContainerList(lctx, container.ListOptions{Filters: lf})
+	lf := make(client.Filters).Add("status", "running")
+	list, err := cli.ContainerList(lctx, client.ContainerListOptions{Filters: lf})
 	if err != nil {
 		return fmt.Errorf("docker: list: %w", err)
 	}
-	for _, c := range list {
+	for _, c := range list.Items {
 		name := containerName(c.Names)
 		if m.matches(c.ID, name, c.Labels) {
 			start(c.ID, name)
@@ -244,13 +242,13 @@ func (s *followerSet) wait() { s.wg.Wait() }
 // The daemon's since is inclusive, so the lines at the mark come back; streamLogs
 // drops them.
 func (s *DockerSource) followContainer(ctx context.Context, cli *client.Client, id, name string, mark dockerMark, out chan<- model.LogLine) (dockerMark, error) {
-	insp, err := cli.ContainerInspect(ctx, id)
+	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 	if err != nil {
 		return mark, fmt.Errorf("inspect: %w", err)
 	}
-	tty := insp.Config != nil && insp.Config.Tty
+	tty := insp.Container.Config != nil && insp.Container.Config.Tty
 
-	opts := container.LogsOptions{
+	opts := client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
@@ -260,6 +258,7 @@ func (s *DockerSource) followContainer(ctx context.Context, cli *client.Client, 
 	if since, ok := mark.since(); ok {
 		// "<sec>.<nsec>" passes through the client's GetTimestamp unchanged.
 		opts.Since = fmt.Sprintf("%d.%09d", since.Unix(), since.Nanosecond())
+		// The client sends no tail for "all", which the daemon reads as no limit.
 		opts.Tail = "all"
 	}
 	logs, err := cli.ContainerLogs(ctx, id, opts)

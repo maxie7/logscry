@@ -132,8 +132,8 @@ jobs:
   #     toolchain's own minor line (Go 1.27 is not an option while golangci-lint is built with
   #     1.26), and the remedy is `go mod edit -toolchain=go1.26.N`. For a module, any fixed
   #     version.
-  #   - Warns: no fixed version, or a standard-library fix only on a newer minor. Today that is
-  #     github.com/docker/docker's two advisories, which #152 migrates away from.
+  #   - Warns: no fixed version, or a standard-library fix only on a newer minor. There are none
+  #     today: github.com/docker/docker's two left with the move to github.com/moby/moby (#152).
   #   - govulncheck failing to run (vuln.go.dev unreachable, say) fails the step. A check that
   #     did not run is not a pass; re-run it.
   # JSON mode exits 0 whatever it finds, so the verdict is jq's alone. Every finding also goes

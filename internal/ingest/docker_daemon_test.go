@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/events"
 
 	"github.com/maxie7/logscry/internal/model"
 )
@@ -34,7 +34,7 @@ import (
 // The logs endpoint emulates the daemon's read path as of docker v28.5.2
 // (daemon/logs.go, daemon/logger/loggerutils/logfile.go):
 //   - tail is applied FIRST, to the combined stdout+stderr log (tail 0 = no history,
-//     "all" or anything non-numeric = everything);
+//     "all", anything non-numeric or no tail at all = everything);
 //   - then since filters, INCLUSIVELY (a line is skipped only if stamped Before since),
 //     and the filter switches off at the first line at or after since;
 //   - every line carries a fixed 9-digit RFC3339Nano stamp, as with timestamps=1.
@@ -237,7 +237,7 @@ func (d *fakeDaemon) writeEntry(w http.ResponseWriter, e fakeEntry) {
 	if e.stream == model.Stderr {
 		st = stdcopy.Stderr
 	}
-	_, _ = stdcopy.NewStdWriter(w, st).Write(line)
+	_, _ = newStdWriter(w, st).Write(line)
 }
 
 func (d *fakeDaemon) notifyLocked() {
@@ -413,6 +413,11 @@ func keys(m map[string]bool) []string {
 	return k
 }
 
+// wireTailAll is the tail a logs request carries for "all": none. The client leaves the
+// parameter out for "" and "all" (moby/moby/client v0.6.2, container_logs.go), and the
+// daemon reads a missing tail as no limit, so expectQuery sees "".
+const wireTailAll = ""
+
 func expectQuery(t *testing.T, label string, q url.Values, since, tail string) {
 	t.Helper()
 	if got := q.Get("since"); got != since {
@@ -449,7 +454,7 @@ func TestDockerRestartDeliversEachLineOnce(t *testing.T) {
 			f.until(firstRaws...)
 			d.die()
 			d.logs(second...)
-			expectQuery(t, "re-attach", d.start(), wireSince(at(5)), "all")
+			expectQuery(t, "re-attach", d.start(), wireSince(at(5)), wireTailAll)
 			f.until(secondRaws...)
 			f.stop()
 
@@ -475,7 +480,7 @@ func TestDockerRestartBoundary(t *testing.T) {
 	d.endStreams() // the stream ends before die this time
 	d.event(events.ActionDie)
 	d.logs(out(T, "C at T"), errl(T, "F at T"))
-	expectQuery(t, "re-attach", d.start(), wireSince(Tm), "all")
+	expectQuery(t, "re-attach", d.start(), wireSince(Tm), wireTailAll)
 	f.until("C at T", "F at T")
 	f.stop()
 
@@ -498,7 +503,7 @@ func TestDockerRestartReadsPastTail(t *testing.T) {
 	f.until(firstRaws[2:]...)
 	d.die()
 	d.logs(second...)
-	expectQuery(t, "re-attach", d.start(), wireSince(at(5)), "all")
+	expectQuery(t, "re-attach", d.start(), wireSince(at(5)), wireTailAll)
 	f.until(secondRaws...)
 	f.stop()
 
@@ -556,10 +561,10 @@ func TestDockerRestartCarriesTheInstantForward(t *testing.T) {
 	d.nextRequest()
 	f.until("line 1", "line 2")
 	d.die()
-	expectQuery(t, "first re-attach", d.start(), wireSince(at(2)), "all")
+	expectQuery(t, "first re-attach", d.start(), wireSince(at(2)), wireTailAll)
 	d.die()
 	d.logs(out(at(200), "line 3"))
-	expectQuery(t, "second re-attach", d.start(), wireSince(at(2)), "all")
+	expectQuery(t, "second re-attach", d.start(), wireSince(at(2)), wireTailAll)
 	f.until("line 3")
 	f.stop()
 
@@ -590,7 +595,7 @@ func TestDockerDieMidWriteIsFollowedAgain(t *testing.T) {
 	}
 	d.die()
 	d.logs(after...)
-	expectQuery(t, "re-attach", d.start(), wireSince(at(cap(f.out))), "all")
+	expectQuery(t, "re-attach", d.start(), wireSince(at(cap(f.out))), wireTailAll)
 	want := append(burstRaws, afterRaws...)
 	f.until(want...)
 	f.stop()
@@ -615,7 +620,7 @@ func TestDockerDieAndStartBackToBack(t *testing.T) {
 			f.until(firstRaws...)
 			d.event(events.ActionDie)
 			d.event(events.ActionStart)
-			expectQuery(t, "re-attach", d.nextRequest(), wireSince(at(5)), "all")
+			expectQuery(t, "re-attach", d.nextRequest(), wireSince(at(5)), wireTailAll)
 			d.logs(second...)
 			f.until(secondRaws...)
 			f.stop()

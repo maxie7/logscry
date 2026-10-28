@@ -20,7 +20,7 @@ linters:
       # pattern misses it.
       exclude-functions:
         - (io.Closer).Close
-        - (*github.com/docker/docker/client.Client).Close
+        - (*github.com/moby/moby/client.Client).Close
 
 formatters:
   enable:
