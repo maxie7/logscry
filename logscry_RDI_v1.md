@@ -141,10 +141,10 @@ type Template struct {
 
 **stdin / subprocess** — trivial: read lines from `os.Stdin`, or run the target via `exec.Command` and read its `StdoutPipe`/`StderrPipe`. Tag `Stream` accordingly.
 
-**Docker** — use the official Go SDK `github.com/docker/docker/client`.
+**Docker** — use the official Go SDK `github.com/moby/moby/client` (API types and stdcopy in `github.com/moby/moby/api`).
 
 - `ContainerLogs(ctx, id, container.LogsOptions{ShowStdout:true, ShowStderr:true, Follow:true, Timestamps:true, Tail:"100"})`.
-- **Gotcha #1 (must handle):** if the container has **no TTY**, Docker multiplexes stdout+stderr into one stream with an 8-byte header per frame. Demultiplex with `stdcopy.StdCopy(stdoutW, stderrW, logsReader)` from `github.com/docker/docker/pkg/stdcopy`. If the container **has** a TTY, the stream is raw (single combined stream, no headers). Decide per container via `ContainerInspect` → `.Config.Tty`.
+- **Gotcha #1 (must handle):** if the container has **no TTY**, Docker multiplexes stdout+stderr into one stream with an 8-byte header per frame. Demultiplex with `stdcopy.StdCopy(stdoutW, stderrW, logsReader)` from `github.com/moby/moby/api/pkg/stdcopy`. If the container **has** a TTY, the stream is raw (single combined stream, no headers). Decide per container via `ContainerInspect` → `.Config.Tty`.
 - **Gotcha #2:** with `Timestamps:true`, each line is prefixed with an RFC3339Nano timestamp — parse it; do **not** assume arrival order matches timestamp order across containers.
 - **Auto-discovery:** subscribe to `client.Events(ctx, ...)` filtered on container `start`/`die` to attach/detach log followers automatically. This gives the "`docker compose up` and it just picks everything up" UX, which is also the demo.
 
@@ -306,7 +306,7 @@ type Source interface {
 ## 12. Tech stack
 
 - **Go** 1.24+ (target the latest stable release; pin in `go.mod`).
-- Docker SDK: `github.com/docker/docker/client` + `.../pkg/stdcopy`.
+- Docker SDK: `github.com/moby/moby/client` + `github.com/moby/moby/api/pkg/stdcopy`.
 - TUI: `github.com/charmbracelet/bubbletea`, `github.com/charmbracelet/lipgloss`, `github.com/charmbracelet/bubbles`.
 - HTTP for LLM: standard library `net/http` (no SDK needed for an OpenAI-compatible endpoint).
 - Config/flags: stdlib `flag` is enough for v1; `spf13/cobra`+`viper` only if the surface grows.

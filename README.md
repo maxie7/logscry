@@ -8,7 +8,7 @@
 # logscry
 
 <p align="center">
-  <img src="https://img.shields.io/github/go-mod/go-version/maxie7/logscry" alt="Go version">
+  <img src="https://img.shields.io/github/go-mod/go-version/maxie7/logscry?label=minimum%20Go" alt="Minimum Go version">
   <img src="https://img.shields.io/github/license/maxie7/logscry" alt="License: Apache-2.0">
   <a href="https://github.com/maxie7/logscry/releases/latest"><img src="https://img.shields.io/github/v/release/maxie7/logscry" alt="Latest release"></a>
   <a href="https://github.com/maxie7/logscry/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/maxie7/logscry/ci.yml?label=CI" alt="CI status"></a>
@@ -125,6 +125,9 @@ tail -f /var/log/app.log | ./bin/logscry
 # see what WOULD escalate without calling an LLM (no model needed)
 ./bin/logscry --docker-all --explain-dry-run
 ```
+
+Following Docker needs Docker Engine 19.03 or newer (API 1.40); an older daemon fails at once
+with `docker: list: … client version … is too new`.
 
 Explanations use a local Ollama by default (`http://localhost:11434/v1`). Pull a model
 and go:
