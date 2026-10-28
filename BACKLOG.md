@@ -20,7 +20,8 @@ Repo stays private through M5; flip to public at M6.
 - [x] subprocess source (`exec.Command`, capture stdout+stderr, tag `Stream`)
 - [x] Docker source: `ContainerLogs` (Follow, Timestamps), parse RFC3339Nano
 - [x] Docker: `stdcopy.StdCopy` demux when no TTY; raw when TTY (detect via `ContainerInspect`)
-- [x] Docker: auto-attach/detach via `client.Events` on start/die
+- [x] Docker: auto-attach/detach via `client.Events` on start/die (the stream is reconnected when
+      it breaks: #100, in TODO-VERSION)
 - [x] Selection flags: `--docker-all` / `--docker-label` / `--docker-name`
 - [x] Fan-in all sources into one `chan LogLine`
 
@@ -1701,7 +1702,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
            Source can only report by returning, so retrying would be silent, and silence was
            this issue's failure.
 
-         Filed as #100.
+         Filed as #100. (Superseded by #100, in TODO-VERSION: the source reconnects.)
       2. **A source's error is reported the moment that source ends, and the others keep
          running.** The run ends when every source has ended, as before. Ending the run on
          the first error was rejected for two reasons:
@@ -6471,6 +6472,178 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       every other dependency.
 
       Targets v0.12.33
+
+- [x] **The Docker source reconnects its events stream instead of ending** — #100, filed by #97.
+      Since #97, a broken events stream ended the Docker source at once and visibly. The
+      containers already followed stopped streaming too, and following Docker again meant
+      restarting logscry, which reads every `--docker-tail` again. #97 costed a reconnect and
+      did not build it: above all, a Source could speak only by returning, so a retry would
+      have been silent.
+
+      Checked in source first:
+      - **The client.** `Events` (moby/moby/client v0.6.2) returns once the daemon has
+        answered, so a refused subscription is already in `Err`. `Messages` is never closed;
+        `Err` gets one error and closes.
+      - **The daemon** (`daemon/events/events.go`):
+        - it keeps its last `eventsLimit = 256` events, of **every** type, filtering only on
+          replay;
+        - `since` is inclusive at nanosecond precision;
+        - the replay and the live subscription are taken under one lock, so nothing falls
+          between them.
+
+      **Decisions.**
+      1. **A loop of connections, with every follower stopped between them.** On a loss,
+         `Lines` cancels the connection's context and waits for its followers, as #97 did.
+         Then it backs off and connects again:
+         - **The order.** It subscribes with `since` = the last event it handled, then checks
+           for a refused subscription, then re-lists the running containers and re-attaches
+           each from its mark.
+         - **`since` before any event** is this host's clock at the first subscription.
+         - **Each connection has its own `followerSet`.** It takes the marks of the one before,
+           which has exited.
+
+         What is deduplicated:
+         - **A replayed event already handled.** `since` is inclusive, so the last one comes
+           back. An event mark (the existing `streamMark`) skips what is before it, and the
+           first *n* at it, by #80's argument per stream: the daemon replays in delivery order.
+         - **A container already followed.** It cannot happen at the re-list: no two sets ever
+           run at once. Within one, `followerSet` is unchanged.
+
+         A follower is launched only by `start` with no entry, or by an exiting follower after
+         its `delete`, both under the set's lock. And a cancelled set launches no successor.
+         So no container is followed twice. The marks make each re-attach read nothing twice.
+      2. **A die from the gap retires its follower rather than cancelling it.** A container
+         that started and exited in the gap reaches logscry as a replayed start and die, back to
+         back.
+         - A die stamped before the subscription, by this host's clock, marks the follower
+           stopped, so a later start is kept (#85), but does not cancel it.
+         - The container has stopped, so the daemon sends its log and ends the stream by
+           itself. `stop` would cut the follower before it read anything.
+         - A live die is handled as before.
+         - With a remote daemon whose clock is off, a gap die can be taken for a live one and
+           cut that drain, or the reverse, which is harmless. Neither duplicates a line.
+      3. **The backoff, and no give-up.** The wait is 1 s, doubling to 30 s.
+         - It restarts at 1 s only after a connection that stayed up for 30 s, so a flapping
+           proxy cannot make logscry retry and notify every second.
+         - It retries for as long as the run lives. A dev-time tool sees Docker Desktop
+           restart, laptops sleep and tunnels reconnect, and each comes back. Giving up would
+           force the restart this removes.
+         - #97's failure was silence, and every attempt is said. At the cap that is one request
+           and one line per 30 s.
+         - **A first connection that fails still ends the source at once**, with the same
+           messages. Nothing is followed yet, and a wrong `DOCKER_HOST` or a daemon too old
+           (#152) is a configuration error, not an outage.
+      4. **The notices: `ingest.Notices`, on the context, beside `Truncations`.**
+         - **The interface is unchanged.** `Source` and every constructor stay as they are.
+         - **The two notices:**
+           - `docker: events lost, reconnecting (attempt N, next in Ds): <cause>`
+           - `docker: events reconnected, M container(s) re-attached`
+
+           The cause is `events: …` or `list: …`; M counts the matching containers the re-list
+           attached.
+         - **The path is the background-notice channel:** the status bar, and `--plain`'s
+           stderr.
+         - **`Send` never blocks**, because neither reader drains that channel continuously:
+           - `--plain` reads it on the goroutine that writes stdout, which a paused pager
+             stops;
+           - the TUI reads it on its event loop. That loop waits for the renderer, which waits
+             for the terminal (Bubble Tea's `write`/`flush` share one lock).
+         - **Why not block.** A source that waited would stall mid-reconnect, silently, which
+           is #97's failure. So a notice with no room is dropped and counted, and the total is
+           printed at exit.
+         - **The share of the buffer.** Notices fill at most 8 slots of the channel, which has
+           room for the one-shot sends besides, so a source's error still never waits.
+         - **The order.** Only `Lines`' own goroutine sends, so every notice comes before `Run`
+           returns and before the channel closes. `Stop` guards it all the same.
+
+      **Tests.** Red first, on main, in 5 of 5 runs, each by assertion within its bound:
+      - the stream closes once;
+      - a container starts and dies inside the gap;
+      - a full cut, with a container running across it and one started in it.
+
+      On main all three read "Lines returned docker: events: EOF" (or `unexpected EOF` on the
+      cut), "want it to re-subscribe".
+
+      **The fake daemon** grows per-container state: the list answers only running containers,
+      and a stopped container's logs end after its history. It also gains an event log replayed
+      by `since` and capped as the daemon's buffer is, an `endEvents` that ends only the open
+      streams, and a TCP proxy whose `down()` refuses and cuts every connection, as killing
+      socat does. Every existing test passes unchanged. `TestDockerEventsErrorEndsTheSource`
+      pinned the behaviour this replaces, and goes.
+
+      Added with the fix, because they need the shorter waits or `Notices`:
+      - the stream closing five times;
+      - the daemon unreachable for five attempts, with the waits 10/20/40/80/80 ms and the
+        refused subscription as the cause;
+      - a cancel during a one-hour wait, which returns at once with no later notice;
+      - goroutines counted by stack after each of five reconnects, and none after the cancel
+        (#119);
+      - a replayed die skipped;
+      - a gap that outruns a 2-event buffer, which loses the gap container and re-lists the
+        running one;
+      - a failed attempt closing its events request (#98);
+      - notices nobody reads, while the source keeps retrying;
+      - a flapping stream that keeps backing off;
+      - `retire`, and marks carried across sets, on `followerSet` directly.
+
+      **A stalled reader, per mode.** Each test sends 100 notices while its reader is stuck,
+      and every `Send` returns:
+      - `--plain`, with stdout a pipe nobody reads;
+      - the TUI on a pty whose screen nobody reads.
+
+      `errs` holding exactly its 8 slots shows the reader really stopped. A source's error
+      still finds room. Once the reader drains, the kept notices are shown.
+
+      **Flakiness and mutants.** Each new test passes 20 of 20 runs under `-race`, the TUI one
+      60 of 60. Eleven mutants each turn tests red:
+      - no `since` on the re-subscription;
+      - dedup off;
+      - a gap die stopped instead of retired;
+      - followers kept across connections, unwaited;
+      - followers made uncancellable (hangs);
+      - a backoff that ignores ctx;
+      - a successor after a connection's cancel;
+      - the wait restarted on every reconnect;
+      - no re-attach count;
+      - no check for a refused subscription;
+      - a blocking `Send`, which turns all three unread and stalled-reader tests red.
+
+      CI's two test steps and `golangci-lint run` pass.
+
+      **Live, main against the branch on Docker 29.9.2.** Each binary reached the daemon through
+      its own socat proxy, which kept only the client's bytes (`socat -r`): requests, never a
+      response. Both ran `--plain --explain-dry-run --docker-name '^lsx100-' --docker-tail all`.
+      The run:
+      1. `lsx100-steady` started after both binaries, logging every 200 ms;
+      2. both proxies were killed together;
+      3. in the gap, `lsx100-late` started and kept logging, and `lsx100-blip` printed 5 lines and
+         exited;
+      4. the proxies came back 5 s after the cut.
+
+      Predicted before running:
+
+      | prediction | result |
+      |---|---|
+      | main prints `ingest: docker: events: unexpected EOF` and exits 0 on its own | **Held.** |
+      | main reads steady only until the cut, and never sees late or blip | **Held.** 20 of steady's 102 lines; nothing else. |
+      | main makes one events request, with no `since` | **Held.** 5 requests in all. |
+      | the branch says `lost … (attempt 1, next in 1s): events: unexpected EOF`, then attempts 2 and 3 (2 s, 4 s) refused, then `reconnected, 2 container(s) re-attached`, with no attempt 4 | **Held**, exactly. |
+      | the re-subscription asks `since` = steady's start, the last event seen | **Held.** 155 ms after `docker run` began. |
+      | steady is re-attached with `since` = its last line read; late with no tail; blip through its replayed start | **Held.** Steady's `since` falls 168 ms before the cut. |
+      | each container's lines arrive exactly once, against `docker logs \| wc -l` | **Held.** Steady 102 of 102, late 31 of 31, blip 5 of 5. |
+      | the TUI's status bar shows the loss, the attempts and the reconnect | **Held.** Attempt 1 (`unexpected EOF`), attempt 2 (refused), then `reconnected, 1 container(s) re-attached`. |
+      | the first live capture, `socat -v` piped through `grep '^GET'`, records every request | **Wrong.** It lost the branch's requests after the reconnect, though every line arrived: chunks from the forked children share one stderr, and a request line can land mid-line. The raw dump replaced it. |
+
+      **Seen and left alone, out of scope:**
+      - A daemon that cannot be reached at startup is still not retried.
+      - A live die still cancels its follower.
+      - The TUI shows only the newest notice.
+      - Ending a pty test by context cancel races inside Bubble Tea: its kill path closes the
+        input reader without waiting for the read loop. The new pty test quits with `q`, as the
+        others do.
+      - Every other Docker-source behaviour, and the selection flags.
+
+      Targets TODO-VERSION
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
