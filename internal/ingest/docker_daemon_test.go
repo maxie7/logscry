@@ -5,12 +5,14 @@ package ingest
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -63,38 +65,60 @@ type fakeEntry struct {
 func out(ts time.Time, text string) fakeEntry  { return fakeEntry{ts, model.Stdout, text} }
 func errl(ts time.Time, text string) fakeEntry { return fakeEntry{ts, model.Stderr, text} }
 
+// fakeContainer is one container the fake daemon knows: its log file, which survives a
+// restart, and whether it is running.
+type fakeContainer struct {
+	id, name string
+	tty      bool
+	running  bool
+	log      []fakeEntry
+	gen      int // bumped when the container stops: open follow streams end
+	stopLen  int // len(log) at the last stop: what a stopped stream may still send
+}
+
+// logReq is one logs request, for the tests that count them per container.
+type logReq struct {
+	id string
+	q  url.Values
+}
+
 type fakeDaemon struct {
-	t    *testing.T
-	name string
-	tty  bool
+	t   *testing.T
+	def *fakeContainer // fakeID, the container every single-container test drives
 
-	mu      sync.Mutex
-	log     []fakeEntry   // the container's log file; survives a restart
-	gen     int           // bumped when the container stops: open follow streams end
-	stopLen int           // len(log) at the last stop: what a stopped stream may still send
-	changed chan struct{} // closed and replaced on every change to log or gen
+	mu         sync.Mutex
+	containers map[string]*fakeContainer
+	changed    chan struct{} // closed and replaced on every change to a log, a gen or the event log
+	logReqs    []logReq      // every logs request, in arrival order
 
-	reqs       chan url.Values // one per logs request, sent once its history is snapshotted
+	reqs       chan url.Values // one per logs request for fakeID, sent once its history is snapshotted
 	gone       chan struct{}   // one per follow stream the client hung up on
-	events     chan events.Message
-	eventsEnd  chan struct{} // closed by endEvents: the events stream ends, logs go on
-	eventsGone chan struct{} // one per events stream the client hung up on
-	listFails  bool          // set by failList: /containers/json answers 500
+	eventsGone chan struct{}   // one per events stream the client hung up on
+	listFails  bool            // set by failList: /containers/json answers 500
+
+	// The event log, as the daemon keeps it: every event ever published, of which a since
+	// replay sees only the newest evLimit (the daemon's eventsLimit, 256). Live streams see
+	// every event published after they subscribed.
+	evlog   []events.Message
+	evLimit int
+	evGen   int             // bumped by endEvents: the open events streams end, later ones work
+	evReqs  chan url.Values // one per events request
+	evConns int             // events streams currently open
 }
 
 func newFakeDaemon(t *testing.T, name string, tty bool, history ...fakeEntry) *fakeDaemon {
 	t.Helper()
+	def := &fakeContainer{id: fakeID, name: name, tty: tty, running: true, log: history}
 	d := &fakeDaemon{
 		t:          t,
-		name:       name,
-		tty:        tty,
-		log:        history,
+		def:        def,
+		containers: map[string]*fakeContainer{fakeID: def},
 		changed:    make(chan struct{}),
-		reqs:       make(chan url.Values, 16),
-		gone:       make(chan struct{}, 16),
-		events:     make(chan events.Message, 64),
-		eventsEnd:  make(chan struct{}),
-		eventsGone: make(chan struct{}, 16),
+		reqs:       make(chan url.Values, 256),
+		gone:       make(chan struct{}, 256),
+		eventsGone: make(chan struct{}, 256),
+		evLimit:    256,
+		evReqs:     make(chan url.Values, 256),
 	}
 	srv := httptest.NewServer(http.HandlerFunc(d.serve))
 	t.Cleanup(srv.Close)
@@ -105,34 +129,68 @@ func newFakeDaemon(t *testing.T, name string, tty bool, history ...fakeEntry) *f
 	return d
 }
 
+// add makes another container known to the daemon, stopped and with an empty log. A test
+// runs it with d.run.
+func (d *fakeDaemon) add(id, name string, tty bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.containers[id] = &fakeContainer{id: id, name: name, tty: tty}
+}
+
 var versionPrefix = regexp.MustCompile(`^/v[0-9.]+`)
 
 func (d *fakeDaemon) serve(w http.ResponseWriter, r *http.Request) {
 	p := versionPrefix.ReplaceAllString(r.URL.Path, "")
-	switch p {
-	case "/_ping":
+	switch {
+	case p == "/_ping":
 		w.Header().Set("Api-Version", "1.47")
 		w.WriteHeader(http.StatusOK)
-	case "/events":
+	case p == "/events":
 		d.serveEvents(w, r)
-	case "/containers/json":
+	case p == "/containers/json":
+		d.serveList(w)
+	case strings.HasPrefix(p, "/containers/"):
+		id, op, _ := strings.Cut(strings.TrimPrefix(p, "/containers/"), "/")
 		d.mu.Lock()
-		fails := d.listFails
+		c := d.containers[id]
 		d.mu.Unlock()
-		if fails {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"message": "list unavailable"})
-			return
+		switch {
+		case c == nil:
+			http.NotFound(w, r)
+		case op == "json":
+			writeJSON(w, map[string]any{"Id": c.id, "Name": "/" + c.name, "Config": map[string]any{"Tty": c.tty}})
+		case op == "logs":
+			d.serveLogs(w, r, c)
+		default:
+			http.NotFound(w, r)
 		}
-		writeJSON(w, []map[string]any{{"Id": fakeID, "Names": []string{"/" + d.name}}})
-	case "/containers/" + fakeID + "/json":
-		writeJSON(w, map[string]any{"Id": fakeID, "Name": "/" + d.name, "Config": map[string]any{"Tty": d.tty}})
-	case "/containers/" + fakeID + "/logs":
-		d.serveLogs(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// serveList answers the running containers, sorted by id. logscry asks with
+// status=running, which is the only filter it ever sends.
+func (d *fakeDaemon) serveList(w http.ResponseWriter) {
+	d.mu.Lock()
+	fails := d.listFails
+	var items []map[string]any
+	for _, id := range slices.Sorted(maps.Keys(d.containers)) {
+		if c := d.containers[id]; c.running {
+			items = append(items, map[string]any{"Id": c.id, "Names": []string{"/" + c.name}})
+		}
+	}
+	d.mu.Unlock()
+	if fails {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "list unavailable"})
+		return
+	}
+	if items == nil {
+		items = []map[string]any{}
+	}
+	writeJSON(w, items)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -140,28 +198,86 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// serveEvents emulates the daemon's events endpoint (daemon/events/events.go): with since,
+// the buffered events stamped at or after it, nanosecond-precise and inclusive, but only
+// from the newest evLimit; then every event published after the subscription. The replay
+// and the live position are taken under one lock, as the daemon takes them, so nothing
+// falls between. Only container start and die are delivered: the filter logscry sends.
 func (d *fakeDaemon) serveEvents(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	d.mu.Lock()
+	gen, pos := d.evGen, len(d.evlog)
+	if s := q.Get("since"); s != "" {
+		since := parseWireSince(d.t, s)
+		pos = max(len(d.evlog)-d.evLimit, 0)
+		for pos < len(d.evlog) && d.evlog[pos].TimeNano < since.UnixNano() {
+			pos++
+		}
+	}
+	d.evConns++
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		d.evConns--
+		d.mu.Unlock()
+	}()
+	d.evReqs <- q
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.(http.Flusher).Flush()
 	enc := json.NewEncoder(w)
 	for {
-		select {
-		case <-r.Context().Done():
-			d.eventsGone <- struct{}{}
+		d.mu.Lock()
+		ended := d.evGen != gen
+		batch := slices.Clone(d.evlog[pos:])
+		pos = len(d.evlog)
+		changed := d.changed
+		d.mu.Unlock()
+		if ended {
 			return
-		case <-d.eventsEnd:
-			return
-		case m := <-d.events:
+		}
+		for _, m := range batch {
+			if m.Type != events.ContainerEventType || (m.Action != events.ActionStart && m.Action != events.ActionDie) {
+				continue
+			}
 			if err := enc.Encode(m); err != nil {
 				return
 			}
-			w.(http.Flusher).Flush()
+		}
+		w.(http.Flusher).Flush()
+		select {
+		case <-changed:
+		case <-r.Context().Done():
+			signal(d.eventsGone)
+			return
 		}
 	}
 }
 
-func (d *fakeDaemon) serveLogs(w http.ResponseWriter, r *http.Request) {
+// signal sends on a counting channel without blocking: a handler that blocked on it would
+// keep httptest's Close waiting.
+func signal(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// parseWireSince reads a since parameter, which logscry sends as <sec>.<9-digit nsec>.
+func parseWireSince(t *testing.T, s string) time.Time {
+	sec, nsec, _ := strings.Cut(s, ".")
+	si, err1 := strconv.ParseInt(sec, 10, 64)
+	ni, err2 := strconv.ParseInt(nsec, 10, 64)
+	if err1 != nil || err2 != nil || len(nsec) != 9 {
+		t.Errorf("since = %q, want <sec>.<9-digit nsec>", s)
+	}
+	return time.Unix(si, ni)
+}
+
+// serveLogs emulates the logs endpoint for one container. A container that is not running
+// gets its history and the end of the stream: the daemon follows only a running one.
+func (d *fakeDaemon) serveLogs(w http.ResponseWriter, r *http.Request, c *fakeContainer) {
 	q := r.URL.Query()
 	tail, err := strconv.Atoi(q.Get("tail"))
 	if err != nil {
@@ -169,24 +285,22 @@ func (d *fakeDaemon) serveLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	var since time.Time
 	if s := q.Get("since"); s != "" {
-		sec, nsec, _ := strings.Cut(s, ".")
-		si, err1 := strconv.ParseInt(sec, 10, 64)
-		ni, err2 := strconv.ParseInt(nsec, 10, 64)
-		if err1 != nil || err2 != nil || len(nsec) != 9 {
-			d.t.Errorf("since = %q, want <sec>.<9-digit nsec>", s)
-		}
-		since = time.Unix(si, ni)
+		since = parseWireSince(d.t, s)
 	}
 
 	d.mu.Lock()
-	history := d.log
+	history := c.log
 	if tail >= 0 && tail < len(history) {
 		history = history[len(history)-tail:]
 	}
 	history = slices.Clone(history)
-	pos, gen := len(d.log), d.gen
+	pos, gen, follow := len(c.log), c.gen, c.running
+	d.logReqs = append(d.logReqs, logReq{c.id, q})
+	d.notifyLocked()
 	d.mu.Unlock()
-	d.reqs <- q
+	if c.id == fakeID {
+		d.reqs <- q
+	}
 
 	w.WriteHeader(http.StatusOK)
 	filtering := !since.IsZero()
@@ -197,22 +311,25 @@ func (d *fakeDaemon) serveLogs(w http.ResponseWriter, r *http.Request) {
 			}
 			filtering = false
 		}
-		d.writeEntry(w, e)
+		d.writeEntry(w, c, e)
 	}
 	w.(http.Flusher).Flush()
+	if !follow {
+		return
+	}
 
 	for {
 		d.mu.Lock()
-		end, ended := len(d.log), d.gen != gen
+		end, ended := len(c.log), c.gen != gen
 		if ended {
-			end = max(pos, d.stopLen) // nothing logged after the stop reaches this stream
+			end = max(pos, c.stopLen) // nothing logged after the stop reaches this stream
 		}
-		live := slices.Clone(d.log[pos:end])
+		live := slices.Clone(c.log[pos:end])
 		pos = end
 		changed := d.changed
 		d.mu.Unlock()
 		for _, e := range live {
-			d.writeEntry(w, e)
+			d.writeEntry(w, c, e)
 		}
 		w.(http.Flusher).Flush()
 		if ended {
@@ -221,15 +338,15 @@ func (d *fakeDaemon) serveLogs(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-changed:
 		case <-r.Context().Done():
-			d.gone <- struct{}{}
+			signal(d.gone)
 			return
 		}
 	}
 }
 
-func (d *fakeDaemon) writeEntry(w http.ResponseWriter, e fakeEntry) {
+func (d *fakeDaemon) writeEntry(w http.ResponseWriter, c *fakeContainer, e fakeEntry) {
 	line := []byte(e.ts.UTC().Format(rfc3339NanoFixed) + " " + e.text + "\n")
-	if d.tty {
+	if c.tty {
 		_, _ = w.Write(line)
 		return
 	}
@@ -246,27 +363,65 @@ func (d *fakeDaemon) notifyLocked() {
 }
 
 // logs appends lines to the container's log file, as the container writing them.
-func (d *fakeDaemon) logs(es ...fakeEntry) {
+func (d *fakeDaemon) logs(es ...fakeEntry) { d.logsTo(fakeID, es...) }
+
+// logsTo appends lines to container id's log file.
+func (d *fakeDaemon) logsTo(id string, es ...fakeEntry) {
 	d.mu.Lock()
-	d.log = append(d.log, es...)
+	c := d.containers[id]
+	c.log = append(c.log, es...)
 	d.notifyLocked()
 	d.mu.Unlock()
 }
 
 // endStreams ends every open follow stream, as the daemon does when the container stops.
-func (d *fakeDaemon) endStreams() {
+func (d *fakeDaemon) endStreams() { d.endStreamsOf(fakeID) }
+
+func (d *fakeDaemon) endStreamsOf(id string) {
 	d.mu.Lock()
-	d.gen++
-	d.stopLen = len(d.log)
+	c := d.containers[id]
+	c.gen++
+	c.stopLen = len(c.log)
 	d.notifyLocked()
 	d.mu.Unlock()
 }
 
-func (d *fakeDaemon) event(action events.Action) {
-	d.events <- events.Message{
+func (d *fakeDaemon) event(action events.Action) { d.eventFor(fakeID, action) }
+
+// eventFor publishes a container event, stamped now, and applies it to the container's
+// state: the daemon publishes start and die as the container's state changes.
+func (d *fakeDaemon) eventFor(id string, action events.Action) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	c := d.containers[id]
+	switch action {
+	case events.ActionStart:
+		c.running = true
+	case events.ActionDie:
+		c.running = false
+	}
+	d.publishLocked(events.Message{
 		Type:   events.ContainerEventType,
 		Action: action,
-		Actor:  events.Actor{ID: fakeID, Attributes: map[string]string{"name": d.name}},
+		Actor:  events.Actor{ID: id, Attributes: map[string]string{"name": c.name}},
+	})
+}
+
+func (d *fakeDaemon) publishLocked(m events.Message) {
+	now := time.Now()
+	m.Time, m.TimeNano = now.Unix(), now.UnixNano()
+	d.evlog = append(d.evlog, m)
+	d.notifyLocked()
+}
+
+// run starts container id, writes its lines and, if exit, stops it: a die event and the end
+// of its streams, as the daemon does when the process exits.
+func (d *fakeDaemon) run(id string, exit bool, es ...fakeEntry) {
+	d.eventFor(id, events.ActionStart)
+	d.logsTo(id, es...)
+	if exit {
+		d.endStreamsOf(id)
+		d.eventFor(id, events.ActionDie)
 	}
 }
 
@@ -277,9 +432,15 @@ func (d *fakeDaemon) failList() {
 	d.mu.Unlock()
 }
 
-// endEvents ends the events stream while every log stream stays open, as a proxy that
-// drops the idle events connection does. The client reads it as io.EOF.
-func (d *fakeDaemon) endEvents() { close(d.eventsEnd) }
+// endEvents ends the open events streams while every log stream stays open, as a proxy that
+// drops the idle events connection does. The client reads it as io.EOF. A later
+// subscription works.
+func (d *fakeDaemon) endEvents() {
+	d.mu.Lock()
+	d.evGen++
+	d.notifyLocked()
+	d.mu.Unlock()
+}
 
 // die stops the container while logscry is still reading it: a die event, which makes
 // logscry cancel the follower, and only once the follower has hung up does the stream
@@ -307,6 +468,38 @@ func (d *fakeDaemon) nextRequest() url.Values {
 	}
 }
 
+// nextEventsRequest waits for the next events request and returns its query.
+func (d *fakeDaemon) nextEventsRequest() url.Values {
+	d.t.Helper()
+	select {
+	case q := <-d.evReqs:
+		return q
+	case <-time.After(5 * time.Second):
+		d.t.Fatal("timed out waiting for an events request")
+		return nil
+	}
+}
+
+// logRequests returns the logs requests made so far for container id.
+func (d *fakeDaemon) logRequests(id string) []url.Values {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var qs []url.Values
+	for _, r := range d.logReqs {
+		if r.id == id {
+			qs = append(qs, r.q)
+		}
+	}
+	return qs
+}
+
+// lastEventTime returns the stamp of the newest event published, as logscry's since sends it.
+func (d *fakeDaemon) lastEventTime() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return time.Unix(0, d.evlog[len(d.evlog)-1].TimeNano)
+}
+
 // start re-starts the container and returns the query of the logs request logscry
 // re-attaches with. It sends one start event, as the daemon does, and waits for that
 // request: a start that arrives while the old follower is still unwinding is kept and
@@ -321,6 +514,99 @@ func (d *fakeDaemon) start() url.Values {
 		d.t.Fatal("timed out waiting for the re-attach")
 		return nil
 	}
+}
+
+// fakeProxy is a TCP forwarder in front of the fake daemon, as socat is in front of the
+// real socket. down stops it as a kill does: the port refuses, and every connection through
+// it, the events stream and every log stream alike, is cut. up listens on the same port
+// again.
+type fakeProxy struct {
+	t      *testing.T
+	target string
+	addr   string
+
+	mu    sync.Mutex
+	ln    net.Listener
+	conns map[net.Conn]bool
+}
+
+// proxy puts a fakeProxy in front of the daemon and points DOCKER_HOST at it. Call it
+// before startFollow.
+func (d *fakeDaemon) proxy() *fakeProxy {
+	d.t.Helper()
+	target := strings.TrimPrefix(os.Getenv("DOCKER_HOST"), "tcp://")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		d.t.Fatalf("proxy: %v", err)
+	}
+	p := &fakeProxy{t: d.t, target: target, addr: ln.Addr().String(), ln: ln, conns: map[net.Conn]bool{}}
+	go p.serve(ln)
+	d.t.Cleanup(p.down)
+	d.t.Setenv("DOCKER_HOST", "tcp://"+p.addr)
+	return p
+}
+
+func (p *fakeProxy) serve(ln net.Listener) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		u, err := net.Dial("tcp", p.target)
+		if err != nil {
+			_ = c.Close()
+			continue
+		}
+		p.mu.Lock()
+		if p.ln != ln { // cut while dialling
+			p.mu.Unlock()
+			_ = c.Close()
+			_ = u.Close()
+			continue
+		}
+		p.conns[c], p.conns[u] = true, true
+		p.mu.Unlock()
+		pipe := func(dst, src net.Conn) {
+			_, _ = io.Copy(dst, src)
+			_ = dst.Close()
+			_ = src.Close()
+		}
+		go pipe(u, c)
+		go pipe(c, u)
+	}
+}
+
+func (p *fakeProxy) down() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ln == nil {
+		return
+	}
+	_ = p.ln.Close()
+	p.ln = nil
+	for c := range p.conns {
+		_ = c.Close()
+	}
+	clear(p.conns)
+}
+
+func (p *fakeProxy) up() {
+	p.t.Helper()
+	var ln net.Listener
+	var err error
+	for range 50 {
+		if ln, err = net.Listen("tcp", p.addr); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		p.t.Fatalf("proxy up: %v", err)
+	}
+	p.mu.Lock()
+	p.ln = ln
+	p.mu.Unlock()
+	go p.serve(ln)
 }
 
 // follow runs src.Lines in the background against the fake daemon.
@@ -651,42 +937,6 @@ func TestDockerDuplicateStartIsIgnored(t *testing.T) {
 	f.stop()
 
 	f.expect(model.Stdout, firstRaws...)
-}
-
-// TestDockerEventsErrorEndsTheSource is #97: the events stream ends while a container is
-// followed and its log stream stays up. The Docker source can no longer see starts and
-// stops, so it must end and say so: its follower stops and Lines returns the error, rather
-// than waiting for a follower nobody stopped.
-func TestDockerEventsErrorEndsTheSource(t *testing.T) {
-	for _, tty := range []bool{false, true} {
-		t.Run(fmt.Sprintf("tty=%v", tty), func(t *testing.T) {
-			history, historyRaws := lines("line", 1, 3, 0, out)
-			d := newFakeDaemon(t, "ab-events", tty, history...)
-			f := startFollow(t, NewDockerSource(DockerSelector{NameRegex: "^ab-events$"}))
-
-			d.nextRequest()
-			f.until(historyRaws...)
-			d.endEvents()
-			select {
-			case err := <-f.done:
-				if !errors.Is(err, io.EOF) || !strings.Contains(err.Error(), "docker: events") {
-					t.Errorf("Lines = %v, want the docker: events error wrapping io.EOF", err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("Lines had not returned 2s after the events stream ended")
-			}
-			select {
-			case <-d.gone:
-			case <-time.After(2 * time.Second):
-				t.Fatal("the follower did not hang up after the events stream ended")
-			}
-			// The caller closes out once Lines has returned. A follower still running would
-			// panic sending this line on it.
-			close(f.out)
-			d.logs(out(at(100), "after the end"))
-			time.Sleep(100 * time.Millisecond)
-		})
-	}
 }
 
 // TestDockerListErrorClosesTheEventsSubscription is #98's second half: Lines subscribes to
