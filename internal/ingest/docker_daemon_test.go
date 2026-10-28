@@ -414,6 +414,17 @@ func (d *fakeDaemon) publishLocked(m events.Message) {
 	d.notifyLocked()
 }
 
+// noise publishes n events logscry does not subscribe to, as healthchecks and execs do.
+// They take room in the daemon's replay buffer all the same.
+func (d *fakeDaemon) noise(n int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for range n {
+		d.publishLocked(events.Message{Type: events.ContainerEventType, Action: events.ActionExecStart,
+			Actor: events.Actor{ID: "n0153", Attributes: map[string]string{"name": "noise"}}})
+	}
+}
+
 // run starts container id, writes its lines and, if exit, stops it: a die event and the end
 // of its streams, as the daemon does when the process exits.
 func (d *fakeDaemon) run(id string, exit bool, es ...fakeEntry) {
@@ -429,6 +440,27 @@ func (d *fakeDaemon) run(id string, exit bool, es ...fakeEntry) {
 func (d *fakeDaemon) failList() {
 	d.mu.Lock()
 	d.listFails = true
+	d.mu.Unlock()
+}
+
+// healList makes the container list answer again.
+func (d *fakeDaemon) healList() {
+	d.mu.Lock()
+	d.listFails = false
+	d.mu.Unlock()
+}
+
+// openEvents reports how many events streams are open.
+func (d *fakeDaemon) openEvents() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.evConns
+}
+
+// setEventLimit sets how many of the newest events a since replay can see.
+func (d *fakeDaemon) setEventLimit(n int) {
+	d.mu.Lock()
+	d.evLimit = n
 	d.mu.Unlock()
 }
 
@@ -611,17 +643,26 @@ func (p *fakeProxy) up() {
 
 // follow runs src.Lines in the background against the fake daemon.
 type follow struct {
-	t      *testing.T
-	cancel context.CancelFunc
-	done   chan error
-	out    chan model.LogLine
-	got    []model.LogLine
+	t       *testing.T
+	cancel  context.CancelFunc
+	done    chan error
+	out     chan model.LogLine
+	got     []model.LogLine
+	notices chan error // what the source said while running (see Notices)
 }
 
 func startFollow(t *testing.T, src *DockerSource) *follow {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	f := &follow{t: t, cancel: cancel, done: make(chan error, 1), out: make(chan model.LogLine, 1024)}
+	notices := make(chan error, 1024)
+	return startFollowWith(t, src, notices, NewNotices(notices, cap(notices)))
+}
+
+// startFollowWith is startFollow with the source's notices sent through n, which a test
+// may give a channel nobody reads.
+func startFollowWith(t *testing.T, src *DockerSource, notices chan error, n *Notices) *follow {
+	t.Helper()
+	ctx, cancel := context.WithCancel(WithNotices(context.Background(), n))
+	f := &follow{t: t, cancel: cancel, done: make(chan error, 1), out: make(chan model.LogLine, 1024), notices: notices}
 	go func() { f.done <- src.Lines(ctx, f.out) }()
 	t.Cleanup(cancel)
 	return f
