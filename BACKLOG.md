@@ -21,7 +21,7 @@ Repo stays private through M5; flip to public at M6.
 - [x] Docker source: `ContainerLogs` (Follow, Timestamps), parse RFC3339Nano
 - [x] Docker: `stdcopy.StdCopy` demux when no TTY; raw when TTY (detect via `ContainerInspect`)
 - [x] Docker: auto-attach/detach via `client.Events` on start/die (the stream is reconnected when
-      it breaks: #100, in TODO-VERSION)
+      it breaks: #100, in v0.12.34)
 - [x] Selection flags: `--docker-all` / `--docker-label` / `--docker-name`
 - [x] Fan-in all sources into one `chan LogLine`
 
@@ -1702,7 +1702,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
            Source can only report by returning, so retrying would be silent, and silence was
            this issue's failure.
 
-         Filed as #100. (Superseded by #100, in TODO-VERSION: the source reconnects.)
+         Filed as #100. (Superseded by #100, in v0.12.34: the source reconnects.)
       2. **A source's error is reported the moment that source ends, and the others keep
          running.** The run ends when every source has ended, as before. Ending the run on
          the first error was rejected for two reasons:
@@ -6643,7 +6643,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
         others do.
       - Every other Docker-source behaviour, and the selection flags.
 
-      Targets TODO-VERSION
+      Targets v0.12.34
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
