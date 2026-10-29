@@ -1633,6 +1633,14 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `deepseek-r1`) can spend the whole default budget on its chain of thought and return
   empty content with `finish_reason: length`. Prefer a plain instruct model such as
   `gemma2:2b`, or raise the cap (see [Configuration](#configuration)).
+- **On a terminal that answers nothing, the TUI waits up to 1 s before it starts.** The TUI asks
+  the terminal for its background colour (OSC 11), which picks its light or dark palette. A
+  terminal answers at once, and one that cannot report its colour still answers the
+  cursor-position query sent with it. Only something that answers neither, such as `script` with
+  no terminal behind it or a bare serial line, makes the TUI wait out the 1 s bound. It then
+  assumes a dark background, or takes it from `COLORFGBG`. An answer that arrives later reaches
+  the TUI as typed input, and contains no key logscry binds. `--version` and `--plain` ask the
+  terminal nothing and never wait (#155).
 
 ## Security
 
