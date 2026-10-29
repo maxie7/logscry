@@ -57,11 +57,15 @@ func newPTY(t *testing.T, cols int) (master, slave *os.File) {
 	return m, s
 }
 
-// answerQueries drains the program's output and replies to the terminal queries Bubble
-// Tea sends at startup (cursor position, background colour). A real terminal answers
-// them; a test that does not will watch the program block before it ever reads a key,
-// and will blame the wrong thing.
-func answerQueries(t *testing.T, master *os.File, out *strings.Builder, mu *sync.Mutex, done <-chan struct{}) {
+// blackBackground is a terminal's answer to OSC 11 when its background is black.
+const blackBackground = "\x1b]11;rgb:0000/0000/0000\x1b\\"
+
+// answerQueriesWith drains the program's output and replies to the terminal queries sent
+// at startup (background colour, cursor position), the colour with background. A real
+// terminal answers them; a test that does not will watch the program block before it ever
+// reads a key, and will blame the wrong thing. A terminal answers in the order it was
+// asked, and termenv asks the colour first, so the colour's answer goes first.
+func answerQueriesWith(t *testing.T, master *os.File, out *strings.Builder, mu *sync.Mutex, done <-chan struct{}, background string) {
 	t.Helper()
 	go func() {
 		buf := make([]byte, 4096)
@@ -77,11 +81,11 @@ func answerQueries(t *testing.T, master *os.File, out *strings.Builder, mu *sync
 				mu.Lock()
 				out.WriteString(chunk)
 				mu.Unlock()
+				if strings.Contains(chunk, "\x1b]11;?") {
+					_, _ = master.WriteString(background)
+				}
 				if strings.Contains(chunk, "\x1b[6n") {
 					_, _ = master.WriteString("\x1b[1;1R")
-				}
-				if strings.Contains(chunk, "\x1b]11;?") {
-					_, _ = master.WriteString("\x1b]11;rgb:0000/0000/0000\x1b\\")
 				}
 			}
 			if err != nil {
@@ -109,6 +113,12 @@ func runOnPTY(t *testing.T, snaps chan pipeline.Snapshot, opts Options) (send fu
 // program picks.
 func runOnPTYAt(t *testing.T, snaps chan pipeline.Snapshot, opts Options, cols int) (send func(string), exited chan error, output func() string) {
 	t.Helper()
+	return runOnPTYWith(t, snaps, opts, cols, blackBackground)
+}
+
+// runOnPTYWith is runOnPTYAt on a terminal that answers OSC 11 with background.
+func runOnPTYWith(t *testing.T, snaps chan pipeline.Snapshot, opts Options, cols int, background string) (send func(string), exited chan error, output func() string) {
+	t.Helper()
 
 	master, slave := newPTY(t, cols)
 	var (
@@ -116,7 +126,7 @@ func runOnPTYAt(t *testing.T, snaps chan pipeline.Snapshot, opts Options, cols i
 		out strings.Builder
 	)
 	done := make(chan struct{})
-	answerQueries(t, master, &out, &mu, done)
+	answerQueriesWith(t, master, &out, &mu, done, background)
 
 	// The test binary has no controlling terminal of its own, so the pty stands in for
 	// /dev/tty. Everything after this line is the production path.

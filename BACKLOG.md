@@ -6645,6 +6645,219 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.34
 
+- [x] **Startup asks the terminal nothing, and the TUI asks with a 1 s bound** — #155, found while
+      gathering #100's live evidence. On a terminal that answers nothing, every logscry process,
+      `--version` and `--plain` included, waited 5 s before `main` ran, sources and all.
+
+      **The cause.** bubbletea v1.3.10's package `init` calls `lipgloss.HasDarkBackground()`
+      (`tea_init.go:7-22`), on purpose: its comment says it makes lipgloss ask *before* a Program
+      takes the terminal, or the answer races Bubble Tea's reader. That reaches termenv v0.16.0's
+      `termStatusReport` (`termenv_unix.go:234-293`):
+      - it writes OSC 11 and then a cursor-position query (`\e[6n`, a sentinel every terminal
+        answers) to stdout, and reads the answers from stdout's fd;
+      - each byte waits up to `OSCTimeout = 5 * time.Second` (`termenv_unix.go:18`, `:150`).
+
+      Package init runs before `main`, so no flag could help. `script` with no terminal behind it
+      answers neither query, and showed it: `--version` took 5,043 ms against 21 ms redirected,
+      with `bubbletea.init.0 → lipgloss.HasDarkBackground → termenv.waitForData` in the
+      goroutine dump.
+
+      **Options, from the pinned sources.**
+      1. **A termenv/lipgloss knob.**
+         - `OSCTimeout` is a `const`.
+         - `WithUnsafe` and `WithTTY` (`output.go:115-134`) apply only to an `Output` logscry
+           builds itself. The query in init uses lipgloss's default renderer, built from
+           `termenv.DefaultOutput()` when lipgloss's package variables are initialized
+           (`renderer.go:12-14`).
+         - `lipgloss.SetHasDarkBackground` (`renderer.go:162-181`) skips the query, but only if
+           it is called before bubbletea's init. A package that calls it must import lipgloss.
+           Once lipgloss is initialized, `github.com/charmbracelet/bubbletea` sorts ahead of any
+           `github.com/maxie7/…` package, and `GODEBUG=inittrace=1` showed lipgloss followed
+           directly by bubbletea.
+         - **What does work** is a `TERM` beginning `screen`, `tmux` or `dumb`. termenv then asks
+           nothing (`termenv_unix.go:235-240`), and it reads `TERM` at the moment it asks.
+           `CI` does the same (`termenv.go:28-33`).
+
+         Setting `TERM` early enough is possible. The Go spec initializes "the first uninitialized
+         package in the list sorted by import path whose imports are all initialized". A package
+         that imports only `os`, which termenv imports too, is ready whenever termenv is, and
+         `github.com/maxie7/…` sorts before `github.com/muesli/termenv`. **Taken.**
+      2. **A newer v1 release.**
+         - The module proxy lists bubbletea v1.3.10, lipgloss v1.1.0 and termenv v0.16.0 as the
+           newest of each line.
+         - `tea_init.go` has had one commit through v1.3.10 (d6458e03f, "fix: force query the
+           terminal bg before running any programs"), and no release note from v1.1.1 through
+           v1.3.10 mentions init or the query.
+         - The lipgloss commits after v1.1.0 never touch `renderer.go`.
+         - Only `charm.land/bubbletea/v2` changed `tea_init.go`.
+
+         **There is none.**
+      3. **Bubble Tea v2.** Estimated, not started. It changes:
+         - three module paths, and termenv goes;
+         - `tea.KeyMsg` becomes `KeyPressMsg` with a new key API (47 references, most in tests);
+         - `View()` returns `tea.View`, and the alt screen moves into it;
+         - the 7 `AdaptiveColor`s become `LightDark` driven by `tea.BackgroundColorMsg`, so the
+           package-level styles (28 `NewStyle`) become model state;
+         - the viewport API;
+         - `panes_test`'s profile forcing, and both pty harnesses.
+
+         About 15 files and 800–1,200 changed lines, 1.5–3 days with the M2 TTY matrix
+         re-proved. Not needed, given 1.
+      4. **Others, rejected.**
+         - A patched bubbletea through `replace`: `go install …@latest`, the README's install
+           path, refuses a module with replace directives.
+         - A fork under its own module path: `bubbles/viewport` would still link the original
+           tea types.
+         - Re-exec: the wait is over before anything could re-exec.
+         - ldflags can neither skip an init nor change a const.
+
+      **Decisions.**
+      1. **`internal/bgquery` sets `TERM=dumb` for the span of package init.**
+         - It does so only when stdout is a character device: a superset of a terminal, and so
+           of every case termenv would ask. A test binary's stdout is a pipe, so it is never
+           touched.
+         - `main` calls `bgquery.Restore()` before anything else: unset if `TERM` was unset,
+           otherwise its old value. The configuration, every source's environment and the first
+           render all see the real `TERM`.
+         - The colour profile is safe. lipgloss reads it lazily, on the first render
+           (`renderer.go:66-79`), and nothing renders during init. Under `dumb` it would have
+           been Ascii.
+         - Nothing changes on Windows: termenv asks a console nothing (`termenv_windows.go:52-55`).
+      2. **The TUI asks, in `Terminal.Run`, before `tea.NewProgram`.** That is the one place
+         main and the pty tests both go through.
+         - The question, the parse (`xTermColor`, which reads only four-digit components), the
+           `l < 0.5` rule and the fallback (`COLORFGBG`, else black) are termenv's own. termenv
+           gets the terminal behind `boundedTTY`, in unsafe mode, so it reads through us, and
+           each read waits with termenv's own `select`, until one deadline shared by the whole
+           question.
+         - Unsafe mode skips termenv's checks before it asks, so the two that matter come first:
+           with `CI` set, or the terminal not in the foreground, termenv decides without asking.
+         - The terminal is put raw with `x/term`, and `defer term.Restore` follows at once. An
+           answer, a timeout, a failed read and a panic all give the terminal its mode back.
+      3. **The bound is 1 s.** It applies only to a terminal that answers neither query; one
+         that cannot report its colour still answers the cursor query at once.
+         - A terminal that answers does so in one round trip: well under a millisecond locally,
+           ~300 ms over intercontinental SSH, ~600 ms over a geostationary link. 1 s covers them.
+         - A silent terminal pays the bound once, at TUI start only. lipgloss v2 picked 2 s for
+           the same question (`terminal.go:49`).
+         - An answer later than the bound reaches Bubble Tea as input. `]11;rgb:hhhh/…` and
+           `[r;cR` hold no key the TUI binds (q, t, p, j, k, Tab, Enter, Space, arrows,
+           Home/End), so it is inert, as it was after 5 s.
+      4. **Who asks what.**
+         - `--version` and `--plain` ask nothing.
+         - The TUI asks once, on unix, when stdout is the terminal's foreground and neither
+           `TERM` nor `CI` rules it out: termenv's own conditions.
+      5. **The terminal asked is the one drawn on.** The question is written to the TUI's
+         stdout and its answer read from the same fd, as termenv did.
+         - `/dev/tty`, the keyboard of the M2 TTY matrix, is opened by `resolve` and not read
+           until the program starts, after the question, so nothing competes for the answer.
+         - With stdout a terminal other than the controlling one (`> /dev/pts/N`), the
+           foreground check fails and nothing is asked, as before.
+
+      **Tests.**
+      - **Red first, on main, by assertion within 3 s.** `TestStartupAsksTheTerminalNothing`
+        re-executes the test binary on a pty that is the child's controlling terminal and
+        answers nothing. Package init runs in the child as in the real binary. The child's
+        environment has no `CI`, which termenv takes as "no terminal" and which would hide the
+        bug on GitHub's runners, and `TERM=xterm-256color`.
+        - `--version` and `--plain` each failed on main with
+          `sent the terminal query "\x1b]11;?"` and `"\x1b[6n"`, then `was still running after
+          3s`.
+        - The TUI failed with `drew nothing within 3s`.
+        - On the branch the first two exit in milliseconds having asked nothing, and the TUI
+          draws within 2.5 s in 256 colours. That last check fails if `TERM` is not restored.
+      - **`TestBackgroundQueryMatchesTermenv`.** Twelve answers, each compared with termenv,
+        unbounded, on an identical pty, and with the verdict written down:
+        - black and white;
+        - `7f7f` and `8080`, either side of lightness 0.5;
+        - Solarized dark and light;
+        - a BEL terminator;
+        - two-digit components, which fall back to dark;
+        - no colour report, with and without `COLORFGBG`;
+        - an answer that beats `COLORFGBG`;
+        - `TERM=screen`, which is asked nothing.
+      - **`TestBackgroundQueryIsBounded`.** A silent pty with the bound at 100 ms: it gives up
+        after at least 100 ms and under 1 s, with termenv's fallback, with and without
+        `COLORFGBG`.
+      - **`TestBackgroundQueryRestoresTheMode`.** The pty's termios before and after are equal
+        after an answer, a timeout, a failed read and a panic. In each case the mode while the
+        question arrived differed, so the restore was really tested.
+      - **`TestPTYTUIFollowsTheTerminalsBackground`.** Through `Resolve` and `Run`, a light
+        answer draws the focused border in `colFocus`'s Light variant and a dark one in its Dark.
+        The pty harness now answers the colour before the cursor query, the order a terminal
+        answers in.
+      - **`TestImportsOnlyOS`.** The structural guard: `go/build` must report exactly `["os"]`
+        as `bgquery`'s imports, for linux, darwin and windows.
+
+      **Mutants**, all red:
+      - `bgquery` importing `gopkg.in/yaml.v3` is caught by `TestImportsOnlyOS` only. **The
+        prediction was wrong**: it said the startup test would go red too. yaml's imports are
+        all standard library, so it initializes early, and the mutant's init trace has yaml
+        (position 88) and `bgquery` (position 89) before termenv (position 111). What breaks the order is an import that
+        can only be initialized after termenv, not one that sorts after it.
+      - `bgquery` importing lipgloss, which is such an import: both `TestImportsOnlyOS` and the
+        startup test turn red.
+      - `bgquery` importing `golang.org/x/sys/unix`, a dependency of termenv itself, is caught
+        by `TestImportsOnlyOS` only. That guard is deliberately stricter than the order needs.
+      - No restore of the mode, and a restore that is not deferred (the panic leaks raw mode):
+        `TestBackgroundQueryRestoresTheMode`.
+      - `Run` not asking: `TestPTYTUIFollowsTheTerminalsBackground`.
+      - `main` not restoring `TERM`: the startup test, by its colour check.
+      - termenv's 5 s as the bound: `TestBackgroundQueryIsBounded` and the startup test.
+      - A verdict always dark: three tests.
+
+      **Flakiness.** The new tests pass 20 of 20 under `-race`. A race-built child sleeps 1 s on
+      exit (`GORACE`'s `atexit_sleep_ms`), half the 2 s bound, so the child runs with it at 0.
+      The startup test then takes about 0.04 s per short case and 1.1 s for the TUI, under
+      `-race` too.
+
+      CI's two test steps (run with `CI=true`, as on the runners) and `golangci-lint run` pass.
+      `GOOS=darwin go build ./...` and `GOOS=windows go build ./...` pass.
+
+      **Live, main (`9b811d0`) against the branch.** A pty harness started each binary as a
+      session leader with the pty as its controlling terminal, `TERM=xterm-256color` and
+      `COLORTERM=truecolor`. It ran three lines on stdin, quit the TUI with `q` 0.5 s after its
+      first frame, and took the median of 10 runs. The times include the harness's spawn.
+
+      | invocation | predicted, main / branch | (i) silent | (ii) answers dark | (iii) answers light | (iv) stdout redirected |
+      |---|---|---|---|---|---|
+      | `--version` | ≈5.0 s / ≈20 ms silent; ≈20 ms elsewhere | 5,046.6 / 37.1 ms | 37.0 / 36.9 ms | 37.4 / 36.9 ms | 37.4 / 20.7 ms |
+      | `--plain`, 3 lines | ≈5.0 s / ≈30 ms silent; ≈30 ms elsewhere | 5,046.9 / 37.2 ms | 37.3 / 37.2 ms | 37.3 / 37.3 ms | 36.7 / 37.3 ms |
+      | TUI, to first frame | ≈5.0 s / ≈1.0 s silent; ≈50 ms answering | 5,050.9 / 1,047.1 ms | 44.6 / 43.6 ms | 44.5 / 45.5 ms | plain by the matrix: 37.3 / 37.3 ms |
+
+      - **Held:** main's 5 s on a silent terminal, for all three; the branch's milliseconds for
+        `--version` and `--plain` there; the TUI's 1 s bound; and no change wherever the terminal
+        answers or stdout is redirected.
+      - **Missed:** the 20 ms prediction for `--version`. Every fast cell reads ≈37 ms, with the
+        odd run at 17–21 ms in either binary. Main with stdout redirected asks nothing and shows
+        the same ≈37 ms, so the extra comes from how the harness measures, not from the
+        binaries; the cause was not chased. The claim the table is for holds: on a silent
+        terminal the branch is as fast as main with stdout redirected.
+      - **Colours, predicted identical, held.** Two passes, 3 runs of each binary per background:
+        - the three plain lines, which carry no level the normalizer reads;
+        - JSON lines at error, warn, info and fatal.
+
+        The 24-bit colours in every frame, as sets:
+        - dark: `107;113;128` (dim), `73;222;128` (quiet), `94;234;211` (focus),
+          `255;95;95` (fatal/error), `229;192;123` (warn);
+        - light: `107;113;128`, `21;128;60`, `15;118;110`, `192;56;43`, `183;121;31`.
+
+        Each is the AdaptiveColor variant for its background, and each set is the same on main
+        and the branch.
+
+      **Seen and left alone, out of scope:**
+      - termenv reads only four-digit colour components, so a terminal that answers `rgb:ff/ff/ff`
+        is taken as dark. The branch keeps that, since the point was no change.
+      - termenv reads the answer from stdout's fd, so a write-only redirect to a terminal falls
+        back to dark. Also kept.
+      - `internal/tui`'s tests do not compile off Linux: `mode_test.go` has no build constraint
+        and calls the linux-only `newPTY`. This predates the branch and is drafted as an issue.
+      - The RDI's repository layout lists neither `internal/export` nor `internal/anonymize`, and
+        `internal/bgquery` is not added to it.
+      - The Bubble Tea v2 migration, and every other dependency.
+
+      Targets v0.12.35
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
