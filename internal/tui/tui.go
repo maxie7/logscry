@@ -67,6 +67,9 @@ func (t Terminal) Run(ctx context.Context, snaps <-chan pipeline.Snapshot, errs 
 	}
 	if t.out != nil {
 		opts = append(opts, tea.WithOutput(t.out))
+		// Ask the screen whether it is dark now, before the program reads the keyboard: an
+		// answer read by Bubble Tea would be lost to the question and arrive as keystrokes.
+		setBackground(t.out)
 	}
 
 	p := tea.NewProgram(New(snaps, errs, o), opts...)

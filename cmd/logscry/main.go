@@ -43,6 +43,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/maxie7/logscry/internal/bgquery"
 	"github.com/maxie7/logscry/internal/config"
 	"github.com/maxie7/logscry/internal/export"
 	"github.com/maxie7/logscry/internal/ingest"
@@ -54,6 +55,10 @@ import (
 )
 
 func main() {
+	// Before anything reads TERM: package init ran with TERM=dumb, so that bubbletea's init asked
+	// the terminal nothing (#155). The TUI asks it itself, bounded (see tui.Terminal.Run).
+	bgquery.Restore()
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

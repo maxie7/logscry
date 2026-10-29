@@ -116,20 +116,28 @@ func (s *silentStartup) wait() (time.Duration, bool) {
 	}
 }
 
-// childEnv is this process's environment for the child, with TERM a terminal termenv would
-// query and without CI: termenv treats any non-empty CI as "not a terminal" and asks nothing,
-// so on GitHub's runners the bug would hide and the test would pass on main.
+// childEnv is this process's environment for the child, with TERM a 256-colour terminal termenv
+// would query and nothing else that decides colour. Above all without CI: termenv treats any
+// non-empty CI as "not a terminal" and asks nothing, so on GitHub's runners the bug would hide
+// and the test would pass on main.
+//
+// Under -race the child would also sleep 1 s on its way out (GORACE's atexit_sleep_ms), half of
+// startupBound, so that is switched off.
 func childEnv() []string {
 	var env []string
+	gorace := "atexit_sleep_ms=0"
 	for _, kv := range os.Environ() {
-		switch {
-		case strings.HasPrefix(kv, "CI="), strings.HasPrefix(kv, "TERM="),
-			strings.HasPrefix(kv, "COLORFGBG="), strings.HasPrefix(kv, startupChildEnv+"="):
+		name, value, _ := strings.Cut(kv, "=")
+		switch name {
+		case "CI", "TERM", "COLORTERM", "COLORFGBG", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", startupChildEnv:
+			continue
+		case "GORACE":
+			gorace = value + " " + gorace
 			continue
 		}
 		env = append(env, kv)
 	}
-	return append(env, "TERM=xterm-256color")
+	return append(env, "TERM=xterm-256color", "GORACE="+gorace)
 }
 
 // terminalQueries are what termenv writes to ask a terminal for its background colour: OSC 11,
@@ -195,6 +203,11 @@ func TestStartupAsksTheTerminalNothing(t *testing.T) {
 		if drawn > tuiBound {
 			t.Errorf("the TUI drew its first frame after %v on a terminal that never answers, want under %v (#155)",
 				drawn, tuiBound)
+		}
+		// In colour: the TERM the child was given, not the TERM=dumb its package init ran with.
+		if !strings.Contains(s.output(), "\x1b[38;5;") {
+			t.Errorf("the TUI drew no 256-colour style under TERM=xterm-256color: TERM was not restored "+
+				"after package init\noutput: %q", s.output())
 		}
 		_, _ = s.master.WriteString("q")
 		if _, exited := s.wait(); !exited {
