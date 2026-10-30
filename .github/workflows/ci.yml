@@ -47,6 +47,18 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Every package's tests must compile for each OS logscry ships. Only Linux runs them, so
+      # nothing else would notice a test file that calls a Linux-only helper (#157). amd64
+      # stands for arm64: no file in the module has an arch constraint.
+      - name: Compile tests (darwin, windows)
+        run: |
+          for goos in darwin windows; do
+            echo "::group::GOOS=$goos"
+            GOOS=$goos GOARCH=amd64 go test -c -o "$RUNNER_TEMP/tests-$goos/" ./... || fail=1
+            echo "::endgroup::"
+          done
+          [ -z "${fail:-}" ] || exit 1
+
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
