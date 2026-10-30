@@ -47,6 +47,9 @@ minutes on 4 cores. A new superset gate must follow their name pattern, `Test…
 and be added to `SUPERSET_GATES` in [`.github/workflows/ci.yml`](.github/workflows/ci.yml); CI
 fails until it is.
 
+The tests compile on every OS logscry ships for, and CI checks that for macOS and Windows; the pty
+and terminal tests run only on Linux, which is the only OS CI runs the tests on.
+
 CI also runs govulncheck in a job of its own, on every push and pull request and weekly. It is
 not part of the local check. It fails only on a vulnerability that the code reaches and that has
 a fix we can take. One with no fixed version only warns. When the job is red over the standard

@@ -6983,6 +6983,63 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Targets v0.12.36
 
+- [x] **Every package's tests compile for darwin and windows** — #157, named in #155's entry.
+      Only Linux runs the tests, and nothing compiled them for another OS.
+
+      **The failures, all of them.** `go test -c` per package, for darwin/amd64, darwin/arm64,
+      windows/amd64 and windows/arm64, with `-gcflags=-e` on the failing one. Each target fails
+      the same way, and only in `internal/tui`:
+      - `mode_test.go:15:14: undefined: newPTY`: `fakeTTY` calls it;
+      - `notices_pty_test.go:28:19: undefined: newPTY`: `TestPTYStalledScreenDoesNotStallNotices`
+        calls it.
+
+      Neither file has a build constraint. `newPTY` lives in the linux-only `pty_test.go`. The
+      other nine packages with tests compile on all four. No file in the module has an arch
+      constraint, so arm64 matches amd64.
+
+      **The fix, per file.**
+      - `pty_other_test.go` is new and `//go:build !linux`. Its `newPTY` skips with the reason.
+        The constraint is `!linux`, not `!unix`, because the harness uses `TIOCSPTLCK` and
+        `TIOCGPTN`, which x/sys/unix does not define for darwin.
+      - `mode_test.go` and `notices_pty_test.go` are unchanged. Moving their pty tests into
+        linux-tagged files would have split `mode_test.go`, whose `TestDecide` and
+        `TestIsTerminalRejectsCharDevices` are portable. The tests would also vanish off Linux
+        instead of saying why they did not run.
+
+      **Which tests exist where.**
+      - **Linux:** unchanged. No file in the Linux build changed. `go test -list .` for every
+        package, main against the branch, is identical: 580 names.
+      - **darwin and windows, compiled and skipped:** `TestResolveTakesTheKeyboardFromDevTTY`,
+        `TestResolveFallsBackToStdin`, `TestResolvePlainWhenOutputIsPiped` and
+        `TestPTYStalledScreenDoesNotStallNotices`. The skip itself cannot be watched here, since
+        nothing runs the tests off Linux.
+      - **darwin and windows, not built:**
+        - in `internal/tui`, 11 tests: the 3 `TestBackgroundQuery*`, and every `TestPTY*` but
+          `TestPTYStalledScreenDoesNotStallNotices` (8);
+        - in `cmd/logscry`, `TestStartupAsksTheTerminalNothing` and `TestStartupChild`.
+
+      **The CI step.** "Compile tests (darwin, windows)", in the build job after Vet, runs
+      `go test -c ./...` for each OS on amd64 and reports both before it fails. It is red at its
+      own commit with the two errors above, for each OS, and green once the stub lands.
+      - Cold, on 4 cores locally, it took 29.5 s. setup-go saves its cache only on a key miss, so
+        expect it to run cold, about 30–60 s.
+      - It is a step rather than a job of its own: a job would cost a runner, a checkout and
+        setup-go to save about as long.
+
+      `GOOS=darwin` and `GOOS=windows` `go vet ./...` and `golangci-lint run ./internal/tui/...`
+      pass. CI's two test steps and `golangci-lint run` pass. actionlint passes, without
+      shellcheck installed.
+
+      **Seen and left alone:**
+      - **Running the tests on macOS and Windows runners.** That needs a darwin `newPTY`
+        (`TIOCPTYGRANT`, `TIOCPTYUNLK`, `TIOCPTYGNAME`).
+      - **`golangci-lint run` lints only the Linux build.** The `!unix` and `!linux` files are
+        linted by nobody in CI.
+      - **`cmd/logscry/startup_pty_test.go` carries its own copy** of `newPTY`'s `/dev/ptmx` code.
+      - The Bubble Tea v2 migration.
+
+      No release (no binary change).
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
