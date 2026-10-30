@@ -3,6 +3,7 @@
 package ingest
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/client"
 
 	"github.com/maxie7/logscry/internal/model"
 )
@@ -290,6 +292,68 @@ func TestDockerUnreachableForSeveralAttempts(t *testing.T) {
 	}
 	if !slices.Equal(got["docker:ab-late"], lateRaws) {
 		t.Errorf("ab-late delivered %q, want %q", got["docker:ab-late"], lateRaws)
+	}
+}
+
+// lateRefusal is cli.Events with a refused subscription's error held until the attempt's
+// context ends: the latest the client can deliver it, after the list has failed (#159).
+// Every other error, a cut stream's included, is passed on as it comes.
+func lateRefusal(cli *client.Client, ctx context.Context, opts client.EventsListOptions) client.EventsResult {
+	sub := cli.Events(ctx, opts)
+	errs := make(chan error, 1)
+	go func() {
+		defer close(errs)
+		err, ok := <-sub.Err
+		if !ok {
+			return
+		}
+		if client.IsErrConnectionFailed(err) {
+			<-ctx.Done()
+		}
+		errs <- err
+	}()
+	return client.EventsResult{Messages: sub.Messages, Err: errs}
+}
+
+// TestDockerLateRefusalIsTheCause: the client closes started before it sends a refusal, so
+// the error can reach Err after Events has returned and the list has run, and been refused
+// too. The attempt still names the subscription, which was refused first.
+func TestDockerLateRefusalIsTheCause(t *testing.T) {
+	history, historyRaws := lines("line", 1, 2, 0, out)
+	d := newFakeDaemon(t, "ab-late", false, history...)
+	p := d.proxy()
+	src := fast(NewDockerSource(DockerSelector{NameRegex: "^ab-late$"}))
+	src.subscribe = lateRefusal
+	f := startFollow(t, src)
+
+	d.nextEventsRequest()
+	d.nextRequest()
+	f.until(historyRaws...)
+	p.down()
+	expectLost(t, f.notice(), 1)
+	for attempt := 2; attempt <= 4; attempt++ {
+		if _, cause := expectLost(t, f.notice(), attempt); !strings.HasPrefix(cause, "events: Cannot connect to the Docker daemon") {
+			t.Errorf("attempt %d: cause %q, want the refused subscription", attempt, cause)
+		}
+	}
+	f.stop()
+}
+
+// TestDockerUnreachableAtStartupSaysTheList: a first connection that fails is said by the list,
+// as before #100, even though its subscription was refused first. Only a reconnect attempt
+// names the subscription.
+func TestDockerUnreachableAtStartupSaysTheList(t *testing.T) {
+	d := newFakeDaemon(t, "ab-down", false)
+	d.proxy().down()
+	f := startFollow(t, NewDockerSource(DockerSelector{NameRegex: "^ab-down$"}))
+
+	select {
+	case err := <-f.done:
+		if err == nil || !strings.HasPrefix(err.Error(), "docker: list: Cannot connect to the Docker daemon") {
+			t.Fatalf("Lines = %v, want the docker: list error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Lines had not returned 5s after a first connection to an unreachable daemon")
 	}
 }
 

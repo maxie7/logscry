@@ -40,6 +40,9 @@ type DockerSource struct {
 
 	// retryMin and retryMax bound the wait between reconnect attempts (see Lines).
 	retryMin, retryMax time.Duration
+	// subscribe opens the events subscription. nil is cli.Events; a test stands in for it to
+	// choose when a refusal reaches Err.
+	subscribe func(cli *client.Client, ctx context.Context, opts client.EventsListOptions) client.EventsResult
 }
 
 // NewDockerSource returns a Source that follows Docker container logs.
@@ -198,11 +201,17 @@ func (s *DockerSource) connect(ctx context.Context, cli *client.Client, m matche
 	} else if st.subscribed.IsZero() {
 		st.subscribed = subscribed
 	}
-	sub := cli.Events(sctx, opts)
+	subscribe := s.subscribe
+	if subscribe == nil {
+		subscribe = (*client.Client).Events
+	}
+	sub := subscribe(cli, sctx, opts)
 	msgs, errs := sub.Messages, sub.Err
 	if resumed {
-		// Events returns once the daemon has answered, so a refused subscription is already
-		// here. (A first connection lets the list say it, as before #100.)
+		// Events returns once the daemon has answered, and a refusal is usually here by then,
+		// which saves the list. It is not always: the client closes started before it sends the
+		// error (system_events.go:53-54), so one can land just after (#159). The list's error
+		// path below takes that one. (A first connection lets the list say it, as before #100.)
 		select {
 		case err := <-errs:
 			return fmt.Errorf("events: %w", err)
@@ -214,6 +223,15 @@ func (s *DockerSource) connect(ctx context.Context, cli *client.Client, m matche
 	lf := make(client.Filters).Add("status", "running")
 	list, err := cli.ContainerList(sctx, client.ContainerListOptions{Filters: lf})
 	if err != nil {
+		if resumed {
+			// The subscription was answered first, so if it was refused, that is the attempt's
+			// cause, whenever its error lands. Closing it ends the client's goroutine on every
+			// path, so its last error comes at once: a refusal of its own, or our cancel's.
+			cancel()
+			if eerr := <-errs; eerr != nil && !errors.Is(eerr, context.Canceled) {
+				return fmt.Errorf("events: %w", eerr)
+			}
+		}
 		return fmt.Errorf("list: %w", err)
 	}
 	attached := 0

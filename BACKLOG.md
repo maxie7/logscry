@@ -6482,8 +6482,10 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Checked in source first:
       - **The client.** `Events` (moby/moby/client v0.6.2) returns once the daemon has
-        answered, so a refused subscription is already in `Err`. `Messages` is never closed;
-        `Err` gets one error and closes.
+        answered. A refused subscription's error reaches `Err` just after that, not before
+        (#159): the client closes `started` and only then sends the error
+        (`system_events.go:53-54`), so it is usually in `Err` when `Events` returns, but not
+        always. `Messages` is never closed; `Err` gets one error and closes.
       - **The daemon** (`daemon/events/events.go`):
         - it keeps its last `eventsLimit = 256` events, of **every** type, filtering only on
           replay;
@@ -6497,7 +6499,8 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
          Then it backs off and connects again:
          - **The order.** It subscribes with `since` = the last event it handled, then checks
            for a refused subscription, then re-lists the running containers and re-attaches
-           each from its mark.
+           each from its mark. A refusal that lands after the check is taken if the list fails
+           (#159).
          - **`since` before any event** is this host's clock at the first subscription.
          - **Each connection has its own `followerSet`.** It takes the marks of the one before,
            which has exited.
@@ -6857,6 +6860,128 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       - The Bubble Tea v2 migration, and every other dependency.
 
       Targets v0.12.35
+
+- [x] **A refused events subscription is the attempt's cause, even when its error lands after
+      the list** — #159, a flaky `TestDockerUnreachableForSeveralAttempts` in CI on a pull request
+      unrelated to the Docker source: `attempt 3: cause "list: Cannot connect to the Docker daemon
+      at …", want the refused subscription`. Reconnecting still worked. The notice named the list
+      instead of the subscription, and one more request was made.
+
+      **The cause, from moby/moby/client v0.6.2.** `Events` returns as soon as its goroutine
+      closes `started` (`system_events.go:36,84`):
+      - on a refused request, the goroutine closes `started` first and sends the error after
+        (`:53-54`);
+      - a `since` it cannot parse goes the same way (`:42-43`).
+
+      So the client never guaranteed what #100's decision 1 assumed: that a refusal is already in
+      `Err` when `Events` returns.
+
+      It held only through the Go scheduler (go1.26.10):
+      - the close readies the caller into its P's `runnext` (`chan.go:484`, `proc.go:1137-1138`);
+      - the closing goroutine runs on to the send, and its P runs the caller only after that.
+
+      The order breaks in two ways:
+      - another P steals the caller after the 3 µs backoff (`proc.go:7695,7704`), while the closing
+        goroutine's thread is stalled;
+      - a preemption lands between the two lines.
+
+      With one P, only the second is possible. So #100's claim is wrong as a guarantee, always,
+      and wrong in fact only under some scheduling.
+
+      **Reproduced first.** The stress run used `-test.run '^TestDockerUnreachableForSeveralAttempts$'
+      -test.count 500 -test.cpu N`, with the same flags for both trees' `go test -c` binaries. The
+      hog was 40 busy loops on 20 CPUs. Failures out of 500:
+
+      | variant | predicted on main | main | branch |
+      |---|---|---|---|
+      | `-race`, cpu 1, idle | 0 | 0 | 0 |
+      | `-race`, cpu 20, idle | 0–1 | 2 | 0 |
+      | plain, cpu 1, idle | 0 | 0 | 0 |
+      | plain, cpu 20, idle | 0–1 | 0 | 0 |
+      | `-race`, cpu 1, hog | 0 | 0 | 0 |
+      | `-race`, cpu 20, hog | ≈1–10 | **58** | 0 |
+      | plain, cpu 1, hog | 0 | 0 | 0 |
+      | plain, cpu 20, hog | a few | **0** | 0 |
+
+      - **One P never fails, as predicted**, so `-cpu 1` alone is the wrong lever.
+      - **Two predictions were wrong.** The race detector widens the window far more than
+        predicted, and without it the window is too narrow to hit even under the hog.
+      - Every one of main's 60 failures named `list:`, at attempts 2 to 5.
+
+      **The window forced.** A copy of the client with `runtime.Gosched()` between `:53` and `:54`
+      reproduces it every time. It is wired in through a `go.work` replace kept outside the tree.
+      The go command refuses an `-overlay` beneath GOMODCACHE, and a first attempt that way ran no
+      test at all. Under `-race -cpu 1 -count=100`:
+      - main's state: 100 of 100 red;
+      - the branch: 100 of 100 green.
+
+      **Options.**
+      1. **After `Events`, wait for `Err` or a sign that the subscription is live.** No such sign
+         exists. On success the client sends nothing on either channel until an event arrives or
+         the stream ends (`:63-82`).
+         - Bounded only by ctx, a reconnect on a quiet host waits for the next start or die:
+           a hang, and #97's silence again.
+         - Bounded by a timeout, it adds that timeout to every reconnect, and the same stall can
+           outlast it.
+
+         Rejected.
+      2. **Keep the order, and let the test accept either step.** There would be no release. But
+         the same outage would be named one way or the other, and the test would stop pinning it.
+         Kept as the fallback.
+      3. **When a resumed attempt's list fails, close the subscription and take how it ended.**
+         `connect` cancels the subscription and receives its last error. Anything but
+         `context.Canceled` is the subscription's own failure, and it is named `events:`.
+         **Taken.**
+         - **It cannot hang.** Every path of the client's goroutine sends once and closes `Err`
+           (`:38`). A refusal is already decided. A live stream ends on the cancel (`:65-66`,
+           `:77-78`, or its body read).
+         - **The success path is untouched.** The new code runs only once the list has failed.
+         - **The requests are unchanged.** The early check stays and saves the list in the usual
+           order. In the race the list is still sent, and refused, as before.
+         - **The notice.** On a reconnect attempt, a refused subscription is now always the
+           cause, as #100 documented. `resumed` leaves a first connection out, so an unreachable
+           daemon at startup still says `docker: list: …`.
+         - **#98 and #119.** A failed attempt's subscription is closed before the wait, as
+           before. The client's goroutine has now ended before `connect` returns.
+         - **A live stream that ends on its own** at the instant its list fails is named
+           `events: EOF`, which is also true.
+
+      **A seam, so that the tree pins it.** `DockerSource.subscribe` is nil in production, which
+      means `cli.Events`. `TestDockerLateRefusalIsTheCause` wraps the real `Events` and holds a
+      refusal (`client.IsErrConnectionFailed`) until the attempt's context ends: the latest the
+      client can deliver it. Attempts 2 to 4 must name the subscription.
+
+      **Tests.**
+      - **New:** `TestDockerLateRefusalIsTheCause`.
+      - **New guard:** `TestDockerUnreachableAtStartupSaysTheList`, which passes on main.
+      - **Unchanged and still strict:** `TestDockerUnreachableForSeveralAttempts`.
+      - **Checked for the same assumption, with nothing to change:**
+        - `TestDockerFailedAttemptClosesItsSubscription` names `list:` with a live subscription.
+          There is no race, and it shows the cancel comes back as `context.Canceled`.
+        - `TestDockerEventsCloseRepeatedly`'s `events: EOF` comes from an established
+          connection.
+        - `TestDockerListErrorClosesTheEventsSubscription` is a first connection.
+        - No test asserts the order of requests across `Events` and the list. The fake records
+          no list requests.
+
+      **Mutants**, through `-overlay`, each turning exactly one of the 15 tests below red:
+      - **the drain removed:** `TestDockerLateRefusalIsTheCause`. It is also 20 of 20 red with
+        the window forced;
+      - **the `resumed` gate removed:** `TestDockerUnreachableAtStartupSaysTheList`;
+      - **the `context.Canceled` check removed:** `TestDockerFailedAttemptClosesItsSubscription`.
+
+      Every reconnect test passes 50 of 50 under `-race`: the twelve before, the two new ones, and
+      `TestDockerListErrorClosesTheEventsSubscription`. CI's two test steps and `golangci-lint run`
+      pass.
+
+      **Seen and left alone, out of scope:**
+      - **The same mechanism on the list's success path.** If the daemon is back within the
+        window, so that the subscription is refused but the list succeeds, the attempt says
+        `reconnected` and then at once `lost (attempt 1)`. It corrects itself and nothing is read
+        twice.
+      - #157, the backoff constants, and every other Docker-source behaviour.
+
+      Targets v0.12.36
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
