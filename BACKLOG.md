@@ -7300,7 +7300,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Found on the way, not addressed here:** `collector.sources` gains one entry per distinct
       source name and never drops one. A journald identifier becomes a source name, so a stream
       can drive it: 200,000 entries from one template in a throwaway test. It is not keyed by
-      template, so it is filed as ISSUE-TBD and named in README Known limitations.
+      template, so it is filed as #163 and named in README Known limitations.
 
       Released as **v0.12.38**.
 

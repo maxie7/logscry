@@ -1662,7 +1662,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   and subprocess sources add a handful of names. A journald entry names its own source, so a
   program that logs under many distinct identifiers can grow it: 200,000 names in a throwaway test.
   Each entry is one short string. Templates, scoring and the export are not affected. Filed as
-  ISSUE-TBD.
+  #163.
 - **A capture recorded without `--all` has lost its long journald messages.** Without
   `--all`, `journalctl -o json` writes any field over 4096 bytes as `null`, and the message is
   not in the file at all. That limit is journalctl(1)'s; systemd's `logs-show.c` applies it to
