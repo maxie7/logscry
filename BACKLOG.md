@@ -7302,7 +7302,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       can drive it: 200,000 entries from one template in a throwaway test. It is not keyed by
       template, so it is filed as ISSUE-TBD and named in README Known limitations.
 
-      Released as **TODO-VERSION**.
+      Released as **v0.12.38**.
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and

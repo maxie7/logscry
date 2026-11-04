@@ -169,7 +169,7 @@ Selection flags: `--docker-all`, `--docker-label k=v`, `--docker-name <regex>`, 
    - timestamps already stripped during ingestion
    - (file paths optional → `<PATH>`)
    So `user 4821 failed` and `user 9933 failed` collapse to `user <NUM> failed`. The template hash is the dedup key and the unit of "seen before vs new".
-3. **Update template state:** upsert into `map[string]*Template`, bump `Count`, push to `Recent`, update `LastSeen`. The map is bounded (`TODO-VERSION`, #126): past 50,000 templates or 64 MiB it evicts the least recently seen, never one with an answer in flight, a card, or a live cache entry. A returning template is novel again, which alone never escalates (§6).
+3. **Update template state:** upsert into `map[string]*Template`, bump `Count`, push to `Recent`, update `LastSeen`. The map is bounded (`v0.12.38`, #126): past 50,000 templates or 64 MiB it evicts the least recently seen, never one with an answer in flight, a card, or a live cache entry. A returning template is novel again, which alone never escalates (§6).
 
 Implementation note: keep the masking regexes ordered and compiled once; expose them so they can be tuned later. The order (`TS`, `UUID`, `IP`, `HEX`, `NUM`, `STR`) is load-bearing in both directions: `IP` runs before `NUM` so an address is not shredded into `<NUM>.<NUM>.<NUM>.<NUM>`, and what `IP` declines does not stay literal — it falls through to `HEX` and `NUM`, so narrowing the IP pattern must be judged on the end of the pipeline, not on the one step. Aim for "good enough to collapse noise", not perfect log parsing.
 

@@ -235,7 +235,7 @@ close: the longest of 70,783 journal entries was 4.2 KiB.
 **The template table is bounded too.** logscry holds at most 50,000 templates, and at most 64 MiB
 of their masked patterns and recent-occurrence times. Past either it evicts the least recently
 seen, so a stream of distinct lines levels off at about 23 MiB of table with short lines and about
-66 MiB with lines at the 64 KiB cap. Until `TODO-VERSION` the table grew for as long as the stream
+66 MiB with lines at the 64 KiB cap. Until `v0.12.38` the table grew for as long as the stream
 ran (#126). Lines held in flight are separate: a stream of one template repeated at the cap levels
 off at about 160 MiB. Ten real boots reached at most 3,108 templates and about 250 KiB of patterns,
 so an ordinary host stays far from either number.
