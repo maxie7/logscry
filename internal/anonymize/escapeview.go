@@ -122,9 +122,9 @@ func (m *Mapper) maskEscaped(s, view string, offs []int) (string, error) {
 // maskUnion is maskEscaped with the late rules' spans (GHSA-8qq6-vx8j-rx37), on a line with an escape or
 // without one, when offs is nil and the chain runs once. A late span joins the chain's only where the chain
 // left a byte of it unmasked: a key the chain masked whole, or inside a larger value it masked, is left as
-// the chain wrote it. One that joins makes its value a TOKEN, by valueTag's rule, and is not counted in the
-// minting order, so a value is minted where the chain minted a span of it, and a value only a late rule
-// read is minted last.
+// the chain wrote it. A key that joins makes its value a TOKEN, by valueTag's rule; 7c's span gives its value
+// the tag of its widest span. Neither is counted in the minting order, so a value is minted where the chain
+// minted a span of it, and a value only a late rule read is minted last.
 func (m *Mapper) maskUnion(s, view string, offs []int, late []maskedSpan) (string, error) {
 	texts := []string{s}
 	if offs != nil {

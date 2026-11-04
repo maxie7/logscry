@@ -100,6 +100,14 @@
 // the text as written (lateDetectors). A span of theirs the chain left a byte of unmasked is unioned with
 // the chain's spans, as an escaped line's two passes are, and the value they make is one TOKEN.
 //
+// #135 IS RULE 7 READ THROUGH THE TEMPLATE. The pipeline collapses an IPv6 address only with two groups
+// before a "::" and a boundary before the first (#33). Past that its digits become <NUM> and its hex letters
+// stay, and 7, which cannot cross a <NUM>, masked the "::" and sent the letters. A chain entry that reads a
+// <NUM> starts left of 7, into the tail of a value a later rule owns, and cuts that value; one that starts
+// later than 7 drops what 7 took. So 7c runs on the same terms as the key rules, alone on the text as written
+// and unioned (ipv6TemplateRule), and a byte the chain masked cannot come back. Unlike them it is no chain
+// entry: a line with no <NUM> is never read, and the chain is the chain of v0.12.36.
+//
 // No detector's TARGET GROUP can land on a placeholder this package minted — <USER_1>, <TOKEN_2> — so masking is
 // safe to run sequentially, the fail-closed re-scan cannot fire on its own output, and no mapping
 // Mask records nests; that inertness is what keeps a home path in a Go stack trace from tripping
@@ -201,6 +209,7 @@ type Mapper struct {
 	reserved map[string]bool   // placeholders the request carries as text, never minted (#142)
 	conflict bool              // a text carried a placeholder already minted; every later Mask refuses
 	late     []detector        // read again on the text as written and unioned (GHSA-8qq6-vx8j-rx37); nil skips it
+	rescan   []detector        // read by residue after dets: the late rule that is no rule of the chain (#135)
 }
 
 // New builds a Mapper. extraHostSuffixes extends the bare-hostname allowlist (detector 9b)
@@ -218,7 +227,8 @@ func New(extraHostSuffixes ...string) *Mapper {
 		byValue: make(map[string]string),
 		byToken: make(map[string]string),
 		counts:  make(map[string]int),
-		late:    lateDetectors,
+		late:    lateRules,
+		rescan:  []detector{ipv6TemplateRule},
 	}
 }
 
@@ -331,6 +341,12 @@ func New(extraHostSuffixes ...string) *Mapper {
 // the chain's. A line on which the chain masks every byte the late rules read comes back as the chain alone
 // writes it (TestVendorKeyUnionMasksASupersetOfV01229). The union's TOKEN is our TOKEN to 13b on the re-scan,
 // so forty characters of the AWS alphabet after a key it masks whole mute the escalation.
+//
+// #135 WIDENS WHAT residue() SEES by the rule it adds, and by less than that rule reads. 7c is no chain
+// entry, so residue reads it apart from m.dets (Mapper.rescan), on the output and on its view. A form the
+// chain leaves whole, an address of eight groups or six and a quad with no "::", mutes if it ever survives
+// masking. A form with a "::" does not reach it: 7 has rewritten the "::" by then, and what is left is #41's
+// shape, one 7c does not read. Nothing at runtime rescues that; the union and its gate do.
 func (m *Mapper) Mask(s string) (string, error) {
 	m.reserve(s)
 	if m.conflict {
@@ -343,6 +359,15 @@ func (m *Mapper) Mask(s string) (string, error) {
 	}
 	return m.maskUnion(s, view, offs, late)
 }
+
+// lateRules are what New reads after the chain: the chain's own last rules, and 7c, which the chain does not
+// hold. Only the first half is the chain's, so the two have separate names: a gate about the key rules
+// reads lateDetectors, and TestIPv6TemplateRuleMasksASupersetOfV01236 holds the difference to account.
+var lateRules = slices.Concat(lateDetectors, []detector{ipv6TemplateRule})
+
+// ipv6TemplateRule is 7c (#135), read as a late rule. It is verify-eligible, and its group admits the
+// pipeline's <NUM> and <IP> and none of our tags, so it cannot land on our output.
+var ipv6TemplateRule = detector{tagIP, mustLongest(ipv6TemplatePattern), 1, true, false}
 
 // lateDetectors are the rules that run last, each read again on its own on the text as written
 // (GHSA-8qq6-vx8j-rx37): rule 12's families and 13a as the chain compiles them, and 13b with the access key
@@ -650,8 +675,8 @@ func token(tag string, n int) string {
 	return fmt.Sprintf("<%s_%d>", tag, n)
 }
 
-// residue re-runs the verify-eligible detectors and returns the tag of the first sensitive
-// value still present, or "" if the text is clean. The fuzzy host detectors are excluded:
+// residue re-runs the verify-eligible detectors, the chain's and then m.rescan, and returns the tag of the
+// first sensitive value still present, or "" if the text is clean. The fuzzy host detectors are excluded:
 // their job is best-effort coverage of bare hostnames, and a missed bare host must not mute
 // an otherwise-safe escalation.
 //
@@ -662,13 +687,15 @@ func token(tag string, n int) string {
 // failure a verifier is wanted for. TestMaskingIsComplete is the check that does see it, and
 // TestNoDetectorGroupLandsOnOurOwnOutput guards the property both arguments rest on.
 func (m *Mapper) residue(s string) string {
-	for _, d := range m.dets {
-		if !d.verify {
-			continue
-		}
-		loc := d.re.FindStringSubmatchIndex(s)
-		if loc != nil && loc[2*d.group] >= 0 {
-			return d.tag
+	for _, dets := range [][]detector{m.dets, m.rescan} {
+		for _, d := range dets {
+			if !d.verify {
+				continue
+			}
+			loc := d.re.FindStringSubmatchIndex(s)
+			if loc != nil && loc[2*d.group] >= 0 {
+				return d.tag
+			}
 		}
 	}
 	return ""
@@ -1126,7 +1153,8 @@ func buildDetectors(extraHostSuffixes []string) []detector {
 		//     same); the hex character of a hex-ending token goes with the address, as on 7; and a prefix
 		//     longer than an address is one value with the quad. On the Template field most of these forms
 		//     arrive as <IP>.<NUM>.<NUM>, with nothing of the value left, which this rule does not read:
-		//     reading it would cut a name 9d masks there (db.<IP>.<NUM>.<NUM>).
+		//     reading it would cut a name 9d masks there (db.<IP>.<NUM>.<NUM>). The full form's six groups
+		//     arrive with a <NUM> in them, which this rule does not read either; that one is 7c's (#135).
 		//
 		//     verify:true, as 7. Its group admits the pipeline's <IP> and none of our tags, so the mapping
 		//     cannot nest.
@@ -1503,7 +1531,9 @@ func awsPairAfter(context string) string {
 // WHICH detectors need this is not a matter of taste, and it is the one durable statement to
 // take away from #43: THE GAPS ARE EXACTLY THE DETECTORS WHOSE VALUES THE PIPELINE DOES NOT
 // ALREADY COLLAPSE. UUIDs and IP addresses arrive as <UUID> and <IP> — one placeholder,
-// nothing left to recognize, no gap possible. Every one of the other nine receives a damaged
+// nothing left to recognize, no gap possible. (That held for the IPv6 forms the pipeline collapses and
+// was false for those it does not, which is #135: see ipv6TemplatePattern, and
+// TestEveryUncollapsedIPv6FormHasATemplatizedRow.) Every one of the other nine receives a damaged
 // but not collapsed value and reads a pipeline placeholder as just another character of the
 // run. Four were widened here at 2da31be; the remaining five (URL credentials, email, both
 // host detectors, home directory) were left out and leaked until #43. That is a fact about
@@ -2161,6 +2191,9 @@ func mangled(class string) string {
 // dotted-quad form ending at the quad would cut a value a later rule reads through the next character
 // ("::ffff:10.0.0.5.6", where 8 masks the last four octets after this pattern stops at "10").
 //
+// An address the template left uncollapsed is rule 7c's (#135, ipv6TemplatePattern). This pattern cannot
+// cross a <NUM>, so on the Template field it takes the "::" and the hex groups touching it and no more.
+//
 // internal/anonymize/ipv6_compare_test.go runs both patterns over one table and names each
 // difference, so a change here that moves a row fails there.
 const ipv6Pattern = `(?i)(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}` +
@@ -2206,6 +2239,62 @@ const ipv6DottedQuadPattern = `(?i)(` +
 // field -- and an optional port. It is ONE const because 7a must take every glued address 7b would
 // take one colon later; see 7b.
 const ipv6DottedQuadTail = `(?:[0-9a-f]{1,4}:)*(?:` + ipv4Pattern + `|<IP>)(?::[0-9]{1,5})?`
+
+// The pieces of 7c. A unit is a hex character or the pipeline's <NUM>, and a group is one to four of them,
+// 7's bound: four hex characters are at most four units once digits collapse. No other placeholder is a
+// unit, and there is no (?i), so a literal <num> is not read.
+const (
+	ipv6TemplateUnit  = `(?:[0-9a-fA-F]|<NUM>)`
+	ipv6TemplateHex   = `[0-9a-fA-F]`
+	ipv6TemplateGroup = ipv6TemplateUnit + `{1,4}`
+
+	// ipv6TemplateNumGroup is a group holding a <NUM>, written out by where the first one stands.
+	ipv6TemplateNumGroup = `(?:<NUM>` + ipv6TemplateUnit + `{0,3}` +
+		`|` + ipv6TemplateHex + `<NUM>` + ipv6TemplateUnit + `{0,2}` +
+		`|` + ipv6TemplateHex + `{2}<NUM>` + ipv6TemplateUnit + `?` +
+		`|` + ipv6TemplateHex + `{3}<NUM>)`
+
+	ipv6TemplateAny  = ipv6TemplateGroup + `(?::` + ipv6TemplateGroup + `)*`
+	ipv6TemplateQuad = `<IP>(?::<NUM>)?`
+)
+
+// ipv6TemplateRun is n groups or more, at least one of them holding a <NUM>: the first that does stands
+// at any of the first n places, or further on.
+func ipv6TemplateRun(n int) string {
+	var alts []string
+	for i := range n {
+		alts = append(alts, fmt.Sprintf(`(?:%s{1,4}:){%d}%s(?::%s){%d,}`,
+			ipv6TemplateHex, i, ipv6TemplateNumGroup, ipv6TemplateGroup, n-1-i))
+	}
+	alts = append(alts, fmt.Sprintf(`(?:%s{1,4}:){%d,}%s(?::%s)*`,
+		ipv6TemplateHex, n, ipv6TemplateNumGroup, ipv6TemplateGroup))
+	return `(?:` + strings.Join(alts, `|`) + `)`
+}
+
+// ipv6TemplatePattern is 7c's source (#135): rule 7 read through the template, derived from what
+// pipeline.Templatize writes, as #43 derives the others. An address it leaves uncollapsed keeps its hex
+// letters, so 7, which stops at a <NUM>, masks the "::" and sends them. The group is the address, and the
+// alternatives are its forms: a run with a <NUM> before the "::", and what may follow it; one after it,
+// the loopback among them; and with no "::", eight groups, or six and a quad. All four want a <NUM>,
+// so a line with none, every raw line, is never read.
+//
+// There is no left boundary. Rule 7 has none, for the reason its comment gives, and the union cannot cut:
+// a span here only joins the chain's. The right boundary is 7a's, and it does not guard against a cut
+// either. It keeps a C++ name out (Vec<NUM>::dot, ns<NUM>::fn(<NUM>)), as it keeps the raw form out of 7a,
+// and leaves a non-boundary follower where #137 has it.
+//
+// It pays as 7 does. A hex-ending word before the address goes with it, a port goes into the placeholder,
+// and a host:port glued to the address is one value with it (TestAcceptedOverMasking).
+var ipv6TemplatePattern = func() string {
+	tail := `(?:(?:` + ipv6TemplateAny + `:)?` + ipv6TemplateQuad + `|` + ipv6TemplateAny + `)?`
+	forms := []string{
+		ipv6TemplateRun(1) + `::` + tail,
+		`(?:` + ipv6TemplateAny + `)?::` + ipv6TemplateRun(1) + `(?::` + ipv6TemplateQuad + `)?`,
+		ipv6TemplateRun(8),
+		ipv6TemplateRun(6) + `:` + ipv6TemplateQuad,
+	}
+	return `(` + strings.Join(forms, `|`) + `)` + ipv6GluedRunEnd
+}()
 
 // bareHostPattern is 9b's source: dotted labels, then one of suffixes.
 //

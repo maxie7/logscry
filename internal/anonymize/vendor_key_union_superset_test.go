@@ -201,8 +201,8 @@ func escapedForms(s string) []string {
 }
 
 // TestVendorKeyUnionMasksASupersetOfV01229 is the gate GHSA-8qq6-vx8j-rx37's fix stands on. For every input,
-// through Mask with New()'s chain and one with an extra suffix, New()'s late rules on (live) against the same
-// Mapper with them off (ref), which is v0.12.29's Mask, and with the bytes a late rule reads taken from the
+// through Mask with New()'s chain and one with an extra suffix, the key rules read late (live) against the
+// same Mapper with them off (ref), which is v0.12.29's Mask, and with the bytes a late rule reads taken from the
 // chain's own rule-12 and rule-13 entries (keyRulesOf), not from lateDetectors:
 //   - an input where ref masks every byte a late rule reads comes back byte for byte, with the same error;
 //   - one where ref sent such a byte (a key it split) is sent, masks every byte ref masked and every byte a
@@ -210,6 +210,10 @@ func escapedForms(s string) []string {
 //     late rule's span; a refusal of it is counted, since nothing it sent is sent either;
 //   - one ref refused is refused, or sent with every byte a late rule reads masked;
 //   - no placeholder minted for a value is text of the input.
+//
+// Live is lateDetectors, not New().late: 7c, also read late since #135, is no key rule, and its own gate
+// holds New() to this one's live side. This gate's claim is about the key rules; the two together give
+// New() a superset of the chain.
 //
 // It and its two Mappers run in parallel with the other superset gates.
 //
@@ -230,7 +234,7 @@ func TestVendorKeyUnionMasksASupersetOfV01229(t *testing.T) {
 			repaired, merged, refusedNow, sentNow := 0, 0, 0, 0
 			for i, in := range corpus {
 				ref, live := mapperOn(c.dets), mapperOn(c.dets)
-				live.late = New().late
+				live.late = lateDetectors
 				refOut, refErr := ref.Mask(in)
 				out, err := live.Mask(in)
 				read := keyBytes(rules, in)
