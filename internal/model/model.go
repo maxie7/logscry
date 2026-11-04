@@ -3,7 +3,10 @@
 // Package model holds the shared types that flow through the logscry pipeline.
 package model
 
-import "time"
+import (
+	"container/list"
+	"time"
+)
 
 // Stream identifies which standard stream a log line came from.
 type Stream int
@@ -52,6 +55,14 @@ type Template struct {
 	Count     int
 	Recent    []time.Time // ring buffer of recent occurrences for burst detection
 
+	// Level is the last level observed on a line of this template, "" if none has carried one.
+	Level string
+
+	// Order is the template's place in the pipeline's least-recently-seen list. It lives here,
+	// and not in a second map, so that nothing keyed by hash has to be kept in step with the
+	// template table (#126). The pipeline is its only reader and writer.
+	Order *list.Element
+
 	// DecayedCount is the template's occurrence count with each occurrence weighted down
 	// by its age, halving every score.Config.BaselineHalfLife; DecayedAt is the instant it
 	// was last advanced. Together they are the burst baseline's memory, which forgets
@@ -82,6 +93,10 @@ type Template struct {
 	// LastFlagID names the newest flag, stamped with LastFlagged. An answer is matched to
 	// its flag by this, never by the hash, which two flags of one template share (#121).
 	LastFlagID FlagID
+	// Awaiting counts this template's queued flags whose terminal answer has not come back. The
+	// pipeline keeps it, and a template with one outstanding cannot be evicted: the answer needs
+	// somewhere to land. Only a run that routes answers through the pipeline counts it down.
+	Awaiting int
 
 	// Explanation is the LLM's verdict on this template, nil until it escalates. It
 	// is set to a pending value the moment the event is handed to the LLM stage and

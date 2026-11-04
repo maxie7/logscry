@@ -186,6 +186,9 @@ func (c *collector) retain(ev Event) {
 	}
 }
 
+// retains reports whether hash has a card. SCAFFOLD: it reports none.
+func (c *collector) retains(_ string) bool { return false }
+
 // preceding returns the raw text of the n lines before the one just written, oldest
 // first. It reads backwards through the ring from the newest entry but one — the newest
 // IS the trigger, and a card does not need to quote the line it is already about.

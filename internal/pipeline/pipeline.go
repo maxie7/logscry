@@ -6,6 +6,7 @@
 package pipeline
 
 import (
+	"container/list"
 	"context"
 	"time"
 
@@ -56,12 +57,37 @@ type Event struct {
 	LastFlagged  time.Time
 }
 
+// The template table's bound (#126). A template is evicted once the table holds more than
+// MaxTemplates, or more than MaxTemplateBytes of what varies per template: see Pipeline.shrink.
+const (
+	// MaxTemplates is 16 times the 3,108 templates of the largest of ten real boots.
+	MaxTemplates = 50_000
+	// MaxTemplateBytes is 177 times the most the largest of those boots can reach.
+	MaxTemplateBytes = 64 << 20
+)
+
+// evictionWalk is the most held templates one shrink steps over. See Pipeline.shrink.
+const evictionWalk = 128
+
 // Pipeline holds the template dedup/count state and the scorer that reads it. Its
 // methods are NOT safe for concurrent use: call them from a single goroutine only
 // (see Run).
 type Pipeline struct {
 	templates map[string]*model.Template
 	scorer    *score.Scorer // nil: no scoring, events carry a zero Score
+
+	// The template table's bound (#126). order holds every template, least recently seen at the
+	// front, and bytes is what they cost (see templateBytes).
+	order        *list.List
+	bytes        int
+	maxTemplates int
+	maxBytes     int
+	evictions    *Evictions // counts them; nil counts nothing
+
+	// retained reports that a template has a card (see collector.retains); nil means none does.
+	// routed reports that answers come back through attach, so Awaiting is counted down.
+	retained func(hash string) bool
+	routed   bool
 
 	// explain is whether an LLM stage is attached. Without one — a plain run, or
 	// --explain-dry-run — an escalation gets no explanation state at all, so dry-run
@@ -86,7 +112,13 @@ type Pipeline struct {
 
 // New returns an empty Pipeline scoring with sc, which may be nil.
 func New(sc *score.Scorer) *Pipeline {
-	return &Pipeline{templates: make(map[string]*model.Template), scorer: sc}
+	return &Pipeline{
+		templates:    make(map[string]*model.Template),
+		scorer:       sc,
+		order:        list.New(),
+		maxTemplates: MaxTemplates,
+		maxBytes:     MaxTemplateBytes,
+	}
 }
 
 // Process runs one line through normalize -> template -> dedup/count -> score and
@@ -357,6 +389,15 @@ func (p *Pipeline) upsert(hash, pattern string, at, now time.Time) (tmpl *model.
 	return tmpl, prevLastSeen
 }
 
+// recentSlot is the bytes one entry of Template.Recent costs.
+const recentSlot = 24
+
+// templateBytes is what a template costs against the byte bound. SCAFFOLD.
+func templateBytes(t *model.Template) int { return len(t.Pattern) + recentSlot*len(t.Recent) }
+
+// shrink is the eviction walk. SCAFFOLD: it evicts nothing yet.
+func (p *Pipeline) shrink(_ *model.Template, _ time.Time) int { return 0 }
+
 // pushRecent appends now to the recent ring, dropping the oldest entry in place
 // once the buffer is full. Bounded at model.RecentCap with no reallocation on wrap.
 func pushRecent(recent []time.Time, now time.Time) []time.Time {
@@ -409,6 +450,9 @@ type Options struct {
 	// argument — the scorer, the rate limiter, the cache, template first/last seen, the
 	// export — so this one switch is the whole of replaying time. See sourceClock.
 	SourceTime bool
+
+	// Evictions counts the templates evicted at the bound, and says so once. Nil counts nothing.
+	Evictions *Evictions
 }
 
 // sourceClock is replay's time: the capture's timestamps, advanced by this goroutine as

@@ -74,6 +74,9 @@ func (n *Notices) Send(err error) {
 	}
 }
 
+// Post is Send without the prefix. SCAFFOLD: it sends nothing yet.
+func (n *Notices) Post(_ error) {}
+
 // Dropped reports how many notices found no room.
 func (n *Notices) Dropped() uint64 {
 	if n == nil {

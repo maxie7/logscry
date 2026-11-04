@@ -4,6 +4,9 @@ package score
 
 import "time"
 
+// minSweep is the fewest entries that are worth a sweep. SCAFFOLD: nothing sweeps yet.
+const minSweep = 64
+
 // entry is one explained template: when it was explained, and how many times it has
 // recurred since. The count is what a card shows as "x412" instead of escalating 412
 // times.
