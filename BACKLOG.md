@@ -7040,6 +7040,140 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       No release (no binary change).
 
+- [x] **An IPv6 address the template leaves uncollapsed is one value on the Template field** — #135,
+      named as out of scope in the anonymizer entries since #134's. With `--llm-anonymize`, the Template field sent the
+      hex letters of an address the template mask fragments. Since v0.8.5; `git tag --contains v0.8.5`
+      counts 52 tags (the issue's 39 was the count at filing). Raw lines were never affected.
+
+      **Cause.** #33 gave the pipeline's pattern a left boundary and a floor of two groups before a
+      `::`. An address outside that keeps its hex letters and has its digits turned into `<NUM>`.
+      Rule 7 cannot cross a `<NUM>`, so it masked the `::` and the hex groups touching it and left the
+      rest: `peer:<NUM>:db<NUM><IP_1><NUM>`, `route fe<NUM><IP_1>/<NUM>`. Two forms with no `::` were
+      worse: nothing of `peer:<NUM>:db<NUM>:<NUM>:…` was masked at all. A hex letter is a digit of the
+      address, not structure. The honesty note in `TestEveryUncollapsedDetectorHasATemplatizedRow`
+      said so already; what was wrong in it was its example, since `fe80::1` has two groups and
+      collapses to `<IP>`. It now reads `fe80::/64`, and `pipelinePH`'s "no gap possible" says where
+      it stops being true.
+
+      **The rule, 7c.** Rule 7 read through the template, derived from real `pipeline.Templatize`
+      output (#43's method): `<NUM>` is the only placeholder a group admits, at least one group must
+      hold one, and the forms are a run before a `::` with what may follow, a run after it, eight
+      groups, and six and a quad. So a line with no `<NUM>` is never read, and no `(?i)` means a
+      literal `<num>` is not read either. Group bound and right boundary are 7's and 7a's.
+      `internal/pipeline` is not in the diff: no template hash moves.
+
+      **Why it is not a chain entry.** The issue asked where in the chain it goes. Measured, nowhere.
+      7 cannot cross a `<NUM>`, so a rule that does starts LEFT of 7, into the tail of a value a later
+      rule owns; one that starts LATER than 7 drops the bytes 7 took. Lines that lost a byte, default
+      / `lab` / `dc1 dc s3`:
+
+      | Left edge, chain entry between 7a and 7b | Lost lines |
+      |---|---|
+      | 7's own, no boundary (of 143,918) | 2,928 / 4,198 / 7,268 |
+      | `\b` lead (of 15,810) | 266 / 266 / 1,103 |
+      | `\b` lead and a no-capture private-host alternative (of 15,810) | 285 / 296 / 301 |
+      | Late, unioned with the chain (of 15,810) | 0 / 0 / 0, refused 0 |
+
+      The cuts were a 9c member, a 9d separator, and 9b on a configured suffix. So 7c runs on the
+      terms GHSA-8qq6-vx8j-rx37 built for the key rules: alone, on the text as written, unioned. Spans
+      only join, so a byte the chain masked cannot come back. `git diff v0.12.36 --
+      internal/anonymize/anonymize.go` touches no chain entry. With the union, the right boundary no
+      longer guards against a cut; it keeps a C++ name out and leaves #137's followers where they
+      were. `lateDetectors` stays keys-only, so `TestLateRulesAreTheChainsLastRules` is untouched, and
+      `New` reads `lateRules`, which is those plus 7c.
+
+      **Why `vendor_key_union_superset_test.go`'s live side changes to `lateDetectors`.** Left as
+      `New().late` it now carries 7c, and the gate goes red ("with nothing to repair, moved", measured)
+      for a rule it says nothing about. That gate keeps its claim about the key rules, the new gate
+      covers `New()` against it, and together they give `New()` a superset of the chain. No row of
+      it moved.
+
+      **The re-scan reads 7c, and that covers less than it sounds.** 7c is in no `m.dets`, so
+      `residue()` could not see it. Decided: it reads it, through `Mapper.rescan`, after the chain,
+      on the output and on the output's view. `m.late` was not reused, since 13b reads differently
+      there and the key rules are the chain's already. But the honest result is narrower than "the
+      re-scan covers 7c". It fires for a form the chain leaves whole: eight groups, and six and a
+      quad. A form with a `::` does not reach it, because 7 has rewritten the `::` by then and what is
+      left is #41's shape, one 7c does not read. Those are most of what the rule is for, and for them
+      the union and the gate are the only protection. A second re-scan pattern for the leftover, a
+      `<NUM>` touching an `<IP_n>` before a boundary, was measured and not taken: it refuses 528 corpus
+      inputs clean on v0.12.36, per mapper, where a `<NUM>` touches a masked value that is no
+      address (0 of the literals, 0 of the boots' templates), and the bar for a refusal here is 0.
+      `TestIPv6TemplateRescanRefusesWhatTheUnionMisses` runs a Mapper with the union made to miss. The
+      no-`::` rows are refused, one of them seen only on the view, and the `::` rows are pinned as NOT
+      refused, so nobody reads this as wider than it is.
+
+      **Gate.** `TestIPv6TemplateRuleMasksASupersetOfV01236`, in `SUPERSET_GATES`. Reference: the same
+      chain, with the key rules read late and 7c neither read nor re-scanned, which is v0.12.36's
+      `Mask`. Both mappers, 94,865 inputs: the earlier gates' corpus as it stands, then every IPv6 row
+      and probe and 4,000 generated lines (PCG 135) raw, through `Templatize` and `TemplatizeLine`,
+      and in the five escaped forms. The earlier corpus is not templated again: it holds each of its
+      inputs raw, templated and escaped. It adds 100 s to the package, which is 117 s
+      now; the first draft took 342 s, recompiling the `lab` chain per input.
+
+      **Predictions against measurements.** Written down before each run.
+
+      | Measure | Predicted | Measured | |
+      |---|---|---|---|
+      | Captures, raw, changed (58,172 lines, each mapper) | 0 | 0 | held |
+      | Captures, templated, changed | 37 each | 37 each, 37 more, 0 less | held |
+      | Distinct templates changed | at most 5 | 5 | held |
+      | Address-shaped among them | 0 | all 5, every one the `::<NUM>` form | **missed**: the loopback, which sent no letter |
+      | Scope operator / other | 0–5 / 0–2 | 0 / 0 | held |
+      | Hex letters newly masked on captures | not predicted | 0 | |
+      | Corpus, bytes less | 0 | 0, 6,473 inputs more, each mapper | held |
+      | Corpus size, inputs more | 94,783, 6,442 | 94,865, 6,473 | **moved**: 82 rows joined it after the number was written |
+      | Literals (6,276, with their templates), bytes less | 0 | 0, 34 more | held |
+      | Refused now, clean on v0.12.36: corpus, literals, boots' templates | 0, 0, 0 | 0, 0, 0 | held |
+      | Refused on v0.12.36, sent now | not predicted | 0 | |
+      | Values taken into a value of another tag | not predicted | 262 / 259 | adversarial frames; captures 0 |
+      | `go test ./...` | no number written first | 3,750 pass, 2 skip (main: 3,677, 2) | |
+
+      The 37 capture records are one over-mask category with nothing at stake: the `<IP_1><NUM>` that
+      was already hiding them is now `<IP_1>`. Invented example: `bind ::1 port`.
+
+      **Mutants, each with what it turned red.** Run against the package, leaf and parent counts.
+
+      | Mutant | Red | Held? |
+      |---|---|---|
+      | Rule removed | 56: rows, table, guard, pins, re-scan test, gate (nothing masked more) | held |
+      | Right boundary removed | 10: `TestIPv6TemplateRightBoundary` and the C++ row; gate green | held |
+      | `<NUM>` not admitted in a group | 56, the same set | held |
+      | Placed after 7 in the chain | 52: the `::` rows; no-`::` rows green; chain guards and the gate | held |
+      | Placed before 7 in the chain | 22: `TestGluedRunMasksASupersetOfMain` and `TestDottedQuadMasksASupersetOfV01224` on "no new rule can touch" inputs, and this gate | **missed**: I said this gate could not see it, sharing the chain, and it does, as bytes 7c reads left unmasked |
+      | Guard rows removed | 1: the guard, by class | held |
+      | Union misses 7c, re-scan keeps it | 56; 2,092 gate lines of "clean, is refused", the rest sent | **missed** in part: I said the re-scan test stays green, and its `New()` half goes red, since the mutant is `New()` |
+      | `residue` does not read `rescan` | 5: the re-scan test's refused rows, nothing else | held |
+
+      The union-miss row is the fail-closed path firing, and it is also the argument above in
+      numbers: the rows refused are the no-`::` ones, and the `::` lines go out.
+
+      **Wire check.** Capturing endpoint, `--plain --llm-anonymize --warmup 0s --warmup-lines 0
+      --rate-limit 100000 --cache-ttl 1s`, one invented `[FATAL]` line per shape, one request each.
+      **Held.** On the Template field v0.12.36 sent `peer:<NUM>:db<NUM><IP_2><NUM>` (`db`),
+      `peer:<NUM>a<NUM>:c<NUM><IP_2><NUM>` (`a`, `c`) and `route fe<NUM><IP_2>/<NUM>` (`fe`); the branch
+      sent `peer:<IP_2>`, `peer:<IP_2>` and `route <IP_2>/<NUM>`, none of them. The control
+      `[FATAL] peer ::ffff:10.0.0.5-x down` (#137) still sends `.0.0.5-x` on both.
+
+      **CI as written.** Coverage step green at 93.5%, anonymize 99.5%. Race step green with the gates
+      skipped, `SUPERSET_GATES` naming and matching eight, and `-race -count=20` green on the five new
+      non-gate tests. `golangci-lint run`: 0 issues. Mean `Mask` 187 → 229 µs, at escalation only.
+
+      **Rows.** A form uncollapsed only for what it is glued to cannot sit in `templatizedRows`, where
+      the plan put it: the `\x00` mark beside it is a boundary to the pipeline, which then collapses
+      it. They are `ipv6TemplateGluedRows`, with their own test. `TestEveryUncollapsedIPv6FormHasATemplatizedRow`
+      takes either table as a form's row, and classes are groups left and right, counted to two, and
+      dotted or not.
+
+      **What it costs, pinned in `TestAcceptedOverMasking` and named in README:** a word's hex-ending
+      letter goes with a `::` after it, as on the raw line (`Cach<IP_1> failed`); a port goes into the
+      placeholder; a `host:port` glued onto a `::` is one IP value and loses its HOST tag. Captures
+      show none of these.
+
+      **Left alone.** `peer:2001:db8::1-x` still sends `db`: #137's right boundary on this field, now
+      pinned as KNOWN_GAP rows and named in README's two entries. #126, #36, `internal/pipeline` and
+      every other detector are untouched. Released as **v0.12.37**.
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

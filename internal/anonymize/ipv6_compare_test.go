@@ -126,8 +126,8 @@ var ipv6MustDiffer = []ipv6Row{
 
 	// #49: an address whose last 32 bits are a dotted quad. The pipeline's pattern has no such form, so
 	// it takes the groups and the first octet, a legal hex group, and leaves the other three to <NUM>;
-	// the full form it does not take at all. Nothing of the value is left on the template (but for the
-	// full form's groups, #135's class). Here the address is rule 7b's, or 7a's when glued on by ':', and
+	// the full form it does not take at all. Nothing of the value is left on the template, but for the
+	// full form's groups, which 7c reads (#135, ipv6OnTheTemplate). Here the address is rule 7b's, or 7a's when glued on by ':', and
 	// is masked whole.
 	{"leak direction: an IPv4-mapped address", "peer ::ffff:192.168.1.1 down",
 		"peer <IP>.<NUM>.<NUM> down", "peer <IP_1> down"},
@@ -196,6 +196,53 @@ func TestIPv6MasksAgreeOnEveryElisionArity(t *testing.T) {
 			}
 			if got := mustMask(t, New(), r.in); got != r.anon {
 				t.Errorf("anonymizer: %q -> %q", r.in, got)
+			}
+		})
+	}
+}
+
+// ipv6OnTheTemplate states where the rows above land on the Template field, which their anon column does not:
+// that column masks the raw line, which holds no <NUM>, and 7c never reads it. in is the raw line, tpl what
+// pipeline.Templatize writes, and mask New().Mask of that. A row whose tpl has no address left in it, or
+// whose mask is tpl, is a control: 7c stays silent on it. Both are asserted, since a pipeline change that moves
+// a row here is #135's class coming back in another form.
+var ipv6OnTheTemplate = []struct {
+	name string
+	in   string
+	tpl  string
+	mask string
+}{
+	// Each sent the hex letters on v0.12.36.
+	{"glued", "peer:2001:db8::1 closed", "peer:<NUM>:db<NUM>::<NUM> closed", "peer:<IP_1> closed"},
+	{"many letters", "peer:2a02:c7f:beef:cafe::1 closed", "peer:<NUM>a<NUM>:c<NUM>f:beef:cafe::<NUM> closed", "peer:<IP_1> closed"},
+	{"one group", "route fe80::/64 dev", "route fe<NUM>::/<NUM> dev", "route <IP_1>/<NUM> dev"},
+	{"glued to a word by '_'", "id_fe80::/64 up", "id_fe<NUM>::/<NUM> up", "id_<IP_1>/<NUM> up"},
+	{"the full form ending in a quad", "peer 0:0:0:0:0:ffff:192.0.2.1 down", "peer <NUM>:<NUM>:<NUM>:<NUM>:<NUM>:ffff:<IP> down", "peer <IP_1> down"},
+	{"loopback, whose digit was never a letter", "bind ::1 port", "bind ::<NUM> port", "bind <IP_1> port"},
+
+	// Collapsed: nothing is left of the value.
+	{"compressed", "peer 2001:db8::dead:beef down", "peer <IP> down", "peer <IP> down"},
+	{"bracketed with a port", "peer [2001:db8::1]:8080 closed", "peer [<IP>]:<NUM> closed", "peer [<IP>]:<NUM> closed"},
+	{"a two-group prefix", "route 2001:db8::/32 dev", "route <IP>/<NUM> dev", "route <IP>/<NUM> dev"},
+
+	// 7c stays silent. A MAC, a clock and a PCI path have no "::" and too few groups, and a C++ name has no
+	// boundary after its "::".
+	{"MAC address", "link 00:1b:44:11:3a:b7 up", "link <NUM>:<NUM>b:<NUM>:<NUM>:<NUM>a:b<NUM> up", "link <NUM>:<NUM>b:<NUM>:<NUM>:<NUM>a:b<NUM> up"},
+	{"clock time", "Tue Aug 18 15:02:04 2026 done", "Tue Aug <NUM> <NUM>:<NUM>:<NUM> <NUM> done", "Tue Aug <NUM> <NUM>:<NUM>:<NUM> <NUM> done"},
+	{"PCI path", "/devices/pci0000:00/0000:00:14.0/usb3", "/devices/pci<NUM>:<NUM>/<NUM>:<NUM>:<NUM>/usb<NUM>", "/devices/pci<NUM>:<NUM>/<NUM>:<NUM>:<NUM>/usb<NUM>"},
+	{"a C++ name, as on the raw line", "Vec3::dot(v)", "Vec<NUM>::dot(v)", "Vec<NUM><IP_1>ot(v)"},
+}
+
+// TestIPv6OnTheTemplate runs ipv6OnTheTemplate through the real composition.
+func TestIPv6OnTheTemplate(t *testing.T) {
+	for _, r := range ipv6OnTheTemplate {
+		t.Run(r.name, func(t *testing.T) {
+			got, _ := pipeline.Templatize(r.in)
+			if got != r.tpl {
+				t.Fatalf("pipeline: %q -> %q, want %q", r.in, got, r.tpl)
+			}
+			if got := mustMask(t, New(), got); got != r.mask {
+				t.Errorf("anonymizer: %q -> %q, want %q", r.tpl, got, r.mask)
 			}
 		})
 	}

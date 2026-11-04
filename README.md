@@ -859,8 +859,8 @@ ambiguous, and it is lost all the same), the hex character of a token written st
 address goes with it, as for every IPv6 address, and a prefix longer than an address is one value.
 When `-`, `_`, a letter, a dot inside a word or other punctuation follows the quad, the address is
 sent as before: that is #137, below. On the Template field most of these forms arrive as
-`<IP>.<NUM>.<NUM>` with nothing of the value left; the full form keeps its groups there, which is
-#135. Checked against the chain as `v0.12.24` built it, over every hand-written row, the dotted-quad
+`<IP>.<NUM>.<NUM>` with nothing of the value left; the full form keeps its groups there, which were
+sent until `v0.12.37` (#135). Checked against the chain as `v0.12.24` built it, over every hand-written row, the dotted-quad
 probes, prefixes of six to twelve groups and 1,000 generated lines, each raw and templatized,
 with and without an extra host suffix: the bytes it masks include every byte `v0.12.24` masked,
 for every input. Measured over the same ten journald boots: nothing changed. None holds an
@@ -1107,6 +1107,47 @@ row and 2,000 generated keys with a piece inside, each raw, templatized and in f
 For every input, the bytes masked include every byte the chain alone masked, and no byte of a key
 is sent. Measured over the same ten journald boots: nothing changed.
 
+**The hex letters of an IPv6 address were sent on the Template field before `v0.12.37`.**
+This was a disclosure of part of an address, since `v0.8.5`, with `--llm-anonymize` only, on the
+Template field only: the raw trigger and context lines masked these shapes whole. The template mask
+collapses an address to `<IP>` only with two groups before a `::` and a boundary before the first
+(#33). Past that it turns the digits into `<NUM>` and leaves the hex letters, and the anonymizer's
+IPv6 rule, which cannot cross a `<NUM>`, masked the `::` and left the letters:
+
+- an address glued onto the token before it: `peer:2001:db8::1` sent `db`, and
+  `peer:2a02:c7f:beef:cafe::1` sent `a` and `c`;
+- a one-group prefix: `route fe80::/64` sent `fe`;
+- the full form of an address ending in a dotted quad: `0:0:0:0:0:ffff:10.0.0.5` sent `ffff`, and
+  `2001:db8:1:2:3:4:10.0.0.5` sent `db`;
+- eight groups glued on, of which nothing at all was masked.
+
+The bare loopback was fragmented too (`bind ::1`), with no letter to send. A new rule reads what the
+template mask writes, an address with a `<NUM>` in a group, and masks the whole address:
+`peer:2001:db8::1` reaches the model as `peer:<IP_1>`. Like the key rules above it reads alone, on
+the text as the log wrote it, and is unioned with the other rules. It could not be a rule in the
+chain, where it cuts a value one way or another. It wants a `<NUM>`, so a raw line is never read, and
+the pipeline does not change, so no template hash moves.
+
+What it costs, pinned:
+
+- a word's hex-ending letter goes with a `::` after it on the Template field, as on the raw line:
+  `Cache2::add failed` goes as `Cach<IP_1> failed`;
+- a port goes into the placeholder when the address is not bracketed, as on the raw line;
+- a `host:port` glued onto a `::` is one value with it, and an IP rather than a host:
+  `http://a.b:80::1/x` goes as `http://<IP_1>/x`.
+
+When `-`, `_`, a letter, a dot inside a word or other punctuation follows the address, it is sent as
+before: that is #137, below. The fail-closed check reads the rule's forms with no `::`, on its output
+and on the view of its output. A form with a `::` is out of its reach, because the IPv6 rule has
+rewritten the `::` by then, so for those forms the masking itself is the only protection.
+
+The check: the chain with the new rule off, which is `v0.12.36`'s, over every earlier gate's corpus,
+every IPv6 row and probe, and 4,000 generated lines of these shapes in host, URL, list, home-path and
+logfmt frames, each raw, templatized and in five escaped forms. For every input, the bytes masked
+include every byte `v0.12.36` masked, and nothing it sent is refused. Measured over the same ten
+journald boots: 37 templates of 58,172 changed, each masking more; they are all the loopback form,
+so no letter of an address was at stake there. Nothing changed on a raw line.
+
 **What the audit found and did not close.** v0.9.0 is a minor release because the package was
 audited systematically for the first time rather than because of the count above: every
 detector whose pattern spans a composite value was checked against every earlier detector that
@@ -1147,14 +1188,9 @@ Each time the audit's own count was right and its scope was narrower than the se
   in part glued or not: `peer ::ffff:10.0.0.5-x` sends `.0.0.5-x`, and `::ffff:10.0.0.5.example`
   sends `.0.0.5.example`. The same goes for `_`, a letter, a dot inside a word, and other
   punctuation. This is the rest of the classes `v0.12.24` and `v0.12.25` mask only up to a
-  space, closing punctuation, `/`, `%`, a sentence dot or the end of the line. Not affected: the
-  same addresses followed by one of those, and every other IPv6 address.
-- **#135** — on the template, an IPv6 address the template mask leaves uncollapsed sends its hex
-  letters: `peer:2001:db8::1` sends `db`, and `route fe80::/64` sends `fe`. So does the full form of
-  an address ending in a dotted quad, whose groups the template mask leaves beside an `<IP>`
-  (`2001:db8:1:2:3:4:10.0.0.5` sends `db`; `0:0:0:0:0:ffff:10.0.0.5` sends `ffff`). Not
-  affected: the raw line, where these shapes are masked whole, and every address the template mask
-  collapses to `<IP>`.
+  space, closing punctuation, `/`, `%`, a sentence dot or the end of the line. On the Template
+  field the same followers stop the rule of `v0.12.37`: `peer:2001:db8::1-x` sends `db`. Not
+  affected: the same addresses followed by one of those, and every other IPv6 address.
 - ~~**#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
   pre-masked template.~~ **Closed in `v0.12.8`.** See the paragraph above. `s3://…@bucket`
   sent `bucket`. It was not an interference defect but a tolerance gap left over from #43, listed
@@ -1457,9 +1493,9 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   bracketed `[addr]:port`, CIDR suffixes, and all IPv4 are unaffected. **This is the template
   mask only.** The `--llm-anonymize` anonymizer is a separate detector set and masks all three
   shapes in full on the raw trigger and context lines — it must, because there under-masking is
-  disclosure rather than fragmentation. On the Template field it does not: by the time the
-  anonymizer reads it, the pipeline has turned these shapes' digits into `<NUM>`, and the hex
-  letters left behind are sent (#135). An address ending in a dotted quad (`::ffff:192.168.1.1`)
+  disclosure rather than fragmentation. By the time it reads the Template field, the pipeline has
+  turned these shapes' digits into `<NUM>`; since `v0.12.37` it reads them there too (#135),
+  unless a word character or other punctuation follows (#137). An address ending in a dotted quad (`::ffff:192.168.1.1`)
   is masked whole on the raw lines since `v0.12.25`, by a rule of its own beside the
   anonymizer's IPv6 pattern rather than inside it; until then it was masked only as far as
   `::ffff:192` and the remaining three octets were sent. On the Template field it arrives as
@@ -1491,18 +1527,11 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   address ending in a dotted quad whole on the same terms, glued or not, so it stops at the same
   characters: `peer ::ffff:10.0.0.5-x down` reaches the model as `peer <IP_1>.0.0.5-x down`, and
   a fifth octet, a dotted name or an address glued on by `:` after the quad leave it to the rules as
-  they were. Affected: a `::`-led address written straight after a `:`, or an address ending in a
+  they were. On the Template field an address the template mask leaves uncollapsed stops at the same
+  characters: `peer:2001:db8::1-x` reaches the model as `peer:<NUM>:db<NUM><IP_1><NUM>-x`, which sends
+  `db`. Affected: a `::`-led address written straight after a `:`, or an address ending in a
   dotted quad, followed by one of those characters. Not affected: every other address, and the same
   addresses followed by a boundary.
-- **#135 — with `--llm-anonymize`, the Template field sends the hex letters of an IPv6 address the
-  template mask fragments.** The three shapes the template mask leaves uncollapsed (a one-group
-  prefix, the bare loopback, an address glued onto the token before it), and the full form of an
-  address ending in a dotted quad, reach the anonymizer with their digits already `<NUM>`, and it
-  cannot recognise an address in what is left:
-  `peer:2001:db8::1` is sent as `peer:<NUM>:db<NUM><IP_1><NUM>` (sending `db`), and
-  `route fe80::/64` as `route fe<NUM><IP_1>/<NUM>` (sending `fe`). Since v0.8.5. Affected: the
-  Template field only. Not affected: the raw trigger and context lines, where all three shapes are
-  masked whole, and every address the template mask collapses to `<IP>`.
 - **With `--llm-anonymize`, four shapes of a raw `/` in a URL userinfo are still sent, by
   design.** These are credential leaks. Since `v0.12.26` the authority is masked whole when the
   text shows that the `/` is inside a userinfo (#59). In these four shapes it cannot: each is also a
