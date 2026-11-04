@@ -204,3 +204,26 @@ func TestCardsPaneNeverResizesTheStream(t *testing.T) {
 		}
 	}
 }
+
+// TestExpandedForgetsAgedOutCards: the expansion map is keyed by hash, and a card that ages out
+// never comes back to clear its entry (#126). Keystrokes drive it, so it grows slowly, but the
+// hash outlives its template all the same.
+func TestExpandedForgetsAgedOutCards(t *testing.T) {
+	m := expandSelected(t, apply(t, explainModel(t), escalationSnapshot(nil)))
+	if !m.expanded["aaa"] {
+		t.Fatal("set-up: the card did not expand")
+	}
+
+	snap := escalationSnapshot(nil)
+	snap.Escalations[0].Hash = "bbb"
+	m = apply(t, m, snap)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if !m.expanded["bbb"] {
+		t.Error("the new card did not expand")
+	}
+	if _, kept := m.expanded["aaa"]; kept {
+		t.Error("the aged-out card is still in the expansion map")
+	}
+}

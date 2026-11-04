@@ -3,6 +3,8 @@
 package tui
 
 import (
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -271,6 +273,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", " ":
 		if m.focus == focusCards && m.selKey != "" {
 			m.expanded[m.selKey] = !m.expanded[m.selKey]
+			// A card that aged out never comes back to clear its entry, so the map holds the
+			// retained cards and no more (#126). It only grows here, so this is where it shrinks.
+			maps.DeleteFunc(m.expanded, func(hash string, _ bool) bool {
+				return !slices.ContainsFunc(m.snap.Escalations, func(ev pipeline.Event) bool { return ev.Hash == hash })
+			})
 			m.refreshCards()
 		}
 		return m, nil

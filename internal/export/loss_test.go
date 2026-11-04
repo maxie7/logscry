@@ -500,3 +500,103 @@ func TestALostFlagNeverTakesAnotherFlagsRecord(t *testing.T) {
 		t.Errorf("Dropped() = %d, want 1 record (the second flag's)", lost)
 	}
 }
+
+// TestALostSecondHalfLeavesNothingBehind: when a record's second half finds the queue full, the
+// first half has no partner coming, and its key never recurs. Left in the writer it holds a
+// template's Pattern for the rest of the run, long after the template is gone (#126). The first
+// half may be anywhere when that happens: already in the writer, or still queued behind the stall.
+func TestALostSecondHalfLeavesNothingBehind(t *testing.T) {
+	at := time.Date(2026, 8, 29, 11, 0, 1, 0, time.UTC)
+	flag := func(i int) (Flag, model.Explanation) {
+		h := fmt.Sprintf("lost%d", i)
+		f, ex := flagFor(h), doneFor(h)
+		f.ID, ex.Flag, ex.At = model.FlagID(i+1), model.FlagID(i+1), at
+		return f, ex
+	}
+	stalled := func(t *testing.T) (*Writer, *gatedSink) {
+		t.Helper()
+		sink := &gatedSink{gate: make(chan struct{})}
+		return newWriter(sink, 0), sink
+	}
+	stall := func(w *Writer) {
+		w.Flag(flagFor("held"))
+		w.WouldEscalate("held", 0, at)
+		waitFor(t, "the writer to take the held record", func() bool { return len(w.in) == 0 })
+	}
+
+	cases := []struct {
+		name string
+		// first and second are the halves in the order they reach send.
+		first, second func(w *Writer, f Flag, ex model.Explanation)
+	}{
+		{"the flag waits", func(w *Writer, f Flag, _ model.Explanation) { w.Flag(f) },
+			func(w *Writer, _ Flag, ex model.Explanation) { w.Resolve(ex) }},
+		{"the answer waits", func(w *Writer, _ Flag, ex model.Explanation) { w.Resolve(ex) },
+			func(w *Writer, f Flag, _ model.Explanation) { w.Flag(f) }},
+	}
+	for _, c := range cases {
+		t.Run(c.name+", already in the writer", func(t *testing.T) {
+			w, sink := stalled(t)
+			f, ex := flag(0)
+			c.first(w, f, ex)
+			waitFor(t, "the writer to take the first half", func() bool { return len(w.in) == 0 })
+			stall(w)
+			fillQueue(w, queueCap)
+			c.second(w, f, ex) // the queue is full: lost
+			close(sink.gate)
+			waitFor(t, "the queue to drain", func() bool { return len(w.in) == 0 })
+			w.WouldEscalate("after", 0, at) // the writer forgets on its next message
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if n := len(w.flags) + len(w.orphans); n != 1 { // "after" is a half with no flag
+				t.Errorf("%d halves are left in the writer, want only the unmatched one", n)
+			}
+			if w.Dropped() == 0 {
+				t.Error("the record was not counted lost")
+			}
+		})
+		t.Run(c.name+", still queued", func(t *testing.T) {
+			w, sink := stalled(t)
+			stall(w)
+			f, ex := flag(0)
+			c.first(w, f, ex)
+			fillQueue(w, queueCap-1)
+			c.second(w, f, ex) // the queue is full: lost
+			close(sink.gate)
+			waitFor(t, "the queue to drain", func() bool { return len(w.in) == 0 })
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if n := len(w.flags) + len(w.orphans); n != 1 { // fillQueue's lone pad
+				t.Errorf("%d halves are left in the writer, want only the pad", n)
+			}
+		})
+	}
+}
+
+// TestAForgottenHalfNeverCostsAnotherRecord: forgetting is by seq, so the zero flag ID's repeated
+// keys and the next flag of a template are untouched by it.
+func TestAForgottenHalfNeverCostsAnotherRecord(t *testing.T) {
+	w, sink, release := heldWriter(t)
+	at := time.Date(2026, 8, 29, 11, 0, 1, 0, time.UTC)
+	f1, r1 := escalationOf(1, at)
+	f1.ID, r1.Flag = 1, 1
+	w.Flag(f1)
+	fillQueue(w, queueCap-1)
+	w.Resolve(r1) // lost
+	release()
+	waitFor(t, "the queue to drain", func() bool { return len(w.in) == 0 })
+
+	f2, r2 := escalationOf(2, at)
+	f2.ID, r2.Flag = 2, 2
+	w.Flag(f2)
+	w.Resolve(r2)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := recordsFor(decodeLines(t, sink.contents()), "x")
+	if len(got) != 1 || got[0]["count_at_flag"] != float64(2) {
+		t.Errorf("x's records are %v, want the second flag's alone", got)
+	}
+}

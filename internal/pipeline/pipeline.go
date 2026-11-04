@@ -6,6 +6,7 @@
 package pipeline
 
 import (
+	"container/list"
 	"context"
 	"time"
 
@@ -56,12 +57,50 @@ type Event struct {
 	LastFlagged  time.Time
 }
 
+// The template table's bound (#126). A stream of distinct lines would otherwise grow the table
+// for as long as it runs, one masked pattern per line, and the 64 KiB line cap only sets the
+// size of each. There is no flag: nothing an operator decides depends on the numbers.
+const (
+	// MaxTemplates is 16 times the 3,108 templates of the largest of ten real boots, and about
+	// 60 days of that laptop's new templates. It is a count as well as a byte bound because the
+	// snapshot sorts the whole table on this goroutine, and the fixed cost of a template is
+	// charged to nothing else: bytes alone would allow about 640,000 short ones.
+	MaxTemplates = 50_000
+	// MaxTemplateBytes bounds what varies per template (see templateBytes). It is 177 times the
+	// 378,280 bytes the largest of those boots can reach. A count alone would allow 3.1 GiB of
+	// patterns at the line cap, and 2.4 GiB of full Recent rings.
+	MaxTemplateBytes = 64 << 20
+)
+
+const (
+	// evictionWalk is how many held templates one shrink steps over. It keeps a line O(1) when
+	// the table is full of them, which is reachable: a crafted stream that hung the pipeline
+	// would be the SECURITY.md item this bound exists for.
+	evictionWalk = 128
+	// recentSlot is what one entry of Template.Recent costs.
+	recentSlot = 24
+)
+
 // Pipeline holds the template dedup/count state and the scorer that reads it. Its
 // methods are NOT safe for concurrent use: call them from a single goroutine only
 // (see Run).
 type Pipeline struct {
 	templates map[string]*model.Template
 	scorer    *score.Scorer // nil: no scoring, events carry a zero Score
+
+	// The template table's bound (#126). order holds every template, least recently seen at the
+	// front, and bytes is what they all cost (see templateBytes). The limits are fields so that a
+	// test can set small ones.
+	order        *list.List
+	bytes        int
+	maxTemplates int
+	maxBytes     int
+	evictions    *Evictions // counts them; nil counts nothing
+
+	// retained reports that a template has a card (see collector.retains); nil means none does.
+	// routed reports that answers come back through attach, so Awaiting is counted down.
+	retained func(hash string) bool
+	routed   bool
 
 	// explain is whether an LLM stage is attached. Without one — a plain run, or
 	// --explain-dry-run — an escalation gets no explanation state at all, so dry-run
@@ -86,7 +125,13 @@ type Pipeline struct {
 
 // New returns an empty Pipeline scoring with sc, which may be nil.
 func New(sc *score.Scorer) *Pipeline {
-	return &Pipeline{templates: make(map[string]*model.Template), scorer: sc}
+	return &Pipeline{
+		templates:    make(map[string]*model.Template),
+		scorer:       sc,
+		order:        list.New(),
+		maxTemplates: MaxTemplates,
+		maxBytes:     MaxTemplateBytes,
+	}
 }
 
 // Process runs one line through normalize -> template -> dedup/count -> score and
@@ -95,6 +140,9 @@ func (p *Pipeline) Process(line model.LogLine, now time.Time) Event {
 	line = Normalize(line)
 	pattern, hash := TemplatizeLine(line)
 	tmpl, prevLastSeen := p.upsert(hash, pattern, line.Time, now)
+	if line.Level != "" {
+		tmpl.Level = line.Level
+	}
 
 	ev := Event{
 		Line:      line,
@@ -195,6 +243,7 @@ func (p *Pipeline) escalated(tmpl *model.Template, queued bool, now time.Time) {
 	// pool, which attach counts back down. A dropped flag never reaches this line, and a dry
 	// run never calls escalated at all.
 	p.explaining++
+	tmpl.Awaiting++
 }
 
 // reexplaining builds the explanation a fresh escalation starts from: a copy of the answer
@@ -239,9 +288,11 @@ func (p *Pipeline) attach(ex model.Explanation) {
 	case model.ExplainDone:
 		p.explaining--
 		p.explained++
+		tmpl.Awaiting--
 	case model.ExplainFailed:
 		p.explaining--
 		p.explainFailed++
+		tmpl.Awaiting--
 	case model.ExplainPending:
 	}
 
@@ -345,16 +396,104 @@ func (p *Pipeline) upsert(hash, pattern string, at, now time.Time) (tmpl *model.
 			EarliestLineTime: at,
 		}
 		p.templates[hash] = tmpl
+		tmpl.Order = p.order.PushBack(tmpl)
+		p.bytes += templateBytes(tmpl)
+		p.shrink(tmpl, now)
 		return tmpl, time.Time{}
 	}
 	prevLastSeen = tmpl.LastSeen
 	tmpl.Count++
 	tmpl.LastSeen = now
+	held := len(tmpl.Recent)
 	tmpl.Recent = pushRecent(tmpl.Recent, now)
+	p.bytes += (len(tmpl.Recent) - held) * recentSlot
+	p.order.MoveToBack(tmpl.Order)
 	if !at.IsZero() && (tmpl.EarliestLineTime.IsZero() || at.Before(tmpl.EarliestLineTime)) {
 		tmpl.EarliestLineTime = at
 	}
+	p.shrink(tmpl, now) // a known template spends bytes too, until its ring is full
 	return tmpl, prevLastSeen
+}
+
+// templateBytes is what a template costs against MaxTemplateBytes: the two things that vary per
+// template. Its fixed cost is what MaxTemplates bounds.
+func templateBytes(t *model.Template) int { return len(t.Pattern) + recentSlot*len(t.Recent) }
+
+// shrink evicts the least recently seen templates until the table is back within both bounds,
+// and returns how many held ones it stepped over. cur, the template this line belongs to, is not
+// a candidate.
+//
+// Two kinds of template are held, and the difference between them is the whole of this function:
+//
+//   - A PIN (see pinned) is never evicted: the template has an answer on the way, a card on
+//     screen, or a cache entry keeping it quiet. Pins are few, because every one of them is a
+//     flag, and flags are rate-limited.
+//   - A BURST HOLD (see score.MayBurst) is a template that could fire a burst right now. It is
+//     honoured for the first half of the walk and then yields.
+//
+// A held template at the front moves to the back, which costs it nothing but its place in line.
+// The walk is limited because a table full of held templates would otherwise cost the whole table
+// per line. Burst holds yield because they are not rate-limited: a table of established templates
+// all seen within the window, with new ones still arriving, is a case where the bound and the
+// hold cannot both be true, and the bound is the one that protects the process. Reaching it takes
+// half a walk of consecutive held templates at the front, which means a full table seen in full
+// inside ten seconds. Pins never yield, so a walk can end with the table over its bound, by no
+// more than the pins the rate limiter let through; the next line carries on from there.
+func (p *Pipeline) shrink(cur *model.Template, now time.Time) (skips int) {
+	for p.over() && skips < evictionWalk {
+		front := p.order.Front()
+		t := front.Value.(*model.Template)
+		switch {
+		case t == cur, p.pinned(t, now):
+		case skips < evictionWalk/2 && p.scorer != nil && p.scorer.MayBurst(t, now):
+		default:
+			p.evict(front, t)
+			continue
+		}
+		p.order.MoveToBack(front)
+		skips++
+	}
+	return skips
+}
+
+// over reports whether the table is past either bound.
+func (p *Pipeline) over() bool {
+	return p.order.Len() > p.maxTemplates || p.bytes > p.maxBytes
+}
+
+// pinned reports whether evicting t now would take something from the user. All three cases are
+// flags, so an unflagged template, which is nearly all of them, costs one comparison.
+//
+// An answer in flight counts only when answers come back through attach. --plain reads them
+// itself, prints their own Pattern and resolves the export by hash and flag, so nothing there
+// needs the template, and Awaiting is never counted down: pinning on it would hold every flagged
+// template for the whole run.
+//
+// A card needs its template because collector.escalations stamps the answer and the live numbers
+// on from it. Inside the cache TTL the template is what keeps a recurring error quiet, and pinning
+// for the whole TTL is what bounds a re-explanation to one per TTL. At the defaults these come to
+// at most 696 templates: 610 cached, 20 cards, 66 in flight.
+func (p *Pipeline) pinned(t *model.Template, now time.Time) bool {
+	if t.FlagCount == 0 {
+		return false
+	}
+	return (p.routed && t.Awaiting > 0) ||
+		(p.retained != nil && p.retained(t.Hash)) ||
+		p.scorer.Explained(t.Hash, now)
+}
+
+// evict drops t. Everything a template owns lives on it, so this is the whole of forgetting one:
+// nothing else in the process is keyed by a hash that outlives its template. It returns as a new
+// template: novel again, which alone never escalates (a merely-new line scores at most 0.95), with
+// its count, baseline and flag history restarted. An ERROR-class line does cross the threshold on
+// that novelty (1.05), which costs a model call, at most one per cache TTL, because the flag pins
+// the template for a TTL; the rate limiter's cap is untouched.
+func (p *Pipeline) evict(e *list.Element, t *model.Template) {
+	p.order.Remove(e)
+	delete(p.templates, t.Hash)
+	p.bytes -= templateBytes(t)
+	t.Order = nil
+	p.evictions.add()
 }
 
 // pushRecent appends now to the recent ring, dropping the oldest entry in place
@@ -409,6 +548,9 @@ type Options struct {
 	// argument — the scorer, the rate limiter, the cache, template first/last seen, the
 	// export — so this one switch is the whole of replaying time. See sourceClock.
 	SourceTime bool
+
+	// Evictions counts the templates evicted at the bound, and says so once. Nil counts nothing.
+	Evictions *Evictions
 }
 
 // sourceClock is replay's time: the capture's timestamps, advanced by this goroutine as
@@ -448,8 +590,11 @@ func Run(ctx context.Context, in <-chan model.LogLine, opts Options) {
 
 	p := New(opts.Scorer)
 	p.explain = opts.Escalations != nil
+	p.routed = opts.Explanations != nil
 	p.export = opts.Export
+	p.evictions = opts.Evictions
 	c := newCollector(opts.RingSize)
+	p.retained = c.retains
 
 	var src *sourceClock // nil: a live run, on the wall clock
 	if opts.SourceTime {

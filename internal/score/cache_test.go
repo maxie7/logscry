@@ -3,6 +3,8 @@
 package score
 
 import (
+	"fmt"
+	"math/rand/v2"
 	"testing"
 	"time"
 )
@@ -64,5 +66,50 @@ func TestCacheReExplainsAfterTTL(t *testing.T) {
 
 	if got := f.sc.Stats().Escalated; got != 2 {
 		t.Errorf("Escalated = %d, want 2 (once per episode)", got)
+	}
+}
+
+// TestCacheForgetsExpiredEntries: an entry past its TTL is a miss whether it is there or not, so
+// keeping it is only a leak: one entry per flag, for the whole run (#126).
+func TestCacheForgetsExpiredEntries(t *testing.T) {
+	const ttl, live = 100 * time.Second, 100
+	c := NewCache(ttl)
+	for i := range 100_000 {
+		c.Mark(fmt.Sprintf("h%d", i), t0.Add(time.Duration(i)*time.Second))
+		if n := len(c.entries); n > 2*live+minSweep {
+			t.Fatalf("after %d marks the cache holds %d entries, %d of them live", i, n, live)
+		}
+	}
+}
+
+// TestCacheSweepChangesNoAnswer runs a cache against a model that never forgets: forgetting must
+// be invisible to Hit and Count, including the recurrence count of an entry that survives a sweep.
+func TestCacheSweepChangesNoAnswer(t *testing.T) {
+	type stamped struct {
+		at time.Time
+		n  int
+	}
+	const ttl = 90 * time.Second
+	c := NewCache(ttl)
+	never := make(map[string]*stamped)
+	r := rand.New(rand.NewPCG(1, 2))
+	now := t0
+	for i := range 200_000 {
+		now = now.Add(time.Duration(r.IntN(500)) * time.Millisecond)
+		h := fmt.Sprintf("h%d", r.IntN(4000))
+		e, ok := never[h]
+		fresh := ok && now.Sub(e.at) < ttl
+		if got := c.Hit(h, now); got != fresh {
+			t.Fatalf("step %d: Hit(%s) = %v, the never-forgetting model says %v", i, h, got, fresh)
+		}
+		if fresh {
+			e.n++
+			if got := c.Count(h, now); got != e.n {
+				t.Fatalf("step %d: Count(%s) = %d, want %d", i, h, got, e.n)
+			}
+			continue
+		}
+		c.Mark(h, now)
+		never[h] = &stamped{at: now, n: 1}
 	}
 }

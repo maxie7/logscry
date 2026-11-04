@@ -7174,6 +7174,136 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       pinned as KNOWN_GAP rows and named in README's two entries. #126, #36, `internal/pipeline` and
       every other detector are untouched. Released as **v0.12.37**.
 
+- [x] **The template table is bounded, and so is everything keyed by it** — #126, found while
+      working on #124, and the stream form of SECURITY.md's "crafted log line or stream" item.
+      `Pipeline.templates` gained one entry per distinct masked pattern and never dropped one. The
+      #124 line cap set the size of an entry and did nothing about their number.
+
+      **Decisions.**
+      1. **Every per-template structure, not only the map.** A template whose state survives
+         somewhere else is still the leak.
+
+         | Structure | Was | Now |
+         |---|---|---|
+         | `Pipeline.templates` | unbounded | 50,000 templates, 64 MiB |
+         | `collector.levels` | unbounded, never deleted | removed: `Template.Level`, freed with the template |
+         | `score.Cache.entries` | unbounded: expired entries stayed | swept when doubled; live ≤ `rate_limit × ttl + rate_limit`, 610 at the defaults |
+         | export `flags`, `orphans` | a half whose partner was lost waited forever, holding `Pattern` | forgotten, including one still queued |
+         | TUI `expanded` | keystroke-driven, aged-out cards stayed | pruned on each toggle: retained cards + 1 |
+         | export `pairs` | flags in flight | unchanged |
+         | `collector.escalated` | 20 (`escalationsKept`) | unchanged; pins its templates |
+         | `collector.ring`, `Snapshot.Templates`, `ContextRing`, the channels | bounded | unchanged |
+         | anonymizer `Mapper` | per request | unchanged |
+
+         The export's half could not be reached by a stream alone: it needs a stalled disk at the
+         moment an answer arrives. It held a template's `Pattern` past the template, so it is the
+         same leak. Its list has its own lock, because a blocking send (replay) can wait on the
+         writer with `w.mu` held, and sharing it would deadlock the writer.
+      2. **Both bounds: 50,000 templates and 64 MiB, with no flag.** Bytes are `len(Pattern)` plus
+         24 per `Recent` entry. Predicted before measuring: at most ~3,500 templates, under 1 MiB
+         of patterns, longest pattern under 4.3 KiB. Measured on the ten boots, with `ab37*` and
+         `logscry-probe` filtered:
+
+         | | Predicted | Measured max | Bound | Margin |
+         |---|---|---|---|---|
+         | Templates | ≤ ~3,500 | 3,108 | 50,000 | 16× |
+         | Pattern bytes | < 1 MiB | 251,680 | n/a | n/a |
+         | With `Recent` | n/a | ≤ 378,280 | 64 MiB | 177× |
+         | Longest pattern | < 4.3 KiB | 6,599 | n/a | n/a |
+
+         The last prediction missed: a coalesced event beats the longest single line. Per boot the
+         range is 2,530–3,108 templates. A count alone allows 3.1 GiB of patterns at the line cap.
+         Bytes alone allow ~640,000 short templates, whose fixed cost nothing charges, and the
+         snapshot sorts the whole table on the pipeline goroutine. `Recent` is charged because it
+         is the other per-template variable: uncharged, 50,000 full rings are 2.4 GiB inside the
+         bound. No flag, as #124: nothing an operator decides depends on the numbers.
+      3. **Least recently seen goes first, and three things never go.** The order is a
+         `container/list` with the element on the template, so no second hash-keyed map exists.
+         Pinned: an answer in flight (`Template.Awaiting`, only where answers come back through
+         `attach`), a retained card, and a template inside its cache TTL. All three are flags, so
+         the limiter bounds them: at most 696 at the defaults (610 + 20 + 66), and an unflagged
+         template costs one comparison. **`--plain` has no card and never calls `attach`:** it
+         prints each event's own pattern and resolves the export by hash and flag. Pinning on
+         `Awaiting` there would hold every flagged template for the run, so it does not.
+      4. **"Inside its burst window" is held only where a burst is possible.** Read literally,
+         everything of a flood is inside its window, the bound becomes the line rate times ten
+         seconds, and a stream at one instant never evicts. So `Scorer.MayBurst` is `Count` and age
+         at the baseline's gates, plus `LastSeen` inside the window. A template with no baseline
+         cannot burst, so nothing that could fire is lost. **The age gate is load-bearing:** a
+         newcomer cannot be held until it has survived 60 s, so a table full of held templates
+         evicts newcomers. On `Count` alone, twenty lines per template grow the held set at line
+         rate.
+      5. **The walk is limited, and burst holds yield.** A held template at the front rotates to
+         the back. Without a limit, a table full of them costs the whole table per line, which is
+         a hang under SECURITY.md. One `shrink` takes at most 128 skips, and burst holds are
+         honoured for the first 64. That is the one exception to "never": 64 consecutive held
+         templates at the front of a full table, new ones still arriving. The bound and the hold
+         cannot both be true there, and the bound protects the process. Pins never yield; a walk
+         that ends on them stops and the next line carries on.
+      6. **What eviction costs is bounded and stated.** A returning template is novel: 0.45, 0.65
+         with WARN, 0.75 on stderr, 0.95 with both. Only ERROR-class lines cross (1.05), so #27
+         holds. A victim already past the 15 min cooloff was novel on main too. A flag pins for a
+         full TTL, so a returning error is explained again **at most once per template per
+         `cache_ttl`**, and `rate_limit` still caps the total. The new cost is an ERROR recurring
+         faster than the cooloff, which on main stayed at 0.60 and silent, or one first seen during
+         warmup. Count, `FirstSeen`, baseline and flag history restart, so `count_at_flag` can read
+         1 under a known hash. `UniqueTemplates` is now templates held.
+      7. **Said once, totalled at exit, no exit code.** As #124: `pipeline.Evictions` follows
+         `ingest.Truncations`, and the notice goes through a new `Notices.Post` (`Send` is now its
+         `ingest: ` wrapper), so it never blocks, like #100's. After `Stop` it is not sent, which is
+         the guard against `close(errs)`; the exit total still reports it. #70's non-zero status is
+         for an artifact that lost records, and eviction loses history, not records.
+
+      **Evidence, each predicted first.**
+
+      Heap after GC, on `Process`, main at b7356de:
+
+      | Distinct | main short (predicted) | branch short (predicted) | main 64 KiB (predicted) | branch 64 KiB (predicted) |
+      |---|---|---|---|---|
+      | 10k | 3.2 MiB (~3.5) | 4.2 MiB (~4.1) | 630 MiB (~629) | 66.5 MiB (~64) |
+      | 50k | 15.8 MiB (~17.5) | 20.4 MiB (~21) | 3,142 MiB (~3.1 GiB) | 66.5 MiB (~64) |
+      | 100k | 31.6 MiB (~35) | 22.1 MiB (~21) | 6,282 MiB (~6.3 GiB) | 66.5 MiB (~64) |
+
+      Stream A below, 10.8 million distinct lines, holds 23 MiB on the branch and 3,476 MiB on main.
+
+      Replay of all ten boots, main against branch: 0 evictions as predicted, and every export byte
+      identical, which is more than the kind, hash, count and reasons compared. 2–12 records a boot.
+
+      A recurring ERROR every 60 s for 3 h, among distinct noise spread across each gap:
+
+      | Stream | Predicted main → branch | main: esc / cached / suppressed | branch |
+      |---|---|---|---|
+      | A: 60,000 noise a gap | 1 → 3 | 1 / 0 / 0 | 3 / 0 / 0 |
+      | B: 40,000 noise a gap | 1 → 1 | 1 / 0 / 0 | 1 / 0 / 0 |
+      | C: distinct ERROR noise | equal | 209 / 0 / 119,792 | 209 / 0 / 119,792 |
+      | D: WARN + stderr, cycling | 0 → 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+      A and B through the real binary, dry run, same counts: 1 and 1 records on main, 3 and 1 on the
+      branch, one notice, status 0, and 10,750,004 and 7,150,002 evictions totalled at exit. Each
+      escalation is one model call, so A's cost is the stated one and no more: one per TTL.
+
+      `collector.snapshot` at 50,000 templates: predicted 10–25 ms a tick, measured 15.3 ms mean and
+      17.9 ms worst, with other harnesses running; 1.0 ms at 3,108. The stop condition was 30 ms.
+
+      **Tests.** `internal/pipeline/eviction_test.go`, and in `score`, `export`, `tui`, `ingest`,
+      `llm` and `cmd/logscry`: red by assertion on no-op scaffolding, except the guards that cannot
+      be (`TestCacheSweepChangesNoAnswer`, `TestAForgottenHalfNeverCostsAnotherRecord`,
+      `TestPinnedSetFitsTheTemplateBound`, `TestPostAfterStopSendsNothing`, the two nil-receiver
+      tests and `TestWordsAreDistinctTemplates`). `-race -count=20` passes.
+      `TestReturningErrorIsExplainedOncePerTTL` needed its flood moved past the burst window: at
+      1 s, an established template was correctly held through it.
+
+      **Seen and left alone, out of scope:** the scoring weights and thresholds; #36; #28; the line
+      cap; `collector.summaries` still sorts the table every tick, now of bounded size; the stream
+      ring and channels, which hold up to #124's figures whatever this bound says.
+
+      **Found on the way, not addressed here:** `collector.sources` gains one entry per distinct
+      source name and never drops one. A journald identifier becomes a source name, so a stream
+      can drive it: 200,000 entries from one template in a throwaway test. It is not keyed by
+      template, so it is filed as #163 and named in README Known limitations.
+
+      Released as **v0.12.38**.
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

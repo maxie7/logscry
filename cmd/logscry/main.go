@@ -120,6 +120,17 @@ func run(ctx context.Context, args []string) (err error) {
 		}
 	}()
 
+	// Templates evicted at the bound, announced once while the run is live and totalled here.
+	// Like the cuts above the status is untouched: every line was scored and shown, and the export
+	// is whole. What an eviction loses is history (#126).
+	var evicted *pipeline.Evictions
+	defer func() {
+		if n := evicted.Count(); n > 0 {
+			fmt.Fprintf(os.Stderr, "logscry: pipeline: %d template(s) evicted at the bound of %d templates or %d MiB\n",
+				n, pipeline.MaxTemplates, pipeline.MaxTemplateBytes>>20)
+		}
+	}()
+
 	sources, stdinOnly := sources(cfg)
 	replay, _ := sources[0].(*ingest.ReplaySource) // nil unless --replay: it is then the only source
 
@@ -140,6 +151,7 @@ func run(ctx context.Context, args []string) (err error) {
 		errs <- notice
 	}
 	cuts = ingest.NewTruncations(func() { errs <- errTruncated })
+	evicted = pipeline.NewEvictions(func() { notices.Post(errEvicting) })
 	ingestCtx := ingest.WithNotices(ingest.WithTruncations(ctx, cuts), notices)
 	go func() {
 		defer close(lines)
@@ -191,9 +203,9 @@ func run(ctx context.Context, args []string) (err error) {
 			fmt.Fprintf(os.Stderr, "logscry: raw log lines will be sent to %s; "+
 				"pass --llm-anonymize to mask IPs, emails, tokens, and hostnames first\n", host)
 		}
-		return runPlainAt(ctx, grouped, errs, sc, escalations, explanations, exp, cfg.ExplainDryRun, replay != nil)
+		return runPlainAt(ctx, grouped, errs, sc, escalations, explanations, exp, evicted, cfg.ExplainDryRun, replay != nil)
 	}
-	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, exp, cfg)
+	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, exp, evicted, cfg)
 }
 
 // noticeRoom is how many of a running source's notices errs holds unread before the next is
@@ -218,6 +230,13 @@ func backgroundNotices(sources int) (chan error, *ingest.Notices) {
 // stderr. "At most": a character the cut would split is dropped whole.
 var errTruncated = fmt.Errorf("ingest: a line over %[1]d KiB was cut to at most its first %[1]d KiB "+
 	"and the rest discarded; the total is reported at exit", ingest.MaxLineBytes>>10)
+
+// errEvicting is the notice for the first template evicted at the bound. It goes the way a running
+// source's notices go, so it never waits: a pipeline stalled on its reader would be worse than the
+// memory this bound protects. Past the end of the sources it is not sent, and the exit total says it.
+var errEvicting = fmt.Errorf("pipeline: the template table reached its bound of %d templates or %d MiB: "+
+	"the least recently seen are being evicted, and one that returns counts as new; "+
+	"the total is reported at exit", pipeline.MaxTemplates, pipeline.MaxTemplateBytes>>20)
 
 // replayNotice reports the lines of a finished replay whose time could not be followed, or
 // nil when there were none or this is not a replay. Both kinds were replayed rather than
@@ -371,7 +390,7 @@ func journaldNotice(cfg config.Config) error {
 // The TUI then sees it appear in the next snapshot, and never touches pipeline state.
 func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, term tui.Terminal,
 	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation,
-	exp *export.Writer, cfg config.Config,
+	exp *export.Writer, evicted *pipeline.Evictions, cfg config.Config,
 ) error {
 	snaps := make(chan pipeline.Snapshot, 1)
 	go pipeline.Run(ctx, lines, pipeline.Options{
@@ -381,6 +400,7 @@ func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, 
 		Explanations: explanations,
 		Export:       exp,
 		SourceTime:   cfg.Replay != "",
+		Evictions:    evicted,
 	})
 	return term.Run(ctx, snaps, errs, tuiOptions(cfg, escalations != nil, exp))
 }
@@ -442,18 +462,19 @@ func runPlain(ctx context.Context, lines <-chan model.LogLine, errs <-chan error
 	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation,
 	exp *export.Writer, dryRun bool,
 ) error {
-	return runPlainAt(ctx, lines, errs, sc, escalations, explanations, exp, dryRun, false)
+	return runPlainAt(ctx, lines, errs, sc, escalations, explanations, exp, nil, dryRun, false)
 }
 
 // runPlainAt is runPlain with the pipeline's clock chosen: the wall for a live run, the
 // lines' own timestamps for a replay (see pipeline.Options.SourceTime).
 func runPlainAt(ctx context.Context, lines <-chan model.LogLine, errs <-chan error,
 	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation,
-	exp *export.Writer, dryRun, sourceTime bool,
+	exp *export.Writer, evicted *pipeline.Evictions, dryRun, sourceTime bool,
 ) error {
 	events := make(chan pipeline.Event, 1024)
 	go pipeline.Run(ctx, lines, pipeline.Options{
 		Events: events, Scorer: sc, Escalations: escalations, Export: exp, SourceTime: sourceTime,
+		Evictions: evicted,
 	})
 	return printPlain(ctx, events, errs, explanations, exp, dryRun)
 }

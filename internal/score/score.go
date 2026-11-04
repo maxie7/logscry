@@ -348,6 +348,28 @@ func (s *Scorer) Evaluate(line model.LogLine, tmpl *model.Template, prevLastSeen
 // Stats returns a copy of the running counters.
 func (s *Scorer) Stats() Stats { return s.stats }
 
+// Explained reports whether hash is inside its cache TTL: evicting its template now would let a
+// recurring error be explained again ahead of time (see pipeline.Pipeline.pinned).
+func (s *Scorer) Explained(hash string, now time.Time) bool {
+	return s.cache.Count(hash, now) > 0
+}
+
+// MayBurst reports whether evicting tmpl now could cost a burst: it has a baseline to burst
+// against, and it was seen inside the burst window. It is what "do not evict a template inside
+// its burst window" means, and the plain reading of that is not available:
+//
+//   - A template with no baseline cannot burst (see burst), so eviction takes no burst from it.
+//   - Held on recency alone, every template of a flood is inside its window, so the table's bound
+//     would be the line rate times ten seconds, and a stream at one instant would never evict.
+//   - BaselineMinAge is what stops the held set growing. A newcomer cannot be held until it has
+//     survived that long, so a table full of held templates evicts newcomers. On BaselineMinCount
+//     alone, twenty lines per template would grow the held set at the line rate.
+func (s *Scorer) MayBurst(tmpl *model.Template, now time.Time) bool {
+	return tmpl.Count >= s.cfg.BaselineMinCount &&
+		now.Sub(tmpl.FirstSeen) >= s.cfg.BaselineMinAge &&
+		now.Sub(tmpl.LastSeen) <= s.cfg.BurstWindow
+}
+
 // novelty reports whether the template has never been seen, or has not been seen for
 // longer than the cooloff.
 //
