@@ -7172,7 +7172,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       **Left alone.** `peer:2001:db8::1-x` still sends `db`: #137's right boundary on this field, now
       pinned as KNOWN_GAP rows and named in README's two entries. #126, #36, `internal/pipeline` and
-      every other detector are untouched. Released as **TODO-VERSION**.
+      every other detector are untouched. Released as **v0.12.37**.
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and

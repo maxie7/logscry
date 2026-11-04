@@ -860,7 +860,7 @@ address goes with it, as for every IPv6 address, and a prefix longer than an add
 When `-`, `_`, a letter, a dot inside a word or other punctuation follows the quad, the address is
 sent as before: that is #137, below. On the Template field most of these forms arrive as
 `<IP>.<NUM>.<NUM>` with nothing of the value left; the full form keeps its groups there, which were
-sent until `TODO-VERSION` (#135). Checked against the chain as `v0.12.24` built it, over every hand-written row, the dotted-quad
+sent until `v0.12.37` (#135). Checked against the chain as `v0.12.24` built it, over every hand-written row, the dotted-quad
 probes, prefixes of six to twelve groups and 1,000 generated lines, each raw and templatized,
 with and without an extra host suffix: the bytes it masks include every byte `v0.12.24` masked,
 for every input. Measured over the same ten journald boots: nothing changed. None holds an
@@ -1107,7 +1107,7 @@ row and 2,000 generated keys with a piece inside, each raw, templatized and in f
 For every input, the bytes masked include every byte the chain alone masked, and no byte of a key
 is sent. Measured over the same ten journald boots: nothing changed.
 
-**The hex letters of an IPv6 address were sent on the Template field before `TODO-VERSION`.**
+**The hex letters of an IPv6 address were sent on the Template field before `v0.12.37`.**
 This was a disclosure of part of an address, since `v0.8.5`, with `--llm-anonymize` only, on the
 Template field only: the raw trigger and context lines masked these shapes whole. The template mask
 collapses an address to `<IP>` only with two groups before a `::` and a boundary before the first
@@ -1189,7 +1189,7 @@ Each time the audit's own count was right and its scope was narrower than the se
   sends `.0.0.5.example`. The same goes for `_`, a letter, a dot inside a word, and other
   punctuation. This is the rest of the classes `v0.12.24` and `v0.12.25` mask only up to a
   space, closing punctuation, `/`, `%`, a sentence dot or the end of the line. On the Template
-  field the same followers stop the rule of `TODO-VERSION`: `peer:2001:db8::1-x` sends `db`. Not
+  field the same followers stop the rule of `v0.12.37`: `peer:2001:db8::1-x` sends `db`. Not
   affected: the same addresses followed by one of those, and every other IPv6 address.
 - ~~**#52** — a URL scheme containing a digit hides the host from the URL-host detector in the
   pre-masked template.~~ **Closed in `v0.12.8`.** See the paragraph above. `s3://…@bucket`
@@ -1494,7 +1494,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   mask only.** The `--llm-anonymize` anonymizer is a separate detector set and masks all three
   shapes in full on the raw trigger and context lines — it must, because there under-masking is
   disclosure rather than fragmentation. By the time it reads the Template field, the pipeline has
-  turned these shapes' digits into `<NUM>`; since `TODO-VERSION` it reads them there too (#135),
+  turned these shapes' digits into `<NUM>`; since `v0.12.37` it reads them there too (#135),
   unless a word character or other punctuation follows (#137). An address ending in a dotted quad (`::ffff:192.168.1.1`)
   is masked whole on the raw lines since `v0.12.25`, by a rule of its own beside the
   anonymizer's IPv6 pattern rather than inside it; until then it was masked only as far as
