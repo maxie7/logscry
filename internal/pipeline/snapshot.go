@@ -89,7 +89,7 @@ type Snapshot struct {
 }
 
 // collector accumulates the display state that the template map alone does not
-// hold: the stream tail, the totals, and the per-template level. Like Pipeline
+// hold: the stream tail and the totals. Like Pipeline
 // it is goroutine-confined — only the pipeline goroutine touches it.
 type collector struct {
 	ring   []Event // fixed-size; wraps in place once full
@@ -101,7 +101,6 @@ type collector struct {
 	// stream ring.
 	escalated []Event
 
-	levels  map[string]string   // template hash -> last level seen
 	sources map[string]struct{} // source name -> seen
 
 	// Lines/sec is averaged over rateWindow rather than recomputed per tick, so
@@ -121,7 +120,6 @@ func newCollector(size int) *collector {
 	}
 	return &collector{
 		ring:    make([]Event, size),
-		levels:  make(map[string]string),
 		sources: make(map[string]struct{}),
 	}
 }
@@ -142,9 +140,6 @@ func (c *collector) observe(ev Event, now time.Time) {
 		// exactly as cheap as they were.
 		ev.Context = c.preceding(cardContext)
 		c.retain(ev)
-	}
-	if ev.Line.Level != "" {
-		c.levels[ev.Hash] = ev.Line.Level
 	}
 	if ev.Line.Source != "" {
 		c.sources[ev.Line.Source] = struct{}{}
@@ -186,8 +181,12 @@ func (c *collector) retain(ev Event) {
 	}
 }
 
-// retains reports whether hash has a card. SCAFFOLD: it reports none.
-func (c *collector) retains(_ string) bool { return false }
+// retains reports whether hash has a card, which keeps its template from being evicted (see
+// Pipeline.pinned). There are at most escalationsKept to look through, and only flagged templates
+// are looked up.
+func (c *collector) retains(hash string) bool {
+	return slices.ContainsFunc(c.escalated, func(ev Event) bool { return ev.Hash == hash })
+}
 
 // preceding returns the raw text of the n lines before the one just written, oldest
 // first. It reads backwards through the ring from the newest entry but one — the newest
@@ -295,7 +294,7 @@ func (c *collector) summaries(p *Pipeline) []TemplateSummary {
 		out = append(out, TemplateSummary{
 			Hash:      hash,
 			Pattern:   tmpl.Pattern,
-			Level:     c.levels[hash],
+			Level:     tmpl.Level,
 			Count:     tmpl.Count,
 			FirstSeen: tmpl.FirstSeen,
 			LastSeen:  tmpl.LastSeen,

@@ -234,6 +234,13 @@ type Writer struct {
 	mu    sync.Mutex
 	pairs map[pairKey]pairState
 	seq   uint64
+	// abandoned names the records whose second half could not be queued, by the seq of the first
+	// half, which is in the writer or on its way there with no partner coming. The writer forgets
+	// them (see forget). Left there, each would hold a template's Pattern for the rest of the run,
+	// long after the template was evicted (#126). Its own lock, because a blocking send can wait
+	// on the writer with mu held, and the writer must never wait on mu.
+	abandonMu sync.Mutex
+	abandoned map[pairKey]uint64
 	// queued counts records whose two halves both went into the queue, which the writer
 	// goroutine will therefore start writing unless Close gives up first.
 	queued atomic.Uint64
@@ -313,6 +320,7 @@ func newWriter(f sink, offset int64) *Writer {
 		stall:       defaultStall,
 		trailerWait: defaultTrailerWait,
 		pairs:       make(map[pairKey]pairState),
+		abandoned:   make(map[pairKey]uint64),
 		f:           f,
 		offset:      offset,
 		flags:       make(map[pairKey]msg),
@@ -483,7 +491,8 @@ func (w *Writer) stalled(abandoned uint64) error {
 // corrupt another one: it waited in the writer, unmatched, and was joined to the NEXT
 // escalation of the same template — one escalation's flag with another's explanation. When it
 // is the second half that cannot be queued, the record is lost then; its first half is already
-// in the writer, where its seq keeps it from joining anything else.
+// in the writer, where its seq keeps it from joining anything else, and it is marked for the
+// writer to forget (see abandon).
 //
 // The default case is the point: the loudest caller is the pipeline goroutine that owns the
 // template map, and a blocking send would let a slow disk stall ingestion. It is the same
@@ -509,6 +518,7 @@ func (w *Writer) send(m msg) {
 			w.queued.Add(1)
 		} else {
 			w.dropped.Add(1)
+			w.abandon(key, p.seq)
 		}
 		return
 	}
@@ -522,6 +532,37 @@ func (w *Writer) send(m msg) {
 		w.dropped.Add(1)
 	}
 	w.pairs[key] = pairState{seq: m.seq, isFlag: m.isFlag, lost: !queued}
+}
+
+// abandon tells the writer goroutine that the record seq lost its second half. It cannot be told
+// on the channel, which has just been found full.
+func (w *Writer) abandon(key pairKey, seq uint64) {
+	w.abandonMu.Lock()
+	defer w.abandonMu.Unlock()
+	w.abandoned[key] = seq
+}
+
+// forget drops every waiting half whose partner was lost, and reports whether m is one itself:
+// the first half can still be behind the stall when its partner is dropped, so it may arrive
+// after the news that nothing is coming for it. Each entry is therefore held only until its half
+// turns up, and it does turn up, because a second half is sent only after its first was queued.
+func (w *Writer) forget(m msg) bool {
+	w.abandonMu.Lock()
+	defer w.abandonMu.Unlock()
+	for key, seq := range w.abandoned {
+		for _, waiting := range []map[pairKey]msg{w.flags, w.orphans} {
+			if h, ok := waiting[key]; ok && h.seq == seq {
+				delete(waiting, key)
+				delete(w.abandoned, key)
+			}
+		}
+	}
+	key := m.key()
+	if seq, ok := w.abandoned[key]; ok && seq == m.seq {
+		delete(w.abandoned, key)
+		return true
+	}
+	return false
 }
 
 // enqueue puts m on the channel, or reports that it could not: the channel was full, or, for a
@@ -582,10 +623,14 @@ func (w *Writer) run() {
 // The halves join only when they carry the same seq, i.e. belong to one record. A waiting half
 // with another seq is stale — its partner was dropped (see send) — and gives way.
 //
-// Both maps hold only unmatched halves, one per flag. A flag left unmatched at shutdown is
-// simply never written, which is correct: it never reached a terminal state.
+// Both maps hold only unmatched halves, one per flag in flight: a half whose partner was lost is
+// forgotten rather than left to wait (see forget). A flag left unmatched at shutdown is simply
+// never written, which is correct: it never reached a terminal state.
 func (w *Writer) handle(m msg) {
 	defer w.progress.Add(1)
+	if w.forget(m) {
+		return
+	}
 	key := m.key()
 	waiting, other := w.orphans, w.flags
 	if !m.isFlag {

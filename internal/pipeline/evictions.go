@@ -24,8 +24,18 @@ type Evictions struct {
 // pipeline goroutine and must not block. nil notifies nothing.
 func NewEvictions(notify func()) *Evictions { return &Evictions{notify: notify} }
 
-// add counts one eviction. SCAFFOLD: it counts nothing yet.
-func (e *Evictions) add() {}
+// add counts one eviction.
+func (e *Evictions) add() {
+	if e == nil {
+		return
+	}
+	e.n.Add(1)
+	e.once.Do(func() {
+		if e.notify != nil {
+			e.notify()
+		}
+	})
+}
 
 // Count reports how many templates have been evicted. Safe to call at any time.
 func (e *Evictions) Count() uint64 {

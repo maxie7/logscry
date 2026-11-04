@@ -54,7 +54,12 @@ func noticesFrom(ctx context.Context) *Notices {
 
 // Send sends err, prefixed "ingest: " as a source's error is, or drops and counts it if the
 // channel has no room for it. It never blocks.
-func (n *Notices) Send(err error) {
+func (n *Notices) Send(err error) { n.Post(fmt.Errorf("ingest: %w", err)) }
+
+// Post sends err as it is, for a notice that is not a source's: the pipeline evicting templates
+// (#126). It drops and counts exactly as Send does, and sends nothing after Stop, so the pipeline,
+// which outlives the channel, can call it at any time.
+func (n *Notices) Post(err error) {
 	if n == nil {
 		return
 	}
@@ -68,14 +73,11 @@ func (n *Notices) Send(err error) {
 		return
 	}
 	select {
-	case n.out <- fmt.Errorf("ingest: %w", err):
+	case n.out <- err:
 	default:
 		n.dropped.Add(1)
 	}
 }
-
-// Post is Send without the prefix. SCAFFOLD: it sends nothing yet.
-func (n *Notices) Post(_ error) {}
 
 // Dropped reports how many notices found no room.
 func (n *Notices) Dropped() uint64 {

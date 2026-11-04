@@ -496,7 +496,8 @@ func TestReturningErrorIsExplainedOncePerTTL(t *testing.T) {
 	for minute := range 180 {
 		now := at.Add(time.Duration(minute) * time.Minute)
 		p.Process(line, now)
-		next = flood(p, next, 20, now.Add(time.Second))
+		// Past the burst window, or an established template is held through the flood.
+		next = flood(p, next, 20, now.Add(30*time.Second))
 	}
 	stats := p.Stats()
 	if stats.Escalated != 3 {

@@ -4,7 +4,7 @@ package score
 
 import "time"
 
-// minSweep is the fewest entries that are worth a sweep. SCAFFOLD: nothing sweeps yet.
+// minSweep is the fewest entries worth sweeping for.
 const minSweep = 64
 
 // entry is one explained template: when it was explained, and how many times it has
@@ -22,14 +22,21 @@ type entry struct {
 //
 // Not safe for concurrent use: it is owned by the pipeline goroutine, like the rest
 // of the scorer.
+//
+// An expired entry is a miss whether it is there or not, so keeping one only costs memory, and
+// the entries would otherwise last the whole run. They go in a sweep, when the map has doubled
+// since the last one, so a Mark stays O(1) on average at any --rate-limit. That holds the map
+// under twice its live entries, of which there are at most rate_limit x ttl + rate_limit: the
+// limiter is the only way in. (#126)
 type Cache struct {
 	ttl     time.Duration
 	entries map[string]*entry
+	sweepAt int // the size that triggers the next sweep
 }
 
 // NewCache returns an empty explanation cache with the given TTL.
 func NewCache(ttl time.Duration) *Cache {
-	return &Cache{ttl: ttl, entries: make(map[string]*entry)}
+	return &Cache{ttl: ttl, entries: make(map[string]*entry), sweepAt: minSweep}
 }
 
 // Hit reports whether hash already has a fresh explanation, bumping that entry's
@@ -48,6 +55,19 @@ func (c *Cache) Hit(hash string, now time.Time) bool {
 // replaces any expired entry, which resets the recurrence count for the new episode.
 func (c *Cache) Mark(hash string, now time.Time) {
 	c.entries[hash] = &entry{at: now, count: 1}
+	if len(c.entries) >= c.sweepAt {
+		c.sweep(now)
+	}
+}
+
+// sweep deletes the expired entries and sets the size of the next sweep.
+func (c *Cache) sweep(now time.Time) {
+	for hash, e := range c.entries {
+		if now.Sub(e.at) >= c.ttl {
+			delete(c.entries, hash)
+		}
+	}
+	c.sweepAt = max(2*len(c.entries), minSweep)
 }
 
 // Count returns how many occurrences of hash the current cache entry covers, or 0 if
