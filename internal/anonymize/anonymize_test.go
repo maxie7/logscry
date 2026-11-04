@@ -4623,7 +4623,7 @@ func TestAcceptedOverMasking(t *testing.T) {
 		// after "sk_test_", where '_' would have ended a snake_case name in short pieces.
 		{"a long camelCase name after a stripe prefix is a key", "run sk" + "_test_createCustomerWithCardAndRefund ok", "run <TOKEN_1> ok"},
 	}
-	for _, c := range append(append(append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...), jsonEscapeOverMaskingRows...), vendorSecretOverMaskingRows...) {
+	for _, c := range append(append(append(append(append(append(cases, gluedRunOverMaskingRows...), dottedQuadOverMaskingRows...), slashUserinfoOverMaskingRows...), jsonEscapeOverMaskingRows...), vendorSecretOverMaskingRows...), ipv6TemplateOverMaskingRows...) {
 		t.Run(c.name, func(t *testing.T) {
 			m := New()
 			if got := mustMask(t, m, c.in); got != c.want {
@@ -4674,6 +4674,26 @@ var gluedRunOverMaskingRows = []struct {
 	{"the colon that glues an address goes with it", "peer:::1 down", "peer<IP_1> down"},
 	{"a netstat port goes with the unspecified address", "tcp6 0 0 :::22 :::* LISTEN", "tcp6 0 0 <IP_1> <IP_2>:* LISTEN"},
 	{"a ':::' operator is one placeholder", "xs ::: ys", "xs <IP_1> ys"},
+}
+
+// ipv6TemplateOverMaskingRows are #135's accepted over-masking rows, at package level for the gate's sake as
+// #134's are. Every one is a Template field. 7c has no left boundary and the union cannot cut, so a word's
+// hex-ending character goes with an address after it, as on 7, and so does whatever a later rule read of a
+// host:port glued on by ':': the two are one value, an IP. Its right boundary is ':' free, so a port goes
+// into the placeholder, as on 7. Each row names what v0.12.36 wrote. Captures show none of these: what
+// 7c changes there is the loopback form, which sent no letter.
+var ipv6TemplateOverMaskingRows = []struct {
+	name string
+	in   string
+	want string
+}{
+	{"a word's last hex letter before a :: is taken, as on a raw line", "Cache<NUM>:: failed", "Cach<IP_1> failed"},
+	{"a word's last hex letter before a :: with a boundary", "Stage<NUM>:: done", "Stag<IP_1> done"},
+	{"a hex-ending token glued by ':' gives its letter", "route:<NUM>:db<NUM>::<NUM> x", "rout<IP_1> x"},
+	{"a :: after a number with a word before it", "step <NUM>:: done", "step <IP_1> done"},
+	{"a port goes into the placeholder", "peer:<NUM>:db<NUM>::<NUM>:<NUM> x", "peer:<IP_1> x"},
+	{"a host:port glued to an address is one value and loses its tag", "x.svc:<NUM>::<NUM> y", "<IP_1> y"},
+	{"the same in a URL", "http://a.b:<NUM>::<NUM>/x", "http://<IP_1>/x"},
 }
 
 // vendorSecretOverMaskingRows are #116's accepted over-masking rows, at package level for the gate's sake
@@ -4927,6 +4947,97 @@ var templatizedRows = []templatizedRow{
 	{"aws-secret/pair", "creds \x00" + awsAccessKeyID + "\x00,\x00" + awsSecretKey + "\x00 loaded"},
 	{"webhook/slack", "post https://\x00" + slackHookHost + "\x00/services/\x00" + slackWebhookPath + "\x00 failed"},
 	{"webhook/discord-versioned", "POST https://\x00" + discordHost + "\x00/api/v10/webhooks/\x00" + discordWebhookPath + "\x00 401"},
+	// #135: IPv6 forms the pipeline leaves uncollapsed. Their hex letters survive it, and rule 7c reads them.
+	// A form uncollapsed only for what it is glued to has no row here: a mark beside it is a boundary to the
+	// pipeline, which then collapses it. Those are ipv6TemplateGluedRows.
+	{"ipv6-template/prefix-one-group", "route \x00fe80::\x00/64 dev"},
+	{"ipv6-template/upper-case-prefix", "route \x00FE80::\x00/64 dev"},
+	{"ipv6-template/loopback", "bind \x00::1\x00 port"},
+	{"ipv6-template/one-group-after", "via \x00::a1b2\x00 dev"},
+	{"ipv6-template/full-dotted-quad", "peer \x000:0:0:0:0:ffff:192.0.2.1\x00 down"},
+}
+
+// ipv6TemplateGluedRows are #135's forms the pipeline leaves uncollapsed for what they are glued to. The line
+// is lead, addr, tail; want is New().Mask of its template. TestIPv6TemplateGluedRows reads each as
+// templatizedRows are read, and in logfmt. The colon that glues a "::" on goes with it, as on 7a (#134).
+var ipv6TemplateGluedRows = []struct {
+	name, lead, addr, tail, want string
+}{
+	{"glued by a colon", "peer:", "2001:db8::1", " closed", "peer:<IP_1> closed"},
+	{"glued by a dot", "peer.", "2001:db8::1", " closed", "peer.<IP_1> closed"},
+	{"glued to a letter", "x", "2001:db8::1", " closed", "x<IP_1> closed"},
+	{"many letters", "peer:", "2a02:c7f:beef:cafe::1", " closed", "peer:<IP_1> closed"},
+	{"a group either side", "peer:", "a1b2::c3", " closed", "peer:<IP_1> closed"},
+	{"a prefix glued on", "peer:", "2001:db8::", "/32 dev", "peer:<IP_1>/<NUM> dev"},
+	{"a group before, two after", "peer:", "fe80::a1:b2", " closed", "peer:<IP_1> closed"},
+	{"two groups after an elision, glued", "peer.", "::a1:b2", " closed", "peer.<IP_1> closed"},
+	{"a port", "peer:", "2001:db8::1:443", " closed", "peer:<IP_1> closed"},
+	{"a zone", "peer:", "2001:db8::1", "%eth0 closed", "peer:<IP_1>%eth<NUM> closed"},
+	{"upper case", "peer:", "2001:DB8::1", " closed", "peer:<IP_1> closed"},
+	{"eight groups", "peer:", "2001:0db8:85a3:0:0:8a2e:370:7334", " closed", "peer:<IP_1> closed"},
+	{"a dotted quad", "peer:", "2001:db8::ffff:192.0.2.1", " closed", "peer:<IP_1> closed"},
+	{"a dotted quad after a lone elision", "peer ", "::192.0.2.1", " closed", "peer <IP_1> closed"},
+	{"a group and a dotted quad after a lone elision", "peer:", "::ffff:192.0.2.1", " closed", "peer<IP_1> closed"},
+	{"a dotted quad after one group", "peer:", "a1::192.0.2.1", " closed", "peer:<IP_1> closed"},
+}
+
+// TestIPv6TemplateGluedRows is TestTemplatizedMaskingIsComplete and its logfmt twin for ipv6TemplateGluedRows:
+// the value comes back as one placeholder with the text around it untouched, and restores.
+func TestIPv6TemplateGluedRows(t *testing.T) {
+	for _, r := range ipv6TemplateGluedRows {
+		t.Run(r.name, func(t *testing.T) {
+			in := r.lead + r.addr + r.tail
+			tpl, _ := pipeline.Templatize(in)
+			if strings.Contains(tpl, "<IP>") && !strings.Contains(r.addr, ".") {
+				t.Fatalf("premise broken: the pipeline collapses %q to %q", in, tpl)
+			}
+			m := New()
+			if got := mustMask(t, m, tpl); got != r.want {
+				t.Errorf("not masked whole:\n in:   %q\n got:  %q\n want: %q", tpl, got, r.want)
+			} else if back := m.Restore(got); back != tpl {
+				t.Errorf("round-trip mismatch:\n in:  %q\n out: %q", tpl, back)
+			}
+			line := `level=error msg="` + in + `" module=store`
+			logfmt, _ := pipeline.TemplatizeLine(model.LogLine{Raw: line})
+			if want := `level=error msg="` + r.want + `" module=store`; mustMask(t, New(), logfmt) != want {
+				t.Errorf("not masked whole on a logfmt template:\n in:   %q\n want: %q", logfmt, want)
+			}
+		})
+	}
+}
+
+// ipv6TemplateRightBoundaryRows are templates on which 7c must not fire, with their exact output, which is
+// v0.12.36's. TestIPv6TemplateRightBoundary asserts both.
+var ipv6TemplateRightBoundaryRows = []struct {
+	name, in, want string
+}{
+	// A C++ name: what follows its "::" is no boundary. On the raw line 7 masks these as it always did, and
+	// without the boundary 7c would take the digit run and the name's letters before the "::" with it.
+	{"a C++ method", "Vec<NUM>::dot(v)", "Vec<NUM><IP_1>ot(v)"},
+	{"a C++ type", "Foo<NUM>::Bar", "Foo<NUM><IP_1>r"},
+	{"a C++ namespace", "ns<NUM>::fn(<NUM>)", "ns<NUM><IP_1>n(<NUM>)"},
+	// KNOWN_GAP #137, on the Template field: each follower can continue a value a later rule reads, so 7c does
+	// not fire, and "db" is sent. Pinned, leak included, so closing them shows up here as a diff.
+	{"KNOWN_GAP #137 a hyphen after the address", "peer:<NUM>:db<NUM>::<NUM>-x", "peer:<NUM>:db<NUM><IP_1><NUM>-x"},
+	{"KNOWN_GAP #137 an underscore after the address", "peer:<NUM>:db<NUM>::<NUM>_x", "peer:<NUM>:db<NUM><IP_1><NUM>_x"},
+	{"KNOWN_GAP #137 a letter after the address", "peer:<NUM>:db<NUM>::<NUM>x", "peer:<NUM>:db<NUM><IP_1><NUM>x"},
+	{"KNOWN_GAP #137 a dot inside a word after the address", "peer:<NUM>:db<NUM>::<NUM>.x", "peer:<NUM>:db<NUM><IP_1><NUM>.x"},
+}
+
+// TestIPv6TemplateRightBoundary is the other half of #135's guard: where 7c must not fire, the output is the
+// chain's, byte for byte.
+func TestIPv6TemplateRightBoundary(t *testing.T) {
+	for _, c := range ipv6TemplateRightBoundaryRows {
+		t.Run(c.name, func(t *testing.T) {
+			got := mustMask(t, New(), c.in)
+			if got != c.want {
+				t.Errorf("right boundary moved:\n in:   %q\n got:  %q\n want: %q", c.in, got, c.want)
+			}
+			if old := mustMask(t, mapperOn(baseDetectors), c.in); got != old {
+				t.Errorf("differs from the chain alone:\n in:   %q\n got:  %q\n then: %q", c.in, got, old)
+			}
+		})
+	}
 }
 
 // TestTemplatizedMaskingIsComplete is TestMaskingIsComplete run over the real composition: the
@@ -5086,11 +5197,12 @@ var lonePipelinePlaceholder = regexp.MustCompile(`^` + pipelinePH + `$`)
 // cannot rot: change the templatizer and the exemptions change with it, red, in this test.
 //
 // One honesty note about that exemption. It is per canonical row, and the IPv6 shapes the
-// pipeline deliberately does NOT collapse (fe80::1 templates as fe<NUM>::<NUM>, README "Known
+// pipeline deliberately does NOT collapse (fe80::/64 templates as fe<NUM>::/<NUM>, README "Known
 // limitations", #40) are not covered by the IPv6 row's exemption. They lose their digits to
 // <NUM> before this package ever sees them, but NOT their hex letters, and a hex letter is a digit
-// of the address: "peer:2001:db8::1" arrives as "peer:<NUM>:db<NUM>::<NUM>" and "db" is sent. That
-// is a leak, not structure, and it is #135.
+// of the address, not structure: "peer:2001:db8::1" arrives as "peer:<NUM>:db<NUM>::<NUM>". Until #135
+// "db" was sent. Rule 7c reads these forms now, and TestEveryUncollapsedIPv6FormHasATemplatizedRow is
+// this test for them.
 // The two IPv6 patterns stay two on purpose (#42); ipv6_compare_test.go compares them.
 func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 	// The templatized marked spans of every row, as (payload, start, end) triples.
@@ -5158,6 +5270,107 @@ func TestEveryUncollapsedDetectorHasATemplatizedRow(t *testing.T) {
 			t.Errorf("detector %d (%s, group %d) reads a value the pipeline does NOT collapse (%q → %q),\n"+
 				"so it must recognize the templatized form and have a row in templatizedRows.\n pattern: %s",
 				i, d.tag, d.group, secret, templated, d.re.String())
+		}
+	}
+}
+
+// ipv6Class is what TestEveryUncollapsedIPv6FormHasATemplatizedRow asks a row for: an address's groups on
+// each side of its "::", counted to two or more, whether it ends in a dotted quad, and whether it has a "::".
+func ipv6Class(addr string) string {
+	count := func(s string) string {
+		switch n := len(strings.FieldsFunc(s, func(r rune) bool { return r == ':' })); {
+		case n >= 2:
+			return "2+"
+		default:
+			return strconv.Itoa(n)
+		}
+	}
+	dotted := ""
+	if strings.Contains(addr, ".") {
+		dotted = " dotted"
+	}
+	left, right, elided := strings.Cut(addr, "::")
+	if !elided {
+		return "no ::" + dotted
+	}
+	return "L" + count(left) + " R" + count(right) + dotted
+}
+
+// TestEveryUncollapsedIPv6FormHasATemplatizedRow is TestEveryUncollapsedDetectorHasATemplatizedRow for the
+// shapes that test's canonical IPv6 row says nothing about. It walks every way of writing an address, any
+// number of groups either side of a "::", the full form, and a dotted quad at the end, glued every way and
+// followed every way, through the real templatizer. #36 is open and will change what that collapses.
+//
+//   - A form the pipeline collapses, to <IP> and at most the quad's last octets, is exempt: nothing of it is
+//     left to send. That is derived from the pipeline each run, not listed.
+//   - Any other form must come back as one placeholder with the text around it untouched, and its class
+//     must have a row in templatizedRows. A shape the pipeline starts to leave uncollapsed fails here by
+//     name, even if 7c happens to read it.
+//   - Each of #135's three shapes must turn up uncollapsed, or the walk proved nothing.
+func TestEveryUncollapsedIPv6FormHasATemplatizedRow(t *testing.T) {
+	rows := map[string]bool{}
+	for _, r := range templatizedRows {
+		parts := strings.Split(r.text, phMark)
+		for i := 1; i < len(parts) && strings.HasPrefix(r.name, "ipv6-template/"); i += 2 {
+			rows[ipv6Class(parts[i])] = true
+		}
+	}
+	for _, r := range ipv6TemplateGluedRows {
+		rows[ipv6Class(r.addr)] = true
+	}
+
+	groups := []string{"db8", "1", "a2", "30", "f", "4c", "b5", "6"}
+	join := func(g []string) string { return strings.Join(g, ":") }
+	addrs := []string{join(groups), "0:0:0:0:0:ffff:192.0.2.1", "::ffff:192.0.2.1", "2001:db8::ffff:192.0.2.1", "a1::192.0.2.1", "::192.0.2.1"}
+	for l := 0; l <= 7; l++ {
+		for r := 0; l+r <= 7; r++ {
+			addrs = append(addrs, join(groups[:l])+"::"+join(groups[8-r:]))
+		}
+	}
+	leads := []string{"peer ", "peer:", "peer.", "peer=", "peer_", "x"}
+	tails := []struct{ raw, tpl string }{
+		{" down", " down"}, {"/64 dev", "/<NUM> dev"}, {"%eth0 dev", "%eth<NUM> dev"}, {", down", ", down"}, {")", ")"},
+	}
+	collapsed := regexp.MustCompile(`^<IP>(?:\.<NUM>)*$`)
+	seen := map[string]bool{}
+	for _, addr := range addrs {
+		if addr == "::" {
+			continue // carries no digit and no letter: the pipeline leaves it and 7 masks it
+		}
+		for _, lead := range leads {
+			for _, tail := range tails {
+				line := lead + addr + tail.raw
+				tpl, _ := pipeline.Templatize(line)
+				value, ok := strings.CutPrefix(tpl, lead)
+				if ok {
+					value, ok = strings.CutSuffix(value, tail.tpl)
+				}
+				if !ok {
+					t.Errorf("premise broken: %q -> %q, which is not %q, a value and %q", line, tpl, lead, tail.tpl)
+					continue
+				}
+				if collapsed.MatchString(value) {
+					continue
+				}
+				class := ipv6Class(addr)
+				seen[class] = true
+				if !rows[class] {
+					t.Errorf("%q templates as %q, uncollapsed, and class %q has no row in templatizedRows", line, tpl, class)
+				}
+				want := lead + "<IP_1>" + tail.tpl
+				if strings.HasPrefix(tpl, lead+"::") && strings.HasSuffix(lead, ":") {
+					want = strings.TrimSuffix(lead, ":") + "<IP_1>" + tail.tpl // the colon that glues it is 7a's (#134)
+				}
+				if got := mustMask(t, New(), tpl); got != want {
+					t.Errorf("the pipeline leaves %q uncollapsed and the value is not one placeholder:\n in:   %q\n got:  %q\n want: %q",
+						line, tpl, got, want)
+				}
+			}
+		}
+	}
+	for class, shape := range map[string]string{"L1 R0": "a one-group prefix", "L0 R1": "the loopback", "L2+ R1": "an address glued on"} {
+		if !seen[class] {
+			t.Errorf("%s (class %q) never came back uncollapsed: this walk no longer covers #135", shape, class)
 		}
 	}
 }
