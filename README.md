@@ -232,6 +232,29 @@ journald entry is cut before it is decoded, so a cut entry is no longer JSON and
 raw text, with no unit or priority, and in a replay with no timestamp. No real capture has come
 close: the longest of 70,783 journal entries was 4.2 KiB.
 
+**The template table is bounded too.** logscry holds at most 50,000 templates, and at most 64 MiB
+of their masked patterns and recent-occurrence times. Past either it evicts the least recently
+seen, so a stream of distinct lines levels off at about 23 MiB of table with short lines and about
+66 MiB with lines at the 64 KiB cap. Until `TODO-VERSION` the table grew for as long as the stream
+ran (#126). Lines held in flight are separate: a stream of one template repeated at the cap levels
+off at about 160 MiB. Ten real boots reached at most 3,108 templates and about 250 KiB of patterns,
+so an ordinary host stays far from either number.
+
+A template is never evicted while an answer is on its way to it, while it has a card, or inside
+its explanation cache TTL. One that could burst right now (it has a baseline and was seen inside
+the burst window) is held as well, unless the table is full of such templates and new ones keep
+arriving, where the bound wins.
+
+An evicted template that returns counts as new: its count, first-seen time, baseline and flag
+history start again, and `count_at_flag` in the [export](#export---export-path) restarts with them.
+New alone never escalates, however often it happens. An ERROR that returns scores 1.05 and does:
+that is at most one more explanation per template per `cache_ttl`, and `rate_limit` still caps the
+total. Inside its TTL a flagged error stays quiet, as it always has.
+
+The first eviction is said once: on stderr with `--plain`, in the status bar in the TUI. The total
+is printed at exit, and the exit status is not affected. The `templates` figure in the TUI counts
+the templates held, not all those ever seen. There is no flag.
+
 You can't call an LLM on every log line in real time — cost, latency, and noise all
 forbid it. The interesting part is the pipeline that avoids doing so:
 
@@ -1277,7 +1300,9 @@ its own counts and its own explanation, even when the model has not yet answered
 `last_seen_at_flag` are what they were at the instant the anomaly crossed the threshold,
 which is what the record is *about*. If that template has fired two hundred more times
 since, the file will not say so — the keys are named the way they are so nothing pretends
-otherwise.
+otherwise. They count from the template's arrival in the table, so a template evicted at the
+[bound](#how-it-works) and flagged again starts over: `count_at_flag` 1 and a later `first_seen`
+under the same `template_hash`.
 
 #### Schema
 
@@ -1448,7 +1473,7 @@ is still synthetic.
 
 | Status | When |
 |---|---|
-| `0` | The run finished: its sources ended, or it was stopped with Ctrl-C or `SIGTERM`. A source that failed along the way (`-- ./app` exiting non-zero, a Docker daemon that cannot be reached at startup) is reported on stderr or in the status bar, not in the status, and so are a line cut at 64 KiB (see [How it works](#how-it-works)) and a Docker events stream that breaks and is reconnected. |
+| `0` | The run finished: its sources ended, or it was stopped with Ctrl-C or `SIGTERM`. A source that failed along the way (`-- ./app` exiting non-zero, a Docker daemon that cannot be reached at startup) is reported on stderr or in the status bar, not in the status, and so are a line cut at 64 KiB, templates evicted at the table's bound (see [How it works](#how-it-works)) and a Docker events stream that breaks and is reconnected. |
 | `1` | logscry could not run as asked (a bad flag or config file, `-h`, no log source, an export file it could not open, a TUI that failed), **or** the export lost records (see [When the file cannot keep up](#when-the-file-cannot-keep-up)). |
 
 The status is the same in `--plain` and the TUI: it describes the run and the file, not the
@@ -1632,13 +1657,12 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   after the last line it read. One edge: a container that delivered nothing before it
   restarted is re-attached like a first attach, so with `--docker-tail 0` the lines it logs
   between the restart and the re-attach (milliseconds) are lost.
-- **A stream of distinct templates grows memory without bound.** logscry keeps every template
-  it has seen, with its masked pattern, for the whole run, and never drops one. Measured: about
-  3.5 MiB per 10,000 distinct templates of short lines, and about 629 MiB per 10,000 at the
-  64 KiB line cap, growing linearly. More lines of templates already seen cost nothing more: a
-  stream of one template repeated at the cap levels off at about 160 MiB. An ordinary host stays
-  far from this; the real journal captures replayed for the line cap produced at most about
-  3,100 templates each, over hours. Filed as #126.
+- **The list of source names grows with each distinct name, and is never pruned.** The status
+  bar's source list keeps every name seen for the whole run and sorts it on each snapshot. Docker
+  and subprocess sources add a handful of names. A journald entry names its own source, so a
+  program that logs under many distinct identifiers can grow it: 200,000 names in a throwaway test.
+  Each entry is one short string. Templates, scoring and the export are not affected. Filed as
+  ISSUE-TBD.
 - **A capture recorded without `--all` has lost its long journald messages.** Without
   `--all`, `journalctl -o json` writes any field over 4096 bytes as `null`, and the message is
   not in the file at all. That limit is journalctl(1)'s; systemd's `logs-show.c` applies it to
