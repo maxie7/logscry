@@ -7404,7 +7404,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       slowdown and not a hang: about 14,500 lines/s against 306,000. Filed as #166 and named in
       README Known limitations.
 
-      Released as **TODO-VERSION**.
+      Released as **v0.12.39**.
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and

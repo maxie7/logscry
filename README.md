@@ -1657,7 +1657,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   after the last line it read. One edge: a container that delivered nothing before it
   restarted is re-attached like a first attach, so with `--docker-tail 0` the lines it logs
   between the restart and the re-attach (milliseconds) are lost.
-- **The status bar's source list grew with each distinct name until `TODO-VERSION`.** From
+- **The status bar's source list grew with each distinct name until `v0.12.39`.** From
   `v0.1.0` it kept every name seen for the whole run and sorted it on each snapshot (#163). A
   subprocess or stdin adds one name. Docker adds one per distinct container name, so Compose stays
   small while `docker run --rm` with generated names adds a `docker:<name>` per container. A
