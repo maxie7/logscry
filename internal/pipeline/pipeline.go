@@ -72,6 +72,19 @@ const (
 	MaxTemplateBytes = 64 << 20
 )
 
+// The source list's bound (#163). It covers the status bar's list and nothing upstream of it.
+// There is no flag, for the same reason as above.
+const (
+	// MaxSources is 78 times the 52 names of the largest of ten real boots, and about 860 days of
+	// that laptop's new names. Docker churn reaches it sooner, in 11 hours at a container every
+	// 10 s, which is harmless: only names silent through 4,096 others go.
+	MaxSources = 4_096
+	// MaxSourceBytes bounds what a name costs, since a name is as long as the line that carried it:
+	// a count alone would allow about 256 MiB. It is 64 bytes a name (the longest of those boots is
+	// 54), so the count binds first on real names, and it holds four names at the line cap.
+	MaxSourceBytes = 256 << 10
+)
+
 const (
 	// evictionWalk is how many held templates one shrink steps over. It keeps a line O(1) when
 	// the table is full of them, which is reachable: a crafted stream that hung the pipeline
@@ -551,6 +564,9 @@ type Options struct {
 
 	// Evictions counts the templates evicted at the bound, and says so once. Nil counts nothing.
 	Evictions *Evictions
+	// SourceEvictions counts the names dropped from the source list, and says so once. Only a run
+	// with Snapshots keeps that list. Nil counts nothing.
+	SourceEvictions *Evictions
 }
 
 // sourceClock is replay's time: the capture's timestamps, advanced by this goroutine as
@@ -594,6 +610,7 @@ func Run(ctx context.Context, in <-chan model.LogLine, opts Options) {
 	p.export = opts.Export
 	p.evictions = opts.Evictions
 	c := newCollector(opts.RingSize)
+	c.sources.evictions = opts.SourceEvictions
 	p.retained = c.retains
 
 	var src *sourceClock // nil: a live run, on the wall clock

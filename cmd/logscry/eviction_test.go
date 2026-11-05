@@ -41,3 +41,26 @@ func TestPlainReportsEvictionOnce(t *testing.T) {
 		t.Errorf("stderr has %q %d times, want exactly 1:\n%s", want, c, got)
 	}
 }
+
+// TestSourceEvictionTotal: nothing at zero, and at any other count evictions rather than names,
+// because a name that returns counts again (#163).
+func TestSourceEvictionTotal(t *testing.T) {
+	if got := sourceEvictionTotal(0); got != "" {
+		t.Errorf("sourceEvictionTotal(0) = %q, want nothing", got)
+	}
+	got := sourceEvictionTotal(7)
+	for _, want := range []string{"7 source-name eviction(s)", fmt.Sprint(pipeline.MaxSources), "256 KiB"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("exit line %q lacks %q", got, want)
+		}
+	}
+}
+
+func TestSourcesEvictingNoticeNamesItsBound(t *testing.T) {
+	got := errSourcesEvicting.Error()
+	for _, want := range []string{fmt.Sprint(pipeline.MaxSources), "256 KiB", "every line is still processed"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("notice %q lacks %q", got, want)
+		}
+	}
+}

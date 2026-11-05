@@ -131,6 +131,15 @@ func run(ctx context.Context, args []string) (err error) {
 		}
 	}()
 
+	// Source names dropped from the status bar's list at its bound: the same again, and a run with
+	// no list (--plain) never counts one.
+	var namesEvicted *pipeline.Evictions
+	defer func() {
+		if line := sourceEvictionTotal(namesEvicted.Count()); line != "" {
+			fmt.Fprintln(os.Stderr, line)
+		}
+	}()
+
 	sources, stdinOnly := sources(cfg)
 	replay, _ := sources[0].(*ingest.ReplaySource) // nil unless --replay: it is then the only source
 
@@ -152,6 +161,7 @@ func run(ctx context.Context, args []string) (err error) {
 	}
 	cuts = ingest.NewTruncations(func() { errs <- errTruncated })
 	evicted = pipeline.NewEvictions(func() { notices.Post(errEvicting) })
+	namesEvicted = pipeline.NewEvictions(func() { notices.Post(errSourcesEvicting) })
 	ingestCtx := ingest.WithNotices(ingest.WithTruncations(ctx, cuts), notices)
 	go func() {
 		defer close(lines)
@@ -205,7 +215,7 @@ func run(ctx context.Context, args []string) (err error) {
 		}
 		return runPlainAt(ctx, grouped, errs, sc, escalations, explanations, exp, evicted, cfg.ExplainDryRun, replay != nil)
 	}
-	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, exp, evicted, cfg)
+	return runTUI(ctx, grouped, errs, term, sc, escalations, explanations, exp, evicted, namesEvicted, cfg)
 }
 
 // noticeRoom is how many of a running source's notices errs holds unread before the next is
@@ -237,6 +247,22 @@ var errTruncated = fmt.Errorf("ingest: a line over %[1]d KiB was cut to at most 
 var errEvicting = fmt.Errorf("pipeline: the template table reached its bound of %d templates or %d MiB: "+
 	"the least recently seen are being evicted, and one that returns counts as new; "+
 	"the total is reported at exit", pipeline.MaxTemplates, pipeline.MaxTemplateBytes>>20)
+
+// errSourcesEvicting is the notice for the first name dropped from the source list, sent the same
+// way. It costs no line and no score, only the list's claim to be whole.
+var errSourcesEvicting = fmt.Errorf("pipeline: the source list reached its bound of %d names or %d KiB: "+
+	"the least recently seen are being dropped from it, and every line is still processed; "+
+	"the total is reported at exit", pipeline.MaxSources, pipeline.MaxSourceBytes>>10)
+
+// sourceEvictionTotal is the exit line for n names dropped from the source list, or "" for none.
+// It says evictions and not names, because a name that returns and goes again counts again.
+func sourceEvictionTotal(n uint64) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("logscry: pipeline: %d source-name eviction(s) at the bound of %d names or %d KiB",
+		n, pipeline.MaxSources, pipeline.MaxSourceBytes>>10)
+}
 
 // replayNotice reports the lines of a finished replay whose time could not be followed, or
 // nil when there were none or this is not a replay. Both kinds were replayed rather than
@@ -390,17 +416,18 @@ func journaldNotice(cfg config.Config) error {
 // The TUI then sees it appear in the next snapshot, and never touches pipeline state.
 func runTUI(ctx context.Context, lines <-chan model.LogLine, errs <-chan error, term tui.Terminal,
 	sc *score.Scorer, escalations chan score.EscalationRequest, explanations chan model.Explanation,
-	exp *export.Writer, evicted *pipeline.Evictions, cfg config.Config,
+	exp *export.Writer, evicted, namesEvicted *pipeline.Evictions, cfg config.Config,
 ) error {
 	snaps := make(chan pipeline.Snapshot, 1)
 	go pipeline.Run(ctx, lines, pipeline.Options{
-		Snapshots:    snaps,
-		Scorer:       sc,
-		Escalations:  escalations,
-		Explanations: explanations,
-		Export:       exp,
-		SourceTime:   cfg.Replay != "",
-		Evictions:    evicted,
+		Snapshots:       snaps,
+		Scorer:          sc,
+		Escalations:     escalations,
+		Explanations:    explanations,
+		Export:          exp,
+		SourceTime:      cfg.Replay != "",
+		Evictions:       evicted,
+		SourceEvictions: namesEvicted,
 	})
 	return term.Run(ctx, snaps, errs, tuiOptions(cfg, escalations != nil, exp))
 }

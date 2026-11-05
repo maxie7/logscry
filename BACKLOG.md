@@ -7304,6 +7304,108 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Released as **v0.12.38**.
 
+- [x] **The status bar's source list is bounded** — #163, found while working on #126.
+      `collector.sources` gained one entry per distinct source name from `v0.1.0` and never dropped
+      one, and `sourceNames` copied and sorted all of it on every snapshot. A journald entry names
+      its own source, so one template could carry 200,000 entries. It is not keyed by template, so
+      #126's bound never touched it. This bounds that list and nothing else: the coalescer is keyed
+      by source too (see the end of this entry).
+
+      **Decisions.**
+      1. **Both bounds: 4,096 names and 256 KiB, with no flag.** A name is as long as the line that
+         carried it, so a count alone allows about 256 MiB, which is #126's lesson again. Predicted
+         before counting, then derived twice over the ten boots with `ab37*` and `logscry-probe`
+         filtered: a pass mirroring `decode` and `journalUnit`, then `decode` itself through a real
+         `Snapshot`. The two agreed on every boot.
+
+         | | Predicted | Measured | Bound | Margin |
+         |---|---|---|---|---|
+         | Names, largest boot | ≤ 120 | 52 | 4,096 | 78× |
+         | Names, smallest boot | ≥ 40 | 45 | n/a | n/a |
+         | Longest name | ≤ 64 B | 54 B | n/a | n/a |
+         | Name bytes, largest boot | ≤ 3 KiB | 1,126 B | 256 KiB | 227× |
+         | Union of ten boots | ≤ 250 | 59 | n/a | n/a |
+
+         Every prediction held, the union 4× loose. Seven new names in 35.9 hours puts the cap about
+         860 days out on that laptop. 256 KiB is 64 bytes a name, so the count binds first on real
+         names, and it still holds four names at the line cap.
+      2. **Docker churn, by arithmetic: there is no capture.** The README's "a handful of names" was
+         wrong for churn: `"docker:"+name` adds one per distinct container name. One container a
+         minute reaches the cap in 2.8 days, one every 10 s in 11.4 hours. That is harmless: the
+         order is last seen, so only a name silent through 4,096 others goes, and the cap only has
+         to exceed the names logging at once.
+      3. **Least recently seen goes first, with no pins.** Unlike a template nothing depends on a
+         name being held: a line, a card, the context ring and the export carry their own. One
+         `container/list` and a map give O(1) per line. A known name allocates nothing, and each
+         eviction is paid for by its insertion. The name on the current line is never its own
+         victim (`Len > 1`).
+      4. **No sorted-slice cache.** A cache pays only for a set both large and stable. A stream
+         churning the list changes it every tick, so the worst case stays, and a real host has 52
+         names to sort. It would also be the first exception to Snapshot's deep copy. The stop
+         condition was 2 ms at the cap; it measured 0.58 ms mean and 1.17 ms worst.
+      5. **What the readers say.** An exact count of names ever seen takes a memory of every name,
+         which is the defect. So `Stats.Sources` is the names held, and `SourcesPartial` says some
+         went. `across 4,096+ sources` is a true lower bound, and under the byte bound so is
+         `4+ sources`. The status bar opens with that count and the tail notice, because a list
+         truncated by the width ends wherever it ends. There is no "+N more": N would be evictions,
+         and 4,097 names in rotation evict once per line.
+      6. **`dockerTail` reads a fact eviction cannot remove.** `Stats.DockerSeen` is sticky, which is
+         exactly main's behaviour, where the name stayed for the run. The `docker:` literal moved
+         out of `tui` rather than being copied: `pipeline.dockerPrefix` is the only reader, and its
+         comment names where `docker.go` builds the name.
+      7. **Said once, totalled at exit, no exit code.** As #126, through a second `Evictions`. A
+         source eviction costs less than a template's, since no score changes, but a silently
+         partial list is the kind of quiet this tool avoids. The total says evictions, not names,
+         because a name that returns counts again. `--plain` never calls `collector.observe`, so it
+         keeps no list, evicts nothing and prints nothing.
+
+      **Evidence, each predicted first.** On `collector.observe` and `snapshot` directly, ring size 1:
+
+      | | main | predicted | branch | predicted |
+      |---|---|---|---|---|
+      | Entries at 200,000 names | 200,000 | 200,000 | 4,096 | 4,096 |
+      | Heap of the set, short names | 11.3 MiB | ~16 | 0.55 MiB | ~0.5 |
+      | Heap of the set, 2,000 names at 64 KiB | 125 MiB | ~128 | 0.20 MiB | < 0.5 |
+      | Snapshot at 4,096 names, mean / worst | 0.60 / 1.15 ms | n/a | 0.58 / 1.17 ms | 0.3–0.8 |
+      | Snapshot at 200,000 names, mean | 31.8 ms | ~70 | 0.60 ms | n/a |
+      | `observe`, repeated name | 14.2 ns | ~30 | 13.5 ns, 0 allocs | ~45 |
+      | `observe`, one eviction per line | n/a | n/a | 188 ns, 2 allocs | n/a |
+
+      Three predictions missed, all high: main's heap and snapshot, and `observe`, which did not
+      slow at all. The four names held at 64 KiB are 0.25 MiB by arithmetic, so the heap delta reads
+      about 0.05 MiB low. `viewStatus` at the cap is 0.36 ms, and 1.1 ms at the byte bound, against
+      16.5 ms for 200,000 names.
+
+      Nothing else moves. Ten boots, 63,017 lines, each through `--plain`
+      and through the TUI under a pty, main against branch. **`--plain` alone would prove nothing:
+      it never runs the set.** Every export byte-identical in both paths, 0 evictions, 2–12 records
+      a boot. Each pty run ended by itself, on `q` sent at ENDED, and its export has the line count
+      of `--plain`'s for the same boot on both binaries, so no comparison is of truncated files.
+      Positive control, an invented capture of 5,096 names through the same pty: the branch shows
+      the notice and `4,096+ sources` and totals exactly 1,000 evictions; main shows neither.
+
+      **Tests.** `internal/pipeline/sources_test.go`, `internal/tui/sources_test.go`,
+      `cmd/logscry/eviction_test.go`. Three red by assertion on main, in 0.1 s, driving the collector
+      directly. Limits are `sourceSet` fields, #126's seam: `Run` is tested at the real bound, and
+      neither `Options` nor a package variable can change it. `-race -count=20` passes. Sixteen
+      mutants; fifteen die in unit tests. Two lessons: the red LRU test could not tell LRU from FIFO,
+      because a name seen every other line comes straight back after eviction, so
+      `TestEvictionOrderIsLastSeen` was added for the no-`MoveToBack` mutant. An unwired notice in
+      `main` survives every unit test, because the notice is reachable only under a terminal; the
+      positive control catches it.
+
+      **Seen and left alone, out of scope:** #165 (Docker follower marks); #36; #28; #126's values;
+      `collector.summaries` still sorting the table every tick.
+
+      **Found on the way, not addressed here:** the coalescer's `grouper.buffers` is keyed by source
+      too, and each line walks all of them. Replay of an invented capture on one timestamp: 3.3 s,
+      13.5 s and 56 s for 20,000, 40,000 and 80,000 names, quadratic, and 0.67 s with
+      `--group-timeout 0`. Spaced 300 ms apart the same captures take under 0.6 s. Live it is a
+      slowdown and not a hang: about 14,500 lines/s against 306,000. Filed as #166 and named in
+      README Known limitations.
+
+      Released as **v0.12.39**.
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
