@@ -1657,12 +1657,28 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   after the last line it read. One edge: a container that delivered nothing before it
   restarted is re-attached like a first attach, so with `--docker-tail 0` the lines it logs
   between the restart and the re-attach (milliseconds) are lost.
-- **The list of source names grows with each distinct name, and is never pruned.** The status
-  bar's source list keeps every name seen for the whole run and sorts it on each snapshot. Docker
-  and subprocess sources add a handful of names. A journald entry names its own source, so a
-  program that logs under many distinct identifiers can grow it: 200,000 names in a throwaway test.
-  Each entry is one short string. Templates, scoring and the export are not affected. Filed as
-  #163.
+- **The status bar's source list grew with each distinct name until `TODO-VERSION`.** From
+  `v0.1.0` it kept every name seen for the whole run and sorted it on each snapshot (#163). A
+  subprocess or stdin adds one name. Docker adds one per distinct container name, so Compose stays
+  small while `docker run --rm` with generated names adds a `docker:<name>` per container. A
+  journald entry names its own source, so a program logging under many identifiers could grow the
+  list at will: 200,000 names held 11 MiB and cost 32 ms a snapshot. The list now holds the 4,096
+  most recently seen names, and at most 256 KiB of them, which ten real boots never approached (52
+  names, 1,126 bytes). That bounds this list and nothing else.
+
+  Once a name has been dropped the TUI says `4,096+ sources`, and fewer under the byte bound. That
+  is a lower bound: how many names a run has seen is not known, because counting them would take
+  a memory of every name. The first drop is said once in the status bar. The evictions are totalled
+  at exit, where a name that returns and goes again counts again, and the exit status is not
+  affected. Lines, scores, cards and the export carry their own names and are not affected.
+  `--plain` keeps no list, so none of this applies to it.
+- **A stream of distinct source names slows multi-line grouping.** Each source name has its own
+  grouping buffer until it goes idle, and each line walks all of them. An invented live stream of
+  distinct names ran at about 14,500 lines/s, against about 306,000 from one source. A crafted
+  `--replay` capture with many names on one timestamp never goes idle, so the buffers last to the
+  end of the file and the cost is quadratic: 56 s for 80,000 names. `--group-timeout 0` turns
+  grouping off and avoids it (0.67 s for the same capture), but a stack trace then stays one event
+  per frame. Filed as ISSUE-TBD.
 - **A capture recorded without `--all` has lost its long journald messages.** Without
   `--all`, `journalctl -o json` writes any field over 4096 bytes as `null`, and the message is
   not in the file at all. That limit is journalctl(1)'s; systemd's `logs-show.c` applies it to
