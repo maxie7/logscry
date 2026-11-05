@@ -1678,7 +1678,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `--replay` capture with many names on one timestamp never goes idle, so the buffers last to the
   end of the file and the cost is quadratic: 56 s for 80,000 names. `--group-timeout 0` turns
   grouping off and avoids it (0.67 s for the same capture), but a stack trace then stays one event
-  per frame. Filed as ISSUE-TBD.
+  per frame. Filed as #166.
 - **A capture recorded without `--all` has lost its long journald messages.** Without
   `--all`, `journalctl -o json` writes any field over 4096 bytes as `null`, and the message is
   not in the file at all. That limit is journalctl(1)'s; systemd's `logs-show.c` applies it to

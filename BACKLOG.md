@@ -7401,7 +7401,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       too, and each line walks all of them. Replay of an invented capture on one timestamp: 3.3 s,
       13.5 s and 56 s for 20,000, 40,000 and 80,000 names, quadratic, and 0.67 s with
       `--group-timeout 0`. Spaced 300 ms apart the same captures take under 0.6 s. Live it is a
-      slowdown and not a hang: about 14,500 lines/s against 306,000. Filed as ISSUE-TBD and named in
+      slowdown and not a hang: about 14,500 lines/s against 306,000. Filed as #166 and named in
       README Known limitations.
 
       Released as **TODO-VERSION**.
