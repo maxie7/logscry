@@ -272,11 +272,7 @@ func (m Model) viewStatus() string {
 		counters += " · ⚠ raw logs → " + h + " (--llm-anonymize)"
 	}
 
-	sources := "no sources"
-	if len(m.snap.Stats.Sources) > 0 {
-		sources = strings.Join(m.snap.Stats.Sources, ", ")
-	}
-	sources += m.dockerTail()
+	sources := m.sourceList()
 
 	// The source list is the elastic segment: on a narrow terminal it gives way
 	// first, so the counters and the mode (PAUSED, ENDED) never truncate away. Once
@@ -306,6 +302,21 @@ func (m Model) footer() string {
 	return " tab cards · ↑/↓ scroll · t view · p pause · q quit"
 }
 
+// sourceList is the status bar's elastic segment. Once names have been dropped at the bound the
+// list is not all of them, so it opens with the count of those held, as a lower bound, and the
+// tail notice: a truncated list ends wherever the width runs out, which is no place for either.
+// There is no "+N more", because N would be evictions, and a name that returns counts again.
+func (m Model) sourceList() string {
+	names := strings.Join(m.snap.Stats.Sources, ", ")
+	switch {
+	case m.snap.Stats.SourcesPartial:
+		return partialSources(len(m.snap.Stats.Sources)) + m.dockerTail() + " · " + names
+	case names == "":
+		return "no sources" + m.dockerTail()
+	}
+	return names + m.dockerTail()
+}
+
 // dockerTail surfaces the --docker-tail replay limit, and only when a Docker source is
 // actually attached (it means nothing otherwise).
 //
@@ -313,15 +324,10 @@ func (m Model) footer() string {
 // the default 100 lines was ALL the backlog being replayed, so an event that happened
 // further back never appeared, and the tool looked broken rather than bounded.
 func (m Model) dockerTail() string {
-	if m.opts.DockerTail == "" {
+	if m.opts.DockerTail == "" || !m.snap.Stats.DockerSeen {
 		return ""
 	}
-	for _, s := range m.snap.Stats.Sources {
-		if strings.HasPrefix(s, "docker:") {
-			return " · tail:" + m.opts.DockerTail
-		}
-	}
-	return ""
+	return " · tail:" + m.opts.DockerTail
 }
 
 // llmCounters is the status bar's account of the LLM stage: answered, in flight, failed.

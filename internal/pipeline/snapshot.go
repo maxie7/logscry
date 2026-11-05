@@ -47,7 +47,14 @@ type Stats struct {
 	TotalLines      int
 	UniqueTemplates int
 	LinesPerSec     float64
-	Sources         []string // every source seen so far, sorted
+	Sources         []string // the source names held, sorted: all seen unless SourcesPartial
+
+	// SourcesPartial says names were dropped at the bound (see MaxSources), so more were seen than
+	// Sources holds. How many more is not known: counting them would take a memory of every name.
+	SourcesPartial bool
+	// DockerSeen says a Docker source has delivered a line. It never clears, so it is what asks
+	// whether one is attached: a Docker name can leave Sources while the container is still there.
+	DockerSeen bool
 
 	// Escalations is how many events cleared every gate. Suppressed is how many were
 	// worth escalating but lost to the rate limiter — shown so the UI can be honest
@@ -101,7 +108,7 @@ type collector struct {
 	// stream ring.
 	escalated []Event
 
-	sources map[string]struct{} // source name -> seen
+	sources *sourceSet // the status bar's list of names, bounded
 
 	// Lines/sec is averaged over rateWindow rather than recomputed per tick, so
 	// the number in the status bar is stable enough to read.
@@ -120,7 +127,7 @@ func newCollector(size int) *collector {
 	}
 	return &collector{
 		ring:    make([]Event, size),
-		sources: make(map[string]struct{}),
+		sources: newSourceSet(),
 	}
 }
 
@@ -142,7 +149,7 @@ func (c *collector) observe(ev Event, now time.Time) {
 		c.retain(ev)
 	}
 	if ev.Line.Source != "" {
-		c.sources[ev.Line.Source] = struct{}{}
+		c.sources.see(ev.Line.Source)
 	}
 	if c.windowFrom.IsZero() {
 		c.windowFrom = now
@@ -232,7 +239,9 @@ func (c *collector) snapshot(p *Pipeline, now time.Time) Snapshot {
 			TotalLines:      c.total,
 			UniqueTemplates: len(p.templates),
 			LinesPerSec:     c.rate,
-			Sources:         c.sourceNames(),
+			Sources:         c.sources.sorted(),
+			SourcesPartial:  c.sources.partial,
+			DockerSeen:      c.sources.docker,
 			Escalations:     scored.Escalated,
 			Suppressed:      scored.Suppressed,
 			Explained:       p.explained,
@@ -317,15 +326,6 @@ func sortSummaries(s []TemplateSummary) {
 		}
 		return a.Hash < b.Hash
 	})
-}
-
-func (c *collector) sourceNames() []string {
-	out := make([]string, 0, len(c.sources))
-	for name := range c.sources {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // trySend delivers a snapshot only if the consumer has taken the previous one,

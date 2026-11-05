@@ -349,7 +349,7 @@ func (m Model) viewCardsEmpty(width, height int) string {
 	watching := fmt.Sprintf("Watching %s %s across %s.",
 		formatCount(m.snap.Stats.UniqueTemplates),
 		plural(m.snap.Stats.UniqueTemplates, "template", "templates"),
-		sourcesPhrase(len(m.snap.Stats.Sources)))
+		sourcesPhrase(len(m.snap.Stats.Sources), m.snap.Stats.SourcesPartial))
 
 	block := lipgloss.JoinVertical(lipgloss.Center,
 		styleQuiet.Render("✓  No anomalies"),
@@ -363,12 +363,20 @@ func (m Model) viewCardsEmpty(width, height int) string {
 
 // sourcesPhrase avoids "across 0 sources" reading as a fault when the run has simply not
 // had a line yet.
-func sourcesPhrase(n int) string {
-	if n == 0 {
+func sourcesPhrase(n int, partial bool) string {
+	switch {
+	case n == 0:
 		return "no sources yet"
+	case partial:
+		return partialSources(n)
 	}
 	return fmt.Sprintf("%d %s", n, plural(n, "source", "sources"))
 }
+
+// partialSources is the count of a list that names were dropped from. The + is what keeps it
+// true: n is what is held, and more than that were seen. Under the byte bound n can be small, and
+// "4+ sources" is as true as "4,096+ sources". It is always plural: at least n+1 were seen.
+func partialSources(n int) string { return formatCount(n) + "+ sources" }
 
 func plural(n int, one, many string) string {
 	if n == 1 {

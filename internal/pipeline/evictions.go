@@ -7,9 +7,11 @@ import (
 	"sync/atomic"
 )
 
-// Evictions counts the templates a run evicted at the bound, and calls notify on the first. An
-// eviction costs history rather than data, but it changes how a returning template is scored, so
-// it is announced as it starts and not only counted at the end.
+// Evictions counts what a run evicted at a bound, and calls notify on the first. A run has one for
+// templates and one for source names. An eviction costs history rather than data, but it changes
+// how a returning template is scored, and what the source list can claim, so it is announced as it
+// starts and not only counted at the end. A template or a name that returns and goes again counts
+// again, so this counts evictions, not the things evicted.
 //
 // It follows ingest.Truncations. The count is atomic because the pipeline goroutine can outlive
 // the run that reads it (Ctrl-C returns while it is still mid-loop). A nil *Evictions counts
@@ -37,7 +39,7 @@ func (e *Evictions) add() {
 	})
 }
 
-// Count reports how many templates have been evicted. Safe to call at any time.
+// Count reports how many evictions there have been. Safe to call at any time.
 func (e *Evictions) Count() uint64 {
 	if e == nil {
 		return 0
