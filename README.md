@@ -401,7 +401,7 @@ message instead. Everywhere else the priority still wins.
 >   in a logfmt line (`time="…" level=error msg="…"`, the shape dockerd, containerd and Go's
 >   slog write). A line counts as logfmt only if all of it is `key=value` pairs. In JSON,
 >   `log.level` is read in both of ECS's spellings: the dotted key (`"log.level": "ERROR"`) and,
->   since `TODO-VERSION`, the nested one Spring Boot's structured logging writes
+>   since `v0.12.40`, the nested one Spring Boot's structured logging writes
 >   (`"log": {"level": "ERROR"}`). When a line carries both, the dotted key decides; logfmt has
 >   only `log.level=`.
 >
