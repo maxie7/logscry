@@ -34,7 +34,11 @@ var levelSynonyms = map[string]string{
 }
 
 // jsonLevelKeys and jsonMessageKeys are the JSON object keys we probe, in order,
-// for the level and human message respectively.
+// for the level and human message respectively. logfmt.go probes the same keys.
+//
+// ECS's nested level, "log": {"level": …}, is not in the list: it is not a top-level key,
+// and logfmt has no nesting. normalizeJSON reads it in log.level's slot, after the dotted
+// key (#168).
 var (
 	jsonLevelKeys   = []string{"level", "lvl", "severity", "log.level"}
 	jsonMessageKeys = []string{"message", "msg", "text"}
@@ -124,6 +128,12 @@ func detectLevelAndMessage(raw string) (level, message string) {
 // normalizeJSON parses a JSON object and extracts a canonical level and message.
 // It reports ok=false when the payload is not a JSON object, letting the caller
 // fall back to the plaintext path.
+//
+// The first level key present with a string value decides, even when its token is not a
+// level. ECS writes its level dotted ("log.level") or nested ("log": {"level": …}, Spring
+// Boot's structured logging); the nested form is read only when no key in jsonLevelKeys
+// decided, so the dotted key wins when a line carries both (#168). That one shape is the
+// only nesting read: no other parent, no deeper path.
 func normalizeJSON(s string) (level, message string, ok bool) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(s), &obj); err != nil {
@@ -131,12 +141,19 @@ func normalizeJSON(s string) (level, message string, ok bool) {
 	}
 
 	idx := jsonKeyIndex(obj)
+	decided := false
 	for _, k := range jsonLevelKeys {
 		if actual, present := idx[k]; present {
 			if v, ok := jsonString(obj[actual]); ok {
 				level = canonicalLevel(v)
+				decided = true
 				break
 			}
+		}
+	}
+	if !decided {
+		if actual, present := idx["log"]; present {
+			level = ecsNestedLevel(obj[actual])
 		}
 	}
 
@@ -150,6 +167,28 @@ func normalizeJSON(s string) (level, message string, ok bool) {
 		}
 	}
 	return level, message, true
+}
+
+// ecsNestedLevel reads the level of ECS's "log" object: its "level" key, in any case, as a
+// string. A "log" that is not an object, or a level that is not a string, reads as absent.
+// The first-byte check keeps a string or array "log" from costing a decode.
+func ecsNestedLevel(raw json.RawMessage) string {
+	if v := bytes.TrimSpace(raw); len(v) == 0 || v[0] != '{' {
+		return ""
+	}
+	inner, ok := decodeObject(raw)
+	if !ok {
+		return ""
+	}
+	actual, present := jsonKeyIndex(inner)["level"]
+	if !present {
+		return ""
+	}
+	v, ok := jsonString(inner[actual])
+	if !ok {
+		return ""
+	}
+	return canonicalLevel(v)
 }
 
 // jsonKeyIndex maps the lowercased form of every key in a JSON object to the key as it
