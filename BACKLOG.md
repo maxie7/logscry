@@ -7455,6 +7455,77 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Released as **v0.12.40**.
 
+- [x] **A Python, Java or Go trace opener carries its level** — #170, seen in real use. The coalescer
+      opens a block on `Traceback (most recent call last):`, `Exception in thread "…" ` and
+      `fatal error:` (`traceStartRe`), but `detectLevelAndMessage` gave the event they head no level
+      unless a token came before it; only Go's `panic:` had one, as a leading `LVL:` token. A new
+      traceback on stderr scored 0.75 (novelty 0.45 + stderr 0.30) and stayed silent; on stdout, or
+      at journald's default priority, 0.45. A Django service's 500s, each a chained traceback,
+      raised no card.
+
+      **The rule.** When nothing else gave a level, `traceOpenerLevel` reads exactly three
+      openers, at the very start of the event's first line: Python's and Java's are ERROR, Go's is
+      FATAL. A leading token, the header rule, JSON and logfmt keys and a journald priority other
+      than 6 all decide first, so the call sits after all of them. An opener after a word, after
+      indentation or on a later line is not read, and neither is a goroutine header on its own,
+      which opens `debug.Stack()` output and SIGQUIT dumps. `Internal Server Error: /…` stays prose.
+      The message is left as the raw event, so no template moves. Every opener is also one of
+      `traceStartRe`'s, unchanged; `TestTraceOpenersAreTraceStarts` fails if they drift.
+
+      **The levels.** A Python traceback is printed for an uncaught exception, and just as often
+      for one caught and logged (`logging.exception`, Django's 500 handler) by a service that is
+      still up; Java's default handler prints its line when one thread dies. Both are ERROR: a new
+      one escalates (1.35 on stderr, 1.05 on stdout) and a repeat stays quiet (0.90 / 0.60). FATAL
+      would fire on every repeat, #27's cry-wolf. Go's runtime exits after `fatal error:`
+      (deadlock, concurrent map writes, out of memory) and cannot recover, which is the class
+      PANIC sits in: FATAL, escalating on its own.
+
+      **Evidence**, main → branch. Ten boots, 63,017 entries, 50,641 grouped events:
+
+      | | Predicted | Measured |
+      |---|---|---|
+      | Events opening with Python's / Java's / Go's opener | 30 / 0 / 0 | 30 / 0 / 0 (held) |
+      | Level changes; template-hash changes | 30, "" → ERROR; 0 | 30, "" → ERROR; 0 (held) |
+      | `--replay --explain-dry-run --plain --export`, default flags: export | byte-identical | 10 of 10, 59 records (held) |
+      | the same, `--plain` stdout | 30 lines, `-` → `ERROR` | 30, 3 per boot (held) |
+      | the same with `--warmup 0 --warmup-lines 0`: new cards | 30 (3 per boot), 9 displaced, 155 → 176 | 10 (1 per boot), 0 displaced, 155 → 165 (missed) |
+      | Levelless plain line, ns/op: prose, access log (allocs) | regexp only +8 to +25 %; prefix-checked ≤ +3 %; allocs same | regexp only +21.6 %, +15.8 %; prefix-checked +1.5 %, −2.2 %; 1 and 2 allocs, unchanged |
+      | Control, invented chained traceback on a subprocess's stderr | 0 → 2 cards at 1.35 | 0 → 2 (held) |
+      | Control, the same as a journald capture at PRIORITY 6 | 0 → 2 cards at 1.05 | 0 → 2 (held) |
+
+      All 30 openers on the boots come from `networkd-dispatcher.service`, at PRIORITY 6, about two
+      seconds into each boot: real tracebacks. Under the default 30 s warmup novelty is muted, a
+      stdout ERROR scores 0.60, and nothing escalates; the export is unchanged. With warmup off, as
+      a run started on a host already up would see them, each boot raises **one new card** at 1.05.
+      The prediction said three: it hashed the raw text of each traceback, which differs only in
+      what the template masks. The three are one template, so the first is novel and the other two
+      are repeats at 0.60. With one token spent rather than three, no other card is displaced. The
+      controls change exactly the two traceback events' levels and no hash.
+
+      **The hot path.** Every plain line without a level reaches the check. Three anchored regexp
+      misses cost about 100 ns on a 480 ns line, so each regexp sits behind a `strings.HasPrefix` on
+      its literal prefix, and only a prefix hit cuts the first line and runs the regexp.
+      `BenchmarkNormalizePlainLevelless` is the measure, ten runs each, medians.
+
+      **Tests.** Red first, failing on main by assertion: `TestTraceOpenerCarriesALevel` (6 rows),
+      `TestChainedTracebackRaisesOneCardPerTraceback` (the invented Django 500 through `drive` and
+      the scorer, warmup off: 5 events and 2 cards, pinned with a comment naming #171) and
+      `TestJournaldTraceOpenerAtThePriority` (PRIORITY 6 rows red, 4 and 0 rows the precedence
+      guard). Passing on main and on the branch: `TestTraceOpenerLosesToEveryOtherLevel` (7 rows,
+      `panic:` among them) and `TestTraceOpenerLookalikesStayUnread` (16 rows). With the fix:
+      `TestTraceOpenersAreTraceStarts`. Nine mutants each turn a test red: either drift in
+      `traceStartRe`, a wrong prefix, an unanchored opener, a fourth opener, matching past the first
+      line, Python at FATAL, no fallback, the fallback ahead of the other rules.
+
+      **Not done, deliberately:** other runtimes' traces (Ruby's `file.rb:N:in`, .NET's
+      `Unhandled exception.`, Node.js's `TypeError:`). None was seen live; nothing filed. README's
+      "Left unread" list names them.
+
+      **Out of scope:** #171 (a chained traceback still splits at its separator, so it raises one
+      card per traceback; README Known limitations says so), #165, #166, #36, #28.
+
+      Released as **v0.12.41**.
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

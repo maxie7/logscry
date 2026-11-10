@@ -155,3 +155,26 @@ func TestJournaldDefaultPriorityReadsALevelAfterAPrefix(t *testing.T) {
 		}
 	})
 }
+
+// TestJournaldTraceOpenerAtThePriority is #170 end to end. A Python service on stdout is
+// recorded at PRIORITY 6, so the text is all there is, and its traceback's opener is the only
+// level the event has. A deliberate priority still wins over the opener, as it wins over a
+// token.
+func TestJournaldTraceOpenerAtThePriority(t *testing.T) {
+	const tb = "Traceback (most recent call last):" // one entry is one physical line; grouping comes later
+	tests := []struct {
+		name, priority, message, wantLevel string
+	}{
+		{"Python at the default priority", "6", tb, "ERROR"},
+		{"Go runtime at the default priority", "6", "fatal error: all goroutines are asleep - deadlock!", "FATAL"},
+		{"a warning priority beats the opener", "4", tb, "WARN"},
+		{"an emergency priority beats the opener", "0", tb, "FATAL"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := journaldLine(t, entryAt(t, tt.priority, tt.message)); got.Level != tt.wantLevel {
+				t.Errorf("Level = %q, want %q", got.Level, tt.wantLevel)
+			}
+		})
+	}
+}

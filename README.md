@@ -260,7 +260,7 @@ forbid it. The interesting part is the pipeline that avoids doing so:
 
 1. **Normalize** each line (JSON, logfmt or plain text) into a level and a message. A
    plain-text level is read at the start of the line or after the line's own timestamp and
-   columns, never out of prose.
+   columns, or from the line a Python, Java or Go runtime opens a trace with; never out of prose.
 2. **Template** it — mask the variable parts (`<NUM>`, `<IP>`, `<UUID>`, …) down to a
    signature, so `user 4821 failed` and `user 9933 failed` become one pattern. A JSON or
    logfmt line is templated on its keys: field names stay, the message (and logfmt's
@@ -403,10 +403,20 @@ message instead. Everywhere else the priority still wins.
 >   `log.level` is read in both of ECS's spellings: the dotted key (`"log.level": "ERROR"`) and,
 >   since `v0.12.40`, the nested one Spring Boot's structured logging writes
 >   (`"log": {"level": "ERROR"}`). When a line carries both, the dotted key decides; logfmt has
->   only `log.level=`.
+>   only `log.level=`;
+> - since `v0.12.41`, from the line a runtime opens a trace with, when nothing above gave a
+>   level: Python's `Traceback (most recent call last):` and Java's `Exception in thread "…" `
+>   are `ERROR`, Go's `fatal error:` is `FATAL`. A raised exception may have been caught and
+>   logged by a service that is still up, so a new one escalates and a repeat stays quiet; after
+>   `fatal error:` the Go runtime exits, so it escalates on its own, as `panic:` always has (it reads
+>   as a leading `LVL:` token). Only the very start of the event's first line counts: Django's
+>   `Internal Server Error: /…` line stays unread, and the traceback under it is its own event,
+>   read as `ERROR`. A goroutine header on its own (`debug.Stack()`, a `SIGQUIT` dump) gets no
+>   level.
 >
 > It does **not** read a level out of prose: a line that starts with an ordinary word gets
-> none, whatever follows, and a bare upper-case level as a line's first word needs a separator
+> none, whatever follows (the three trace openers above are fixed lines the runtimes print,
+> not prose), and a bare upper-case level as a line's first word needs a separator
 > after it (`ERROR - disk full` has a level, `PANIC button pressed` has none). The rule still
 > takes a few prose shapes for a level: a level word that is the first word after numbers,
 > brackets or a timestamp (`42 ERROR rows skipped`, `[cache] WARN threshold`), after a
@@ -427,6 +437,9 @@ message instead. Everywhere else the priority still wins.
 >   a lower-case `error` with nothing to set it apart.
 > - **JSON levels in other shapes:** a number (pino's and bunyan's `"level": 50`), or a level
 >   nested anywhere but ECS's `log` object (`"event": {"level": …}`, `"log": {"severity": …}`).
+> - **Other runtimes' traces:** Ruby's `app.rb:3:in 'post': … (RuntimeError)`, .NET's
+>   `Unhandled exception. …` and Node.js's `TypeError: …` get a level only from a token or the
+>   source.
 >
 > Configure such a service to log JSON with a string level and it is read correctly. Levels at
 > priority **5** (notice) and **7** (debug) are also left alone: both are non-default, so both
@@ -1499,7 +1512,10 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `file.s:N`, which always carries the offset. Such a line continues the event before it
   even with its indentation stripped. A line that cites a position among other text is an
   ordinary log line, so slog's `source=server.go:99`, logrus's `file="main.go:42"` and
-  `log`'s `Lshortfile` prefix stay one event per line.
+  `log`'s `Lshortfile` prefix stay one event per line. A chained Python traceback still splits
+  at its separator (`During handling of the above exception, another exception occurred:`), so
+  each traceback in the chain is its own event and, since `v0.12.41`, can raise its own card
+  (#171).
 - **`--journald` needs `journalctl`, and journal access is a permission thing.** The
   source is Linux-only and shells out to `journalctl`, so it fails at startup on a host
   without it. More often it does something subtler: a user outside the `systemd-journal`
