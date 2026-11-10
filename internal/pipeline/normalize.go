@@ -171,15 +171,13 @@ func normalizeJSON(s string) (level, message string, ok bool) {
 
 // ecsNestedLevel reads the level of ECS's "log" object: its "level" key, in any case, as a
 // string. A "log" that is not an object, or a level that is not a string, reads as absent.
-// The first-byte check keeps a string or array "log" from costing a decode.
+// The first-byte check saves a failed decode on a string "log", which Docker's json-file
+// lines carry on every line ({"log":"…","stream":"stdout",…}).
 func ecsNestedLevel(raw json.RawMessage) string {
 	if v := bytes.TrimSpace(raw); len(v) == 0 || v[0] != '{' {
 		return ""
 	}
-	inner, ok := decodeObject(raw)
-	if !ok {
-		return ""
-	}
+	inner, _ := decodeObject(raw) // a malformed value leaves a nil map: no "level" in its index
 	actual, present := jsonKeyIndex(inner)["level"]
 	if !present {
 		return ""

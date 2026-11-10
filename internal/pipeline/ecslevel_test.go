@@ -149,3 +149,12 @@ func BenchmarkNormalizeJSON(b *testing.B) {
 		})
 	}
 }
+
+// TestECSNestedLevelMalformedObject: raw always comes from a document the outer decode
+// accepted, so it always decodes there. Called directly, a malformed object still reads as
+// absent: decodeObject leaves a nil map, whose index holds no "level".
+func TestECSNestedLevelMalformedObject(t *testing.T) {
+	if got := ecsNestedLevel([]byte(`{`)); got != "" {
+		t.Errorf("ecsNestedLevel(`{`) = %q, want none", got)
+	}
+}
