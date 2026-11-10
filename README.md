@@ -399,7 +399,11 @@ message instead. Everywhere else the priority still wins.
 >   line is not shortened, so its template is the one it always had;
 > - under any of `level`, `lvl`, `severity`, or `log.level`, inside a JSON payload or anywhere
 >   in a logfmt line (`time="…" level=error msg="…"`, the shape dockerd, containerd and Go's
->   slog write). A line counts as logfmt only if all of it is `key=value` pairs.
+>   slog write). A line counts as logfmt only if all of it is `key=value` pairs. In JSON,
+>   `log.level` is read in both of ECS's spellings: the dotted key (`"log.level": "ERROR"`) and,
+>   since `TODO-VERSION`, the nested one Spring Boot's structured logging writes
+>   (`"log": {"level": "ERROR"}`). When a line carries both, the dotted key decides; logfmt has
+>   only `log.level=`.
 >
 > It does **not** read a level out of prose: a line that starts with an ordinary word gets
 > none, whatever follows, and a bare upper-case level as a line's first word needs a separator
@@ -421,10 +425,12 @@ message instead. Everywhere else the priority still wins.
 > - **A level after a word that is not a column:** a syslog file's host name
 >   (`Jul 13 10:00:00 web app[42]: ERROR: ...`), Apache's `[core:error]`, a quoted `"ERROR"`, or
 >   a lower-case `error` with nothing to set it apart.
+> - **JSON levels in other shapes:** a number (pino's and bunyan's `"level": 50`), or a level
+>   nested anywhere but ECS's `log` object (`"event": {"level": …}`, `"log": {"severity": …}`).
 >
-> Configure such a service to log JSON and it is read correctly. Levels at priority **5**
-> (notice) and **7** (debug) are also left alone: both are non-default, so both are taken at
-> their word, and a unit logging at either still loses a level its text reports.
+> Configure such a service to log JSON with a string level and it is read correctly. Levels at
+> priority **5** (notice) and **7** (debug) are also left alone: both are non-default, so both
+> are taken at their word, and a unit logging at either still loses a level its text reports.
 
 Lines are tagged `journald:<unit>` (`journald:nginx`, `journald:kernel`), and `--journald`
 composes with the other sources — `logscry --journald --docker-all` follows both.
