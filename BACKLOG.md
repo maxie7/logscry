@@ -7406,6 +7406,55 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Released as **v0.12.39**.
 
+- [x] **ECS's nested `"log": {"level": …}` is read** — #168, seen in real use. `normalizeJSON` probed
+      `level`, `lvl`, `severity` and `log.level` as top-level keys only. ECS writes the level either
+      dotted (`"log.level": "ERROR"`, read since M9) or nested (`"log": {"level": "ERROR"}`), and the
+      nested form is what Spring Boot's structured logging writes. Such a line got level "": an
+      exception logged at ERROR on stdout scored 0.45 on novelty alone and never escalated. README
+      named `log.level` among the keys read, which a reader takes to cover either spelling.
+
+      **The rule.** Exactly ECS's shape: a top-level object `log` holding a string `level`, both keys
+      in any case, matched as `jsonKeyIndex` matches every other key. It sits in `log.level`'s slot,
+      after the dotted key, and the rule every JSON level key follows is unchanged: the first key
+      present with a string value decides, even when its token is not a level. So the dotted key
+      decides when a line carries both, and `{"log.level":"verbose","log":{"level":"error"}}` has no
+      level, as `{"level":"verbose","severity":"error"}` has none. A `log` that is not an object, or
+      a `level` that is not a string, reads as absent. `jsonLevelKeys` is unchanged, so logfmt, which
+      shares it and has no nesting, is untouched; the message still comes from `jsonMessageKeys`;
+      templates never read the level keys, so no template moves. The nested probe runs only when no
+      key decided and `log` is present, and a `log` that does not start with `{` costs no decode.
+
+      **Evidence**, main → branch:
+
+      | | Predicted | Measured |
+      |---|---|---|
+      | Non-ECS JSON, level key first: ns/op, allocs/op | ±3 %, same | 3,940 → 4,000 (+1.5 %), 31 → 31 |
+      | Non-ECS JSON, no level key: ns/op, allocs/op | ±3 %, same | 3,340 → 3,322 (−0.5 %), 25 → 25 |
+      | ECS dotted: ns/op, allocs/op | ±3 %, same | 4,046 → 3,985 (−1.5 %), 29 → 29 |
+      | ECS nested: ns/op, allocs/op | +25 to +70 %, +6 to +12 | 3,542 → 6,278 (+77 %), 23 → 41 |
+      | Ten boots: messages with a top-level `log` object | 0 | 0 (and 0 JSON-object messages at all) |
+      | Ten boots: per-line level / template-hash changes | 0 / 0 | 0 / 0 over 63,017 lines |
+      | Ten boots: `--replay --explain-dry-run --plain --export` | byte-identical | 10 of 10, 59 records |
+
+      The nested cost missed its prediction on both counts: decoding the two-key `log` object takes
+      12 allocations, the key index 2 and the string 4, where the guess was one small decode. It is
+      paid only by a line that had no level before. The boots carry no JSON payload, so they show
+      the change is inert there and nothing more. The positive control is an invented journald
+      capture, every entry at `PRIORITY=6` (#24's path): 150 nested INFO lines to clear warmup, a
+      novel nested ERROR, its dotted-key twin and a novel nested INFO. Main escalated the dotted
+      ERROR alone; the branch escalated both ERRORs at 1.05; the INFO never escalated; per line,
+      152 level changes (every nested line) and 0 template-hash changes.
+      `TestNovelNestedECSErrorEscalates` holds the same in the pipeline, with the dotted twin
+      escalating on main too as the harness check.
+
+      **Not done, deliberately:** numeric levels (pino and bunyan's `"level": 50`), a nested
+      `severity`, OpenTelemetry's `SeverityText`, and any general dotted-path walk. None was seen
+      live; nothing filed. README's "Left unread" list names the first two shapes.
+
+      **Out of scope:** #165, #166, #36, #28.
+
+      Released as **v0.12.40**.
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
