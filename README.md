@@ -404,7 +404,7 @@ message instead. Everywhere else the priority still wins.
 >   since `v0.12.40`, the nested one Spring Boot's structured logging writes
 >   (`"log": {"level": "ERROR"}`). When a line carries both, the dotted key decides; logfmt has
 >   only `log.level=`;
-> - since `TODO-VERSION`, from the line a runtime opens a trace with, when nothing above gave a
+> - since `v0.12.41`, from the line a runtime opens a trace with, when nothing above gave a
 >   level: Python's `Traceback (most recent call last):` and Java's `Exception in thread "…" `
 >   are `ERROR`, Go's `fatal error:` is `FATAL`. A raised exception may have been caught and
 >   logged by a service that is still up, so a new one escalates and a repeat stays quiet; after
@@ -1514,7 +1514,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   ordinary log line, so slog's `source=server.go:99`, logrus's `file="main.go:42"` and
   `log`'s `Lshortfile` prefix stay one event per line. A chained Python traceback still splits
   at its separator (`During handling of the above exception, another exception occurred:`), so
-  each traceback in the chain is its own event and, since `TODO-VERSION`, can raise its own card
+  each traceback in the chain is its own event and, since `v0.12.41`, can raise its own card
   (#171).
 - **`--journald` needs `journalctl`, and journal access is a permission thing.** The
   source is Linux-only and shells out to `journalctl`, so it fails at startup on a host
