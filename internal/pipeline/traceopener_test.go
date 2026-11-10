@@ -4,6 +4,7 @@ package pipeline
 
 import (
 	"math"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +100,8 @@ func TestTraceOpenerLookalikesStayUnread(t *testing.T) {
 		{"opener after a word", "worker: Traceback (most recent call last):"},
 		{"Java opener after a word", "Caught Exception in thread \"main\" java.lang.IllegalStateException"},
 		{"Java opener without the quoted name", "Exception in thread main java.lang.IllegalStateException"},
+		{"Java opener cut off after the name", "Exception in thread \"main\""},
+		{"Java thread name across lines", "Exception in thread \"main\n\" java.lang.IllegalStateException"},
 		{"plural", "fatal errors: 3"},
 		{"title case", "Fatal error: x"},
 		{".NET unhandled exception", "Unhandled exception. System.InvalidOperationException: ledger closed"},
@@ -111,6 +114,53 @@ func TestTraceOpenerLookalikesStayUnread(t *testing.T) {
 				t.Errorf("Level = %q, want none", got)
 			}
 		})
+	}
+}
+
+// TestTraceOpenersAreTraceStarts keeps one source of truth. An opener that carries a level must
+// also open a block in the coalescer, or its level would land on a lone first line while the
+// trace's frames became events of their own. Each opener's pattern extends one of traceStartRe's
+// alternatives literally (the whole pattern when the alternative is anchored, the pattern after
+// its "^" when it is not), so whatever matches the opener matches traceStartRe. Each example
+// matches both, and each regexp starts with its prefix, literally, so the fast check can never
+// reject a line the regexp would take.
+func TestTraceOpenersAreTraceStarts(t *testing.T) {
+	examples := map[string]string{
+		"ERROR:Traceback": "Traceback (most recent call last):",
+		"ERROR:Exception": `Exception in thread "main" java.lang.IllegalStateException: ledger closed`,
+		"FATAL:fatal":     "fatal error: concurrent map writes",
+	}
+	if len(traceOpeners) != len(examples) {
+		t.Fatalf("%d openers, want exactly %d: Python's, Java's and Go's", len(traceOpeners), len(examples))
+	}
+	alts := strings.Split(traceStartRe.String(), "|") // traceStartRe is a strings.Join on "|"
+	for _, o := range traceOpeners {
+		src := o.re.String()
+		if !strings.HasPrefix(src, "^") {
+			t.Errorf("%s is not anchored at the start of the event", src)
+		}
+		extends := false
+		for _, alt := range alts {
+			if strings.HasPrefix(alt, "^") && strings.HasPrefix(src, alt) ||
+				!strings.HasPrefix(alt, "^") && strings.HasPrefix(strings.TrimPrefix(src, "^"), alt) {
+				extends = true
+			}
+		}
+		if !extends {
+			t.Errorf("%s extends no traceStartRe alternative %q", src, alts)
+		}
+		if !strings.HasPrefix(src, "^"+regexp.QuoteMeta(o.prefix)) {
+			t.Errorf("prefix %q is not where %s starts", o.prefix, src)
+		}
+		key, _, _ := strings.Cut(o.prefix, " ")
+		ex, ok := examples[o.level+":"+key]
+		if !ok {
+			t.Errorf("no example for the %s opener %s", o.level, src)
+			continue
+		}
+		if !o.re.MatchString(ex) || !traceStartRe.MatchString(ex) {
+			t.Errorf("%q: opener %v, traceStartRe %v; want both", ex, o.re.MatchString(ex), traceStartRe.MatchString(ex))
+		}
 	}
 }
 

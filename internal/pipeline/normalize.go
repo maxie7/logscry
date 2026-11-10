@@ -111,6 +111,9 @@ func Normalize(line model.LogLine) model.LogLine {
 // logfmt path reads it — TemplatizeLine templates such a line from Raw. A level found in
 // the middle of prose is still not a level: only a line that is logfmt throughout is read
 // this way. A plaintext level after the line's header columns is headerLevel's (#31).
+//
+// Only when none of that gave a level is the event read for a runtime's own trace opener
+// (traceOpenerLevel, #170), so every rule above, and a level the source supplied, wins over it.
 func detectLevelAndMessage(raw string) (level, message string) {
 	trimmed := strings.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
@@ -122,7 +125,47 @@ func detectLevelAndMessage(raw string) (level, message string) {
 	if pairs, ok := parseLogfmt(trimmed); ok {
 		level = logfmtLevel(pairs)
 	}
+	if level == "" {
+		level = traceOpenerLevel(raw)
+	}
 	return level, message
+}
+
+// traceOpeners are the lines three runtimes print themselves above a trace, each with the
+// level it stands for (#170). Python's and Java's are ERROR: the exception may have been
+// caught and logged by a service that is still up, so a new one escalates and a recurring one
+// stays quiet. Go's "fatal error:" is FATAL: the runtime cannot recover and the process exits,
+// the crash class PANIC already sits in. Every opener is also one of the coalescer's
+// traceStartRe, so the event it heads is the folded trace; TestTraceOpenersAreTraceStarts
+// fails if the two drift. A goroutine header is not here: on its own it opens debug.Stack()
+// output and SIGQUIT dumps, which are not errors.
+//
+// prefix is re's literal prefix, checked first: every plain line without a level comes here,
+// and a prefix miss costs a few nanoseconds where three regexp misses cost about 100.
+var traceOpeners = []struct {
+	prefix string
+	re     *regexp.Regexp
+	level  string
+}{
+	{"Traceback (most recent call last):", regexp.MustCompile(`^Traceback \(most recent call last\):`), "ERROR"}, // Python
+	{`Exception in thread "`, regexp.MustCompile(`^Exception in thread "[^"]*" `), "ERROR"},                      // Java
+	{"fatal error:", regexp.MustCompile(`^fatal error:`), "FATAL"},                                               // Go runtime
+}
+
+// traceOpenerLevel is the level of the trace opener raw starts with, or "". Only the very
+// start of the first line counts: an opener after a word, after indentation or on a later line
+// is not the runtime's own header. The message is not touched, so no template moves.
+func traceOpenerLevel(raw string) string {
+	for _, o := range traceOpeners {
+		if !strings.HasPrefix(raw, o.prefix) {
+			continue
+		}
+		line, _, _ := strings.Cut(raw, "\n")
+		if o.re.MatchString(line) {
+			return o.level
+		}
+	}
+	return ""
 }
 
 // normalizeJSON parses a JSON object and extracts a canonical level and message.
