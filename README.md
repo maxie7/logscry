@@ -1512,7 +1512,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `file.s:N`, which always carries the offset. Such a line continues the event before it
   even with its indentation stripped. A line that cites a position among other text is an
   ordinary log line, so slog's `source=server.go:99`, logrus's `file="main.go:42"` and
-  `log`'s `Lshortfile` prefix stay one event per line. Since `TODO-VERSION`, a chained Python
+  `log`'s `Lshortfile` prefix stay one event per line. Since `v0.12.42`, a chained Python
   traceback is one event (#171). Its two separator lines, `During handling of the above
   exception, another exception occurred:` and `The above exception was the direct cause of the
   following exception:`, continue a block that `Traceback (most recent call last):` opened, and
