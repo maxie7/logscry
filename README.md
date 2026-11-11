@@ -411,8 +411,8 @@ message instead. Everywhere else the priority still wins.
 >   `fatal error:` the Go runtime exits, so it escalates on its own, as `panic:` always has (it reads
 >   as a leading `LVL:` token). Only the very start of the event's first line counts: Django's
 >   `Internal Server Error: /…` line stays unread, and the traceback under it is its own event,
->   read as `ERROR`. A goroutine header on its own (`debug.Stack()`, a `SIGQUIT` dump) gets no
->   level.
+>   a chained one included, read as `ERROR`. A goroutine header on its own (`debug.Stack()`, a
+>   `SIGQUIT` dump) gets no level.
 >
 > It does **not** read a level out of prose: a line that starts with an ordinary word gets
 > none, whatever follows (the three trace openers above are fixed lines the runtimes print,
@@ -1512,10 +1512,15 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   `file.s:N`, which always carries the offset. Such a line continues the event before it
   even with its indentation stripped. A line that cites a position among other text is an
   ordinary log line, so slog's `source=server.go:99`, logrus's `file="main.go:42"` and
-  `log`'s `Lshortfile` prefix stay one event per line. A chained Python traceback still splits
-  at its separator (`During handling of the above exception, another exception occurred:`), so
-  each traceback in the chain is its own event and, since `v0.12.41`, can raise its own card
-  (#171).
+  `log`'s `Lshortfile` prefix stay one event per line. Since `TODO-VERSION`, a chained Python
+  traceback is one event (#171). Its two separator lines, `During handling of the above
+  exception, another exception occurred:` and `The above exception was the direct cause of the
+  following exception:`, continue a block that `Traceback (most recent call last):` opened, and
+  the next `Traceback (most recent call last):` continues it when the last non-blank line was a
+  separator. Each counts only as the whole line and only in that place: a separator after any
+  other line, or with other text on its line, is its own event, and so are two tracebacks with no
+  separator between them. A chain is still cut at 200 lines or 64 KiB, the bound on any one
+  grouped event.
 - **`--journald` needs `journalctl`, and journal access is a permission thing.** The
   source is Linux-only and shells out to `journalctl`, so it fails at startup on a host
   without it. More often it does something subtler: a user outside the `systemd-journal`

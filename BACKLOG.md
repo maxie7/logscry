@@ -7526,6 +7526,69 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Released as **v0.12.41**.
 
+- [x] **A chained Python traceback is one event** — #171, found while fixing #170. Python joins the
+      links of a chained exception with one of two fixed lines, `During handling of the above
+      exception, another exception occurred:` (raised inside an `except`) and `The above exception
+      was the direct cause of the following exception:` (`raise … from …`), each with a blank line on
+      either side, and opens the next link with `Traceback (most recent call last):` again. Neither
+      separator was a continuation. The first link folded with its summary and the blank line after
+      it; the separator became a header; the blank line after it arrived with no active block and was
+      an event of its own; the next opener opened a new block. The invented Django 500 was five
+      events where it is two, and since #170 each link raised its own card.
+
+      **The rule.** Two cues join `isContinuation`'s third tier, the one consulted only once a block
+      is active, after every cue already there. A separator continues a block whose header is
+      Python's traceback opener (the same prefix `traceStartRe` and `traceOpeners` use). The opener
+      continues a block whose last non-blank line is a separator. All three are whole-line, exact
+      matches. A separator after a log line, a Java trace or a Go dump, or with other text on its line,
+      is a header, and so is a traceback that follows another with no separator between them. Leading
+      whitespace still folds any line by indentation, as before.
+
+      **State read from the folded text, not kept on `pending`.** The folded text already holds it,
+      so `add`, `pending`, the caps and the flushes are unchanged, and nothing can go stale. Only a line
+      that equals one of the three strings inside an active block pays: the check walks back over
+      the trailing blank lines and one line, never the whole buffer. A field would cost a compare on
+      every folded line. The caps still apply: a chain counts as one event toward `maxCoalesceLines`
+      and `maxCoalesceBytes`, so a long one is cut where the cap falls, as any event is.
+
+      **Evidence**, main → branch. Ten boots, 63,017 entries, 50,641 grouped events:
+
+      | | Predicted | Measured |
+      |---|---|---|
+      | Python traceback events; with a separator; separator entries | 30; 0; 0 | 30; 0; 0 (held) |
+      | Template-hash changes (every grouped event) | 0 | 0, 10 of 10 boots identical (held) |
+      | `--replay --explain-dry-run --plain --export`, default flags | byte-identical | 10 of 10, 59 records, stdout identical (held) |
+      | the same with `--warmup 0 --warmup-lines 0` | byte-identical | 10 of 10, 165 records, stdout identical (held) |
+      | `BenchmarkGrouperAdd/plain`: ns/op; B/op and allocs | ±3 %; unchanged | −0.5 %; 144 B and 1 alloc, unchanged (held) |
+      | `BenchmarkGrouperAdd/python-chain`: ns/op; B/op; allocs | ±10 %; +30 to +70 %; unchanged | −5.8 %; 198 → 334, +68.7 %; 1, unchanged (held) |
+      | Control, an invented chained traceback on a subprocess's stderr, warmup off | 2 → 1 card at 1.35 | 2 → 1 (held) |
+      | Control, the same as a journald capture at PRIORITY 6, warmup off | 2 → 1 card at 1.05 | 2 → 1 (held) |
+
+      The 30 tracebacks on the boots are #170's: three per boot from one unit, each a single link,
+      so nothing on them folds and every record is unchanged. On the controls the one card left is the
+      whole chain. The Python-chain benchmark spends more bytes because the later links concatenate
+      onto the whole chain instead of a fresh event, and fewer nanoseconds because three fewer events
+      are emitted per cycle; one allocation per line on both. A plain line costs about 9.9 µs in the
+      grouper on main and on the branch, nearly all of it in `continuationRe`'s and `traceStartRe`'s
+      backtracking; the new cues sit behind `p.active` and never run on it. Ten runs each, medians.
+
+      **Tests.** Red first, failing on main by assertion, each through `Coalesce` and
+      `CoalesceSourceTime`: `TestPythonChainFoldsIntoOneEvent` (4 rows: each separator, a three-link
+      chain with both, the Django 500 as two events) and `TestPythonChainStillStopsAtTheLineCap` (a
+      253-line chain cut at line 200, inside its second link). `TestChainedTracebackRaisesOneCardPerTraceback`
+      now expects 2 events and 1 card at 1.35, its comment saying what it was before. Passing on main
+      and on the branch: `TestNotAPythonChain` (8 rows). Four mutants each turn a test red: a separator
+      that ignores the header, an opener that always continues, no skip over blank lines, a separator
+      read outside an active block.
+
+      **Not done, deliberately:** folding the log line above a traceback (`Internal Server Error:
+      /…`, `ERROR:root:…`) into it; Python 3.11 exception groups beyond what indentation already folds;
+      other runtimes. None showed a live defect; nothing filed.
+
+      **Out of scope:** #166, #165, #36, #28, the levels from #170.
+
+      Released as **TODO-VERSION**.
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
