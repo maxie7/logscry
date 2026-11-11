@@ -642,3 +642,189 @@ func TestNotPartOfAGoDump(t *testing.T) {
 		}
 	}
 }
+
+// Python prints a chained exception as one traceback per link, joined by a fixed separator
+// line with a blank line on each side (#171). The links below are invented.
+var (
+	ledgerTB = []string{
+		"Traceback (most recent call last):",
+		`  File "/srv/ledger/post.py", line 18, in post`,
+		"    rate = rates[currency]",
+		"KeyError: 'NOK'",
+	}
+	ledgerFromTB = []string{
+		"Traceback (most recent call last):",
+		`  File "/srv/ledger/post.py", line 21, in post`,
+		"    raise LedgerError(currency) from err",
+		"ledger.errors.LedgerError: NOK",
+	}
+	ledgerAbortTB = []string{
+		"Traceback (most recent call last):",
+		`  File "/srv/ledger/batch.py", line 7, in run`,
+		"    post(entry)",
+		"RuntimeError: batch 12 aborted",
+	}
+)
+
+const (
+	contextSeparator = "During handling of the above exception, another exception occurred:"
+	causeSeparator   = "The above exception was the direct cause of the following exception:"
+)
+
+// eachCoalescer runs lines through Coalesce and through CoalesceSourceTime (stamped 1 ms
+// apart), each as a subtest, and hands what came out to check.
+func eachCoalescer(t *testing.T, lines []string, check func(t *testing.T, got []model.LogLine)) {
+	t.Helper()
+	t.Run("Coalesce", func(t *testing.T) { check(t, drive(t, time.Second, lines...)) })
+	t.Run("CoalesceSourceTime", func(t *testing.T) {
+		timed := make([]model.LogLine, len(lines))
+		for i, raw := range lines {
+			timed[i] = at(time.Duration(i)*time.Millisecond, "proc:app", model.Stderr, raw)
+		}
+		check(t, driveAt(t, 200*time.Millisecond, timed...))
+	})
+}
+
+// rawsOf is each event's text.
+func rawsOf(events []model.LogLine) []string {
+	raws := make([]string, len(events))
+	for i, ev := range events {
+		raws[i] = ev.Raw
+	}
+	return raws
+}
+
+// TestPythonChainFoldsIntoOneEvent is #171: a chained Python traceback is one event, whichever
+// separator joins its links and however many there are. Before, it split at each separator into
+// the link before it, the separator, the blank line after it and the next link.
+func TestPythonChainFoldsIntoOneEvent(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string
+		want  []string
+	}{
+		{"during handling", slices.Concat(ledgerTB, []string{"", contextSeparator, ""}, ledgerFromTB), nil},
+		{"direct cause", slices.Concat(ledgerTB, []string{"", causeSeparator, ""}, ledgerFromTB), nil},
+		{"three links, both separators", slices.Concat(ledgerTB, []string{"", causeSeparator, ""}, ledgerFromTB,
+			[]string{"", contextSeparator, ""}, ledgerAbortTB), nil},
+		{"the Django 500, below its framework line", chainedTraceback,
+			[]string{chainedTraceback[0], strings.Join(chainedTraceback[1:], "\n")}},
+	}
+	for _, tt := range tests {
+		if tt.want == nil {
+			tt.want = []string{strings.Join(tt.lines, "\n")}
+		}
+		t.Run(tt.name, func(t *testing.T) {
+			eachCoalescer(t, tt.lines, func(t *testing.T, got []model.LogLine) {
+				if !slices.Equal(rawsOf(got), tt.want) {
+					t.Fatalf("got %d events, want %d:\n%s", len(got), len(tt.want), heads(got))
+				}
+			})
+		})
+	}
+}
+
+// TestNotAPythonChain pins what stays apart: two tracebacks with no separator between them, a
+// separator that follows no Python traceback, and a separator line with other text on it. Each
+// separator here is its own event, and so is the blank line after it.
+func TestNotAPythonChain(t *testing.T) {
+	java := []string{
+		`Exception in thread "main" java.lang.IllegalStateException: ledger closed`,
+		"\tat com.example.ledger.Ledger.post(Ledger.java:42)",
+	}
+	tb, from := strings.Join(ledgerTB, "\n"), strings.Join(ledgerFromTB, "\n")
+	tests := []struct {
+		name  string
+		lines []string
+		want  []string
+	}{
+		{"two tracebacks back to back", slices.Concat(ledgerTB, ledgerFromTB), []string{tb, from}},
+		{"two tracebacks, a blank line between", slices.Concat(ledgerTB, []string{""}, ledgerFromTB),
+			[]string{tb + "\n", from}},
+		{"a separator after a log line", slices.Concat([]string{"order 4242 posted", contextSeparator, ""}, ledgerFromTB),
+			[]string{"order 4242 posted", contextSeparator, "", from}},
+		{"a separator opening the stream", slices.Concat([]string{causeSeparator, ""}, ledgerFromTB),
+			[]string{causeSeparator, "", from}},
+		{"a separator after a Java trace", slices.Concat(java, []string{"", contextSeparator, ""}, ledgerFromTB),
+			[]string{strings.Join(java, "\n") + "\n", contextSeparator, "", from}},
+		{"a separator after a Go dump", slices.Concat(goroutineDump, []string{"", causeSeparator, ""}, ledgerFromTB),
+			[]string{strings.Join(goroutineDump, "\n") + "\n", causeSeparator, "", from}},
+		{"text before the separator", slices.Concat(ledgerTB, []string{"", "ERROR: " + contextSeparator, ""}, ledgerFromTB),
+			[]string{tb + "\n", "ERROR: " + contextSeparator, "", from}},
+		{"text after the separator", slices.Concat(ledgerTB, []string{"", causeSeparator + " retrying", ""}, ledgerFromTB),
+			[]string{tb + "\n", causeSeparator + " retrying", "", from}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eachCoalescer(t, tt.lines, func(t *testing.T, got []model.LogLine) {
+				if !slices.Equal(rawsOf(got), tt.want) {
+					t.Fatalf("got %d events, want %d:\n%s", len(got), len(tt.want), heads(got))
+				}
+			})
+		})
+	}
+}
+
+// TestPythonChainStillStopsAtTheLineCap: a chain counts toward maxCoalesceLines as one event, so
+// a long one is cut where the cap falls, inside its second link here, and the rest is the next
+// event, exactly as an over-long single trace is.
+func TestPythonChainStillStopsAtTheLineCap(t *testing.T) {
+	link := func(n int, summary string) []string {
+		lines := []string{"Traceback (most recent call last):"}
+		for i := range n {
+			lines = append(lines, fmt.Sprintf(`  File "/srv/ledger/step.py", line %d, in step`, i+1), "    step(n)")
+		}
+		return append(lines, summary)
+	}
+	lines := slices.Concat(link(74, "KeyError: 'NOK'"), []string{"", contextSeparator, ""}, link(49, "ledger.errors.LedgerError: NOK"))
+	if len(lines) != 253 {
+		t.Fatalf("the chain is %d lines, want 253: 150, the separator and its blanks, 100", len(lines))
+	}
+	want := []string{strings.Join(lines[:maxCoalesceLines], "\n"), strings.Join(lines[maxCoalesceLines:], "\n")}
+	eachCoalescer(t, lines, func(t *testing.T, got []model.LogLine) {
+		if !slices.Equal(rawsOf(got), want) {
+			t.Fatalf("got %d events, want 2, cut at line %d:\n%s", len(got), maxCoalesceLines, heads(got))
+		}
+	})
+}
+
+// BenchmarkGrouperAdd measures the grouper on every line it is given: isContinuation runs on
+// each. "plain" is a stream with no trace in it, the bulk of a busy run; "python-chain" is the
+// Django 500, the framework line and a two-link chain.
+func BenchmarkGrouperAdd(b *testing.B) {
+	streams := []struct {
+		name  string
+		lines []string
+	}{
+		{"plain", []string{
+			`198.51.100.7 - - [13/Jul/2026:10:00:00 +0000] "GET /api/orders/4242 HTTP/1.1" 200 512 "-" "curl/8.5.0"`,
+			"order 4242 placed by user 17 in 12ms",
+			"INFO: worker 3 picked up job 8812",
+			`time=2026-07-13T10:00:00Z level=info msg="job done" id=8812`,
+		}},
+		{"python-chain", chainedTraceback},
+	}
+	for _, s := range streams {
+		b.Run(s.name, func(b *testing.B) {
+			lines := make([]model.LogLine, len(s.lines))
+			for i, raw := range s.lines {
+				lines[i] = model.LogLine{Source: "proc:app", Stream: model.Stderr, Raw: raw}
+			}
+			// add emits at most one line per call, so one slot drained after each call never
+			// blocks, and no goroutine handoff is timed.
+			out := make(chan model.LogLine, 1)
+			g := newGrouper(context.Background(), out, 200*time.Millisecond, false)
+			now := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				g.add(lines[i%len(lines)], now)
+				select {
+				case <-out:
+				default:
+				}
+				i++
+			}
+		})
+	}
+}
