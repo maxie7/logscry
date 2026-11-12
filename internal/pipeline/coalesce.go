@@ -55,7 +55,12 @@ const goroutineHeader = `^goroutine \d+(?: [a-z]+=\w+)* \[.*\]:\s*$`
 // A fatal signal's dump (SIGQUIT: quit) has no regex of its own: its first line is a plain
 // header, and the "PC=0x… m=0 sigcode=0" line the runtime writes straight after it is the cue
 // that folds into it and makes the block active (#94).
-var continuationRe = regexp.MustCompile(strings.Join([]string{
+//
+// The alternation is anchored as a whole. Go's regexp does not treat an alternation of "^"
+// branches as anchored, so a line that matched nothing was tried again at every byte offset:
+// on a 200-byte ordinary line, about 30 times the work (#174). Every branch starts with "^", so the
+// group matches exactly what the branches did.
+var continuationRe = regexp.MustCompile("^(?:" + strings.Join([]string{
 	`^\s*File ".*", line \d+`,   // Python:  File "app.py", line 10, in <module>
 	`^\s*at\s+[\w$.]+\(`,        // Java:    at com.foo.Bar.baz(Bar.java:1)
 	`^\s*Caused by:`,            // Java:    Caused by: ...
@@ -67,19 +72,37 @@ var continuationRe = regexp.MustCompile(strings.Join([]string{
 	`^\s*[^\s=]+\.go:\d+(?: \+0x[0-9a-f]+)?(?: fp=0x[0-9a-f]+ sp=0x[0-9a-f]+ pc=0x[0-9a-f]+)?\s*$`, // Go: /app/main.go:42 +0x1d
 	`^\s*[^\s=]+\.s:\d+ \+0x[0-9a-f]+(?: fp=0x[0-9a-f]+ sp=0x[0-9a-f]+ pc=0x[0-9a-f]+)?\s*$`,       // Go: …/asm_amd64.s:1771 +0x1
 	`^PC=0x[0-9a-f]+ m=\d+ sigcode=\d+(?: addr=0x[0-9a-f]+)?\s*$`,                                  // Go: PC=0x46f4c1 m=0 sigcode=0
-}, "|"))
+}, "|") + ")")
 
 // traceStartRe recognizes a header that itself opens a multi-line block, so the lines
 // after it are kept even before the first indented continuation confirms the block —
 // notably Go's "[signal ...]" and blank line between "panic:" and the goroutine dump, and
 // the un-indented call line under a goroutine header that starts a dump.
-var traceStartRe = regexp.MustCompile(strings.Join([]string{
+//
+// Its cues are traceStartCues, each anchored with "^" and matched as one anchored group (see
+// continuationRe, #174), and Java's opener, which counts anywhere in the line.
+var traceStartRe = traceStartCue{
+	anchored: regexp.MustCompile("^(?:" + strings.Join(traceStartCues, "|") + ")"),
+	anywhere: "Exception in thread ", // Java
+}
+
+var traceStartCues = []string{
 	`^Traceback \(most recent call last\):`, // Python
 	`^\s*panic:`,                            // Go
 	`^fatal error:`,                         // Go runtime
 	goroutineHeader,                         // Go runtime, debug.Stack()
-	`Exception in thread `,                  // Java
-}, "|"))
+}
+
+// traceStartCue matches a line that any anchored cue matches, or that holds the literal
+// anywhere: what one alternation of both would match, without trying every offset.
+type traceStartCue struct {
+	anchored *regexp.Regexp
+	anywhere string
+}
+
+func (c traceStartCue) MatchString(raw string) bool {
+	return c.anchored.MatchString(raw) || strings.Contains(raw, c.anywhere)
+}
 
 // Python prints a chained exception as one traceback per link, oldest first, joined by one of
 // two fixed lines (traceback.py's _context_message and _cause_message) with a blank line on each
@@ -108,10 +131,12 @@ func endsWithChainSeparator(raw string) bool {
 // "ZeroDivisionError: ..." of a Python trace, or a fully-qualified
 // "java.lang.NullPointerException: ...". It is consulted ONLY once a block is already
 // active (see isContinuation), so an ordinary "INFO:" / "GET:" log line, which lacks
-// the exception-type shape, is never mistaken for a trace tail.
-var excSummaryRe = regexp.MustCompile(
+// the exception-type shape, is never mistaken for a trace tail. Anchored as one group, like
+// continuationRe (#174).
+var excSummaryRe = regexp.MustCompile(`^(?:` +
 	`^[\w$.]*(?:Error|Exception|Throwable|Fault|Failure|Warning|Interrupt|Timeout|Panic)\b` + // ValueError:, RuntimeException
-		`|^[\w$]+(?:\.[\w$]+)+:`, // java.lang.NullPointerException:
+	`|^[\w$]+(?:\.[\w$]+)+:` + // java.lang.NullPointerException:
+	`)`,
 )
 
 // goFrameRe matches an un-indented Go call frame ("main.doStuff(...)"), also only
