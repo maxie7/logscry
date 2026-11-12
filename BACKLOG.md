@@ -7589,6 +7589,86 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Released as **v0.12.42**.
 
+- [x] **The coalescer's cue regexps are anchored as a whole** — #174, found while measuring #171.
+      `continuationRe` (eleven branches), `excSummaryRe` (two) and `traceStartRe` (four, plus Java's
+      `Exception in thread `) were each built as one alternation of `^` branches. Go's regexp does not
+      treat such an alternation as anchored, so a line that matched no cue was tried again at every
+      byte offset. `continuationRe` runs on every line of a stream that holds a buffer,
+      `traceStartRe` on every header, and `excSummaryRe` inside active blocks. A 200-byte ordinary
+      line cost 11.5 µs in the grouper. Not a defect at everyday rates, but it held the grouper far
+      below ingest on a burst, and it is the per-line cost #166 multiplies.
+
+      **The rule.** `continuationRe` and `excSummaryRe` wrap their branches, unchanged and still
+      commented, in one `^(?:…)` group. Every branch starts with `^`, so the group matches what the
+      branches did. `traceStartRe`'s four `^` cues, now the slice `traceStartCues`, form one anchored
+      group. Java's opener still counts anywhere in the line, as a literal check beside it, so its
+      meaning is kept. Anchoring it too would be a change in what the cue matches, and was not
+      proposed. `add`, `isContinuation`, `pending` and the flushes are untouched.
+      `TestTraceOpenersAreTraceStarts` (#170) now reads the alternatives from `traceStartCues` and
+      the literal. It also checks that the anchored group is built from them and that every cue in
+      the slice is anchored. It still fails if a level opener stops being a trace start.
+
+      **Evidence**, main → branch. Benchmarks are medians of 10, interleaved:
+
+      | | Predicted | Measured |
+      |---|---|---|
+      | Cues on every physical line of the ten boots: 63,017 entries, and the 78 lines of the 39 multi-line ones | 0 differences | 0 for each of the three cues; 60, 30 and 1,206 matches on both (held) |
+      | `FuzzCuesMatchTheirReference`, 10 minutes | 0 failures | 3,965,991 execs, 0 failures (held) |
+      | `--replay --explain-dry-run --plain --export`, default flags | byte-identical | 10 of 10, 59 records, stdout identical (held) |
+      | the same with `--warmup 0 --warmup-lines 0` | byte-identical | 10 of 10, 165 records, stdout identical (held) |
+      | `BenchmarkGrouperAdd/plain` | 0.5 to 1.2 µs; B/op and allocs unchanged | 11.5 → 0.84 µs, −92.7 %; 144 B and 1 alloc, unchanged (held) |
+      | `BenchmarkGrouperAdd/python-chain` | −60 to −85 %; B/op and allocs unchanged | 3.68 → 0.93 µs, −74.6 %; 334 to 336 B on both, 1 alloc (held) |
+      | `BenchmarkCue/continuation`, ordinary line | 0.4 to 0.8 µs | 24.1 → 0.81 µs (missed, just above) |
+      | `BenchmarkCue/traceStart`, ordinary line | 0.2 to 0.6 µs | 9.29 µs → 109 ns (missed, faster) |
+      | `BenchmarkCue/excSummary`, ordinary line | 0.1 to 0.4 µs | 5.23 → 1.03 µs (missed, slower) |
+      | each cue on a line it matches | within ±30 % | continuation −1.1 %, excSummary −2.4 %; traceStart 174 → 92 ns, −47 % (missed for traceStart, faster) |
+      | `--replay --explain-dry-run --plain`, the largest boot (11,060 entries), wall time | −0.1 to −0.3 s | 0.225 s on both (missed); CPU 0.655 → 0.555 s |
+      | allocations, every benchmark | unchanged | unchanged (held) |
+
+      On the cue benchmarks, three predictions missed:
+      - `excSummaryRe`'s first branch, `^[\w$.]*` followed by a type suffix, still walks back through
+        the line's first token once per position, even anchored.
+      - `traceStartRe` on an ordinary line is now one anchored miss and one `strings.Contains`.
+      - On a matching Java line, the literal check finds the opener without the regexp.
+
+      The wall time did not move, and the prediction missed by all of it. The coalescer runs on its
+      own goroutine beside decode and scoring, so the time it saves, the 0.1 s of CPU predicted,
+      comes off the CPU total and not off this replay's critical path.
+
+      **README's figure.** README's only throughput figures are #166's: about 14,500 lines/s with
+      distinct source names, against about 306,000 from one source. The harness behind them is not
+      in the tree. An invented live stream through `Coalesce` on main gave 13,600 lines/s with
+      distinct names, close to the first figure. From one source it gave 153,000 lines/s on a short
+      line and 30,000 on a 200-byte line, so the second figure was not reproduced, and README is
+      unchanged. On the branch the same stream gives 844,000 and 712,000 lines/s from one source, and
+      13,400 with distinct names: #166's walk over the buffers is what that figure measures.
+
+      **Tests.** `internal/pipeline/cuereference_test.go` keeps the three patterns as they were
+      written before this change, as the reference. A deliberate change to a cue changes both.
+      `FuzzCuesMatchTheirReference` asserts each cue matches exactly what its reference matches. Its
+      59 seeds are invented: a match and a near miss per branch, each cue after a word and after a
+      line break, Java's opener at the start, in the middle and cut short, the empty string and
+      invalid UTF-8. CI runs the seeds. `BenchmarkCue` times each cue on an ordinary line and on a
+      line it matches.
+
+      Six mutants each turn a test red:
+      - dropping `^fatal error:`;
+      - changing Java's literal;
+      - building the anchored group from something other than the slice;
+      - an unanchored cue in the slice;
+      - dropping a `continuationRe` branch;
+      - dropping `excSummaryRe`'s Java branch.
+
+      **Other per-line regexps of this shape:** none in `internal/pipeline`. `leadingLevelRe` and
+      `firstWordDelimRe` are already `^…(?:…)`, and on the 200-byte line take 72 and 53 ns (medians
+      of 10). The other `^` patterns are single branches. The template maskers are searches,
+      unanchored by design.
+
+      **Out of scope:** #166, #165, #36, #28, and any change to what a cue matches. Nothing found on
+      the way; nothing filed.
+
+      Released as **v0.12.43**.
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

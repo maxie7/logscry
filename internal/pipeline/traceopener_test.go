@@ -5,6 +5,7 @@ package pipeline
 import (
 	"math"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -133,7 +134,15 @@ func TestTraceOpenersAreTraceStarts(t *testing.T) {
 	if len(traceOpeners) != len(examples) {
 		t.Fatalf("%d openers, want exactly %d: Python's, Java's and Go's", len(traceOpeners), len(examples))
 	}
-	alts := strings.Split(traceStartRe.String(), "|") // traceStartRe is a strings.Join on "|"
+	alts := append(slices.Clone(traceStartCues), regexp.QuoteMeta(traceStartRe.anywhere)) // what traceStartRe matches
+	if src, want := traceStartRe.anchored.String(), "^(?:"+strings.Join(traceStartCues, "|")+")"; src != want {
+		t.Fatalf("traceStartRe is %s, want %s: the anchored group is built from traceStartCues", src, want)
+	}
+	for _, cue := range traceStartCues {
+		if !strings.HasPrefix(cue, "^") {
+			t.Errorf("traceStartCues entry %s is unanchored; only traceStartRe.anywhere counts anywhere in the line", cue)
+		}
+	}
 	for _, o := range traceOpeners {
 		src := o.re.String()
 		if !strings.HasPrefix(src, "^") {
