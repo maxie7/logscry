@@ -81,6 +81,29 @@ var traceStartRe = regexp.MustCompile(strings.Join([]string{
 	`Exception in thread `,                  // Java
 }, "|"))
 
+// Python prints a chained exception as one traceback per link, oldest first, joined by one of
+// two fixed lines (traceback.py's _context_message and _cause_message) with a blank line on each
+// side. The next link opens with pythonTraceOpener again (#171). Each is matched as a whole line,
+// and only inside an active block: a separator continues a block that pythonTraceOpener opened,
+// and the opener continues one whose last non-blank line is a separator (see isContinuation).
+const (
+	pythonTraceOpener = "Traceback (most recent call last):"
+	pythonContextSep  = "During handling of the above exception, another exception occurred:"  // raised in an except
+	pythonCauseSep    = "The above exception was the direct cause of the following exception:" // raise … from …
+)
+
+// endsWithChainSeparator reports whether the last non-blank line of raw is one of Python's chain
+// separators. Only the trailing blank lines and one line are read, not the whole buffer.
+func endsWithChainSeparator(raw string) bool {
+	for {
+		i := strings.LastIndexByte(raw, '\n')
+		if line := raw[i+1:]; i < 0 || strings.TrimSpace(line) != "" {
+			return line == pythonContextSep || line == pythonCauseSep
+		}
+		raw = raw[:i]
+	}
+}
+
 // excSummaryRe matches an un-indented exception summary — the trailing
 // "ZeroDivisionError: ..." of a Python trace, or a fully-qualified
 // "java.lang.NullPointerException: ...". It is consulted ONLY once a block is already
@@ -353,6 +376,11 @@ func CoalesceSourceTime(ctx context.Context, in <-chan model.LogLine, out chan<-
 //     call frame, or a Go register line. Gating these on an active block is what keeps
 //     ordinary prefix-less log lines from being swallowed, so an unrelated burst stays one
 //     event per line.
+//  4. Only once p.active: Python's chain (#171). A separator line continues a block whose
+//     header is Python's traceback opener, and the next opener continues a block whose last
+//     non-blank line is a separator, so a chained traceback is one event. The state is read
+//     from the folded text rather than kept on pending: only these three exact lines pay for
+//     it, and nothing on pending can go stale.
 func isContinuation(p *pending, raw string) bool {
 	if len(raw) > 0 && (raw[0] == ' ' || raw[0] == '\t') && strings.TrimSpace(raw) != "" {
 		return true
@@ -366,6 +394,12 @@ func isContinuation(p *pending, raw string) bool {
 		}
 		if excSummaryRe.MatchString(raw) || goFrameRe.MatchString(raw) || goRegisterRe.MatchString(raw) {
 			return true
+		}
+		switch raw {
+		case pythonContextSep, pythonCauseSep:
+			return strings.HasPrefix(p.line.Raw, pythonTraceOpener)
+		case pythonTraceOpener:
+			return endsWithChainSeparator(p.line.Raw)
 		}
 	}
 	return false

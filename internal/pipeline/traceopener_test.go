@@ -184,17 +184,16 @@ var chainedTraceback = []string{
 }
 
 // TestChainedTracebackRaisesOneCardPerTraceback is #170 end to end: the traceback above on a
-// subprocess's stderr, grouped, then scored with warmup off. Each traceback block is a new
-// ERROR on stderr, 0.45 + 0.90 = 1.35, and escalates; the framework's line, the separator
-// and the blank line between them score 0.75 and stay quiet. Before, every event was
-// levelless and nothing escalated.
+// subprocess's stderr, grouped, then scored with warmup off. The chained traceback is a new
+// ERROR on stderr, 0.45 + 0.90 = 1.35, and escalates; the framework's line scores 0.75 and
+// stays quiet. Before, every event was levelless and nothing escalated.
 //
-// The chain still splits at its separator (#171), so it is five events and two cards. When
-// #171 folds the chain into one event, this becomes one event of the traceback and one card.
+// The chain is one event (#171), so it is two events and one card. Before #171 the chain split
+// at its separator: five events, and two cards, one per traceback block.
 func TestChainedTracebackRaisesOneCardPerTraceback(t *testing.T) {
 	events := drive(t, 200*time.Millisecond, chainedTraceback...)
-	if len(events) != 5 {
-		t.Fatalf("got %d events, want 5 (the chain splits at its separator, #171):\n%s", len(events), dump(events))
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want 2 (the chain is one event, #171):\n%s", len(events), dump(events))
 	}
 
 	p := New(score.New(scoringConfig(), nil))
@@ -205,8 +204,8 @@ func TestChainedTracebackRaisesOneCardPerTraceback(t *testing.T) {
 			cards = append(cards, ev)
 		}
 	}
-	if len(cards) != 2 {
-		t.Fatalf("got %d cards, want 2, one per traceback block (#171):\n%s", len(cards), dump(events))
+	if len(cards) != 1 {
+		t.Fatalf("got %d cards, want 1, the whole chain (#171):\n%s", len(cards), dump(events))
 	}
 	for i, ev := range cards {
 		if !strings.HasPrefix(ev.Line.Raw, "Traceback (most recent call last):") {
