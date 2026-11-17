@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"regexp"
 	"strings"
 	"sync"
@@ -43,6 +44,9 @@ type DockerSource struct {
 	// subscribe opens the events subscription. nil is cli.Events; a test stands in for it to
 	// choose when a refusal reaches Err.
 	subscribe func(cli *client.Client, ctx context.Context, opts client.EventsListOptions) client.EventsResult
+	// state is what Lines keeps across its connections. nil is a fresh one; a test passes its
+	// own to count the marks once Lines has returned.
+	state *dockerState
 }
 
 // NewDockerSource returns a Source that follows Docker container logs.
@@ -54,7 +58,7 @@ func NewDockerSource(sel DockerSelector) *DockerSource {
 func (s *DockerSource) Name() string { return "docker" }
 
 // Lines implements Source. It creates a Docker client, subscribes to container
-// start/die events, attaches a follower to every already-running container that
+// start/die/destroy events, attaches a follower to every already-running container that
 // matches the selector, and thereafter attaches/detaches followers as containers
 // come and go. It blocks until ctx is cancelled (a clean stop → nil), or until the
 // first connection to the daemon fails before it has listed the containers.
@@ -70,7 +74,8 @@ func (s *DockerSource) Name() string { return "docker" }
 //
 // A container's log survives a restart, so a re-attach to an ID logscry has read
 // from resumes after the last line read (see dockerMark) rather than fetching the
-// tail again: the tail's lines were already counted.
+// tail again: the tail's lines were already counted. Once the container is destroyed it can
+// never restart, and that position is forgotten (#165).
 func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) error {
 	m, err := newMatcher(s.Selector)
 	if err != nil {
@@ -90,7 +95,10 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 		minDelay, maxDelay = time.Second, 30*time.Second
 	}
 
-	st := &dockerState{marks: map[string]dockerMark{}}
+	st := s.state
+	if st == nil {
+		st = &dockerState{marks: map[string]dockerMark{}}
+	}
 	delay := minDelay
 	// attempt counts the failed connections since the stream was last up: the notices'
 	// "attempt N". 0 is the first connection, which has nothing to resume.
@@ -157,9 +165,10 @@ func (st *dockerState) since() time.Time {
 
 // connect runs one connection to the daemon. It subscribes to events (from st.since() if
 // resumed, so that the daemon replays what happened since), lists the running containers
-// and attaches to those that match, then calls connected with how many it attached and
-// follows events until ctx is cancelled (→ nil) or the stream fails. Every follower it
-// started has exited by the time it returns, and their marks are in st.
+// (and, if resumed, every container, to forget the destroyed ones) and attaches to those that
+// match, then calls connected with how many it attached and follows events until ctx is
+// cancelled (→ nil) or the stream fails. Every follower it started has exited by the time it
+// returns, and their marks are in st.
 //
 // An error before the list has succeeded returns without calling connected.
 func (s *DockerSource) connect(ctx context.Context, cli *client.Client, m matcher, st *dockerState,
@@ -189,7 +198,7 @@ func (s *DockerSource) connect(ctx context.Context, cli *client.Client, m matche
 	// list and subscribe are not missed.
 	ef := make(client.Filters).
 		Add("type", string(events.ContainerEventType)).
-		Add("event", string(events.ActionStart), string(events.ActionDie))
+		Add("event", string(events.ActionStart), string(events.ActionDie), string(events.ActionDestroy))
 	opts := client.EventsListOptions{Filters: ef}
 	// What the replay holds is the gap's history: events stamped before this instant, by
 	// this host's clock, which on the daemon's own host is the daemon's.
@@ -233,6 +242,22 @@ func (s *DockerSource) connect(ctx context.Context, cli *client.Client, m matche
 			}
 		}
 		return fmt.Errorf("list: %w", err)
+	}
+	if resumed {
+		// A container destroyed during the gap can no longer restart, so its mark is dropped
+		// (#165). Its destroy reaches the replay only if the daemon's buffer still holds it, so
+		// every container is listed, stopped ones included, and a mark whose ID is not among
+		// them goes. A destroy after the subscription comes as an event, so none falls
+		// between. Nothing of this connection reads a mark yet. If the list fails, every mark
+		// is kept, as before #165, and the next reconnect lists again: a mark kept too long
+		// costs memory, one dropped too soon costs a re-read of --docker-tail.
+		if all, err := cli.ContainerList(sctx, client.ContainerListOptions{All: true}); err == nil {
+			exists := make(map[string]bool, len(all.Items))
+			for _, c := range all.Items {
+				exists[c.ID] = true
+			}
+			followers.prune(exists)
+		}
 	}
 	attached := 0
 	for _, c := range list.Items {
@@ -278,6 +303,9 @@ func (s *DockerSource) connect(ctx context.Context, cli *client.Client, m matche
 				} else {
 					stop(msg.Actor.ID)
 				}
+			case events.ActionDestroy:
+				// The container is gone and can never restart: its mark is of no more use.
+				followers.forget(msg.Actor.ID)
 			}
 		case err := <-errs:
 			if ctx.Err() != nil {
@@ -289,7 +317,8 @@ func (s *DockerSource) connect(ctx context.Context, cli *client.Client, m matche
 }
 
 // followerSet runs at most one follower per container ID, and remembers where each ID's
-// last follower stopped reading so that a restart of it resumes there (see dockerMark).
+// last follower stopped reading so that a restart of it resumes there (see dockerMark), until
+// the container is destroyed (#165).
 //
 // A follower is stopped on die and removes its own entry only once it has unwound. A start
 // for the same ID can arrive in between: Lines handles the die and the restart's start
@@ -316,6 +345,7 @@ type follower struct {
 	stopped     bool   // stop was called: a die was seen for this run of the container
 	restart     bool   // a start arrived while this stopped follower was still unwinding
 	restartName string // that start's container name, the latest if there were several
+	destroyed   bool   // forget was called: the container is gone, so its exit stores no mark
 }
 
 func newFollowerSet(ctx context.Context, follow func(ctx context.Context, id, name string, mark dockerMark) dockerMark) *followerSet {
@@ -362,6 +392,13 @@ func (s *followerSet) launchLocked(id, name string) {
 		// shutdown, or as its connection to the daemon ends) no successor is launched.
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		if f.destroyed {
+			// forget dropped the mark while this follower was unwinding, and nothing can
+			// restart a destroyed container, so it stores none and launches no successor: a
+			// pending start's would only fail and store the mark again.
+			delete(s.running, id)
+			return
+		}
 		s.marks[id] = m
 		delete(s.running, id)
 		if f.restart && s.ctx.Err() == nil {
@@ -389,6 +426,26 @@ func (s *followerSet) retire(id string) {
 	if f, ok := s.running[id]; ok {
 		f.stopped = true
 	}
+}
+
+// forget drops id's mark: its container is destroyed and can never restart. A follower still
+// unwinding is not cancelled, since the daemon ends a removed container's stream by itself; it
+// is marked so that its exit stores no mark.
+func (s *followerSet) forget(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.marks, id)
+	if f, ok := s.running[id]; ok {
+		f.destroyed = true
+	}
+}
+
+// prune drops the mark of every ID not in exists: containers destroyed while no event could
+// say so.
+func (s *followerSet) prune(exists map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	maps.DeleteFunc(s.marks, func(id string, _ dockerMark) bool { return !exists[id] })
 }
 
 // wait blocks until every follower, including any successor launched on the way out,

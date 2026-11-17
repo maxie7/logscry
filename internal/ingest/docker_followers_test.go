@@ -327,3 +327,61 @@ func TestFollowerSetMarksCarryAcrossSets(t *testing.T) {
 	next.release <- markAt(6)
 	waitReturns(t, second)
 }
+
+// TestFollowerSetForgetWhileUnwinding is #165's race: a destroy reaches the set while the
+// container's follower is still on its way out, and that follower stores its mark as it exits.
+// It must not bring back the mark forget dropped, nor launch a pending start's successor, which
+// would only fail on the removed container and store the mark again.
+func TestFollowerSetForgetWhileUnwinding(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		before func(s *followerSet) // between the launch and forget
+	}{
+		{"stopped", func(s *followerSet) { s.stop("c1") }},
+		{"stopped with a pending start", func(s *followerSet) { s.stop("c1"); s.start("c1", "app") }},
+		{"retired", func(s *followerSet) { s.retire("c1") }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ff := newFakeFollows()
+			s := newFollowerSet(context.Background(), ff.follow)
+			s.marks["c1"] = markAt(2) // an earlier run's
+			s.start("c1", "app")
+			old := ff.next(t)
+			tt.before(s)
+			s.forget("c1")
+			if _, ok := s.marks["c1"]; ok {
+				t.Error("forget left the mark")
+			}
+			old.release <- markAt(5)
+			ff.none(t, 100*time.Millisecond)
+			waitReturns(t, s)
+			if m, ok := s.marks["c1"]; ok {
+				t.Errorf("the exiting follower stored %+v after forget", m)
+			}
+			if len(s.running) != 0 {
+				t.Errorf("%d follower(s) still registered after the exit", len(s.running))
+			}
+		})
+	}
+
+	t.Run("after the exit", func(t *testing.T) {
+		ff := newFakeFollows()
+		s := newFollowerSet(context.Background(), ff.follow)
+		s.start("c1", "app")
+		ff.next(t).release <- markAt(5)
+		waitReturns(t, s)
+		s.forget("c1")
+		if _, ok := s.marks["c1"]; ok {
+			t.Error("forget left the mark of a follower that had exited")
+		}
+	})
+
+	t.Run("unknown id", func(t *testing.T) {
+		s := newFollowerSet(context.Background(), newFakeFollows().follow)
+		s.marks["c2"] = markAt(5)
+		s.forget("c1")
+		if len(s.marks) != 1 || len(s.running) != 0 {
+			t.Errorf("forget of an unknown id changed the set: marks %v, running %d", s.marks, len(s.running))
+		}
+	})
+}

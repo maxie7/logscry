@@ -7669,6 +7669,114 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Released as **v0.12.43**.
 
+- [x] **A destroyed Docker container's mark is forgotten** — #165, found while reviewing #163.
+      `followerSet.marks`, shared with `dockerState.marks` so that it outlives reconnects, is where
+      each container's followers stopped reading, so that a restart of the same ID resumes after
+      its last line (#80, #85). It was written on every follower exit and never deleted. The events
+      subscription asked only for `start` and `die`, so logscry never learned that a container was
+      gone for good. A host churning containers (`docker run --rm` loops, CI runners) gained one
+      entry per container ID for the whole run. Same class as #126 and #163, with a different
+      remedy.
+
+      **Decisions.**
+      1. **Exact, not a bound.** A mark is useless only once its container can never restart,
+         which is `destroy`. Dropping a live one costs a re-read of `--docker-tail`, i.e. duplicate
+         lines, so no count or age may evict one. The subscription asks for `destroy` too, and
+         `followerSet.forget` drops that ID's mark, whether the event is live or comes from a
+         reconnect's replay. The replay and its skip logic (#159) are unchanged: a destroy is one
+         more event in the stream they already order and count.
+      2. **The unwinding follower is marked, not cancelled.** A destroy can be handled while the
+         ID's follower is still on its way out, and `launchLocked` stores the mark on exit. A
+         `destroyed` flag on the follower makes that exit store nothing and launch no successor.
+         Without that, a pending start (die, start, die, destroy) would launch a successor that
+         fails on the removed container and stores `prev` again. Cancelling would change nothing
+         observable, since the daemon ends a removed container's stream by itself, so stop and
+         retire keep their meaning.
+      3. **A reconnect lists every container, because the gap is real.** The daemon replays only
+         its newest 256 events of every kind (`TestDockerGapOutrunsTheEventBuffer` pins the same
+         loss for a start), and a restarted daemon starts with an empty buffer. A destroy in such
+         a gap would otherwise leak its mark for the rest of the run, which
+         `TestDockerDestroyOutrunsTheEventBuffer` shows. So a resumed connection, once its running
+         list has succeeded, makes one `ContainerList` with `All: true` and drops every mark whose
+         ID is not listed (`followerSet.prune`).
+         - **Timing.** No follower of that connection is running yet, and the previous
+           connection's set has passed `wait`.
+         - **Cost.** One request per successful reconnect, O(containers on the host). Nothing on
+           the first connection or per event.
+         - **What can go wrong.**
+           - A destroy after the list arrives as an event: we subscribe first.
+           - A container destroyed between the two lists has its mark pruned. The follower the
+             attach starts for it then 404s and stores a mark, and the destroy event forgets it.
+           - If the list fails, every mark is kept, as before, the attempt does not fail and
+             nothing new is said. The next reconnect lists again.
+         - **Error paths.** The running list's error paths, #159's included, are untouched.
+      4. **A stopped container that still exists keeps its mark.** It can restart, and it is in
+         the list of every container.
+      5. **The count needs a seam.** `DockerSource.state` (unexported, nil: `Lines` makes its own,
+         like `subscribe`) lets a test read the marks once `Lines` has returned. It landed with the
+         red tests, which otherwise could not compile on main.
+      6. **The fake daemon now honours what logscry asks for.** It delivers the events the
+         subscription's `filters` name instead of start and die always, so a branch that handles
+         destroy but never subscribes to it goes red. It answers `all=1` with every container.
+         Main asks for start and die and lists with `status=running`, so every existing test sees
+         what it saw. These and two doc comments are the only existing test lines changed; no
+         existing test changed.
+
+      **Evidence, each predicted first.**
+
+      | | main | predicted | branch | predicted |
+      |---|---|---|---|---|
+      | Marks after 10,000 start/die/destroy cycles through the fakes, 64-hex IDs | 10,000 | 10,000 | 0 | 0 |
+      | Bytes per mark (heap after GC, 10,000 through `launchLocked`; end to end) | 206–225; 208 | 170–210 | n/a | n/a |
+      | Heap held by the marks at 10,000 cycles | 2.0 MiB | ~2 MiB | 0 | 0 |
+      | Live: 300 `docker run --rm` containers, marks at exit | 300 | 300 | 0 | 0 |
+      | Live: peak marks over the run (2 s ticks) | 300 | 300 | 7 | small |
+      | Live: lines received from those containers | 300 | 300 | 300 | 300 |
+
+      - **Bytes per mark** missed high, by up to 15 B: a 64-byte key, an 80-byte Swiss-table slot,
+        and the table's slack.
+      - **The 10,000 cycles.** "Main" is main's `docker.go` with only the seam added, run through
+        `-overlay`. The branch's 0 needs the run to end after the last destroy has been handled.
+        Without a barrier the harness cancelled first and kept the last container's mark: at
+        shutdown, so harmless.
+      - **The live churn** ran on Docker 29.10, 10 containers at a time, each `echo x; sleep 1`, so
+        that `--rm` could not remove one before its follower had inspected it. Its marks were
+        counted through an `-overlay` probe and its lines with `grep -c`, counts only. The branch's
+        peak of 7 is containers between their die and their destroy. Main and branch read the same
+        300 lines: forgetting re-reads nothing.
+
+      **Tests.** `internal/ingest/docker_destroy_test.go`, plus
+      `TestFollowerSetForgetWhileUnwinding` appended to `docker_followers_test.go`.
+      - **Red on main by assertion.**
+        - 20 churned containers keep 20 marks.
+        - A destroy handled while the follower is still reading keeps its mark. The order is
+          forced: a barrier container's start proves the destroy was handled before the stream
+          ends.
+        - A destroy in the gap keeps its mark, both replayed and pushed out of the buffer.
+      - **Pins, which pass on main and on the branch.**
+        - A stopped container keeps its mark across a reconnect and resumes after its last line.
+        - The same when the list of every container fails.
+      - **`TestFollowerSetForgetWhileUnwinding`** names `forget`, so it came with the fix. It holds
+        the follower in its unwind and checks stopped, stopped with a pending start, retired,
+        forget after the exit, and an unknown ID.
+      - **Runs.** The new tests pass `-race -count=50`. Every block that touches an added line of
+        `docker.go` is covered.
+
+      **Mutants.** Seven:
+      - six die, each in at least one new test:
+        - destroy dropped from the filter;
+        - the `destroy` case dropped;
+        - the `destroyed` exit check dropped;
+        - a successor still launched;
+        - no reconcile;
+        - reconcile from the running list, which turns both pins red;
+      - one survives, as decision 2 predicts: `forget` also cancelling the follower.
+
+      **Out of scope:** #166, #36, #28, and the source list's bound from #163. README's #163 entry
+      stays true as written. Nothing found on the way; nothing filed.
+
+      Released as **v0.12.44**.
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained

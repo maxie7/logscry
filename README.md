@@ -324,7 +324,7 @@ Key flags:
 |---|---|---|
 | `--docker-all` | off | Follow all Docker containers, auto-attaching to new ones |
 | `--docker-name <re>` | — | Follow containers whose name matches a regexp |
-| `--docker-tail <n>` | `100` | Lines of history fetched per container on first attach (`all` for everything); a restarted container resumes after the last line read |
+| `--docker-tail <n>` | `100` | Lines of history fetched per container on first attach (`all` for everything); a restarted container resumes after the last line read, until the container is removed |
 | `--journald` | off | Follow the systemd journal (Linux; see below) |
 | `--journald-unit <u>` | — | Follow only these units (repeatable, OR-combined); implies `--journald` |
 | `--journald-priority <n>` | `7` | Priority floor: `0` emerg … `7` debug (`3` = errors and worse) |
@@ -1663,7 +1663,9 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   as it runs, and says `docker: events reconnected, M container(s) re-attached` once the daemon
   answers. It asks the daemon to replay the events it missed, re-lists the running containers,
   and resumes each from the last line it read: no line arrives twice, and lines logged during
-  the gap arrive late rather than not at all. Other sources keep running throughout. If these
+  the gap arrive late rather than not at all. It also lists every container, stopped ones
+  included, to forget the position of each one removed during the gap, which the replay may no
+  longer hold. Other sources keep running throughout. If these
   notices come faster than they can be shown (a paused pager, a stalled terminal), the surplus
   is dropped rather than waited for, and the count is printed at exit. What can still be missed:
   - **A container that starts and exits during a long gap.** The daemon keeps only its last 256
@@ -1683,7 +1685,12 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   the full backlog. A restarted container is not read from its tail again: logscry resumes
   after the last line it read. One edge: a container that delivered nothing before it
   restarted is re-attached like a first attach, so with `--docker-tail 0` the lines it logs
-  between the restart and the re-attach (milliseconds) are lost.
+  between the restart and the re-attach (milliseconds) are lost. logscry keeps that position
+  for as long as the container exists, stopped or not, and forgets it once the container is
+  removed (`docker rm`, or `--rm` as it exits), since a removed container can never restart.
+  Until `v0.12.44` it kept one position per container ID for the whole run, about 210 bytes
+  each, so a host churning containers (`docker run --rm` loops, CI runners) grew it without
+  end (#165).
 - **The status bar's source list grew with each distinct name until `v0.12.39`.** From
   `v0.1.0` it kept every name seen for the whole run and sorted it on each snapshot (#163). A
   subprocess or stdin adds one name. Docker adds one per distinct container name, so Compose stays
