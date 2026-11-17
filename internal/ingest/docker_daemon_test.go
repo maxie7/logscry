@@ -104,6 +104,10 @@ type fakeDaemon struct {
 	evGen   int             // bumped by endEvents: the open events streams end, later ones work
 	evReqs  chan url.Values // one per events request
 	evConns int             // events streams currently open
+
+	// allListFails is set by failAllList: a list of every container, stopped ones included,
+	// answers 500 while the running list works.
+	allListFails bool
 }
 
 func newFakeDaemon(t *testing.T, name string, tty bool, history ...fakeEntry) *fakeDaemon {
@@ -148,7 +152,7 @@ func (d *fakeDaemon) serve(w http.ResponseWriter, r *http.Request) {
 	case p == "/events":
 		d.serveEvents(w, r)
 	case p == "/containers/json":
-		d.serveList(w)
+		d.serveList(w, r)
 	case strings.HasPrefix(p, "/containers/"):
 		id, op, _ := strings.Cut(strings.TrimPrefix(p, "/containers/"), "/")
 		d.mu.Lock()
@@ -169,14 +173,19 @@ func (d *fakeDaemon) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serveList answers the running containers, sorted by id. logscry asks with
-// status=running, which is the only filter it ever sends.
-func (d *fakeDaemon) serveList(w http.ResponseWriter) {
+// serveList answers the running containers, sorted by id, or with all=1 every container. It
+// reads no other filter: logscry's running list sends only status=running.
+func (d *fakeDaemon) serveList(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	fails := d.listFails
+	// all=1 lists every container the daemon knows, stopped ones included.
+	all := r.URL.Query().Get("all") != ""
+	if all && d.allListFails {
+		fails = true
+	}
 	var items []map[string]any
 	for _, id := range slices.Sorted(maps.Keys(d.containers)) {
-		if c := d.containers[id]; c.running {
+		if c := d.containers[id]; c.running || all {
 			items = append(items, map[string]any{"Id": c.id, "Names": []string{"/" + c.name}})
 		}
 	}
@@ -202,7 +211,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 // the buffered events stamped at or after it, nanosecond-precise and inclusive, but only
 // from the newest evLimit; then every event published after the subscription. The replay
 // and the live position are taken under one lock, as the daemon takes them, so nothing
-// falls between. Only container start and die are delivered: the filter logscry sends.
+// falls between. Only the events the subscription's filters ask for are delivered (delivers).
 func (d *fakeDaemon) serveEvents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	d.mu.Lock()
@@ -238,7 +247,7 @@ func (d *fakeDaemon) serveEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, m := range batch {
-			if m.Type != events.ContainerEventType || (m.Action != events.ActionStart && m.Action != events.ActionDie) {
+			if !delivers(q, m) {
 				continue
 			}
 			if err := enc.Encode(m); err != nil {

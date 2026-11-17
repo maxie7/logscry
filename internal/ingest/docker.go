@@ -43,6 +43,9 @@ type DockerSource struct {
 	// subscribe opens the events subscription. nil is cli.Events; a test stands in for it to
 	// choose when a refusal reaches Err.
 	subscribe func(cli *client.Client, ctx context.Context, opts client.EventsListOptions) client.EventsResult
+	// state is what Lines keeps across its connections. nil is a fresh one; a test passes its
+	// own to count the marks once Lines has returned.
+	state *dockerState
 }
 
 // NewDockerSource returns a Source that follows Docker container logs.
@@ -90,7 +93,10 @@ func (s *DockerSource) Lines(ctx context.Context, out chan<- model.LogLine) erro
 		minDelay, maxDelay = time.Second, 30*time.Second
 	}
 
-	st := &dockerState{marks: map[string]dockerMark{}}
+	st := s.state
+	if st == nil {
+		st = &dockerState{marks: map[string]dockerMark{}}
+	}
 	delay := minDelay
 	// attempt counts the failed connections since the stream was last up: the notices'
 	// "attempt N". 0 is the first connection, which has nothing to resume.
