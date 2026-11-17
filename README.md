@@ -1688,7 +1688,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   between the restart and the re-attach (milliseconds) are lost. logscry keeps that position
   for as long as the container exists, stopped or not, and forgets it once the container is
   removed (`docker rm`, or `--rm` as it exits), since a removed container can never restart.
-  Until `TODO-VERSION` it kept one position per container ID for the whole run, about 210 bytes
+  Until `v0.12.44` it kept one position per container ID for the whole run, about 210 bytes
   each, so a host churning containers (`docker run --rm` loops, CI runners) grew it without
   end (#165).
 - **The status bar's source list grew with each distinct name until `v0.12.39`.** From

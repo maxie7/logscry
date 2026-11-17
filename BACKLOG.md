@@ -7775,7 +7775,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Out of scope:** #166, #36, #28, and the source list's bound from #163. README's #163 entry
       stays true as written. Nothing found on the way; nothing filed.
 
-      Released as **TODO-VERSION**.
+      Released as **v0.12.44**.
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
