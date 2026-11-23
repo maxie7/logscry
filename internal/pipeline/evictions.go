@@ -8,7 +8,7 @@ import (
 )
 
 // Evictions counts what a run evicted at a bound, and calls notify on the first. A run has one for
-// templates and one for source names. An eviction costs history rather than data, but it changes
+// templates, one for source names and one for the coalescer's buffers flushed early. An eviction costs history rather than data, but it changes
 // how a returning template is scored, and what the source list can claim, so it is announced as it
 // starts and not only counted at the end. A template or a name that returns and goes again counts
 // again, so this counts evictions, not the things evicted.

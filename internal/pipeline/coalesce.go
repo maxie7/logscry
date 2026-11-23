@@ -4,6 +4,7 @@ package pipeline
 
 import (
 	"cmp"
+	"container/heap"
 	"context"
 	"regexp"
 	"slices"
@@ -29,6 +30,23 @@ const (
 	// bias is toward emitting rather than swallowing.
 	maxCoalesceLines = 200
 	maxCoalesceBytes = 64 << 10
+)
+
+// MaxGroupBuffers and MaxGroupBytes bound the buffers the coalescer holds at once: one per
+// (source, stream) with a line pending, and their text and source names in bytes (see
+// pending.charge). A journald entry names its own source, so a stream of distinct names held one
+// buffer per name until each went idle, and on one timestamp until the end of input (#166). Past
+// either bound the least recently touched buffer is flushed early: it is emitted, never dropped,
+// and a trace still arriving on its stream continues as a second event.
+//
+// A buffer is held from its stream's last line until the group timeout (200 ms by default) or its
+// stream's next header, so the count is the streams that logged within the timeout. Ten real
+// boots held at most 20 buffers and 17,544 bytes at once; the count binds past 2,048 containers
+// logging on both streams within one timeout. The bytes allow 256 buffers at maxCoalesceBytes at once, where the count
+// alone allows 4,096 of them, 256 MiB. No flag: nothing an operator decides depends on them.
+const (
+	MaxGroupBuffers = 4096
+	MaxGroupBytes   = 16 << 20
 )
 
 // goroutineHeader is the header the Go runtime writes above each goroutine in a dump:
@@ -163,54 +181,165 @@ type pending struct {
 	active bool          // a multi-line block is confirmed in progress
 	last   time.Time     // when the last line attached — the idle-flush anchor
 	seq    uint64        // arrival order of the header, which orders simultaneous flushes
+
+	// index is the buffer's place in the grouper's deadlines, and prev and next its neighbours
+	// in the touch order. A buffer that leaves is cleared of all three (index -1), so nothing the
+	// grouper keeps points at a line already emitted.
+	index      int
+	prev, next *pending
 }
 
-// inOrder returns the buffered keys that pass keep, in the order they must be flushed:
-// earliest idle deadline first, then header arrival. At end of input every deadline is
-// irrelevant and arrival alone decides.
+// charge is what p counts against MaxGroupBytes: its text and its source name. A journald entry
+// names its own source, so a name can be as long as the line that carried it (#163).
+func (p *pending) charge() int { return len(p.line.Raw) + len(p.line.Source) }
+
+// deadlines is a min-heap of the held buffers in the order they must be flushed idle: earliest
+// deadline first, then header arrival. Its top is the one buffer a line or the timer has to look
+// at, so neither walks the rest (#166).
 //
-// It exists because the buffers live in a map, and ranging over a map to flush several of
-// them at once hands the pipeline its lines in whatever order the runtime's hash seed
-// picked — different on every run. journald keys one stream per unit and Docker one per
-// container, so a multi-source run routinely holds many buffers, and the order they leave
-// in is the order the stream pane shows, --plain prints, and the scorer's context ring
-// records (#69).
-func inOrder(buffers map[streamKey]*pending, byDeadline bool, keep func(*pending) bool) []streamKey {
-	var keys []streamKey
-	for k, p := range buffers {
-		if keep(p) {
-			keys = append(keys, k)
-		}
+// The order is fixed, and not the buffer map's, because ranging over a map to flush several at
+// once hands the pipeline its lines in whatever order the runtime's hash seed picked: different on
+// every run. journald keys one stream per unit and Docker one per container, so a multi-source run
+// routinely holds many buffers, and the order they leave in is the order the stream pane shows,
+// --plain prints, and the scorer's context ring records (#69).
+type deadlines []*pending
+
+func (h deadlines) Len() int { return len(h) }
+
+func (h deadlines) Less(i, j int) bool {
+	if c := h[i].last.Compare(h[j].last); c != 0 {
+		return c < 0
 	}
-	slices.SortFunc(keys, func(a, b streamKey) int {
-		pa, pb := buffers[a], buffers[b]
-		if byDeadline {
-			if c := pa.last.Compare(pb.last); c != 0 {
-				return c
-			}
-		}
-		return cmp.Compare(pa.seq, pb.seq)
-	})
-	return keys
+	return h[i].seq < h[j].seq
+}
+
+func (h deadlines) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+
+func (h *deadlines) Push(x any) {
+	p := x.(*pending)
+	p.index = len(*h)
+	*h = append(*h, p)
+}
+
+// Pop clears the slot it vacates: the backing array outlives the slice's length, and a buffer
+// left in its spare capacity would keep an emitted line, up to maxCoalesceBytes, reachable.
+func (h *deadlines) Pop() any {
+	old := *h
+	n := len(old) - 1
+	p := old[n]
+	old[n] = nil
+	p.index = -1
+	*h = old[:n]
+	return p
+}
+
+// touchOrder lists the held buffers least recently touched first, a header or a fold being a
+// touch. It is the order the bound flushes them early in. It is not the deadline order, which
+// differs on a tie: on one timestamp the earliest deadline is the oldest header, even one that
+// has just folded a frame, and the bound would split the very trace still arriving. The links
+// live on pending, so keeping the order allocates nothing.
+type touchOrder struct{ front, back *pending }
+
+func (l *touchOrder) pushBack(p *pending) {
+	p.prev = l.back
+	if l.back != nil {
+		l.back.next = p
+	} else {
+		l.front = p
+	}
+	l.back = p
+}
+
+func (l *touchOrder) remove(p *pending) {
+	if p.prev != nil {
+		p.prev.next = p.next
+	} else {
+		l.front = p.next
+	}
+	if p.next != nil {
+		p.next.prev = p.prev
+	} else {
+		l.back = p.prev
+	}
+	p.prev, p.next = nil, nil
+}
+
+func (l *touchOrder) moveToBack(p *pending) {
+	if l.back != p {
+		l.remove(p)
+		l.pushBack(p)
+	}
 }
 
 // grouper is the buffer state and the fold/flush rules both coalescers share. Only what
 // drives it differs: Coalesce is clocked by the wall and a timer, CoalesceSourceTime by the
 // lines' own timestamps. Owned by the one goroutine running either of them.
+//
+// Every buffer held is in buffers, in deadlines and in order, and counted in bytes; hold and drop
+// are the only ways in and out.
 type grouper struct {
-	ctx     context.Context
-	out     chan<- model.LogLine
-	timeout time.Duration
-	buffers map[streamKey]*pending
-	seq     uint64 // numbers headers as they arrive; see inOrder
+	ctx       context.Context
+	out       chan<- model.LogLine
+	timeout   time.Duration
+	buffers   map[streamKey]*pending
+	deadlines deadlines
+	order     touchOrder
+	bytes     int    // the sum of charge over the held buffers
+	seq       uint64 // numbers headers as they arrive; see deadlines
 
 	// restamp sets each emitted line's Time to the moment it is released. Only replay wants
 	// it (see CoalesceSourceTime); a live line keeps the time its source gave it.
 	restamp bool
+
+	// maxBuffers and maxBytes are the bound, MaxGroupBuffers and MaxGroupBytes. They are fields
+	// so that a test can set small ones.
+	maxBuffers, maxBytes int
+	early                *Evictions // counts the buffers flushed early at the bound; nil counts nothing
+
+	// visited counts the buffers whose deadline flushIdle or nextDeadline read: a test's measure
+	// of the work a line costs.
+	visited uint64
 }
 
 func newGrouper(ctx context.Context, out chan<- model.LogLine, timeout time.Duration, restamp bool) *grouper {
-	return &grouper{ctx: ctx, out: out, timeout: timeout, buffers: make(map[streamKey]*pending), restamp: restamp}
+	return &grouper{
+		ctx: ctx, out: out, timeout: timeout, buffers: make(map[streamKey]*pending), restamp: restamp,
+		maxBuffers: MaxGroupBuffers, maxBytes: MaxGroupBytes, early: earlyFlushesFrom(ctx),
+	}
+}
+
+type earlyFlushesKey struct{}
+
+// WithEarlyFlushes returns ctx carrying e, which a coalescer started with it counts its early
+// flushes on.
+func WithEarlyFlushes(ctx context.Context, e *Evictions) context.Context {
+	return context.WithValue(ctx, earlyFlushesKey{}, e)
+}
+
+// earlyFlushesFrom returns the Evictions ctx carries, or nil, which counts nothing.
+func earlyFlushesFrom(ctx context.Context) *Evictions {
+	e, _ := ctx.Value(earlyFlushesKey{}).(*Evictions)
+	return e
+}
+
+// hold makes p the buffer for key, the most recently touched.
+func (g *grouper) hold(key streamKey, p *pending) {
+	g.buffers[key] = p
+	heap.Push(&g.deadlines, p)
+	g.order.pushBack(p)
+	g.bytes += p.charge()
+}
+
+// drop lets go of p, which has been emitted.
+func (g *grouper) drop(p *pending) {
+	delete(g.buffers, streamKey{source: p.line.Source, stream: p.line.Stream})
+	heap.Remove(&g.deadlines, p.index)
+	g.order.remove(p)
+	g.bytes -= p.charge()
 }
 
 // emit sends p's merged line downstream at time at, reporting false on cancellation so the
@@ -229,7 +358,8 @@ func (g *grouper) emit(p *pending, at time.Time) bool {
 }
 
 // add folds line, observed at now, into the buffer for its stream — or, if it starts a new
-// logical line, flushes that stream's predecessor and holds this one in its place.
+// logical line, flushes that stream's predecessor and holds this one in its place. Either way it
+// then keeps the buffers within the bound.
 func (g *grouper) add(line model.LogLine, now time.Time) bool {
 	key := streamKey{source: line.Source, stream: line.Stream}
 	if p := g.buffers[key]; p != nil && isContinuation(p, line.Raw) {
@@ -237,13 +367,17 @@ func (g *grouper) add(line model.LogLine, now time.Time) bool {
 		p.count++
 		p.active = true
 		p.last = now
+		g.bytes += 1 + len(line.Raw)
+		heap.Fix(&g.deadlines, p.index)
+		g.order.moveToBack(p)
 		if p.count >= maxCoalesceLines || len(p.line.Raw) >= maxCoalesceBytes {
 			if !g.emit(p, now) {
 				return false
 			}
-			delete(g.buffers, key)
+			g.drop(p)
+			return true
 		}
-		return true
+		return g.shrink(now)
 	}
 	// A header: flush any predecessor for this stream, then hold this line as the next
 	// potential header.
@@ -251,38 +385,72 @@ func (g *grouper) add(line model.LogLine, now time.Time) bool {
 		if !g.emit(p, now) {
 			return false
 		}
+		g.drop(p)
 	}
 	g.seq++
-	g.buffers[key] = &pending{
+	g.hold(key, &pending{
 		line:   line,
 		count:  1,
 		active: traceStartRe.MatchString(line.Raw),
 		last:   now,
 		seq:    g.seq,
+	})
+	return g.shrink(now)
+}
+
+// shrink flushes the least recently touched buffers early, at now as a header's flush is, until
+// both bounds hold again. Each is emitted whole, so no line is lost; what it costs is that a
+// trace still arriving on that stream continues as a second event (#166).
+func (g *grouper) shrink(now time.Time) bool {
+	for len(g.buffers) > g.maxBuffers || g.bytes > g.maxBytes {
+		p := g.order.front
+		if !g.emit(p, now) {
+			return false
+		}
+		g.drop(p)
+		g.early.add()
 	}
 	return true
 }
 
 // flushIdle emits every buffer idle for at least the timeout as of now, earliest deadline
 // first. Each is released at its own deadline — the instant a live timer would have fired.
+// It reads the top of the deadlines and stops at the first that has not expired: expiry is
+// monotone in the deadline, so none behind it has either.
 func (g *grouper) flushIdle(now time.Time) bool {
-	expired := func(p *pending) bool { return now.Sub(p.last) >= g.timeout }
-	for _, key := range inOrder(g.buffers, true, expired) {
-		if !g.emit(g.buffers[key], g.buffers[key].last.Add(g.timeout)) {
+	for len(g.deadlines) > 0 {
+		p := g.deadlines[0]
+		g.visited++
+		if now.Sub(p.last) < g.timeout {
+			break
+		}
+		if !g.emit(p, p.last.Add(g.timeout)) {
 			return false
 		}
-		delete(g.buffers, key)
+		g.drop(p)
 	}
 	return true
 }
 
-// flushAll emits everything still buffered, in arrival order, at time now: ingestion ended.
+// nextDeadline returns the earliest idle deadline of the buffers held, and false when none is.
+func (g *grouper) nextDeadline() (time.Time, bool) {
+	if len(g.deadlines) == 0 {
+		return time.Time{}, false
+	}
+	g.visited++
+	return g.deadlines[0].last.Add(g.timeout), true
+}
+
+// flushAll emits everything still buffered, in arrival order, at time now: ingestion ended,
+// every deadline is irrelevant, and arrival alone decides. A sort, once.
 func (g *grouper) flushAll(now time.Time) bool {
-	all := func(*pending) bool { return true }
-	for _, key := range inOrder(g.buffers, false, all) {
-		if !g.emit(g.buffers[key], now) {
+	held := slices.Clone(g.deadlines)
+	slices.SortFunc(held, func(a, b *pending) int { return cmp.Compare(a.seq, b.seq) })
+	for _, p := range held {
+		if !g.emit(p, now) {
 			return false
 		}
+		g.drop(p)
 	}
 	return true
 }
@@ -306,13 +474,7 @@ func Coalesce(ctx context.Context, in <-chan model.LogLine, out chan<- model.Log
 	var timerC <-chan time.Time // nil while no buffer is waiting, which parks the select case
 
 	arm := func(now time.Time) {
-		var earliest time.Time
-		found := false
-		for _, p := range g.buffers {
-			if d := p.last.Add(timeout); !found || d.Before(earliest) {
-				earliest, found = d, true
-			}
-		}
+		earliest, found := g.nextDeadline()
 		if !found {
 			timer.Stop()
 			timerC = nil

@@ -7777,6 +7777,140 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
 
       Released as **v0.12.44**.
 
+- [x] **The coalescer's buffers are bounded, and a line no longer walks them all** — #166, found
+      while working on #163. `grouper.buffers` holds one buffer per (source, stream) with a line
+      pending. On every line `flushIdle` called `inOrder`, which walked and sorted all of them, and
+      live `arm` walked them again for the earliest deadline. A journald entry names its own source,
+      so a stream of distinct names made a line O(n log n). On one timestamp nothing goes idle, so
+      every buffer lasted to the end of input, each up to `maxCoalesceBytes`.
+
+      **Decisions.**
+      1. **A deadline heap, in `inOrder`'s order.** `deadlines` is a `container/heap` ordered by
+         `last`, then `seq`, exactly as `inOrder` sorted with `byDeadline`.
+         - A fold moves its buffer's deadline and calls `heap.Fix`.
+         - `flushIdle` emits from the top while it has expired and pops only after the emit
+           succeeds. Expiry is monotone in `last`, so this is the same set in the same order as
+           "filter, then sort".
+         - `arm` reads the top through `nextDeadline`. Its timer handling is unchanged.
+         - `flushAll` stays a one-time sort by `seq`.
+         - `inOrder` is gone; #69's reason for a fixed order now sits on `deadlines`.
+      2. **The early flush takes the least recently touched, not the heap top.** A header or a fold
+         is a touch, and an intrusive list on `pending` keeps the order, so it allocates nothing.
+         The two orders differ only on a tie, and the tie is the case that matters: on one
+         timestamp the heap top is the oldest header, even one that has just folded a frame, so the
+         bound would split the trace still arriving every time.
+         `TestEarlyFlushEmitsTheLeastRecentlyTouched` holds that tie.
+      3. **Both bounds: 4,096 buffers and 16 MiB, with no flag.** A buffer is charged its text plus
+         its source name, since a journald name can be as long as its line (#163); the count covers
+         the fixed cost. A buffer lives from its stream's last line until the group timeout or its
+         stream's next header, so the count is the streams that logged within one timeout. Live, the
+         count binds past 2,048 containers logging on both streams within 200 ms. The bytes allow
+         256 buffers at the 64 KiB cap at once, where the count alone allows 4,096, 256 MiB.
+         Predicted before counting, then counted on the ten boots through the grouper as
+         `CoalesceSourceTime` drives it:
+
+         | | Predicted | Measured | Bound | Margin |
+         |---|---|---|---|---|
+         | Buffers at once, any boot | ≤ 40 | 19–20 | 4,096 | 204× |
+         | Bytes at once, any boot | ≤ 32 KiB | 14,255–17,544 | 16 MiB | 956× |
+
+         Both held. The largest boot (11,060 entries) peaked at 20 buffers, like the smallest
+         (4,779) at 19: the peak is the units logging within one 200 ms window, not the length of
+         the boot.
+      4. **An early flush emits and never drops.** It is released at `now`, as a header's flush is,
+         so a replay's output stays monotone. What it costs is pinned by
+         `TestEarlyFlushSplitsATraceInProgress`: the trace leaves as far as it has got, and its next
+         frame opens a second event, into which the later frames still fold. `shrink` loops, since
+         one long line can pass the bytes by more than one buffer.
+      5. **Nothing emitted stays reachable.** `Pop` clears the slot it vacates, because the heap's
+         backing array outlives its length. Every buffer that leaves, by a header, idle, early, cap
+         or end-of-input flush, has its links cleared and its index set to -1.
+      6. **Said once, totalled at exit, no exit code.** As #126 and #163, through a third
+         `Evictions`. It reaches the coalescer through `WithEarlyFlushes` on its context, the
+         pattern of `ingest.WithTruncations`. So `Coalesce`, `CoalesceSourceTime` and `newGrouper`
+         keep their signatures, and no existing test line changed. A first early flush after the
+         sources have stopped posts nothing, and the exit total still counts it.
+
+      **Evidence, each predicted first.** Medians; main is `git archive main`, built and benchmarked
+      beside the branch.
+
+      | | Predicted | main | branch |
+      |---|---|---|---|
+      | Ten boots, 63,017 entries, `--replay --explain-dry-run --plain --export`, default flags and `--warmup 0 --warmup-lines 0` | byte-identical, 0 early flushes | | 20 of 20 identical in export, stdout and stderr; 59 and 165 records; 0 early flushes (held) |
+      | One-timestamp replay, 20k / 40k / 80k names, 5 runs | within +30 % of `--group-timeout 0` | 3.33 / 13.46 / 56.91 s | 0.23 / 0.39 / 0.72 s, against 0.19 / 0.36 / 0.69 (held) |
+      | Early flushes on those captures | 15,904 / 35,904 / 75,904 | none | 15,904 / 35,904 / 75,904, one notice each (held) |
+      | Live `Coalesce`, one source, short / 200-byte line, 10 runs | 700–850k lines/s | 1,093,855 / 810,602 | 1,096,642 / 818,881 (missed, high) |
+      | Live `Coalesce`, distinct names, short / 200-byte line | 300–700k lines/s | 14,358 / 14,483 | 1,522,116 / 1,401,367 (missed, high) |
+      | `BenchmarkGrouperAdd/plain`, 10 runs interleaved | +3 to +15 %; 176 B; 1 alloc | 771 ns, 144 B, 1 alloc | 861 ns (+11.6 %), 177 B, 1 alloc (held) |
+      | `BenchmarkGrouperAdd/python-chain` | ±10 %; ≤ +32 B; 1 alloc | 1,008 ns, 335 B, 1 alloc | 1,030 ns (+2.1 %), 340 B, 1 alloc (held) |
+      | Heap after GC, 80,000 names pending, short / 4 KiB lines | main 20–30 MiB; branch 1–2 MiB | 20.3 / 330 MiB | 1.59 / 17.4 MiB, 4,096 / 4,077 buffers (held) |
+      | The same, once every buffer has flushed idle | n/a | 5.07 MiB, the map's table | 0.68 / 0.67 MiB |
+      | `FuzzGrouperMatchesReference`, 10 minutes | 0 failures | | 8,575,518 execs, 0 failures (held) |
+
+      - **The one-timestamp captures above the bound come out identical to main's,** in stdout as in
+        export. Each name there has one line, so the order the bound flushes them in is their
+        arrival, which is the order main flushed them in at the end.
+      - **Live, one source, the absolute prediction missed** because the rebuilt harness (#174's is
+        not in the tree) gives main 1.09 million lines/s, not #174's 844,000. Main against branch it
+        did not move: +0.3 % and +1.0 %.
+      - **Live, distinct names, the prediction missed high,** above even one source: a new name has
+        no buffer, so `isContinuation` and its regexps never run on it.
+      - **`plain` pays about 90 ns** for a heap removal and push and two list operations per header.
+        Live throughput from one source shows none of it.
+      - **The heap after a full flush** is what decision 5 is for. With the mutant "Pop without the
+        nil" the same run keeps 1.59 and 17.38 MiB, which is every buffer held at the bound, after
+        all of them have been emitted.
+
+      **Tests.** `internal/pipeline/groupbound_test.go`, `internal/pipeline/coalescereference_test.go`,
+      `cmd/logscry/groupflush_test.go`.
+      - **Red on main by assertion,** on scaffolding that changes no behaviour: the constants, the
+        limit fields, a no-op `WithEarlyFlushes`, a `visited` counter, and `arm`'s walk lifted into
+        `nextDeadline`.
+        - `TestGroupingWorkPerLineIsFlat`: 64, 512 and 4,000 buffers held, both drivers; main visits
+          every buffer on every line.
+        - `TestIdleFlushVisitsOnlyWhatItFlushes`, `TestPendingBuffersStayWithinTheirCount`,
+          `TestPendingBuffersStayWithinTheirBytes`, `TestEarlyFlushEmitsTheLeastRecentlyTouched`,
+          `TestEarlyFlushTakesWhatTheBytesNeed`, `TestEarlyFlushesNotifyOnceAndCount`.
+        - `TestEarlyFlushSplitsATraceInProgress`, through both coalescers at the real bound.
+      - **Guards, which pass on main and on the branch.**
+        - `TestGroupBoundIsTheDocumentedOne`.
+        - `TestGrouperMatchesReference`: 300 seeded runs of 400 steps each way, over up to 50
+          sources and both streams. The steps are folds, runs to the line and byte caps, blank
+          lines, Python's separators, and clock steps of none, to either side of the timeout and
+          back. Every emitted line is compared field by field, Time included, and live, the
+          deadline after every step.
+        - `FuzzGrouperMatchesReference`: the same steps decoded from bytes. CI runs its seeds.
+        - The reference is main's buffer handling, verbatim but for a `ref` prefix, as
+          `cuereference_test.go` keeps the cues.
+      - **With the fix,** because they name what it adds:
+        - `TestEmittedBuffersAreUnreachable`: every way out, then the heap's spare capacity, the
+          links and the indexes.
+        - `TestEarlyFlushChargesTheSourceName`, `TestAFoldCanFlushEarly`, and the three cancelled
+          flushes (`TestEarlyFlushCancelled`, `TestIdleFlushCancelled`, `TestFlushAllCancelled`).
+        - In `cmd/logscry`: `TestReplayReportsEarlyFlushOnce` (4,096 + 4,000 invented units on one
+          timestamp: one notice, a total of 4,000, exit 0), `TestEarlyFlushTotal` and
+          `TestFlushingEarlyNoticeNamesItsBound`.
+      - **Runs.** `-race -count=50` passes. Every block that touches an added line is covered.
+
+      **Mutants.** Fourteen, each red in at least one test:
+      - no `heap.Fix` on a fold;
+      - `Less` by `seq` alone;
+      - FIFO, no move on a touch;
+      - the charge without the name;
+      - `shrink` with `if`;
+      - no count;
+      - a notice on every flush;
+      - `nextDeadline` from the back;
+      - pop before emit, idle and early;
+      - Pop without the nil;
+      - links or index kept on removal;
+      - `flushAll` by deadline.
+
+      **Out of scope:** #36, #28, what a cue matches, and #163's and #165's bounds. Nothing found on
+      the way; nothing filed.
+
+      Released as **v0.12.45**.
+
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
       ran one `strings.ReplaceAll` per token, with no fixpoint. If a mapping's VALUE contained
