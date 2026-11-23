@@ -31,6 +31,13 @@ const (
 	maxCoalesceBytes = 64 << 10
 )
 
+// MaxGroupBuffers and MaxGroupBytes bound the buffers the coalescer holds at once: one per
+// (source, stream) with a line pending, and the bytes of their text and source names (#166).
+const (
+	MaxGroupBuffers = 4096
+	MaxGroupBytes   = 16 << 20
+)
+
 // goroutineHeader is the header the Go runtime writes above each goroutine in a dump:
 // "goroutine 1 [running]:", or since Go 1.23, under GOTRACEBACK=system or crash and in every
 // SIGQUIT dump, "goroutine 1 gp=0x… m=0 mp=0x… [running]:". Only key=value fields may come
@@ -207,10 +214,36 @@ type grouper struct {
 	// restamp sets each emitted line's Time to the moment it is released. Only replay wants
 	// it (see CoalesceSourceTime); a live line keeps the time its source gave it.
 	restamp bool
+
+	// maxBuffers and maxBytes are the bound, MaxGroupBuffers and MaxGroupBytes. They are fields
+	// so that a test can set small ones.
+	maxBuffers, maxBytes int
+	early                *Evictions // counts the buffers flushed early at the bound; nil counts nothing
+
+	// visited counts the buffers whose deadline flushIdle or nextDeadline read: a test's measure
+	// of the work a line costs.
+	visited uint64
 }
 
 func newGrouper(ctx context.Context, out chan<- model.LogLine, timeout time.Duration, restamp bool) *grouper {
-	return &grouper{ctx: ctx, out: out, timeout: timeout, buffers: make(map[streamKey]*pending), restamp: restamp}
+	return &grouper{
+		ctx: ctx, out: out, timeout: timeout, buffers: make(map[streamKey]*pending), restamp: restamp,
+		maxBuffers: MaxGroupBuffers, maxBytes: MaxGroupBytes, early: earlyFlushesFrom(ctx),
+	}
+}
+
+type earlyFlushesKey struct{}
+
+// WithEarlyFlushes returns ctx carrying e, which a coalescer started with it counts its early
+// flushes on.
+func WithEarlyFlushes(ctx context.Context, e *Evictions) context.Context {
+	return context.WithValue(ctx, earlyFlushesKey{}, e)
+}
+
+// earlyFlushesFrom returns the Evictions ctx carries, or nil, which counts nothing.
+func earlyFlushesFrom(ctx context.Context) *Evictions {
+	e, _ := ctx.Value(earlyFlushesKey{}).(*Evictions)
+	return e
 }
 
 // emit sends p's merged line downstream at time at, reporting false on cancellation so the
@@ -266,7 +299,10 @@ func (g *grouper) add(line model.LogLine, now time.Time) bool {
 // flushIdle emits every buffer idle for at least the timeout as of now, earliest deadline
 // first. Each is released at its own deadline — the instant a live timer would have fired.
 func (g *grouper) flushIdle(now time.Time) bool {
-	expired := func(p *pending) bool { return now.Sub(p.last) >= g.timeout }
+	expired := func(p *pending) bool {
+		g.visited++
+		return now.Sub(p.last) >= g.timeout
+	}
 	for _, key := range inOrder(g.buffers, true, expired) {
 		if !g.emit(g.buffers[key], g.buffers[key].last.Add(g.timeout)) {
 			return false
@@ -274,6 +310,19 @@ func (g *grouper) flushIdle(now time.Time) bool {
 		delete(g.buffers, key)
 	}
 	return true
+}
+
+// nextDeadline returns the earliest idle deadline of the buffers held, and false when none is.
+func (g *grouper) nextDeadline() (time.Time, bool) {
+	var earliest time.Time
+	found := false
+	for _, p := range g.buffers {
+		g.visited++
+		if d := p.last.Add(g.timeout); !found || d.Before(earliest) {
+			earliest, found = d, true
+		}
+	}
+	return earliest, found
 }
 
 // flushAll emits everything still buffered, in arrival order, at time now: ingestion ended.
@@ -306,13 +355,7 @@ func Coalesce(ctx context.Context, in <-chan model.LogLine, out chan<- model.Log
 	var timerC <-chan time.Time // nil while no buffer is waiting, which parks the select case
 
 	arm := func(now time.Time) {
-		var earliest time.Time
-		found := false
-		for _, p := range g.buffers {
-			if d := p.last.Add(timeout); !found || d.Before(earliest) {
-				earliest, found = d, true
-			}
-		}
+		earliest, found := g.nextDeadline()
 		if !found {
 			timer.Stop()
 			timerC = nil
