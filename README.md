@@ -1706,7 +1706,7 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   at exit, where a name that returns and goes again counts again, and the exit status is not
   affected. Lines, scores, cards and the export carry their own names and are not affected.
   `--plain` keeps no list, so none of this applies to it.
-- **Multi-line grouping walked every buffer on each line until `TODO-VERSION`.** Each source and
+- **Multi-line grouping walked every buffer on each line until `v0.12.45`.** Each source and
   stream with a line pending has its own grouping buffer until it goes idle or its next event
   starts, and each line walked and sorted all of them (#166). A journald entry names its own
   source, so an invented live stream of distinct names was grouped at about 14,400 lines/s, against

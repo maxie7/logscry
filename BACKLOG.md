@@ -7909,7 +7909,7 @@ tool, recorded here so the reasoning survives. Epic numbers stay reserved for fe
       **Out of scope:** #36, #28, what a cue matches, and #163's and #165's bounds. Nothing found on
       the way; nothing filed.
 
-      Released as **TODO-VERSION**.
+      Released as **v0.12.45**.
 
 - [x] **`Restore` resolves a nested mapping by rule, not by map order** — #50, filed from the
       rejected widening of detector 4 in #46. `Restore` ranged over `m.byToken`, a Go map, and
