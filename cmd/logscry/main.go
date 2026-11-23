@@ -140,6 +140,15 @@ func run(ctx context.Context, args []string) (err error) {
 		}
 	}()
 
+	// Grouping buffers flushed early at the coalescer's bound: the same again. Nothing is lost, but
+	// a trace still arriving on a flushed stream continues as a second event (#166).
+	var flushedEarly *pipeline.Evictions
+	defer func() {
+		if line := earlyFlushTotal(flushedEarly.Count()); line != "" {
+			fmt.Fprintln(os.Stderr, line)
+		}
+	}()
+
 	sources, stdinOnly := sources(cfg)
 	replay, _ := sources[0].(*ingest.ReplaySource) // nil unless --replay: it is then the only source
 
@@ -162,6 +171,7 @@ func run(ctx context.Context, args []string) (err error) {
 	cuts = ingest.NewTruncations(func() { errs <- errTruncated })
 	evicted = pipeline.NewEvictions(func() { notices.Post(errEvicting) })
 	namesEvicted = pipeline.NewEvictions(func() { notices.Post(errSourcesEvicting) })
+	flushedEarly = pipeline.NewEvictions(func() { notices.Post(errFlushingEarly) })
 	ingestCtx := ingest.WithNotices(ingest.WithTruncations(ctx, cuts), notices)
 	go func() {
 		defer close(lines)
@@ -199,7 +209,7 @@ func run(ctx context.Context, args []string) (err error) {
 			// timer would never fire, and would fold lines a live run kept apart.
 			coalesce = pipeline.CoalesceSourceTime
 		}
-		go coalesce(ctx, lines, g, cfg.Group.Timeout)
+		go coalesce(pipeline.WithEarlyFlushes(ctx, flushedEarly), lines, g, cfg.Group.Timeout)
 		grouped = g
 	}
 
@@ -253,6 +263,21 @@ var errEvicting = fmt.Errorf("pipeline: the template table reached its bound of 
 var errSourcesEvicting = fmt.Errorf("pipeline: the source list reached its bound of %d names or %d KiB: "+
 	"the least recently seen are being dropped from it, and every line is still processed; "+
 	"the total is reported at exit", pipeline.MaxSources, pipeline.MaxSourceBytes>>10)
+
+// errFlushingEarly is the notice for the first grouping buffer flushed early at the coalescer's
+// bound, sent the same way. It costs no line, only the grouping of a trace that was still arriving.
+var errFlushingEarly = fmt.Errorf("pipeline: multi-line grouping reached its bound of %d buffers or %d MiB: "+
+	"the least recently touched are being flushed early, so a stack trace still arriving can split in two, "+
+	"and every line is still processed; the total is reported at exit", pipeline.MaxGroupBuffers, pipeline.MaxGroupBytes>>20)
+
+// earlyFlushTotal is the exit line for n grouping buffers flushed early, or "" for none.
+func earlyFlushTotal(n uint64) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("logscry: pipeline: %d grouping buffer(s) flushed early at the bound of %d buffers or %d MiB",
+		n, pipeline.MaxGroupBuffers, pipeline.MaxGroupBytes>>20)
+}
 
 // sourceEvictionTotal is the exit line for n names dropped from the source list, or "" for none.
 // It says evictions and not names, because a name that returns and goes again counts again.

@@ -294,3 +294,173 @@ func TestGroupBoundIsTheDocumentedOne(t *testing.T) {
 		t.Errorf("a grouper starts at %d buffers, %d bytes; want the constants", g.maxBuffers, g.maxBytes)
 	}
 }
+
+// TestEarlyFlushChargesTheSourceName: a buffer's name counts toward the bytes as well as its text.
+// Three buffers fill the bound exactly; a one-byte line under a two-byte name then passes it, so
+// the least recently touched goes; a 100-byte one passes it by two buffers' worth.
+func TestEarlyFlushChargesTheSourceName(t *testing.T) {
+	out := make(chan model.LogLine, 16)
+	g := newGrouper(context.Background(), out, time.Second, true)
+	g.maxBytes = 150
+	small := strings.Repeat("x", 48)
+	groupReplay(g, []model.LogLine{
+		{Source: "s1", Raw: small}, {Source: "s2", Raw: small}, {Source: "s3", Raw: small},
+		{Source: "s4", Raw: "z"},
+	})
+	if got, want := sourcesOf(drained(out)), []string{"s1"}; !slices.Equal(got, want) {
+		t.Errorf("after the one-byte line, flushed early: %v, want %v", got, want)
+	}
+	groupReplay(g, []model.LogLine{{Source: "s5", Raw: strings.Repeat("y", 98)}})
+	if got, want := sourcesOf(drained(out)), []string{"s2", "s3"}; !slices.Equal(got, want) {
+		t.Errorf("after the 100-byte line, flushed early: %v, want %v", got, want)
+	}
+	if b := heldBytes(g); b != 103 {
+		t.Errorf("%d bytes held, want 103", b)
+	}
+}
+
+// TestAFoldCanFlushEarly: a fold grows its buffer, and when that passes the bytes the least
+// recently touched other buffer goes, not the one still growing.
+func TestAFoldCanFlushEarly(t *testing.T) {
+	out := make(chan model.LogLine, 16)
+	g := newGrouper(context.Background(), out, time.Second, true)
+	g.maxBytes = 150
+	small := strings.Repeat("x", 48)
+	groupReplay(g, []model.LogLine{
+		{Source: "s1", Raw: small}, {Source: "s2", Raw: small}, {Source: "s3", Raw: small},
+		{Source: "s3", Raw: "    at frame"},
+	})
+	if got, want := sourcesOf(drained(out)), []string{"s1"}; !slices.Equal(got, want) {
+		t.Errorf("flushed early: %v, want %v", got, want)
+	}
+	if p := g.buffers[streamKey{source: "s3"}]; p == nil || p.count != 2 {
+		t.Errorf("s3's buffer = %+v, want held with its 2 lines", p)
+	}
+}
+
+// TestEarlyFlushCancelled: an early flush that cannot be delivered, the consumer gone, stops add
+// and drops nothing.
+func TestEarlyFlushCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	g := newGrouper(ctx, make(chan model.LogLine), time.Second, true)
+	g.maxBuffers = 1
+	if !g.add(model.LogLine{Source: "a", Raw: "order 1"}, groupT0) {
+		t.Fatal("add within the bound reported cancellation")
+	}
+	if g.add(model.LogLine{Source: "b", Raw: "order 2"}, groupT0) {
+		t.Error("add past the bound reported success with the consumer gone")
+	}
+	if len(g.buffers) != 2 {
+		t.Errorf("%d buffers held, want both: nothing is dropped", len(g.buffers))
+	}
+}
+
+// checkUnreachable fails if the grouper still reaches a buffer it has let go of: through its heap's
+// spare capacity, or through a buffer's links or index. It also checks that every buffer held is
+// where the heap and the touch order say.
+func checkUnreachable(t *testing.T, g *grouper, seen map[*pending]bool) {
+	t.Helper()
+	h := g.deadlines
+	for i, p := range h[len(h):cap(h)] {
+		if p != nil {
+			t.Errorf("the heap's spare slot %d still holds a buffer (%q)", len(h)+i, p.line.Source)
+		}
+	}
+	held := 0
+	for p := g.order.front; p != nil; p = p.next {
+		held++
+		if g.buffers[streamKey{source: p.line.Source, stream: p.line.Stream}] != p || h[p.index] != p {
+			t.Errorf("buffer %q is in the touch order but not where the map and the heap say", p.line.Source)
+		}
+	}
+	if held != len(g.buffers) || len(h) != len(g.buffers) {
+		t.Errorf("%d buffers in the map, %d in the heap, %d in the touch order", len(g.buffers), len(h), held)
+	}
+	for p := range seen {
+		if g.buffers[streamKey{source: p.line.Source, stream: p.line.Stream}] == p {
+			continue
+		}
+		if p.index != -1 || p.prev != nil || p.next != nil {
+			t.Errorf("emitted buffer %q kept index %d, prev %v, next %v; want -1 and no links",
+				p.line.Source, p.index, p.prev != nil, p.next != nil)
+		}
+	}
+}
+
+// TestEmittedBuffersAreUnreachable: a buffer that has been emitted, whichever way it left, is
+// reachable from nothing the grouper keeps. The heap's backing array outlives its length, so a slot
+// Pop vacated and did not clear would hold an emitted line, up to maxCoalesceBytes, for as long as
+// the run; so would a link from a buffer still held. Every way out is taken here: early flushes,
+// header flushes, a cap flush, the idle flush and the flush at end of input.
+func TestEmittedBuffersAreUnreachable(t *testing.T) {
+	out := make(chan model.LogLine, 4*maxCoalesceLines)
+	g := newGrouper(context.Background(), out, time.Second, true)
+	g.maxBuffers = 48
+	seen := map[*pending]bool{}
+	step := func(line model.LogLine) {
+		g.flushIdle(groupT0)
+		g.add(line, groupT0)
+		for _, p := range g.buffers {
+			seen[p] = true
+		}
+		drained(out)
+	}
+	for i := range 64 { // 16 early flushes
+		step(model.LogLine{Source: unit(i), Raw: "order 4242 placed"})
+	}
+	for i := 16; i < 64; i++ { // a header flush each
+		step(model.LogLine{Source: unit(i), Raw: "order 4243 placed"})
+	}
+	step(model.LogLine{Source: unit(63), Raw: "ledger closed"})
+	for range maxCoalesceLines - 1 { // the cap flush
+		step(model.LogLine{Source: unit(63), Raw: "    at frame"})
+	}
+	checkUnreachable(t, g, seen)
+
+	g.flushIdle(groupT0.Add(time.Hour))
+	drained(out)
+	if len(g.deadlines) != 0 || g.bytes != 0 {
+		t.Fatalf("after the idle flush: %d buffers, %d bytes held, want none", len(g.deadlines), g.bytes)
+	}
+	checkUnreachable(t, g, seen)
+
+	for i := range 8 {
+		step(model.LogLine{Source: unit(i), Raw: "order 4244 placed"})
+	}
+	g.flushAll(groupT0)
+	drained(out)
+	if len(g.deadlines) != 0 || g.bytes != 0 {
+		t.Fatalf("after the flush at end of input: %d buffers, %d bytes held, want none", len(g.deadlines), g.bytes)
+	}
+	checkUnreachable(t, g, seen)
+}
+
+// TestIdleFlushCancelled: an idle flush that cannot be delivered stops, and the buffer it could not
+// deliver is still held, so a heap pop never runs ahead of its emit.
+func TestIdleFlushCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	g := newGrouper(ctx, make(chan model.LogLine), time.Second, true)
+	g.add(model.LogLine{Source: "a", Raw: "order 1"}, groupT0)
+	if g.flushIdle(groupT0.Add(time.Second)) {
+		t.Error("flushIdle reported success with the consumer gone")
+	}
+	if len(g.buffers) != 1 || len(g.deadlines) != 1 {
+		t.Errorf("%d buffers, %d deadlines held, want the one that was not delivered", len(g.buffers), len(g.deadlines))
+	}
+}
+
+// TestFlushAllCancelled: the flush at end of input stops at the first line it cannot deliver.
+func TestFlushAllCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	g := newGrouper(ctx, make(chan model.LogLine), time.Second, true)
+	g.add(model.LogLine{Source: "a", Raw: "order 1"}, groupT0)
+	if g.flushAll(groupT0) {
+		t.Error("flushAll reported success with the consumer gone")
+	}
+	if len(g.buffers) != 1 {
+		t.Errorf("%d buffers held, want the one that was not delivered", len(g.buffers))
+	}
+}
