@@ -1706,13 +1706,21 @@ renderer, so a job checking it sees an incomplete export whichever way the outpu
   at exit, where a name that returns and goes again counts again, and the exit status is not
   affected. Lines, scores, cards and the export carry their own names and are not affected.
   `--plain` keeps no list, so none of this applies to it.
-- **A stream of distinct source names slows multi-line grouping.** Each source name has its own
-  grouping buffer until it goes idle, and each line walks all of them. An invented live stream of
-  distinct names ran at about 14,500 lines/s, against about 306,000 from one source. A crafted
-  `--replay` capture with many names on one timestamp never goes idle, so the buffers last to the
-  end of the file and the cost is quadratic: 56 s for 80,000 names. `--group-timeout 0` turns
-  grouping off and avoids it (0.67 s for the same capture), but a stack trace then stays one event
-  per frame. Filed as #166.
+- **Multi-line grouping walked every buffer on each line until `TODO-VERSION`.** Each source and
+  stream with a line pending has its own grouping buffer until it goes idle or its next event
+  starts, and each line walked and sorted all of them (#166). A journald entry names its own
+  source, so an invented live stream of distinct names was grouped at about 14,400 lines/s, against
+  about 1.1 million from one source. A `--replay` capture with many names on one timestamp never
+  goes idle, so every buffer lasted to the end of the file: 57 s for 80,000 names. A line now costs
+  the same however many buffers are held: 1.5 million lines/s for that live stream, and 0.72 s for
+  that capture, against 0.69 s with grouping off (`--group-timeout 0`).
+
+  The buffers are bounded too: at most 4,096, holding at most 16 MiB of text and source names.
+  Ten real boots held at most 20 buffers and 17,544 bytes at once. Past either bound the buffer
+  touched longest ago is flushed early. No line is lost, but a stack trace still arriving on that
+  stream continues as a second event. The first early flush is said once, on stderr with `--plain`
+  and in the status bar in the TUI. The total is printed at exit, and the exit status is not
+  affected.
 - **A capture recorded without `--all` has lost its long journald messages.** Without
   `--all`, `journalctl -o json` writes any field over 4096 bytes as `null`, and the message is
   not in the file at all. That limit is journalctl(1)'s; systemd's `logs-show.c` applies it to
